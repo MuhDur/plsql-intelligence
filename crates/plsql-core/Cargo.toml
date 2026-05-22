@@ -1,0 +1,16 @@
+[package]
+name = "plsql-core"
+version = "0.1.0"
+description = "Shared core types for the plsql-intelligence workspace"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+miette.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

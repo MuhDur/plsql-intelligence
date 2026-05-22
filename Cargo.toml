@@ -1,0 +1,51 @@
+[workspace]
+members = [
+    "crates/plsql-core",
+    "crates/plsql-output",
+    "crates/plsql-render",
+    "crates/plsql-store",
+    "crates/plsql-engine",
+    "crates/plsql-catalog",
+    "crates/plsql-depgraph",
+    "crates/plsql-ir",
+    "crates/plsql-privileges",
+    "crates/plsql-symbols",
+    "crates/plsql-parser",
+    "crates/plsql-parser-antlr",
+    "crates/plsql-parser-java",
+    "crates/plsql-project",
+    "crates/plsql-doc",
+    "crates/plsql-bindgen",
+    "crates/plsql-lineage",
+    "crates/plsql-sast",
+    "crates/plsql-cicd",
+    "crates/plsql-mcp",
+    "crates/plsql-support",
+    "crates/plsql-accretion",
+    "tools/corpus-bench",
+    "tools/corpus-grow",
+    "tools/corpus-license-check",
+    "tools/plan-lint",
+    "tools/usr-loop",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+miette = { version = "7", features = ["fancy-no-backtrace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+thiserror = "2"
+tracing = "0.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"

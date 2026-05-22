@@ -1,0 +1,25 @@
+[package]
+name = "plsql-depgraph"
+version = "0.1.0"
+description = "Typed dependency-graph IR for plsql-intelligence"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+miette.workspace = true
+plsql-catalog = { path = "../plsql-catalog" }
+plsql-core = { path = "../plsql-core" }
+plsql-output = { path = "../plsql-output" }
+plsql-render = { path = "../plsql-render" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

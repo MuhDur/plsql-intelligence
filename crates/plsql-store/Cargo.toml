@@ -1,0 +1,25 @@
+[package]
+name = "plsql-store"
+version = "0.1.0"
+description = "SQLite-backed content-addressed cache for plsql-intelligence"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[[bin]]
+name = "plsqld"
+path = "src/bin/plsqld.rs"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

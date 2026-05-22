@@ -1,0 +1,68 @@
+--- a/customers.sql
++++ b/customers.sql
+@@ -8,7 +8,6 @@
+     email           VARCHAR2(320),
+     phone           VARCHAR2(40),
+     region          VARCHAR2(60),
+-    legacy_segment  VARCHAR2(30),
+     created_at      DATE          DEFAULT SYSDATE,
+     CONSTRAINT customers_pk PRIMARY KEY (customer_id)
+ );
+--- a/v_high_value_customers.sql
++++ b/v_high_value_customers.sql
+@@ -6,7 +6,6 @@
+         customer_id,
+         customer_name,
+         email,
+         region,
+-        legacy_segment,
+         created_at
+     FROM customers
+-    WHERE legacy_segment IS NOT NULL;
++    WHERE region IS NOT NULL;
+--- a/pkg_customer_report.pkb
++++ b/pkg_customer_report.pkb
+@@ -18,7 +18,7 @@
+         OPEN v_cur FOR
+             SELECT customer_id, customer_name, email, region, legacy_segment
++            SELECT customer_id, customer_name, email, region, created_at
+             FROM   customers
+-            WHERE  legacy_segment = p_segment
++            WHERE  region = p_segment
+             ORDER BY customer_name;
+@@ -26,11 +26,11 @@
+         CURSOR c_summary IS
+-            SELECT legacy_segment AS seg_name, COUNT(*) AS seg_count, region AS seg_region
++            SELECT region AS seg_name, COUNT(*) AS seg_count, region AS seg_region
+             FROM   customers
+-            WHERE  legacy_segment IS NOT NULL
+-            GROUP BY legacy_segment, region
++            WHERE  region IS NOT NULL
++            GROUP BY region
+@@ -41,7 +41,7 @@
+     IS
+-        v_current_segment customers.legacy_segment%TYPE;
++        v_region customers.region%TYPE;
+     BEGIN
+-        SELECT legacy_segment
++        SELECT region
+         INTO   v_current_segment
++        INTO   v_region
+--- a/proc_segment_summary.sql
++++ b/proc_segment_summary.sql
+@@ -9,7 +9,7 @@
+ IS
+-    v_seg    customers.legacy_segment%TYPE;
++    v_region customers.region%TYPE;
+     v_count  NUMBER;
+ BEGIN
+     FOR rec IN (
+-        SELECT legacy_segment AS seg_name, COUNT(*) AS cnt
++        SELECT region AS seg_name, COUNT(*) AS cnt
+         FROM   customers
+-        WHERE  (p_region IS NULL OR region = p_region)
+-          AND  legacy_segment IS NOT NULL
+-        GROUP BY legacy_segment
++        WHERE  (p_region IS NULL OR region = p_region)
++          AND  region IS NOT NULL
++        GROUP BY region

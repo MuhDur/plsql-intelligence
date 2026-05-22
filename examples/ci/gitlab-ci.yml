@@ -1,0 +1,84 @@
+# Example GitLab CI workflow gating MRs that touch PL/SQL via the
+# `plsql cicd` family. Drop this into `.gitlab-ci.yml` (or include from
+# the same) in a downstream PL/SQL repository.
+#
+# Three jobs mirror the GitHub Actions example:
+#   1. `plsql:predict` — predicts invalidation from the changeset
+#   2. `plsql:gate`    — applies the policy file
+#   3. `plsql:mr-note` — posts the verdict as an MR discussion
+#
+# Plan reference: §15 (CI/CD Recompilation Cascade) + §15.7 (PR integration).
+
+stages:
+  - plsql-cicd
+
+# Common base for every job — installs the CLI and configures git for
+# rename-aware classify-change.
+.plsql_base:
+  stage: plsql-cicd
+  image: registry.gitlab.com/plsql-intelligence/runner:0.x
+  before_script:
+    - git config --global rename.detection true
+    - plsql --version
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        paths:
+          - "**/*.sql"
+          - "**/*.pks"
+          - "**/*.pkb"
+          - "**/*.tps"
+          - "**/*.tpb"
+          - "**/*.trg"
+          - "**/*.vw"
+
+plsql:predict:
+  extends: .plsql_base
+  script:
+    - >
+      plsql lineage classify-change
+      --before "$CI_MERGE_REQUEST_DIFF_BASE_SHA"
+      --after  "$CI_COMMIT_SHA"
+      --robot-json > changeset.json
+    - >
+      plsql cicd predict
+      --changeset changeset.json
+      --mode catalog-aware
+      --catalog-snapshot ./.plsql/catalog-snapshot.json
+      --robot-json > prediction.json
+  artifacts:
+    paths:
+      - changeset.json
+      - prediction.json
+    expire_in: 7 days
+
+plsql:gate:
+  extends: .plsql_base
+  needs:
+    - plsql:predict
+  script:
+    - >
+      plsql cicd gate
+      --prediction prediction.json
+      --policy .plsql-cicd-policy.toml
+      --robot-json > gate.json
+  artifacts:
+    paths:
+      - gate.json
+    expire_in: 7 days
+    when: always
+  # Exit 0 pass / 1 violations / 2 invocation error.
+  allow_failure: false
+
+plsql:mr-note:
+  extends: .plsql_base
+  needs:
+    - plsql:gate
+  when: always
+  script:
+    - >
+      plsql post-pr-comment
+      --gate gate.json
+      --gitlab
+      --merge-request "$CI_MERGE_REQUEST_IID"
+      --project       "$CI_PROJECT_ID"

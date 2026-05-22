@@ -1,0 +1,6 @@
+{
+  "_doc": "USR §0 monotonic non-regression baseline (PLSQL-USR-001 §3.G6). The committed FLOOR every gated candidate's private-estate run must meet or exceed: dep_graph edges, fact_store facts, completeness.extracted_semantics_ratio. P6 RATCHET (2026-05-19): raised from the conservative P4 floor (0/0/0.0) to a real measured private-estate run via `usr-gate-rs metrics $PLSQL_PRIVATE_ESTATE` (literal: edges=4429 facts=8420 ratio=1.0). Deliberate, human-reviewed bump under the SAME discipline as the gate sha-pin (compliance STAKE-RUBRIC): the floor only moves UP, only by an explicit committed change. Lowering ANY value is a monotonic-value regression (I-MONOTONIC-VALUE) requiring another deliberate human-reviewed commit documenting why.",
+  "dep_graph_edges": 4429,
+  "facts": 8420,
+  "extracted_semantics_ratio": 1.0
+}

@@ -1,0 +1,19 @@
+[package]
+name = "plsql-parser"
+version = "0.1.0"
+description = "PL/SQL parser frontend: ParseBackend trait, token tape, CST, AST types"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+plsql-core = { path = "../plsql-core" }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

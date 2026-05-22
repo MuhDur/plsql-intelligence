@@ -1,0 +1,29 @@
+[package]
+name = "plsql-catalog"
+version = "0.1.0"
+description = "Offline-first Oracle catalog snapshot model for plsql-intelligence"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+oracle-driver = ["dep:oracle"]
+live-xe = ["oracle-driver"]
+
+[dependencies]
+chrono = { version = "0.4.44", features = ["serde"] }
+oracle = { version = "0.6.3", optional = true }
+plsql-core = { path = "../plsql-core" }
+plsql-output = { path = "../plsql-output" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

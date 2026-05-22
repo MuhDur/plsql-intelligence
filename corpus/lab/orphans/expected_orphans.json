@@ -1,0 +1,32 @@
+{
+  "schema_id": "plsql.lineage.orphan_candidates",
+  "schema_version": "1.0.0",
+  "_comment": "Golden expected report for corpus/lab/orphans/. detect_orphans run against a depgraph built from this corpus should produce a structurally-equivalent OrphanCandidatesReport.",
+  "payload": {
+    "candidates": [
+      {
+        "object_id": "lab.pkg_legacy_purge",
+        "kind": "PackageBody",
+        "last_used": null,
+        "evidence": [
+          "no incoming edges in depgraph (identity_kind = PackageBody)"
+        ],
+        "confidence": "high_confidence_unused"
+      },
+      {
+        "object_id": "lab.pkg_likely_orphan",
+        "kind": "PackageBody",
+        "last_used": null,
+        "evidence": [
+          "no incoming edges in depgraph (identity_kind = PackageBody)",
+          "object has outgoing references but nothing points at it"
+        ],
+        "confidence": "likely_unused"
+      }
+    ],
+    "objects_examined": 4,
+    "objects_with_references": 2,
+    "observation_window": null,
+    "_comment": "pkg_actively_used + pkg_caller are NOT orphan candidates: pkg_actively_used has an incoming Calls edge from pkg_caller; pkg_caller has zero incoming but is the demo entry point so test harness can either exclude it or expect it as a HighConfidenceUnused root."
+  }
+}

@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy (-D warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-targets
+      - run: cargo test --workspace --doc
+
+  bench-no-run:
+    name: cargo bench --no-run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo bench --workspace --no-run
+
+  corpus-license-check:
+    name: corpus license check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run -p corpus-license-check
+
+  # Surrogate for `PLSQL-PARSE-012` — once the parse-corpus harness lands it
+  # will replace this job with structured parse-quality metrics (clean rate,
+  # recovered rate, skipped-token ratio, top-level recognition).
+  parse-success:
+    name: parse-success (parser tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p plsql-parser -p plsql-parser-antlr
+
+  # `PLSQL-LAB-010` — lab-as-release-gate. PR-blocking CI for drift
+  # in `corpus/lab/expected/*.json` goldens. Fails if any golden is
+  # invalid JSON, or if the lineage tests that consume the goldens
+  # regress. Cheap (no Oracle, no docker); runs on every PR.
+  lab-gate:
+    name: lab-gate (corpus/lab goldens, PR-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: make lab-gate
+
+  # `PLSQL-LAB-003` — sanity-check the L1 hero diff golden artifact
+  # via `make demo-no-db-verify`. Cheap (no Oracle, no docker) so it
+  # runs on every PR; it asserts the parse_change_file pipeline
+  # consumes the diff and the golden JSON is present.
+  demo-no-db:
+    name: demo-no-db (hero-diff golden gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: make demo-no-db-verify
+
+  # `PLSQL-PLAN-002` — run plan-lint on every push/PR. Now a blocking
+  # gate (PLSQL-PLAN-003 closed all known error-severity drift); warnings
+  # still surface but don't fail the build.
+  plan-lint:
+    name: plan-lint (structural integrity)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run plan-lint (human report)
+        run: cargo run -p plan-lint -- --doctor
+      - name: Run plan-lint (JSON report)
+        run: cargo run -p plan-lint -- --robot-json > plan-lint-report.json
+      - name: Upload JSON report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan-lint-report
+          path: plan-lint-report.json
+          if-no-files-found: ignore

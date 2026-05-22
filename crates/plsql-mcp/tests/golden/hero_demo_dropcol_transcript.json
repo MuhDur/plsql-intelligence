@@ -1,0 +1,87 @@
+{
+  "bead": "PLSQL-LAB-008",
+  "scenario": "§1.4 DROP COLUMN hero: ALTER TABLE customers DROP COLUMN legacy_segment — 'know what breaks before you DROP COLUMN Oracle PL/SQL'",
+  "schema_placeholder": "HEROCOL_T_<PID>",
+  "steps": [
+    {
+      "step": 1,
+      "tool": "list_objects",
+      "input": "schema=HEROCOL_T_<PID>",
+      "response": "entries=[CUSTOMERS/TABLE VALID, HEROCOL_T_<PID>_CUST_PK/INDEX VALID, PKG_CUSTOMER_REPORT/PACKAGE VALID, PKG_CUSTOMER_REPORT/PACKAGE BODY VALID, PROC_SEGMENT_SUMMARY/PROCEDURE VALID, V_HIGH_VALUE_CUSTOMERS/VIEW VALID], all_valid_before_drop=true"
+    },
+    {
+      "step": 2,
+      "tool": "query",
+      "input": "SELECT column_name, data_type, data_length, nullable FROM all_tab_columns WHERE owner=HEROCOL_T_<PID> AND table_name=CUSTOMERS",
+      "response": "columns=7, has_legacy_segment=true"
+    },
+    {
+      "step": 3,
+      "tool": "query",
+      "input": "SELECT text FROM all_views WHERE owner=HEROCOL_T_<PID> AND view_name=V_HIGH_VALUE_CUSTOMERS",
+      "response": "view_text_length=141, references_legacy_segment=true"
+    },
+    {
+      "step": 4,
+      "tool": "get_object_source",
+      "input": "owner=HEROCOL_T_<PID>, name=PKG_CUSTOMER_REPORT, type=PACKAGE BODY",
+      "response": "lines=70, references_legacy_segment=true"
+    },
+    {
+      "step": 5,
+      "tool": "get_object_source",
+      "input": "owner=HEROCOL_T_<PID>, name=PROC_SEGMENT_SUMMARY, type=PROCEDURE",
+      "response": "lines=24, references_legacy_segment=true"
+    },
+    {
+      "step": 6,
+      "tool": "query",
+      "input": "SELECT name, type, owner FROM all_dependencies WHERE referenced_owner=HEROCOL_T_<PID> AND referenced_name=CUSTOMERS",
+      "response": "dependent_count=3, dependents=[PKG_CUSTOMER_REPORT/HEROCOL_T_<PID>, PROC_SEGMENT_SUMMARY/HEROCOL_T_<PID>, V_HIGH_VALUE_CUSTOMERS/HEROCOL_T_<PID>]"
+    },
+    {
+      "step": 7,
+      "tool": "get_errors",
+      "input": "owner=HEROCOL_T_<PID>, name=PKG_CUSTOMER_REPORT (before drop)",
+      "response": "errors_before_drop=0, compile_status=VALID"
+    },
+    {
+      "step": 8,
+      "tool": "alter_table_drop_column",
+      "input": "ALTER TABLE HEROCOL_T_<PID>.CUSTOMERS DROP COLUMN LEGACY_SEGMENT",
+      "response": "DDL applied; column LEGACY_SEGMENT removed from CUSTOMERS table"
+    },
+    {
+      "step": 9,
+      "tool": "query",
+      "input": "SELECT object_name, object_type, status FROM all_objects WHERE owner=HEROCOL_T_<PID> AND object_name IN (CUSTOMERS, V_HIGH_VALUE_CUSTOMERS, PKG_CUSTOMER_REPORT, PROC_SEGMENT_SUMMARY)",
+      "response": "V_HIGH_VALUE_CUSTOMERS/VIEW=INVALID, PKG_CUSTOMER_REPORT/PACKAGE=VALID, PKG_CUSTOMER_REPORT/PACKAGE_BODY=INVALID, PROC_SEGMENT_SUMMARY/PROCEDURE=INVALID"
+    },
+    {
+      "step": 10,
+      "tool": "query",
+      "input": "SELECT COUNT(*) FROM all_tab_columns WHERE owner=HEROCOL_T_<PID> AND table_name=CUSTOMERS AND column_name=LEGACY_SEGMENT",
+      "response": "col_count=0, column_absent_from_catalog=true"
+    }
+  ],
+  "what_breaks": [
+    {
+      "kind": "PackageBody",
+      "object_id": "HEROCOL_T_<PID>.PKG_CUSTOMER_REPORT",
+      "oracle_status": "INVALID",
+      "reason": "Package body references customers.legacy_segment in get_customers_by_segment (WHERE + SELECT), get_segment_summary (GROUP BY), and audit_segment_access (%TYPE anchor + SELECT)"
+    },
+    {
+      "kind": "Procedure",
+      "object_id": "HEROCOL_T_<PID>.PROC_SEGMENT_SUMMARY",
+      "oracle_status": "INVALID",
+      "reason": "Procedure references customers.legacy_segment via %TYPE anchor and a SELECT in the FOR loop cursor"
+    },
+    {
+      "kind": "View",
+      "object_id": "HEROCOL_T_<PID>.V_HIGH_VALUE_CUSTOMERS",
+      "oracle_status": "INVALID",
+      "reason": "View SELECT-references customers.legacy_segment directly in select list + WHERE clause; column no longer exists after DROP COLUMN"
+    }
+  ]
+}

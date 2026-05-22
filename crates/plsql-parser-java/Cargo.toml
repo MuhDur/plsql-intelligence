@@ -1,0 +1,16 @@
+[package]
+name = "plsql-parser-java"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Subprocess-based Java ANTLR ParseBackend for plsql-intelligence (PLSQL-PARSE-000B)"
+
+[dependencies]
+plsql-core = { path = "../plsql-core" }
+plsql-parser = { path = "../plsql-parser" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

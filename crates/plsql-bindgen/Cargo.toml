@@ -1,0 +1,28 @@
+[package]
+name = "plsql-bindgen"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Type-safe Rust bindings generation for PL/SQL packages and tables."
+
+[[bin]]
+name = "plsql-bindgen"
+path = "src/main.rs"
+
+[dependencies]
+plsql-core = { path = "../plsql-core" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[features]
+default = []
+async = []
+# `PLSQL-BG-014` / oracle-9rkm: enables the xe_roundtrip integration
+# test against a live Oracle XE 23ai container. Off by default so
+# `cargo test --workspace` doesn't try to bind to a port-1521 service
+# that isn't there.
+live-roundtrip = []
+
+[lints]
+workspace = true

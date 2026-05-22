@@ -1,0 +1,32 @@
+[package]
+name = "plsql-accretion"
+version = "0.1.0"
+description = "USR loop library (Layer 5): GapRecord capture from honest-uncertainty exhaust (PLSQL-USR-001)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+plsql-core = { path = "../plsql-core" }
+plsql-engine = { path = "../plsql-engine" }
+plsql-output = { path = "../plsql-output" }
+plsql-parser = { path = "../plsql-parser" }
+plsql-parser-antlr = { path = "../plsql-parser-antlr", features = [
+    "antlr-codegen",
+] }
+plsql-support = { path = "../plsql-support" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[[bin]]
+name = "usr-gate-rs"
+path = "src/bin/usr_gate_rs.rs"
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

@@ -1,0 +1,72 @@
+{
+  "schema_id": "plsql.lineage.what_breaks_golden",
+  "schema_version": "1.0.0",
+  "scenario": "rename parameter p_emp_id → p_employee_id on employee_mgmt.fire_employee and employee_mgmt.get_salary",
+  "change_set": {
+    "old_run_id": null,
+    "new_run_id": null,
+    "changes": [
+      {
+        "kind": "Signature",
+        "object_id": "employee_mgmt.fire_employee",
+        "summary": "parameter p_emp_id renamed to p_employee_id",
+        "breaking_for_named_callers": true,
+        "breaking_for_positional_callers": false
+      },
+      {
+        "kind": "Signature",
+        "object_id": "employee_mgmt.get_salary",
+        "summary": "parameter p_emp_id renamed to p_employee_id",
+        "breaking_for_named_callers": true,
+        "breaking_for_positional_callers": false
+      },
+      {
+        "kind": "Body",
+        "object_id": "employee_mgmt",
+        "summary": "body updated to reference renamed parameter inside fire_employee + get_salary",
+        "breaking_for_named_callers": false,
+        "breaking_for_positional_callers": false
+      }
+    ]
+  },
+  "what_breaks": {
+    "nodes": [
+      {
+        "logical_id": "employee_mgmt.fire_employee",
+        "kind": "Procedure",
+        "confidence": "Exact"
+      },
+      {
+        "logical_id": "employee_mgmt.get_salary",
+        "kind": "Function",
+        "confidence": "Exact"
+      }
+    ],
+    "edges": [
+      {
+        "source": "employee_mgmt.fire_employee",
+        "target": "employee_mgmt.fire_employee_named_callers",
+        "kind": "BreakingRename",
+        "confidence": "Exact"
+      },
+      {
+        "source": "employee_mgmt.get_salary",
+        "target": "employee_mgmt.get_salary_named_callers",
+        "kind": "BreakingRename",
+        "confidence": "Exact"
+      }
+    ],
+    "unknown_reasons": []
+  },
+  "positional_callers_still_compile": [
+    "Callers that used `employee_mgmt.fire_employee(42)` (positional) compile unchanged.",
+    "Callers that used `employee_mgmt.get_salary(42)` (positional) compile unchanged."
+  ],
+  "audit_trail": {
+    "input_diff": "change.diff",
+    "before_root": "before/",
+    "after_root": "after/",
+    "parser": "plsql_lineage::parse_change_file",
+    "expected_unresolved_count": 0
+  }
+}

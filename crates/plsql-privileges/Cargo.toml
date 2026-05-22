@@ -1,0 +1,21 @@
+[package]
+name = "plsql-privileges"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Privilege and authorization model for PL/SQL analysis"
+
+[dependencies]
+plsql-core = { path = "../plsql-core" }
+plsql-catalog = { path = "../plsql-catalog" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

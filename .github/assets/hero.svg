@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" width="1200" height="300" role="img" aria-label="PL/SQL Intelligence Engine — know what breaks before you change Oracle PL/SQL">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1120"/>
+      <stop offset="1" stop-color="#131f38"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#38bdf8"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+    <radialGradient id="ripple" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#f0b429" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#f0b429" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1200" height="300" fill="url(#bg)"/>
+  <rect width="1200" height="4" fill="url(#accent)"/>
+
+  <!-- text block -->
+  <text x="72" y="92" font-family="'Segoe UI',Roboto,Helvetica,Arial,sans-serif" font-size="20" letter-spacing="3.5" fill="#38bdf8" font-weight="600">OFFLINE ORACLE PL/SQL CODE INTELLIGENCE</text>
+  <text x="70" y="158" font-family="'Segoe UI',Roboto,Helvetica,Arial,sans-serif" font-size="58" fill="#f8fafc" font-weight="700">PL/SQL Intelligence Engine</text>
+  <text x="72" y="205" font-family="'Segoe UI',Roboto,Helvetica,Arial,sans-serif" font-size="25" fill="#94a3b8">Know what breaks before you change Oracle PL/SQL.</text>
+  <text x="72" y="252" font-family="'Segoe UI',Roboto,Helvetica,Arial,sans-serif" font-size="17" fill="#64748b" letter-spacing="0.4">offline  ·  package-aware  ·  honest uncertainty  ·  self-healing  ·  100% safe Rust</text>
+
+  <!-- change-impact graph motif -->
+  <g transform="translate(1000,150)">
+    <circle cx="0" cy="0" r="120" fill="url(#ripple)"/>
+    <!-- edges -->
+    <g stroke-width="2.5" fill="none">
+      <path d="M0,0 L-78,-58" stroke="#f0b429"/>
+      <path d="M0,0 L82,-44" stroke="#f0b429"/>
+      <path d="M0,0 L60,72" stroke="#f0b429"/>
+      <path d="M0,0 L-86,46" stroke="#334155"/>
+      <path d="M82,-44 L96,38" stroke="#334155"/>
+      <path d="M-78,-58 L-30,-104" stroke="#334155"/>
+    </g>
+    <!-- downstream nodes -->
+    <g>
+      <circle cx="-78" cy="-58" r="13" fill="#1e293b" stroke="#f0b429" stroke-width="2.5"/>
+      <circle cx="82" cy="-44" r="13" fill="#1e293b" stroke="#f0b429" stroke-width="2.5"/>
+      <circle cx="60" cy="72" r="13" fill="#1e293b" stroke="#f0b429" stroke-width="2.5"/>
+      <circle cx="-86" cy="46" r="11" fill="#1e293b" stroke="#475569" stroke-width="2"/>
+      <circle cx="96" cy="38" r="11" fill="#1e293b" stroke="#475569" stroke-width="2"/>
+      <circle cx="-30" cy="-104" r="11" fill="#1e293b" stroke="#475569" stroke-width="2"/>
+    </g>
+    <!-- the changed node -->
+    <circle cx="0" cy="0" r="20" fill="#f0b429"/>
+    <circle cx="0" cy="0" r="20" fill="none" stroke="#fde68a" stroke-width="2"/>
+  </g>
+</svg>

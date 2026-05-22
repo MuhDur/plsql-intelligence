@@ -1,0 +1,138 @@
+//! Scripted MCP client integration test (PLSQL-MCP-009).
+//!
+//! Drives `plsql-mcp` exactly as a real MCP client would — one
+//! newline-delimited JSON-RPC request at a time through
+//! [`handle_request_line`] — over the full registered foundation
+//! tool surface, and golden-asserts the structural invariants of
+//! every response.
+//!
+//! "Golden snapshot" here follows the workspace idiom (see
+//! PLSQL-PARSE-014): deterministic structural assertions on the
+//! canonical JSON rather than an `insta` dependency. Every
+//! invariant that must never silently regress is pinned:
+//! JSON-RPC framing, id echo, the MCP-007 trust block on every
+//! success, and the exact registered foundation tool set.
+
+use plsql_mcp::{
+    ToolRegistry, handle_request_line, register_analyze_project_tool, register_foundation_tools,
+    register_graph_tools,
+};
+
+/// The foundation tool surface a scripted client should see.
+const EXPECTED_TOOLS: &[&str] = &[
+    "analyze_project",
+    "find_callers",
+    "find_callees",
+    "get_dependencies",
+    "dynamic_sql_evidence",
+    "completeness_report",
+    "doc_lookup",
+];
+
+fn foundation_registry() -> ToolRegistry {
+    let mut r = ToolRegistry::new();
+    register_analyze_project_tool(&mut r);
+    register_graph_tools(&mut r);
+    register_foundation_tools(&mut r);
+    r
+}
+
+fn call(reg: &ToolRegistry, line: &str) -> serde_json::Value {
+    let resp = handle_request_line(line, reg).expect("server produced a response");
+    serde_json::to_value(&resp).expect("response serializes")
+}
+
+#[test]
+fn scripted_session_golden_invariants() {
+    let reg = foundation_registry();
+
+    // --- frame 1: initialize ---
+    let init = call(
+        &reg,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    );
+    assert_eq!(init["jsonrpc"], "2.0");
+    assert_eq!(init["id"], 1, "id is echoed");
+    assert!(init["error"].is_null(), "initialize must not error");
+    assert!(init["result"]["serverInfo"]["name"].is_string());
+    // MCP-007: trust block on every success.
+    assert_eq!(
+        init["result"]["meta"]["trust_block"]["schema_id"],
+        "plsql.mcp.trust_block"
+    );
+
+    // --- frame 2: tools/list — exact foundation surface ---
+    let list = call(
+        &reg,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+    );
+    assert_eq!(list["id"], 2);
+    let tools = list["result"]["tools"]
+        .as_array()
+        .expect("tools array present");
+    let mut names: Vec<String> = tools
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    let mut expected: Vec<String> = EXPECTED_TOOLS.iter().map(|s| (*s).to_string()).collect();
+    expected.sort();
+    assert_eq!(names, expected, "registered foundation surface is pinned");
+    assert_eq!(
+        list["result"]["meta"]["trust_block"]["live_database_used"],
+        false
+    );
+
+    // --- frame 3: ping — empty payload + trust block ---
+    let ping = call(
+        &reg,
+        r#"{"jsonrpc":"2.0","id":3,"method":"ping","params":{}}"#,
+    );
+    assert_eq!(ping["id"], 3);
+    assert!(ping["result"]["meta"]["trust_block"].is_object());
+
+    // --- frame 4: unknown method — typed JSON-RPC error ---
+    let bad = call(
+        &reg,
+        r#"{"jsonrpc":"2.0","id":4,"method":"no/such","params":{}}"#,
+    );
+    assert_eq!(bad["id"], 4);
+    assert_eq!(bad["error"]["code"], -32601, "method not found");
+    assert!(
+        bad["result"].is_null(),
+        "an error response carries no result (and so no trust block)"
+    );
+
+    // --- frame 5: malformed line — parse error, never a panic ---
+    let parse_err = call(&reg, "{not valid json");
+    assert_eq!(parse_err["error"]["code"], -32700);
+}
+
+#[test]
+fn responses_are_deterministic_across_runs() {
+    let reg = foundation_registry();
+    let line = r#"{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}"#;
+    let a = call(&reg, line);
+    let b = call(&reg, line);
+    assert_eq!(a, b, "identical request -> byte-identical response");
+}
+
+#[test]
+fn every_registered_tool_is_discoverable_and_described() {
+    let reg = foundation_registry();
+    let list = call(
+        &reg,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+    );
+    for t in list["result"]["tools"].as_array().unwrap() {
+        assert!(t["name"].as_str().is_some_and(|n| !n.is_empty()));
+        // Each tool advertises a non-empty human description so an
+        // agent can choose without trial calls.
+        let desc = t
+            .get("description")
+            .and_then(|d| d.as_str())
+            .or_else(|| t.get("summary").and_then(|d| d.as_str()))
+            .unwrap_or("");
+        assert!(!desc.is_empty(), "tool {} has no description", t["name"]);
+    }
+}

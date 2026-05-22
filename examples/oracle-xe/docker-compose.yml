@@ -1,0 +1,48 @@
+# Oracle XE 23ai container for plsql-intelligence lab demos.
+#
+# Spins up a local Oracle XE 23ai instance with the synthetic-lab L1/L2/L3
+# fixtures pre-loaded so `plsql-mcp` (live-DB feature) can talk to a real
+# Oracle without a paid license. Drop into a downstream consumer or run
+# from this repo via `make demo-oracle-xe`.
+#
+# License note: Oracle XE 23ai is licensed under the Oracle Free Use Terms
+# and Conditions (FUTC). Read https://www.oracle.com/database/free/ before
+# distributing the resulting image.
+#
+# Plan reference: plan.md §6.2.8.1 (Synthetic Lab) + §15 (CI/CD cascade).
+
+services:
+  oracle-xe:
+    # Pinned to the official Oracle Container Registry image — pull
+    # requires `docker login container-registry.oracle.com` and
+    # accepting the FUTC license once.
+    image: container-registry.oracle.com/database/free:23.7.0.0-lite
+    container_name: plsql-intelligence-xe
+    restart: unless-stopped
+    ports:
+      - "1521:1521" # SQL*Net listener
+      - "5500:5500" # EM Express
+    environment:
+      ORACLE_PWD: "${ORACLE_PWD:-DemoPlsqlIntel#2026}"
+      ORACLE_CHARACTERSET: AL32UTF8
+      ENABLE_ARCHIVELOG: "false"
+    volumes:
+      # Bind-mount the synthetic lab corpus so setup.sh can SQL*Plus it
+      # into the FREEPDB1 pluggable database on first boot.
+      - ../../corpus/lab:/opt/oracle/lab:ro
+      - ./setup.sh:/opt/oracle/scripts/startup/01-load-lab.sh:ro
+      # Persistent storage so subsequent `make demo-oracle-xe` calls
+      # reuse the loaded fixtures instead of replaying them.
+      - oracle-xe-data:/opt/oracle/oradata
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'echo "select 1 from dual;" | sqlplus -s system/${ORACLE_PWD:-DemoPlsqlIntel#2026}@//localhost:1521/FREEPDB1 | grep -q 1'
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 5m
+
+volumes:
+  oracle-xe-data:
+    name: plsql-intelligence-xe-data

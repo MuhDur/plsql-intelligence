@@ -1,0 +1,45 @@
+# Autonomous (no-auth) Oracle Free 23ai override for CI / agent / dev use.
+#
+# The canonical docker-compose.yml pins the official
+# `container-registry.oracle.com/database/free` image, which requires a
+# one-time `docker login container-registry.oracle.com` + FUTC license
+# acceptance — a human gate that blocks unattended CI and agent runs.
+#
+# This override swaps in `gvenzl/oracle-free:23-slim` (Docker Hub, no
+# auth, same Oracle Free 23ai engine, same `FREEPDB1` pluggable DB,
+# same SQL*Plus). It is functionally equivalent for the synthetic-lab
+# fixtures and the live-DB integration suites, and is the image the
+# repository's own integration tests boot.
+#
+# Usage (compose merges the override on top of the base):
+#   docker compose \
+#     -f examples/oracle-xe/docker-compose.yml \
+#     -f examples/oracle-xe/docker-compose.gvenzl.yml up -d
+# or via the Makefile target `make demo-oracle-xe-ci`.
+#
+# Convention remap vs the Oracle image:
+#   * SYS/SYSTEM password env is ORACLE_PASSWORD (gvenzl), kept equal to
+#     ORACLE_PWD so setup.sh's `${ORACLE_PWD}` reference still resolves.
+#   * First-boot scripts live in /container-entrypoint-initdb.d/ (gvenzl)
+#     instead of /opt/oracle/scripts/startup/ (Oracle image).
+#   * gvenzl runs *.sql/*.sh there once, after the DB + FREEPDB1 are up.
+
+services:
+  oracle-xe:
+    image: gvenzl/oracle-free:23-slim
+    environment:
+      ORACLE_PWD: "${ORACLE_PWD:-DemoPlsqlIntel#2026}"
+      ORACLE_PASSWORD: "${ORACLE_PWD:-DemoPlsqlIntel#2026}"
+      ORACLE_CHARACTERSET: AL32UTF8
+    volumes:
+      - ../../corpus/lab:/opt/oracle/lab:ro
+      - ./setup.sh:/container-entrypoint-initdb.d/01-load-lab.sh:ro
+      - oracle-xe-data:/opt/oracle/oradata
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'echo "select 1 from dual;" | sqlplus -s system/${ORACLE_PWD:-DemoPlsqlIntel#2026}@//localhost:1521/FREEPDB1 | grep -q 1'
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 4m

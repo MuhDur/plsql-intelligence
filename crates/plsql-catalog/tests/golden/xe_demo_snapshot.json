@@ -1,0 +1,25 @@
+{
+  "objects": [
+    [
+      "PKG_AUTONOMOUS",
+      "PACKAGE"
+    ],
+    [
+      "PKG_CC_FLAGS",
+      "PACKAGE"
+    ],
+    [
+      "PKG_DB_LINK_CALLER",
+      "PACKAGE"
+    ],
+    [
+      "PKG_OPAQUE_DYNAMIC",
+      "PACKAGE"
+    ],
+    [
+      "PKG_SPEC_NO_BODY",
+      "PACKAGE"
+    ]
+  ],
+  "schema": "DEMO"
+}

@@ -1,0 +1,15 @@
+{
+  "schema_id": "plsql.lab.plscope",
+  "schema_version": "1.0.0",
+  "schemas": {
+    "BILLING": {
+      "availability": "identifiers_and_statements",
+      "collected_at": "2026-05-15T12:00:00Z",
+      "identifiers": [],
+      "references": [],
+      "source_hash": null,
+      "statements": [],
+      "warnings": []
+    }
+  }
+}

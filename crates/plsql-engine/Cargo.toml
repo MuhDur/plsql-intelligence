@@ -1,0 +1,32 @@
+[package]
+name = "plsql-engine"
+version = "0.1.0"
+description = "Canonical analysis orchestration for plsql-intelligence"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+plsql-catalog = { path = "../plsql-catalog" }
+plsql-core = { path = "../plsql-core" }
+plsql-depgraph = { path = "../plsql-depgraph" }
+plsql-ir = { path = "../plsql-ir" }
+plsql-output = { path = "../plsql-output" }
+plsql-parser = { path = "../plsql-parser" }
+plsql-parser-antlr = { path = "../plsql-parser-antlr", features = ["antlr-codegen"] }
+plsql-project = { path = "../plsql-project" }
+plsql-store = { path = "../plsql-store" }
+plsql-symbols = { path = "../plsql-symbols" }
+clap = { version = "4.5", features = ["derive"] }
+miette = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror.workspace = true
+tracing.workspace = true
+
+[[bin]]
+name = "plsql-engine"
+path = "src/main.rs"
+
+[lints]
+workspace = true

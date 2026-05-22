@@ -1,0 +1,95 @@
+# USR Loop CI (PLSQL-USR-001 §6, §10 P6).
+#
+# Two tiers:
+#   * PR-blocking (every push/PR): the adversarial gate self-test
+#     (the single most important test — the safety rail's canary) +
+#     the §4 accretion monotonic tripwire (I-MONOTONIC-VALUE: a
+#     release may never lower coverage_index). These are REQUIRED
+#     checks; if either fails the loop is unsafe/non-accretive by
+#     definition and the PR is blocked.
+#   * Nightly: the full §5 acceptance proof (the DoD). It needs the
+#     private Oracle PL/SQL estate, which CI runners do not have, so it
+#     runs the script which honestly SKIPs (exit 0 + loud
+#     "estate-absent" banner) on the runner while still exercising
+#     every codepath up to the estate boundary; the real DoD proof is
+#     run on an estate-bearing host (mirrors estate_correctness).
+
+name: usr-loop
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    # Nightly 03:17 UTC — the full acceptance proof + tripwire.
+    - cron: "17 3 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ----------------------------------------------------------------
+  # REQUIRED PR CHECK 1 — the adversarial gate self-test.
+  # The suppression / privacy-leak / round-trip-break trio MUST be
+  # rejected at their exact named stages. If this ever goes green on
+  # a bad candidate the feature is unsafe and the PR is blocked.
+  # ----------------------------------------------------------------
+  gate-selftest:
+    name: gate self-test (adversarial trio — REQUIRED)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Adversarial gate self-test (suppression/leak/rt-break)
+        run: cargo test -p plsql-accretion --test gate_selftest -- --test-threads=16
+      - name: P6 land + tripwire hermetic tests
+        run: cargo test -p plsql-accretion --test land_tripwire -- --test-threads=16
+      - name: Proposer→gate e2e (P5 keystone, real gate)
+        run: cargo test -p plsql-accretion --test proposer_gate_e2e -- --test-threads=16
+
+  # ----------------------------------------------------------------
+  # REQUIRED PR CHECK 2 — the §4 accretion monotonic tripwire.
+  # coverage_index(HEAD) must be >= coverage_index(last release tag).
+  # A release that lowers it fails here (I-MONOTONIC-VALUE).
+  # ----------------------------------------------------------------
+  accretion-tripwire:
+    name: accretion tripwire (monotone coverage_index — REQUIRED)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # tags needed for the release-baseline compare
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: §4 monotonic tripwire (public benchmark, never a private estate)
+        run: bash scripts/accretion_tripwire.sh
+
+  # ----------------------------------------------------------------
+  # NIGHTLY — the full §5 acceptance proof (the DoD).
+  # On a CI runner the private estate is absent, so usr_acceptance.sh
+  # honestly SKIPs (exit 0 + loud banner) — it is NOT a fabricated
+  # pass. The binding DoD proof runs on an estate-bearing host. We
+  # still run it nightly so the script itself never bit-rots.
+  # ----------------------------------------------------------------
+  acceptance-nightly:
+    name: §5 acceptance proof (nightly DoD; estate-aware)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install nightly (G1 antlr-codegen build)
+        uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Full §5 DoD proof (honest SKIP if estate absent)
+        run: bash scripts/usr_acceptance.sh
+      - name: §0 correctness harness (honest SKIP if estate absent)
+        run: bash scripts/estate_correctness.sh

@@ -1,0 +1,91 @@
+# Example GitHub Actions workflow that gates PRs touching PL/SQL with
+# the `plsql cicd` family. Drop this into `.github/workflows/` of a
+# downstream PL/SQL repository and adjust the `paths:` filter, the
+# `oracle_version` target, and the policy-file path to match the
+# consumer's environment.
+#
+# Three jobs are wired:
+#   1. `predict`   — predicts invalidation from the changeset
+#   2. `gate`      — applies the policy file (`.plsql-cicd-policy.toml`)
+#   3. `pr-comment`— posts a structured PR comment with the verdict
+#
+# Plan reference: §15 (CI/CD Recompilation Cascade) + §15.5 (CICD bead seeds).
+
+name: plsql-cicd
+
+on:
+  pull_request:
+    paths:
+      - "**/*.sql"
+      - "**/*.pks"
+      - "**/*.pkb"
+      - "**/*.tps"
+      - "**/*.tpb"
+      - "**/*.trg"
+      - "**/*.vw"
+
+permissions:
+  contents: read
+  pull-requests: write   # required by `plsql post-pr-comment`
+
+jobs:
+  plsql-cicd:
+    name: plsql cicd predict + gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full depth for git-diff classification)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install plsql CLI
+        # Replace with the official install one-liner once published.
+        # During development, build from a sibling checkout instead.
+        run: |
+          curl -fsSL https://example.invalid/install.sh | bash -s -- --version 0.x
+
+      - name: Determine changeset
+        id: changeset
+        run: |
+          plsql lineage classify-change \
+            --before ${{ github.event.pull_request.base.sha }} \
+            --after  ${{ github.sha }} \
+            --robot-json > changeset.json
+          echo "path=changeset.json" >> "$GITHUB_OUTPUT"
+
+      - name: Predict invalidations
+        run: |
+          plsql cicd predict \
+            --changeset ${{ steps.changeset.outputs.path }} \
+            --mode catalog-aware \
+            --catalog-snapshot ./.plsql/catalog-snapshot.json \
+            --robot-json > prediction.json
+
+      - name: Apply policy gate
+        id: gate
+        run: |
+          plsql cicd gate \
+            --prediction prediction.json \
+            --policy .plsql-cicd-policy.toml \
+            --robot-json > gate.json
+          # Exit code: 0 pass, 1 violations, 2 invocation error.
+
+      - name: Post structured PR comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          plsql post-pr-comment \
+            --gate gate.json \
+            --pull-request ${{ github.event.pull_request.number }} \
+            --repository ${{ github.repository }}
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: plsql-cicd-reports
+          path: |
+            changeset.json
+            prediction.json
+            gate.json

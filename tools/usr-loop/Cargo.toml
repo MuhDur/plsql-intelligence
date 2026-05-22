@@ -1,0 +1,21 @@
+[package]
+name = "usr-loop"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "USR loop orchestrator: capture honest-uncertainty gaps from an Oracle estate (PLSQL-USR-001)"
+
+[[bin]]
+name = "usr-loop"
+path = "src/main.rs"
+
+[dependencies]
+plsql-accretion = { path = "../../crates/plsql-accretion" }
+plsql-engine = { path = "../../crates/plsql-engine" }
+plsql-output = { path = "../../crates/plsql-output" }
+clap = { version = "4.5", features = ["derive"] }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

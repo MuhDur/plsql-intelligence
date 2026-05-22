@@ -1,0 +1,49 @@
+--- a/pkg_employee_mgmt.pks
++++ b/pkg_employee_mgmt.pks
+@@ -17,11 +17,11 @@
+     );
+ 
+     PROCEDURE fire_employee(
+-        p_emp_id IN NUMBER
++        p_employee_id IN NUMBER
+     );
+ 
+     FUNCTION get_salary(
+-        p_emp_id IN NUMBER
++        p_employee_id IN NUMBER
+     ) RETURN NUMBER;
+ 
+     FUNCTION count_employees(
+--- a/pkg_employee_mgmt.pkb
++++ b/pkg_employee_mgmt.pkb
+@@ -17,11 +17,11 @@
+     END hire_employee;
+ 
+     PROCEDURE fire_employee(
+-        p_emp_id IN NUMBER
++        p_employee_id IN NUMBER
+     )
+     IS
+     BEGIN
+-        DELETE FROM employees WHERE emp_id = p_emp_id;
++        DELETE FROM employees WHERE emp_id = p_employee_id;
+         IF SQL%ROWCOUNT = 0 THEN
+             RAISE_APPLICATION_ERROR(-20002, 'Employee not found');
+         END IF;
+@@ -29,14 +29,14 @@
+     END fire_employee;
+ 
+     FUNCTION get_salary(
+-        p_emp_id IN NUMBER
++        p_employee_id IN NUMBER
+     ) RETURN NUMBER
+     IS
+         v_salary NUMBER(12,2);
+     BEGIN
+         SELECT salary INTO v_salary
+         FROM employees
+-        WHERE emp_id = p_emp_id;
++        WHERE emp_id = p_employee_id;
+         RETURN v_salary;
+     EXCEPTION
+         WHEN NO_DATA_FOUND THEN

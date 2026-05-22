@@ -1,0 +1,84 @@
+{
+  "bead": "PLSQL-MCP-LIVE-019",
+  "scenario": "hero_demo: §1.4 parameter rename p_emp_id → p_employee_id on employee_mgmt.fire_employee and employee_mgmt.get_salary — 'know what breaks before you change Oracle PL/SQL'",
+  "schema_placeholder": "HERO_T_<PID>",
+  "steps": [
+    {
+      "step": 1,
+      "tool": "list_objects",
+      "input": "schema=HERO_T_<PID>, object_type=PACKAGE",
+      "response": "entries=[HERO_T_<PID>.EMPLOYEE_MGMT status=VALID]"
+    },
+    {
+      "step": 2,
+      "tool": "get_object_source",
+      "input": "owner=HERO_T_<PID>, name=EMPLOYEE_MGMT, type=PACKAGE",
+      "response": "lines=30, sanitized=0, params_include_p_emp_id=true"
+    },
+    {
+      "step": 3,
+      "tool": "get_object_source",
+      "input": "owner=HERO_T_<PID>, name=EMPLOYEE_MGMT, type=PACKAGE BODY",
+      "response": "lines=57, sanitized=0, body_contains_p_emp_id=true"
+    },
+    {
+      "step": 4,
+      "tool": "query",
+      "input": "SELECT argument_name, position, data_type, in_out FROM all_arguments WHERE owner=HERO_T_<PID> AND package_name=EMPLOYEE_MGMT AND object_name IN (FIRE_EMPLOYEE, GET_SALARY)",
+      "response": "rows=3, p_emp_id_param_count=2"
+    },
+    {
+      "step": 5,
+      "tool": "get_errors",
+      "input": "owner=HERO_T_<PID>, name=EMPLOYEE_MGMT",
+      "response": "errors_before_change=0, compile_status=VALID"
+    },
+    {
+      "step": 6,
+      "tool": "query",
+      "input": "SELECT name, type, owner FROM all_dependencies WHERE referenced_owner=HERO_T_<PID> AND referenced_name=EMPLOYEE_MGMT",
+      "response": "dependent_count=1, dependents=[EMPLOYEE_MGMT]"
+    },
+    {
+      "step": 7,
+      "tool": "create_or_replace",
+      "input": "Apply after/pkg_employee_mgmt.pks to HERO_T_<PID>.EMPLOYEE_MGMT (rename p_emp_id → p_employee_id)",
+      "response": "DDL applied; spec now reflects renamed parameters"
+    },
+    {
+      "step": 8,
+      "tool": "get_object_source",
+      "input": "owner=HERO_T_<PID>, name=EMPLOYEE_MGMT, type=PACKAGE (after rename)",
+      "response": "lines=30, param_renamed=true, has_p_employee_id=true, p_emp_id_removed=true"
+    },
+    {
+      "step": 9,
+      "tool": "get_errors",
+      "input": "owner=HERO_T_<PID>, name=EMPLOYEE_MGMT (after spec rename)",
+      "response": "errors=[]"
+    },
+    {
+      "step": 10,
+      "tool": "query",
+      "input": "SELECT object_type, status FROM all_objects WHERE owner=HERO_T_<PID> AND object_name=EMPLOYEE_MGMT",
+      "response": "spec_status=VALID, body_status=INVALID, impact=PACKAGE_BODY_INVALID_after_signature_rename"
+    }
+  ],
+  "what_breaks": [
+    {
+      "kind": "Body",
+      "object_id": "HERO_T_<PID>.employee_mgmt",
+      "reason": "PACKAGE BODY status=INVALID after spec rename: body still references old parameter name p_emp_id"
+    },
+    {
+      "kind": "Signature",
+      "object_id": "HERO_T_<PID>.employee_mgmt.fire_employee",
+      "reason": "parameter p_emp_id renamed to p_employee_id; named-notation callers (p_emp_id=>) must be updated"
+    },
+    {
+      "kind": "Signature",
+      "object_id": "HERO_T_<PID>.employee_mgmt.get_salary",
+      "reason": "parameter p_emp_id renamed to p_employee_id; named-notation callers (p_emp_id=>) must be updated"
+    }
+  ]
+}

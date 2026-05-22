@@ -1,0 +1,31 @@
+[package]
+name = "plsql-cicd"
+version = "0.1.0"
+description = "CI/CD recompilation cascade types and operations for plsql-intelligence"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+## Compile the `oracle` crate driver (wraps OCI) into plsql-catalog so that
+## `plsql-cicd` can open live Oracle connections for `verify` and `inspect`.
+oracle-driver = ["plsql-catalog/oracle-driver"]
+## Enable the live Oracle XE 23ai integration tests for `verify`
+## (oracle-m941 / PLSQL-CICD-005). Requires the `plsql-intelligence-xe`
+## container running at localhost:1521/FREEPDB1 and
+## LD_LIBRARY_PATH=/tmp/instantclient_23_7 set.
+live-xe = ["oracle-driver"]
+
+[dependencies]
+plsql-catalog = { path = "../plsql-catalog" }
+plsql-core = { path = "../plsql-core" }
+plsql-output = { path = "../plsql-output" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml = "1.1"
+tracing.workspace = true
+
+[lints]
+workspace = true

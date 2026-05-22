@@ -1,0 +1,144 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (must already exist)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Public binaries (i.e., those intended for end users). Internal-only
+  # dev tools like `plan-lint` and `corpus-license-check` stay out of the
+  # release archive.
+  RELEASE_BINS: "plsql-depgraph"
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-13
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked
+      - name: Build (cargo)
+        if: ${{ !matrix.cross }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Build only the public binaries — internal dev tools
+          # (plan-lint, corpus-license-check) stay out of the release
+          # path so a cross-compile failure there can't block a release.
+          args=""
+          for bin in $RELEASE_BINS; do
+            args="$args --bin $bin"
+          done
+          cargo build --release --target ${{ matrix.target }} $args
+      - name: Build (cross)
+        if: matrix.cross
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=""
+          for bin in $RELEASE_BINS; do
+            args="$args --bin $bin"
+          done
+          cross build --release --target ${{ matrix.target }} $args
+      - name: Stage release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-staging
+          for bin in $RELEASE_BINS; do
+            ext=""
+            case "${{ matrix.target }}" in
+              *windows*) ext=".exe" ;;
+            esac
+            src="target/${{ matrix.target }}/release/${bin}${ext}"
+            if [[ ! -f "$src" ]]; then
+              echo "::warning::missing $src — skipping (binary not yet wired into workspace?)"
+              continue
+            fi
+            dst="release-staging/${bin}-${{ matrix.target }}${ext}"
+            cp "$src" "$dst"
+          done
+      - name: Upload per-target artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: plsql-intelligence-${{ matrix.target }}
+          path: release-staging/*
+          if-no-files-found: warn
+
+  publish:
+    name: publish github release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all target artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          pattern: plsql-intelligence-*
+          merge-multiple: true
+      - name: Generate SHA256 manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-artifacts
+          (sha256sum * 2>/dev/null || shasum -a 256 *) | sort > SHA256SUMS
+          cat SHA256SUMS
+      - name: Resolve tag name
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          files: |
+            release-artifacts/*

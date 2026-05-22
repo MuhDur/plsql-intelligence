@@ -1,0 +1,50 @@
+[package]
+name = "plsql-mcp"
+version = "0.1.0"
+description = "Foundation MCP adapter for the PL/SQL Intelligence engine (Apache-2.0 OR MIT)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["live-db"]
+# Enables the live-DB tool surface (§13A.2). Pulls in `plsql-catalog`'s
+# `oracle-driver` feature so the binary can connect to Oracle when an
+# Instant Client is present at runtime. When disabled the binary still
+# exposes the foundation static-analysis tools.
+live-db = ["plsql-catalog/oracle-driver"]
+# Enables the live Oracle XE 23ai integration tests for the MCP live-DB
+# tools (oracle-7nmg / PLSQL-MCP-LIVE-018).  Requires the
+# `plsql-intelligence-xe` container running at localhost:1521/FREEPDB1 and
+# `LD_LIBRARY_PATH=/tmp/instantclient_23_7` set.
+live-xe = ["oracle-driver"]
+# Internal alias: the live-xe integration-test gate pulls in the OCI driver.
+oracle-driver = ["plsql-catalog/oracle-driver"]
+
+[[bin]]
+name = "plsql-mcp"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+plsql-catalog = { path = "../plsql-catalog" }
+plsql-cicd = { path = "../plsql-cicd" }
+plsql-core = { path = "../plsql-core" }
+plsql-depgraph = { path = "../plsql-depgraph" }
+plsql-doc = { path = "../plsql-doc" }
+plsql-engine = { path = "../plsql-engine" }
+plsql-ir = { path = "../plsql-ir" }
+plsql-lineage = { path = "../plsql-lineage" }
+plsql-parser-antlr = { path = "../plsql-parser-antlr" }
+plsql-sast = { path = "../plsql-sast" }
+plsql-symbols = { path = "../plsql-symbols" }
+plsql-output = { path = "../plsql-output" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+toml = "1.1"
+tracing.workspace = true
+
+[lints]
+workspace = true

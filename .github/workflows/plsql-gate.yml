@@ -1,0 +1,71 @@
+# Reference `.github/workflows/plsql-gate.yml` per PLSQL-CICD-017.
+#
+# Unlike `ci.yml` (which gates the *plsql-intelligence repository itself*),
+# this file is the canonical GitHub Actions reference workflow that a
+# downstream PL/SQL consumer copies into their own repository to gate
+# their PRs with the `plsql cicd` family.
+#
+# Maintenance note: this file is NOT enabled in this repo (we have no
+# PL/SQL code of our own to gate). It exists at this path so a Dependabot-
+# style integration can mirror it. Use `examples/ci/github-actions.yml`
+# for the annotated walkthrough version.
+
+name: plsql-gate
+
+on:
+  pull_request:
+    paths:
+      - "**/*.sql"
+      - "**/*.pks"
+      - "**/*.pkb"
+      - "**/*.tps"
+      - "**/*.tpb"
+      - "**/*.trg"
+      - "**/*.vw"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  plsql-cicd:
+    runs-on: ubuntu-latest
+    if: ${{ false }}   # reference-only — flip to `true` after dropping
+                       # into a downstream repository.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install plsql CLI (released)
+        run: curl -fsSL https://example.invalid/install.sh | bash -s -- --version 0.x
+
+      - name: Run plsql cicd predict + gate
+        run: |
+          plsql lineage classify-change \
+            --before ${{ github.event.pull_request.base.sha }} \
+            --after  ${{ github.sha }} --robot-json > changeset.json
+          plsql cicd predict --changeset changeset.json --mode catalog-aware \
+            --catalog-snapshot ./.plsql/catalog-snapshot.json \
+            --robot-json > prediction.json
+          plsql cicd gate --prediction prediction.json \
+            --policy .plsql-cicd-policy.toml --robot-json > gate.json
+
+      - name: Post structured PR comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          plsql post-pr-comment --gate gate.json \
+            --pull-request ${{ github.event.pull_request.number }} \
+            --repository ${{ github.repository }}
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: plsql-cicd-reports
+          path: |
+            changeset.json
+            prediction.json
+            gate.json

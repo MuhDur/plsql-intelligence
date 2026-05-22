@@ -1,0 +1,445 @@
+schema_version = 1
+
+[policy]
+require_public_entries = true
+allow_reference_only_sources = true
+
+# Every committed file under `corpus/public/` must have one `[[file]]` entry.
+# Files without redistribution permission may be referenced by URL but must not
+# be vendored into the repository.
+#
+# Example:
+# [[file]]
+# path = "public/oracle-samples/hr/create.sql"
+# source_url = "https://github.com/oracle-samples/db-sample-schemas"
+# license = "UPL-1.0"
+# redistribution_allowed = true
+# fetched_on = "2026-05-11"
+# notes = "Oracle HR sample schema, vendored verbatim"
+
+# L1 synthetic corpus — PLSQL-LAB-001
+# All files below are original synthetic PL/SQL, authored for this project.
+# No private estate code (C5/C6). Patterns are grammar-derived.
+
+[[file]]
+path = "synthetic/l1/pkg_employee_mgmt.pks"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: package spec with basic procedures, functions, record type"
+
+[[file]]
+path = "synthetic/l1/pkg_employee_mgmt.pkb"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: package body with DML, exception handling"
+
+[[file]]
+path = "synthetic/l1/pkg_cursor_demo.pks"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: package spec with cursor declarations and record types"
+
+[[file]]
+path = "synthetic/l1/pkg_cursor_demo.pkb"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: package body with explicit cursor loops, %ROWTYPE, %ISOPEN"
+
+[[file]]
+path = "synthetic/l1/pkg_bulk_ops.pks"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: package spec with BULK COLLECT and FORALL types"
+
+[[file]]
+path = "synthetic/l1/pkg_bulk_ops.pkb"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: package body with BULK COLLECT, FORALL, nested table operations"
+
+[[file]]
+path = "synthetic/l1/pkg_error_handling.pks"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: package spec with named exceptions and PRAGMA EXCEPTION_INIT"
+
+[[file]]
+path = "synthetic/l1/pkg_error_handling.pkb"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: package body with autonomous transaction, multi-level exception handling"
+
+[[file]]
+path = "synthetic/l1/pkg_collections.pks"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: package spec with VARRAY, nested table, associative array types"
+
+[[file]]
+path = "synthetic/l1/pkg_collections.pkb"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: package body with string splitting, array merging, IN OUT NOCOPY"
+
+[[file]]
+path = "synthetic/l1/pkg_dynamic_sql.pks"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: package spec with REF CURSOR and dynamic SQL interface"
+
+[[file]]
+path = "synthetic/l1/pkg_dynamic_sql.pkb"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: package body with EXECUTE IMMEDIATE, OPEN FOR, DBMS_ASSERT"
+
+[[file]]
+path = "synthetic/l1/pkg_overload.pks"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: package spec with overloaded procedures and functions"
+
+[[file]]
+path = "synthetic/l1/pkg_overload.pkb"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: package body implementing 6 overloaded subprograms"
+
+[[file]]
+path = "synthetic/l1/pkg_type_demo.pks"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: object type specification with member function"
+
+[[file]]
+path = "synthetic/l1/pkg_type_demo.pkb"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: object type body with member function implementation"
+
+[[file]]
+path = "synthetic/l1/pkg_security.pks"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: package spec with AUTHID CURRENT_USER, ACCESSIBLE BY clause"
+
+[[file]]
+path = "synthetic/l1/pkg_security.pkb"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: package body with invoker rights, autonomous transaction"
+
+[[file]]
+path = "synthetic/l1/pkg_conditional.pks"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: package spec with conditional compilation ($IF/$THEN/$ELSE/$END)"
+
+[[file]]
+path = "synthetic/l1/pkg_conditional.pkb"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: package body with conditional compilation, DBMS_DB_VERSION checks"
+
+[[file]]
+path = "synthetic/l1/vw_active_employees.sql"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: simple view with JOIN and WHERE filter"
+
+[[file]]
+path = "synthetic/l1/vw_dept_summary.sql"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: aggregate view with GROUP BY, LEFT JOIN"
+
+[[file]]
+path = "synthetic/l1/vw_high_earners.sql"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: correlated subquery view"
+
+[[file]]
+path = "synthetic/l1/vw_audit_report.sql"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: view with CASE expression and JOIN"
+
+[[file]]
+path = "synthetic/l1/vw_unresolved_deps.sql"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: view with UNION ALL, NOT EXISTS, all_objects reference"
+
+[[file]]
+path = "synthetic/l1/trg_employees_audit.sql"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: compound trigger with INSERTING/UPDATING/DELETING predicates"
+
+[[file]]
+path = "synthetic/l1/trg_check_salary.sql"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L1 seed: BEFORE trigger with WHEN clause and RAISE_APPLICATION_ERROR"
+
+# --- antlr/grammars-v4 PL/SQL example corpus — PLSQL-WS-013 ---
+# Vendored snapshot of a representative subset of the upstream
+# `sql/plsql/examples/` directory. Each upstream .g4 source carries an
+# explicit Apache-2.0 header; we adopt the same license for the ingested
+# examples here. Refresh by re-fetching `source_url` per file.
+
+[[file]]
+path = "public/antlr-grammars-v4-plsql/examples/alter_function.sql"
+source_url = "https://raw.githubusercontent.com/antlr/grammars-v4/master/sql/plsql/examples/alter_function.sql"
+license = "Apache-2.0"
+redistribution_allowed = true
+fetched_on = "2026-05-15"
+notes = "ALTER FUNCTION single-statement example"
+
+[[file]]
+path = "public/antlr-grammars-v4-plsql/examples/alter_index.sql"
+source_url = "https://raw.githubusercontent.com/antlr/grammars-v4/master/sql/plsql/examples/alter_index.sql"
+license = "Apache-2.0"
+redistribution_allowed = true
+fetched_on = "2026-05-15"
+notes = "ALTER INDEX coverage"
+
+[[file]]
+path = "public/antlr-grammars-v4-plsql/examples/associate_statistics.sql"
+source_url = "https://raw.githubusercontent.com/antlr/grammars-v4/master/sql/plsql/examples/associate_statistics.sql"
+license = "Apache-2.0"
+redistribution_allowed = true
+fetched_on = "2026-05-15"
+notes = "ASSOCIATE STATISTICS DDL coverage"
+
+[[file]]
+path = "public/antlr-grammars-v4-plsql/examples/avg_min_max.sql"
+source_url = "https://raw.githubusercontent.com/antlr/grammars-v4/master/sql/plsql/examples/avg_min_max.sql"
+license = "Apache-2.0"
+redistribution_allowed = true
+fetched_on = "2026-05-15"
+notes = "Aggregate function coverage (AVG / MIN / MAX)"
+
+[[file]]
+path = "public/antlr-grammars-v4-plsql/examples/cast_multiset04.sql"
+source_url = "https://raw.githubusercontent.com/antlr/grammars-v4/master/sql/plsql/examples/cast_multiset04.sql"
+license = "Apache-2.0"
+redistribution_allowed = true
+fetched_on = "2026-05-15"
+notes = "CAST(... MULTISET) expression coverage"
+
+[[file]]
+path = "public/antlr-grammars-v4-plsql/examples/condition14.sql"
+source_url = "https://raw.githubusercontent.com/antlr/grammars-v4/master/sql/plsql/examples/condition14.sql"
+license = "Apache-2.0"
+redistribution_allowed = true
+fetched_on = "2026-05-15"
+notes = "Condition / predicate expression coverage"
+
+[[file]]
+path = "public/antlr-grammars-v4-plsql/examples/context.sql"
+source_url = "https://raw.githubusercontent.com/antlr/grammars-v4/master/sql/plsql/examples/context.sql"
+license = "Apache-2.0"
+redistribution_allowed = true
+fetched_on = "2026-05-15"
+notes = "CREATE CONTEXT DDL coverage"
+
+[[file]]
+path = "public/antlr-grammars-v4-plsql/examples/create_edition.sql"
+source_url = "https://raw.githubusercontent.com/antlr/grammars-v4/master/sql/plsql/examples/create_edition.sql"
+license = "Apache-2.0"
+redistribution_allowed = true
+fetched_on = "2026-05-15"
+notes = "CREATE EDITION (editioning) coverage"
+
+[[file]]
+path = "public/antlr-grammars-v4-plsql/examples/create_function03.sql"
+source_url = "https://raw.githubusercontent.com/antlr/grammars-v4/master/sql/plsql/examples/create_function03.sql"
+license = "Apache-2.0"
+redistribution_allowed = true
+fetched_on = "2026-05-15"
+notes = "CREATE FUNCTION example (three-arg variant)"
+
+[[file]]
+path = "public/antlr-grammars-v4-plsql/examples/create_synonym01.sql"
+source_url = "https://raw.githubusercontent.com/antlr/grammars-v4/master/sql/plsql/examples/create_synonym01.sql"
+license = "Apache-2.0"
+redistribution_allowed = true
+fetched_on = "2026-05-15"
+notes = "CREATE SYNONYM (private synonym) coverage"
+
+[[file]]
+path = "public/antlr-grammars-v4-plsql/README.md"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "Original README documenting the antlr/grammars-v4 PL/SQL example corpus ingestion"
+
+# --- Oracle sample schemas — PLSQL-WS-012 (MIT license per
+#     https://github.com/oracle-samples/db-sample-schemas/blob/main/LICENSE.txt)
+
+[[file]]
+path = "public/oracle-samples/README.md"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "Original README documenting the oracle-samples ingestion"
+
+[[file]]
+path = "public/oracle-samples/human_resources/hr_create.sql"
+source_url = "https://raw.githubusercontent.com/oracle-samples/db-sample-schemas/main/human_resources/hr_create.sql"
+license = "MIT"
+redistribution_allowed = true
+fetched_on = "2026-05-15"
+notes = "HR schema DDL"
+
+[[file]]
+path = "public/oracle-samples/human_resources/hr_code.sql"
+source_url = "https://raw.githubusercontent.com/oracle-samples/db-sample-schemas/main/human_resources/hr_code.sql"
+license = "MIT"
+redistribution_allowed = true
+fetched_on = "2026-05-15"
+notes = "HR PL/SQL routines"
+
+[[file]]
+path = "public/oracle-samples/order_entry/oe_views.sql"
+source_url = "https://raw.githubusercontent.com/oracle-samples/db-sample-schemas/main/order_entry/oe_views.sql"
+license = "MIT"
+redistribution_allowed = true
+fetched_on = "2026-05-15"
+notes = "OE views"
+
+[[file]]
+path = "public/oracle-samples/order_entry/coe_v3.sql"
+source_url = "https://raw.githubusercontent.com/oracle-samples/db-sample-schemas/main/order_entry/coe_v3.sql"
+license = "MIT"
+redistribution_allowed = true
+fetched_on = "2026-05-15"
+notes = "OE structure v3"
+
+[[file]]
+path = "public/oracle-samples/order_entry/ccus_v3.sql"
+source_url = "https://raw.githubusercontent.com/oracle-samples/db-sample-schemas/main/order_entry/ccus_v3.sql"
+license = "MIT"
+redistribution_allowed = true
+fetched_on = "2026-05-15"
+notes = "OE customers v3"
+
+[[file]]
+path = "public/oracle-samples/order_entry/cord_v3.sql"
+source_url = "https://raw.githubusercontent.com/oracle-samples/db-sample-schemas/main/order_entry/cord_v3.sql"
+license = "MIT"
+redistribution_allowed = true
+fetched_on = "2026-05-15"
+notes = "OE order types v3"
+
+[[file]]
+path = "public/oracle-samples/order_entry/cmnt_v3.sql"
+source_url = "https://raw.githubusercontent.com/oracle-samples/db-sample-schemas/main/order_entry/cmnt_v3.sql"
+license = "MIT"
+redistribution_allowed = true
+fetched_on = "2026-05-15"
+notes = "OE comments v3"
+
+[[file]]
+path = "public/oracle-samples/sales_history/sh_create.sql"
+source_url = "https://raw.githubusercontent.com/oracle-samples/db-sample-schemas/main/sales_history/sh_create.sql"
+license = "MIT"
+redistribution_allowed = true
+fetched_on = "2026-05-15"
+notes = "SH schema DDL (tables + partitions)"
+
+# L2 synthetic corpus — PLSQL-LAB-004
+# Adds synonyms, ACCESSIBLE BY, AUTHID DEFINER/CURRENT_USER mix,
+# DBMS_ASSERT scenarios, and EXECUTE IMMEDIATE with/without binds.
+
+[[file]]
+path = "synthetic/l2/syn_employees.sql"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L2: synonym + public synonym + synonym chain"
+
+[[file]]
+path = "synthetic/l2/pkg_accessible_by.pks"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L2: ACCESSIBLE BY whitelist on package spec"
+
+[[file]]
+path = "synthetic/l2/pkg_accessible_by.pkb"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L2: ACCESSIBLE BY package body"
+
+[[file]]
+path = "synthetic/l2/pkg_rights_mix.pks"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L2: AUTHID DEFINER vs CURRENT_USER spec pair"
+
+[[file]]
+path = "synthetic/l2/pkg_rights_mix.pkb"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L2: AUTHID DEFINER vs CURRENT_USER package bodies"
+
+[[file]]
+path = "synthetic/l2/pkg_dbms_assert.pks"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L2: DBMS_ASSERT validator coverage spec"
+
+[[file]]
+path = "synthetic/l2/pkg_dbms_assert.pkb"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L2: DBMS_ASSERT validator coverage body (sanitised EXECUTE IMMEDIATE)"
+
+[[file]]
+path = "synthetic/l2/pkg_execute_immediate.pks"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L2: EXECUTE IMMEDIATE bind / no-bind / static-string spec"
+
+[[file]]
+path = "synthetic/l2/pkg_execute_immediate.pkb"
+source = "synthetic"
+license = "Apache-2.0 OR MIT"
+redistribution_allowed = true
+notes = "L2: EXECUTE IMMEDIATE bind / no-bind / static-string body"

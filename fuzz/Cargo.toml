@@ -1,0 +1,72 @@
+[package]
+name = "plsql-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detach from the parent workspace so the fuzz crate's nightly/sanitizer
+# build never perturbs the main workspace lockfile or CI gate.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.plsql-core]
+path = "../crates/plsql-core"
+
+[dependencies.plsql-parser-antlr]
+path = "../crates/plsql-parser-antlr"
+
+[dependencies.plsql-ir]
+path = "../crates/plsql-ir"
+
+[dependencies.plsql-catalog]
+path = "../crates/plsql-catalog"
+
+[dependencies.serde_json]
+version = "1"
+
+[[bin]]
+name = "parse_lower"
+path = "fuzz_targets/parse_lower.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lower_statement_body"
+path = "fuzz_targets/lower_statement_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lower_expression"
+path = "fuzz_targets/lower_expression.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lower_type_decl"
+path = "fuzz_targets/lower_type_decl.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ir_lower_statement_body"
+path = "fuzz_targets/ir_lower_statement_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "catalog_snapshot_json"
+path = "fuzz_targets/catalog_snapshot_json.rs"
+test = false
+doc = false
+bench = false

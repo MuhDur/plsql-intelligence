@@ -1,0 +1,708 @@
+{
+  "schema_id": "plsql.catalog.snapshot",
+  "schema_version": {
+    "major": 1,
+    "minor": 1,
+    "patch": 0
+  },
+  "snapshot": {
+    "schemas": {
+      "0": {
+        "objects": {
+          "1": {
+            "Table": {
+              "common": {
+                "owner": 0,
+                "name": 1,
+                "object_type": "Table",
+                "status": "Valid",
+                "edition_name": null,
+                "editionable": null,
+                "last_ddl_time": null,
+                "source_hash": null,
+                "ddl": null
+              },
+              "columns": {
+                "3": {
+                  "name": 3,
+                  "position": 2,
+                  "data_type": {
+                    "owner": null,
+                    "name": "VARCHAR2",
+                    "length": null,
+                    "precision": null,
+                    "scale": null,
+                    "char_semantics": null
+                  },
+                  "nullable": false,
+                  "default_expression": null,
+                  "generated_expression": null,
+                  "hidden": false
+                },
+                "2": {
+                  "name": 2,
+                  "position": 1,
+                  "data_type": {
+                    "owner": null,
+                    "name": "NUMBER",
+                    "length": null,
+                    "precision": null,
+                    "scale": null,
+                    "char_semantics": null
+                  },
+                  "nullable": false,
+                  "default_expression": null,
+                  "generated_expression": null,
+                  "hidden": false
+                },
+                "5": {
+                  "name": 5,
+                  "position": 4,
+                  "data_type": {
+                    "owner": null,
+                    "name": "VARCHAR2",
+                    "length": null,
+                    "precision": null,
+                    "scale": null,
+                    "char_semantics": null
+                  },
+                  "nullable": true,
+                  "default_expression": null,
+                  "generated_expression": null,
+                  "hidden": false
+                },
+                "6": {
+                  "name": 6,
+                  "position": 5,
+                  "data_type": {
+                    "owner": null,
+                    "name": "VARCHAR2",
+                    "length": null,
+                    "precision": null,
+                    "scale": null,
+                    "char_semantics": null
+                  },
+                  "nullable": false,
+                  "default_expression": null,
+                  "generated_expression": null,
+                  "hidden": false
+                },
+                "4": {
+                  "name": 4,
+                  "position": 3,
+                  "data_type": {
+                    "owner": null,
+                    "name": "VARCHAR2",
+                    "length": null,
+                    "precision": null,
+                    "scale": null,
+                    "char_semantics": null
+                  },
+                  "nullable": true,
+                  "default_expression": null,
+                  "generated_expression": null,
+                  "hidden": false
+                }
+              },
+              "temporary": false,
+              "temporary_duration": null,
+              "index_organized": false
+            }
+          },
+          "26": {
+            "Sequence": {
+              "common": {
+                "owner": 0,
+                "name": 26,
+                "object_type": "Sequence",
+                "status": "Valid",
+                "edition_name": null,
+                "editionable": null,
+                "last_ddl_time": null,
+                "source_hash": null,
+                "ddl": null
+              },
+              "increment_by": 0,
+              "min_value": null,
+              "max_value": null,
+              "cycle": false,
+              "ordered": false,
+              "cache_size": null
+            }
+          },
+          "16": {
+            "Table": {
+              "common": {
+                "owner": 0,
+                "name": 16,
+                "object_type": "Table",
+                "status": "Valid",
+                "edition_name": null,
+                "editionable": null,
+                "last_ddl_time": null,
+                "source_hash": null,
+                "ddl": null
+              },
+              "columns": {
+                "17": {
+                  "name": 17,
+                  "position": 1,
+                  "data_type": {
+                    "owner": null,
+                    "name": "NUMBER",
+                    "length": null,
+                    "precision": null,
+                    "scale": null,
+                    "char_semantics": null
+                  },
+                  "nullable": false,
+                  "default_expression": null,
+                  "generated_expression": null,
+                  "hidden": false
+                },
+                "8": {
+                  "name": 8,
+                  "position": 2,
+                  "data_type": {
+                    "owner": null,
+                    "name": "NUMBER",
+                    "length": null,
+                    "precision": null,
+                    "scale": null,
+                    "char_semantics": null
+                  },
+                  "nullable": false,
+                  "default_expression": null,
+                  "generated_expression": null,
+                  "hidden": false
+                },
+                "9": {
+                  "name": 9,
+                  "position": 3,
+                  "data_type": {
+                    "owner": null,
+                    "name": "NUMBER",
+                    "length": null,
+                    "precision": null,
+                    "scale": null,
+                    "char_semantics": null
+                  },
+                  "nullable": false,
+                  "default_expression": null,
+                  "generated_expression": null,
+                  "hidden": false
+                },
+                "18": {
+                  "name": 18,
+                  "position": 4,
+                  "data_type": {
+                    "owner": null,
+                    "name": "DATE",
+                    "length": null,
+                    "precision": null,
+                    "scale": null,
+                    "char_semantics": null
+                  },
+                  "nullable": false,
+                  "default_expression": null,
+                  "generated_expression": null,
+                  "hidden": false
+                }
+              },
+              "temporary": false,
+              "temporary_duration": null,
+              "index_organized": false
+            }
+          },
+          "11": {
+            "Table": {
+              "common": {
+                "owner": 0,
+                "name": 11,
+                "object_type": "Table",
+                "status": "Valid",
+                "edition_name": null,
+                "editionable": null,
+                "last_ddl_time": null,
+                "source_hash": null,
+                "ddl": null
+              },
+              "columns": {
+                "12": {
+                  "name": 12,
+                  "position": 1,
+                  "data_type": {
+                    "owner": null,
+                    "name": "NUMBER",
+                    "length": null,
+                    "precision": null,
+                    "scale": null,
+                    "char_semantics": null
+                  },
+                  "nullable": false,
+                  "default_expression": null,
+                  "generated_expression": null,
+                  "hidden": false
+                },
+                "15": {
+                  "name": 15,
+                  "position": 5,
+                  "data_type": {
+                    "owner": null,
+                    "name": "NUMBER",
+                    "length": null,
+                    "precision": null,
+                    "scale": null,
+                    "char_semantics": null
+                  },
+                  "nullable": false,
+                  "default_expression": null,
+                  "generated_expression": null,
+                  "hidden": false
+                },
+                "8": {
+                  "name": 8,
+                  "position": 2,
+                  "data_type": {
+                    "owner": null,
+                    "name": "NUMBER",
+                    "length": null,
+                    "precision": null,
+                    "scale": null,
+                    "char_semantics": null
+                  },
+                  "nullable": false,
+                  "default_expression": null,
+                  "generated_expression": null,
+                  "hidden": false
+                },
+                "13": {
+                  "name": 13,
+                  "position": 3,
+                  "data_type": {
+                    "owner": null,
+                    "name": "VARCHAR2",
+                    "length": null,
+                    "precision": null,
+                    "scale": null,
+                    "char_semantics": null
+                  },
+                  "nullable": false,
+                  "default_expression": null,
+                  "generated_expression": null,
+                  "hidden": false
+                },
+                "14": {
+                  "name": 14,
+                  "position": 4,
+                  "data_type": {
+                    "owner": null,
+                    "name": "NUMBER",
+                    "length": null,
+                    "precision": null,
+                    "scale": null,
+                    "char_semantics": null
+                  },
+                  "nullable": false,
+                  "default_expression": null,
+                  "generated_expression": null,
+                  "hidden": false
+                }
+              },
+              "temporary": false,
+              "temporary_duration": null,
+              "index_organized": false
+            }
+          },
+          "25": {
+            "Procedure": {
+              "common": {
+                "owner": 0,
+                "name": 25,
+                "object_type": "Procedure",
+                "status": "Valid",
+                "edition_name": null,
+                "editionable": null,
+                "last_ddl_time": null,
+                "source_hash": null,
+                "ddl": null
+              },
+              "signature": {
+                "routine_name": 25,
+                "overload": null,
+                "arguments": [],
+                "return_type": null,
+                "authid_current_user": false,
+                "accessible_by": []
+              }
+            }
+          },
+          "7": {
+            "Table": {
+              "common": {
+                "owner": 0,
+                "name": 7,
+                "object_type": "Table",
+                "status": "Valid",
+                "edition_name": null,
+                "editionable": null,
+                "last_ddl_time": null,
+                "source_hash": null,
+                "ddl": null
+              },
+              "columns": {
+                "9": {
+                  "name": 9,
+                  "position": 3,
+                  "data_type": {
+                    "owner": null,
+                    "name": "NUMBER",
+                    "length": null,
+                    "precision": null,
+                    "scale": null,
+                    "char_semantics": null
+                  },
+                  "nullable": false,
+                  "default_expression": null,
+                  "generated_expression": null,
+                  "hidden": false
+                },
+                "6": {
+                  "name": 6,
+                  "position": 4,
+                  "data_type": {
+                    "owner": null,
+                    "name": "VARCHAR2",
+                    "length": null,
+                    "precision": null,
+                    "scale": null,
+                    "char_semantics": null
+                  },
+                  "nullable": false,
+                  "default_expression": null,
+                  "generated_expression": null,
+                  "hidden": false
+                },
+                "10": {
+                  "name": 10,
+                  "position": 5,
+                  "data_type": {
+                    "owner": null,
+                    "name": "DATE",
+                    "length": null,
+                    "precision": null,
+                    "scale": null,
+                    "char_semantics": null
+                  },
+                  "nullable": false,
+                  "default_expression": null,
+                  "generated_expression": null,
+                  "hidden": false
+                },
+                "8": {
+                  "name": 8,
+                  "position": 1,
+                  "data_type": {
+                    "owner": null,
+                    "name": "NUMBER",
+                    "length": null,
+                    "precision": null,
+                    "scale": null,
+                    "char_semantics": null
+                  },
+                  "nullable": false,
+                  "default_expression": null,
+                  "generated_expression": null,
+                  "hidden": false
+                },
+                "2": {
+                  "name": 2,
+                  "position": 2,
+                  "data_type": {
+                    "owner": null,
+                    "name": "NUMBER",
+                    "length": null,
+                    "precision": null,
+                    "scale": null,
+                    "char_semantics": null
+                  },
+                  "nullable": false,
+                  "default_expression": null,
+                  "generated_expression": null,
+                  "hidden": false
+                }
+              },
+              "temporary": false,
+              "temporary_duration": null,
+              "index_organized": false
+            }
+          },
+          "23": {
+            "Package": {
+              "common": {
+                "owner": 0,
+                "name": 23,
+                "object_type": "Package",
+                "status": "Valid",
+                "edition_name": null,
+                "editionable": null,
+                "last_ddl_time": null,
+                "source_hash": null,
+                "ddl": null
+              },
+              "procedures": [],
+              "functions": [],
+              "package_stateful": null,
+              "authid_current_user": false,
+              "accessible_by": []
+            }
+          },
+          "24": {
+            "Package": {
+              "common": {
+                "owner": 0,
+                "name": 24,
+                "object_type": "Package",
+                "status": "Valid",
+                "edition_name": null,
+                "editionable": null,
+                "last_ddl_time": null,
+                "source_hash": null,
+                "ddl": null
+              },
+              "procedures": [],
+              "functions": [],
+              "package_stateful": null,
+              "authid_current_user": true,
+              "accessible_by": [
+                {
+                  "owner": 0,
+                  "object_name": 23
+                }
+              ]
+            }
+          },
+          "19": {
+            "View": {
+              "common": {
+                "owner": 0,
+                "name": 19,
+                "object_type": "View",
+                "status": "Valid",
+                "edition_name": null,
+                "editionable": null,
+                "last_ddl_time": null,
+                "source_hash": null,
+                "ddl": null
+              },
+              "columns": {
+                "21": {
+                  "name": 21,
+                  "position": 4,
+                  "data_type": {
+                    "owner": null,
+                    "name": "NUMBER",
+                    "length": null,
+                    "precision": null,
+                    "scale": null,
+                    "char_semantics": null
+                  },
+                  "nullable": true,
+                  "default_expression": null,
+                  "generated_expression": null,
+                  "hidden": false
+                },
+                "3": {
+                  "name": 3,
+                  "position": 2,
+                  "data_type": {
+                    "owner": null,
+                    "name": "VARCHAR2",
+                    "length": null,
+                    "precision": null,
+                    "scale": null,
+                    "char_semantics": null
+                  },
+                  "nullable": false,
+                  "default_expression": null,
+                  "generated_expression": null,
+                  "hidden": false
+                },
+                "2": {
+                  "name": 2,
+                  "position": 1,
+                  "data_type": {
+                    "owner": null,
+                    "name": "NUMBER",
+                    "length": null,
+                    "precision": null,
+                    "scale": null,
+                    "char_semantics": null
+                  },
+                  "nullable": false,
+                  "default_expression": null,
+                  "generated_expression": null,
+                  "hidden": false
+                },
+                "22": {
+                  "name": 22,
+                  "position": 5,
+                  "data_type": {
+                    "owner": null,
+                    "name": "NUMBER",
+                    "length": null,
+                    "precision": null,
+                    "scale": null,
+                    "char_semantics": null
+                  },
+                  "nullable": true,
+                  "default_expression": null,
+                  "generated_expression": null,
+                  "hidden": false
+                },
+                "20": {
+                  "name": 20,
+                  "position": 3,
+                  "data_type": {
+                    "owner": null,
+                    "name": "NUMBER",
+                    "length": null,
+                    "precision": null,
+                    "scale": null,
+                    "char_semantics": null
+                  },
+                  "nullable": true,
+                  "default_expression": null,
+                  "generated_expression": null,
+                  "hidden": false
+                }
+              },
+              "query_hash": null,
+              "read_only": null,
+              "check_option": null
+            }
+          }
+        },
+        "synonyms": {},
+        "grants": [
+          {
+            "object_owner": 0,
+            "object_name": 1,
+            "privilege": "Select",
+            "grantee": {
+              "Role": 27
+            },
+            "grantable": false,
+            "via_role": null,
+            "with_hierarchy": false
+          },
+          {
+            "object_owner": 0,
+            "object_name": 7,
+            "privilege": "Select",
+            "grantee": {
+              "Role": 27
+            },
+            "grantable": false,
+            "via_role": null,
+            "with_hierarchy": false
+          },
+          {
+            "object_owner": 0,
+            "object_name": 11,
+            "privilege": "Select",
+            "grantee": {
+              "Role": 27
+            },
+            "grantable": false,
+            "via_role": null,
+            "with_hierarchy": false
+          },
+          {
+            "object_owner": 0,
+            "object_name": 23,
+            "privilege": "Execute",
+            "grantee": "Public",
+            "grantable": false,
+            "via_role": null,
+            "with_hierarchy": false
+          }
+        ],
+        "indexes": {},
+        "constraints": {},
+        "triggers": {},
+        "dependencies": [],
+        "plscope": null
+      }
+    },
+    "profile": {
+      "oracle_version": "Oracle19c",
+      "compatibility": null,
+      "feature_policy": {
+        "enabled": [],
+        "disabled": [],
+        "unknown_feature_behavior": "RecordUnknown"
+      },
+      "current_schema": null,
+      "current_user": null,
+      "current_edition": null,
+      "plsql_ccflags": {},
+      "nls": {
+        "language": null,
+        "territory": null,
+        "date_format": null,
+        "timestamp_format": null,
+        "timestamp_tz_format": null,
+        "length_semantics": "Byte"
+      },
+      "enabled_roles": [],
+      "db_link_policy": "RecordOpaqueRemoteObjects"
+    },
+    "capabilities": {
+      "can_query_dba_views": false,
+      "can_query_all_views": true,
+      "can_use_dbms_metadata": false,
+      "can_read_source": true,
+      "plscope_enabled": false,
+      "can_query_scheduler": false,
+      "can_query_roles_and_grants": true,
+      "warnings": []
+    },
+    "generated_at": "2026-05-15T12:03:51.063818923Z",
+    "source": {
+      "kind": "SyntheticTestCatalog",
+      "path": null,
+      "description": "Synthetic test catalog"
+    },
+    "interner": [
+      "BILLING",
+      "CUSTOMERS",
+      "CUSTOMER_ID",
+      "NAME",
+      "EMAIL",
+      "LEGACY_SEGMENT",
+      "STATUS",
+      "INVOICES",
+      "INVOICE_ID",
+      "AMOUNT",
+      "CREATED_DATE",
+      "INVOICE_LINES",
+      "LINE_ID",
+      "DESCRIPTION",
+      "QTY",
+      "UNIT_PRICE",
+      "PAYMENTS",
+      "PAYMENT_ID",
+      "PAYMENT_DATE",
+      "V_CUSTOMER_BALANCE",
+      "TOTAL_INVOICED",
+      "TOTAL_PAID",
+      "BALANCE",
+      "BILLING_API",
+      "PAYMENT_PROCESSOR",
+      "GENERATE_INVOICE",
+      "INVOICE_SEQ",
+      "reader"
+    ]
+  }
+}
