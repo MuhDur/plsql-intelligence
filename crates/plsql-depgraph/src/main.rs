@@ -11,7 +11,7 @@
 //!            `plsql-depgraph robot-docs`   — agent handbook (plain text).
 
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 
 use clap::{Args, Parser, Subcommand};
 use miette::{Diagnostic, IntoDiagnostic};
@@ -24,9 +24,8 @@ use thiserror::Error;
 #[derive(Debug, Parser)]
 #[command(name = "plsql-depgraph")]
 #[command(about = "Query and diagnose plsql-intelligence dependency graph artifacts")]
-#[command(arg_required_else_help = true)]
 #[command(
-    after_help = "DISCOVERY:\n  plsql-depgraph capabilities   machine-readable agent contract (JSON)\n  plsql-depgraph robot-docs     agent handbook — start here if you are an AI"
+    after_help = "DISCOVERY:\n  plsql-depgraph capabilities   machine-readable agent contract (JSON)\n  plsql-depgraph robot-docs     agent handbook — start here if you are an AI\n  plsql-depgraph --robot-triage one-shot bootstrap (capabilities + health + quick_ref)"
 )]
 struct Cli {
     #[arg(
@@ -42,8 +41,14 @@ struct Cli {
         help = "Emit versioned machine-readable output using the shared robot-JSON envelope"
     )]
     robot_json: bool,
+    /// One-shot agent bootstrap. Emits {capabilities, health, quick_ref}
+    /// in a single JSON mega-object on stdout and exits — short-circuits
+    /// any subcommand. Exit 0 normally; reserved exit 2 if a future
+    /// blocker is wired. Mirrors `plsql-mcp --robot-triage`.
+    #[arg(long, global = true)]
+    robot_triage: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -160,6 +165,13 @@ enum CliError {
     #[error("failed to parse dependency graph JSON")]
     ParseGraph,
     #[error("missing required `--graph <PATH|->` argument")]
+    #[diagnostic(help(
+        "produce a DepGraph artifact with the canonical pipeline, then pass it via `--graph`:\n  \
+         plsql-engine analyze <project-root> --out run.json\n  \
+         jq .payload.dep_graph run.json > depgraph.json\n  \
+         plsql-depgraph --graph depgraph.json <subcommand>\n\
+         or stream it on stdin: `... | plsql-depgraph --graph - <subcommand>`."
+    ))]
     MissingGraph,
     #[error("{label} selector is invalid: {message}")]
     InvalidSelector { label: String, message: String },
@@ -202,7 +214,8 @@ fn capabilities_json() -> serde_json::Value {
         "version": env!("CARGO_PKG_VERSION"),
         "global_flags": {
             "--robot-json": "emit versioned machine-readable output using the shared robot-JSON envelope",
-            "--graph": "path to a serialized DepGraph JSON artifact, or '-' to read from stdin"
+            "--graph": "path to a serialized DepGraph JSON artifact, or '-' to read from stdin",
+            "--robot-triage": "one-shot bootstrap: emit {capabilities, health, quick_ref} on stdout and exit"
         },
         "commands": {
             "query": "run a read-only query against a serialized dependency graph (neighbors / reverse-neighbors / path / cycle-detect); requires --graph",
@@ -238,9 +251,28 @@ fn run() -> std::result::Result<(), CliError> {
     let cli = Cli::parse();
     let robot_json = cli.robot_json;
 
+    // --robot-triage short-circuits any subcommand: emit the mega
+    // bootstrap object (capabilities + health + quick_ref) and exit.
+    if cli.robot_triage {
+        return run_robot_triage(robot_json);
+    }
+
+    let Some(command) = cli.command else {
+        // Bare invocation without --robot-triage: behave like the old
+        // arg_required_else_help and print usage to stderr (exit 2).
+        use clap::CommandFactory;
+        let _ = Cli::command().write_long_help(&mut std::io::stderr());
+        let _ = writeln!(std::io::stderr());
+        let _ = writeln!(
+            std::io::stderr(),
+            "no subcommand given — try `plsql-depgraph query ...`, `plsql-depgraph doctor --graph run.json`, or `plsql-depgraph --robot-triage`."
+        );
+        std::process::exit(2);
+    };
+
     // `capabilities` and `robot-docs` describe the tool itself — they must
     // work without any graph artifact. Handle them before artifact loading.
-    match cli.command {
+    match command {
         Command::Capabilities => {
             run_capabilities(robot_json);
             return Ok(());
@@ -255,13 +287,67 @@ fn run() -> std::result::Result<(), CliError> {
     let graph_path = cli.graph.as_deref().ok_or(CliError::MissingGraph)?;
     let graph = load_graph(graph_path)?;
 
-    match cli.command {
+    match command {
         Command::Query(query) => run_query(query.operation, &graph, robot_json),
         Command::Doctor => run_doctor(&graph, robot_json),
         Command::Explain(explain) => run_explain(explain, &graph, robot_json),
         // Already handled above; unreachable but required for exhaustiveness.
         Command::Capabilities | Command::RobotDocs => Ok(()),
     }
+}
+
+/// `--robot-triage` mega-bootstrap. Combine `capabilities` + a light
+/// health summary + a quick-ref of canonical invocations into a single
+/// JSON object on stdout. Mirrors `plsql-mcp --robot-triage`. Always
+/// exits 0 in the current build (no blockers wired); the exit-2 path
+/// is reserved for future blocker conditions.
+fn run_robot_triage(robot_json: bool) -> std::result::Result<(), CliError> {
+    let health = serde_json::json!({
+        "binary": "plsql-depgraph",
+        "version": env!("CARGO_PKG_VERSION"),
+        "requires": "a DepGraph artifact (passed via --graph <PATH|->) for query/doctor/explain",
+        "blockers": Vec::<&str>::new(),
+        "status": "ok",
+    });
+    let quick_ref = serde_json::json!([
+        {
+            "description": "bootstrap (capabilities + health + quick_ref in one call)",
+            "invocation": "plsql-depgraph --robot-triage"
+        },
+        {
+            "description": "full versioned agent contract",
+            "invocation": "plsql-depgraph capabilities"
+        },
+        {
+            "description": "produce a graph artifact via the engine",
+            "invocation": "plsql-engine analyze /path/to/project --out run.json"
+        },
+        {
+            "description": "query neighbors of a node",
+            "invocation": "plsql-depgraph --graph run.json query neighbors --logical-id MY_PKG"
+        },
+        {
+            "description": "machine-readable health check",
+            "invocation": "plsql-depgraph --robot-json --graph run.json doctor"
+        },
+        {
+            "description": "detect cycles",
+            "invocation": "plsql-depgraph --graph run.json query cycle-detect"
+        }
+    ]);
+    let mega = serde_json::json!({
+        "capabilities": capabilities_json(),
+        "health": health,
+        "quick_ref": quick_ref,
+    });
+    let rendered = if robot_json {
+        serde_json::to_string(&mega)
+    } else {
+        serde_json::to_string_pretty(&mega)
+    };
+    let s = rendered.map_err(|_| CliError::SerializeRobotJson)?;
+    println!("{s}");
+    Ok(())
 }
 
 fn run_capabilities(robot_json: bool) {
@@ -740,5 +826,43 @@ mod tests {
         assert!(handbook.contains("plsql-depgraph"));
         assert!(handbook.contains("capabilities"));
         assert!(!handbook.is_empty());
+    }
+
+    /// `--robot-triage` is a global flag that must parse without a
+    /// subcommand. Regression for the bug where `arg_required_else_help`
+    /// rejected the bare flag.
+    #[test]
+    fn clap_accepts_robot_triage_without_subcommand() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["plsql-depgraph", "--robot-triage"])
+            .expect("--robot-triage must parse without a subcommand");
+        assert!(cli.robot_triage);
+        assert!(cli.command.is_none());
+    }
+
+    /// Capabilities must advertise the new `--robot-triage` global flag
+    /// so an agent can discover it from the contract document.
+    #[test]
+    fn capabilities_advertises_robot_triage() {
+        let c = capabilities_json();
+        assert!(
+            c["global_flags"]["--robot-triage"].is_string(),
+            "capabilities must advertise --robot-triage"
+        );
+    }
+
+    /// Clap v4 ships typo suggestions by default. Pin the behavior so a
+    /// future dep bump that disables it does not silently regress
+    /// agent UX (Axiom 7 — intent inference).
+    #[test]
+    fn clap_typo_suggests_robot_json() {
+        use clap::Parser;
+        let err =
+            Cli::try_parse_from(["plsql-depgraph", "--robotjson", "doctor"]).unwrap_err();
+        let s = err.to_string();
+        assert!(
+            s.contains("--robot-json") || s.contains("similar"),
+            "clap should suggest --robot-json for --robotjson typo; got: {s}"
+        );
     }
 }

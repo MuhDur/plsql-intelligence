@@ -1,4 +1,4 @@
-//! `execute_approved` + `deploy_ddl` (`PLSQL-MCP-LIVE-015`).
+//! `execute_approved` + `deploy_ddl`.
 //!
 //! Two execution surfaces share this module:
 //!
@@ -22,6 +22,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::create_or_replace::{CreateOrReplaceError, parse_target_schema};
 use crate::cross_schema::{
     CrossSchemaConfirmation, CrossSchemaError, require_cross_schema_confirmation,
 };
@@ -41,8 +42,15 @@ pub struct ExecuteApprovedRequest {
     /// against `target_schema` to decide whether the cross-schema
     /// confirmation step is needed.
     pub principal_schema: String,
-    /// Target schema for the DDL — usually parsed out of the
-    /// `CREATE OR REPLACE … <schema>.<name>` header by the caller.
+    /// Target schema for the DDL, as the caller understands it.
+    ///
+    /// This field is **not trusted** for the cross-schema guard:
+    /// `run_execute_approved` derives the real target from the
+    /// schema named in the byte-verified `ddl_bytes` header.
+    /// The field is still validated for agreement — if it disagrees
+    /// with the parsed DDL header the request is rejected outright.
+    /// An empty string means "caller did not specify"; it is accepted
+    /// only when it agrees with (or is silent about) the DDL.
     pub target_schema: String,
     /// What the operator typed when prompted for the cross-schema
     /// confirmation. `None` is acceptable for same-schema writes;
@@ -80,6 +88,14 @@ pub enum ExecuteApprovedError {
     Preview(#[from] PreviewError),
     #[error("execute_approved cross-schema check failed: {0}")]
     CrossSchema(#[from] CrossSchemaError),
+    #[error(
+        "execute_approved refused: caller-supplied target_schema {caller:?} disagrees with the schema {ddl:?} named in the verified DDL header"
+    )]
+    TargetSchemaMismatch { caller: String, ddl: String },
+    #[error(
+        "execute_approved refused: verified DDL is not a recognised CREATE OR REPLACE shape: {0}"
+    )]
+    DdlShape(#[from] CreateOrReplaceError),
 }
 
 /// Compose preview verification + cross-schema confirmation into
@@ -105,9 +121,31 @@ pub fn run_execute_approved(
     let verified =
         registry.verify_byte_for_byte(&req.token, &req.connection, &req.ddl_bytes, now)?;
 
+    // oracle-jy0w: derive the cross-schema guard's target from the
+    // schema named in the *byte-verified* DDL header — never from the
+    // caller-supplied `target_schema` field, which an agent could set
+    // to the principal schema to slip a cross-schema write past the
+    // operator-typed confirmation. An unqualified DDL header targets
+    // the current schema, so the effective target is the principal.
+    let parsed_schema = parse_target_schema(&verified.ddl_bytes)?;
+    let effective_target = parsed_schema
+        .map(|s| s.to_ascii_uppercase())
+        .unwrap_or_else(|| req.principal_schema.trim().to_ascii_uppercase());
+
+    // The caller's `target_schema` is still validated: if it names a
+    // schema, it must agree with the one the verified DDL actually
+    // targets. An empty field means "caller did not specify".
+    let caller_target = req.target_schema.trim();
+    if !caller_target.is_empty() && caller_target.to_ascii_uppercase() != effective_target {
+        return Err(ExecuteApprovedError::TargetSchemaMismatch {
+            caller: caller_target.to_string(),
+            ddl: effective_target,
+        });
+    }
+
     let cross_schema = require_cross_schema_confirmation(
         &req.principal_schema,
-        &req.target_schema,
+        &effective_target,
         req.operator_typed_schema.as_deref(),
     )?;
 
@@ -254,10 +292,30 @@ mod tests {
 
     #[test]
     fn execute_approved_requires_typed_schema_for_cross_schema() {
+        // A genuine cross-schema write: the verified DDL names ANALYTICS
+        // while the principal is BILLING. Without an operator-typed
+        // confirmation the request must be refused. The target is now
+        // derived from the verified DDL header, so the request's
+        // `target_schema` field is set to match it (oracle-jy0w).
         let mut registry = PreviewRegistry::new();
-        mint_token(&mut registry, "tok-c");
-        let mut req = approved_request("tok-c");
-        req.target_schema = "ANALYTICS".into();
+        let mint = PatchPackageRequest {
+            connection: "analytics-dev".into(),
+            schema: "ANALYTICS".into(),
+            package: "INVOICE_PKG".into(),
+            part: PackagePart::Body,
+            source: "BEGIN\n  NULL;\nEND INVOICE_PKG;\n".into(),
+            mode: PatchMode::DryRun,
+        };
+        run_patch_package(&mut registry, mint, fixed("tok-c")).unwrap();
+
+        let req = ExecuteApprovedRequest {
+            connection: "analytics-dev".into(),
+            token: "tok-c".into(),
+            ddl_bytes: "CREATE OR REPLACE PACKAGE BODY ANALYTICS.INVOICE_PKG AS\nBEGIN\n  NULL;\nEND INVOICE_PKG;\n".into(),
+            principal_schema: "BILLING".into(),
+            target_schema: "ANALYTICS".into(),
+            operator_typed_schema: None,
+        };
         let err = run_execute_approved(&mut registry, req).unwrap_err();
         assert!(matches!(
             err,
@@ -289,6 +347,119 @@ mod tests {
         };
         let plan = run_execute_approved(&mut registry, req).unwrap();
         assert!(plan.cross_schema.confirmed);
+    }
+
+    #[test]
+    fn execute_approved_derives_target_schema_from_verified_ddl() {
+        // oracle-jy0w: a caller that submits ANALYTICS-targeting DDL
+        // but lies in `target_schema` (claiming the principal schema)
+        // must NOT slip past the cross-schema confirmation. The guard
+        // keys off the schema named in the verified ddl_bytes, not the
+        // unverified field.
+        let mut registry = PreviewRegistry::new();
+        let req = PatchPackageRequest {
+            connection: "analytics-dev".into(),
+            schema: "ANALYTICS".into(),
+            package: "INVOICE_PKG".into(),
+            part: PackagePart::Body,
+            source: "BEGIN\n  NULL;\nEND INVOICE_PKG;\n".into(),
+            mode: PatchMode::DryRun,
+        };
+        run_patch_package(&mut registry, req, fixed("tok-lie")).unwrap();
+
+        let req = ExecuteApprovedRequest {
+            connection: "analytics-dev".into(),
+            token: "tok-lie".into(),
+            ddl_bytes: "CREATE OR REPLACE PACKAGE BODY ANALYTICS.INVOICE_PKG AS\nBEGIN\n  NULL;\nEND INVOICE_PKG;\n".into(),
+            principal_schema: "BILLING".into(),
+            // The lie: claims BILLING (== principal) so the old code
+            // would take the SameSchema branch and skip confirmation.
+            target_schema: "BILLING".into(),
+            operator_typed_schema: None,
+        };
+        let err = run_execute_approved(&mut registry, req).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ExecuteApprovedError::TargetSchemaMismatch { .. }
+                    | ExecuteApprovedError::CrossSchema(
+                        CrossSchemaError::ConfirmationMissing { .. }
+                    )
+            ),
+            "lying target_schema must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn execute_approved_unqualified_ddl_defaults_to_principal() {
+        // A DDL header with no explicit schema targets the current
+        // schema — unqualified ⇒ principal, which is same-schema.
+        // Minted via create_or_replace so the previewed bytes equal the
+        // unqualified DDL verbatim (the patch builder always emits a
+        // schema-qualified header).
+        use crate::create_or_replace::{
+            CreateOrReplaceMode, CreateOrReplaceRequest, run_create_or_replace,
+        };
+        let unqualified_ddl =
+            "CREATE OR REPLACE PACKAGE BODY INVOICE_PKG AS\nBEGIN\n  NULL;\nEND INVOICE_PKG;\n";
+        let mut registry = PreviewRegistry::new();
+        run_create_or_replace(
+            &mut registry,
+            CreateOrReplaceRequest {
+                connection: "billing-dev".into(),
+                operation_summary: "replace unqualified package body".into(),
+                ddl_bytes: unqualified_ddl.into(),
+                mode: CreateOrReplaceMode::DryRun,
+            },
+            fixed("tok-unq"),
+        )
+        .unwrap();
+
+        let req = ExecuteApprovedRequest {
+            connection: "billing-dev".into(),
+            token: "tok-unq".into(),
+            ddl_bytes: unqualified_ddl.into(),
+            principal_schema: "BILLING".into(),
+            target_schema: "BILLING".into(),
+            operator_typed_schema: None,
+        };
+        let plan = run_execute_approved(&mut registry, req).unwrap();
+        assert!(plan.cross_schema.confirmed);
+        assert!(matches!(
+            plan.cross_schema.decision,
+            crate::cross_schema::CrossSchemaDecision::SameSchema { .. }
+        ));
+    }
+
+    #[test]
+    fn execute_approved_rejects_caller_target_schema_disagreement() {
+        // Even an honest cross-schema write is rejected when the
+        // caller's target_schema field disagrees with the DDL header.
+        let mut registry = PreviewRegistry::new();
+        let req = PatchPackageRequest {
+            connection: "analytics-dev".into(),
+            schema: "ANALYTICS".into(),
+            package: "INVOICE_PKG".into(),
+            part: PackagePart::Body,
+            source: "BEGIN\n  NULL;\nEND INVOICE_PKG;\n".into(),
+            mode: PatchMode::DryRun,
+        };
+        run_patch_package(&mut registry, req, fixed("tok-dis")).unwrap();
+
+        let req = ExecuteApprovedRequest {
+            connection: "analytics-dev".into(),
+            token: "tok-dis".into(),
+            ddl_bytes: "CREATE OR REPLACE PACKAGE BODY ANALYTICS.INVOICE_PKG AS\nBEGIN\n  NULL;\nEND INVOICE_PKG;\n".into(),
+            principal_schema: "BILLING".into(),
+            // Disagrees with the DDL header (ANALYTICS).
+            target_schema: "REPORTING".into(),
+            operator_typed_schema: Some("REPORTING".into()),
+        };
+        let err = run_execute_approved(&mut registry, req).unwrap_err();
+        assert!(
+            matches!(err, ExecuteApprovedError::TargetSchemaMismatch { .. }),
+            "disagreeing target_schema must be rejected, got {err:?}"
+        );
     }
 
     #[test]

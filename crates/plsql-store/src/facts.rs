@@ -1,10 +1,10 @@
-//! Fact persistence + query (PLSQL-FACT-005).
+//! Fact persistence + query.
 //!
-//! The normalized fact stream (PLSQL-FACT-001/002/004, defined in
-//! `plsql-ir`) needs a durable home so a later engine run, a CLI
-//! query, or a consumer process can read facts back without
-//! re-analysing source. This module provides a backend-agnostic
-//! [`FactRepository`] with two implementations:
+//! The normalized fact stream defined in `plsql-ir` needs a durable
+//! home so a later engine run, a CLI query, or a consumer process
+//! can read facts back without re-analysing source. This module
+//! provides a backend-agnostic [`FactRepository`] with two
+//! implementations:
 //!
 //! * [`InMemoryFactRepository`] — process-lifetime, ideal for tests
 //!   and one-shot CLI runs that never touch disk.

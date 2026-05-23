@@ -1,4 +1,4 @@
-//! End-to-end test (`PLSQL-LIN-012`).
+//! End-to-end test.
 //!
 //! Builds a synthetic DepGraph that mimics a 50-object schema and
 //! asserts `impact(table) ⊇ expected_set` for a handful of seed
@@ -15,7 +15,7 @@
 //! - 5 triggers `TRG00…TRG04`, each fires on one table.
 //! - 5 sequences `SEQ00…SEQ04`, each owned by one schema.
 //!
-//! For each seed (table T00..T09), the bead's contract is that
+//! For each seed (table T00..T09), the contract is that
 //! `impact(table)` is a *superset* of the hand-rolled expected set
 //! (every direct + transitive dependent the engine should reach).
 

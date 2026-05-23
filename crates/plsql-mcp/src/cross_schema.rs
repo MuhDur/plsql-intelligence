@@ -1,5 +1,4 @@
-//! Interactive schema-name confirmation for cross-schema writes
-//! (`PLSQL-MCP-LIVE-016`).
+//! Interactive schema-name confirmation for cross-schema writes.
 //!
 //! When the active connection's principal schema does not match the
 //! schema being written to (a "cross-schema write"), the live-DB

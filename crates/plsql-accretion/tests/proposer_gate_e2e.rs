@@ -1,5 +1,4 @@
 //! `proposer_gate_e2e.rs` — the P5 keystone (spec §10 P5 + §3),
-//! PLSQL-USR-001.
 //!
 //! Takes a **realistic synthetic gap cluster** (re-synthesised from
 //! grammar + the spec's description of a top private-estate class — an
@@ -93,6 +92,11 @@ fn scoped_env<'a>(
         ("USR_GATE_FIXTURES_DIR", fixtures),
         ("USR_GATE_BASELINE", baseline),
         ("USR_GATE_ESTATE", estate_absent),
+        // Proposer-e2e fixtures pin via the documented `true`
+        // hooks; opt in to the trusted-pin path so the G9
+        // mutation-kill cycle actually runs (oracle-k30w
+        // shell-injection guard otherwise refuses by default).
+        ("USR_GATE_TRUST_PINS", "1"),
     ]
 }
 

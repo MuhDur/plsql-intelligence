@@ -1,9 +1,9 @@
-//! Oracle → Rust type mapping per plan §12.3 (`PLSQL-BG-002`).
+//! Oracle → Rust type mapping per plan §12.3.
 //!
 //! Centralizes every entry from the §12.3 table so the wrapper emitter
-//! (`PLSQL-BG-004` and later) never invents a mapping locally. Unsupported
-//! types are surfaced as `BindingDiagnostic`s using the codes catalog from
-//! `PLSQL-BG-011`.
+//! never invents a mapping locally. Unsupported types are surfaced as
+//! `BindingDiagnostic`s using the codes catalog from this crate.
+
 
 use crate::{BindingDiagnostic, BindingDiagnosticCode, DiagnosticSpan, RustTypeRef};
 
@@ -103,7 +103,7 @@ impl TypeMapping {
     }
 }
 
-/// Driver-capability knobs (`PLSQL-BG-017` / oracle-4nq6).
+/// Driver-capability knobs.
 ///
 /// Some Oracle constructs are only bindable on certain
 /// driver+server combinations. Today only PL/SQL `BOOLEAN` swings on
@@ -157,10 +157,9 @@ impl Default for DriverCapability {
 /// generated namespace) or a `BindingDiagnostic`. Implements the §12.3
 /// table verbatim.
 ///
-/// Backward-compat shim: keeps the historical 3-arg signature.
-/// `PLSQL-BG-017` callers should prefer
-/// [`map_oracle_type_with_capability`] which honours driver-specific
-/// behavior for PL/SQL `BOOLEAN`.
+/// Backward-compat shim: keeps the historical 3-arg signature. New
+/// callers should prefer [`map_oracle_type_with_capability`] which
+/// honours driver-specific behavior for PL/SQL `BOOLEAN`.
 #[must_use]
 pub fn map_oracle_type(
     oracle_type: &OracleType,
@@ -173,7 +172,7 @@ pub fn map_oracle_type(
 /// Capability-aware variant of [`map_oracle_type`]. Honours
 /// [`DriverCapability::pl_sql_boolean_bindable`] for the PL/SQL
 /// `BOOLEAN` arm; identical to the legacy function for every other
-/// type. (PLSQL-BG-017 / oracle-4nq6.)
+/// type.
 #[must_use]
 pub fn map_oracle_type_with_capability(
     oracle_type: &OracleType,

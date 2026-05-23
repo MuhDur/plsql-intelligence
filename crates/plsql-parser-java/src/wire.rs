@@ -1,4 +1,4 @@
-//! Parser-backend wire protocol (PLSQL-PARSE-000D).
+//! Parser-backend wire protocol.
 //!
 //! The stable, neutral contract the Rust side
 //! ([`JavaAntlrBackend`](crate::JavaAntlrBackend)) speaks to the

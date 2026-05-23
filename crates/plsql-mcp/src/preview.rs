@@ -1,4 +1,4 @@
-//! `preview_sql` + `read_patch_preview` tools (`PLSQL-MCP-LIVE-011`).
+//! `preview_sql` + `read_patch_preview` tools.
 //!
 //! Implements the two-step DDL preview / approval flow described in plan
 //! §13A.3:
@@ -9,7 +9,7 @@
 //! 2. Agent (or operator) inspects the previewed DDL via
 //!    `read_patch_preview(token)`.
 //! 3. The token is later spent through
-//!    `SessionSafetyState::enable_writes` (`PLSQL-MCP-LIVE-008`); any new
+//!    `SessionSafetyState::enable_writes`; any new
 //!    `preview_sql` call invalidates the prior token byte-for-byte.
 
 use std::collections::BTreeMap;
@@ -136,7 +136,7 @@ impl PreviewRegistry {
     }
 
     /// Verify `executed_ddl_bytes` byte-for-byte against the previewed
-    /// payload. Called by `execute_approved` (`PLSQL-MCP-LIVE-013`) before
+    /// payload. Called by `execute_approved` before
     /// running the DDL.
     pub fn verify_byte_for_byte(
         &self,

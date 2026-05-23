@@ -1,4 +1,4 @@
-//! `land_tripwire.rs` — P6 hermetic tests (spec §8, PLSQL-USR-001):
+//! `land_tripwire.rs` — P6 hermetic tests (spec §8):
 //!
 //! * **land idempotency/determinism** — re-landing the same accepted
 //!   candidate is a no-op; the `landed_commit` anchor is a pure
@@ -48,6 +48,10 @@ fn unique_tmp(tag: &str) -> PathBuf {
     std::fs::create_dir_all(dir.join("corpus")).unwrap();
     std::fs::create_dir_all(dir.join("fixtures")).unwrap();
     std::fs::create_dir_all(dir.join("ledger")).unwrap();
+    // The DeterministicStubProposer pins under `.usr/usr_pin_<sig16>`
+    // via single-program shell hooks (oracle-k30w shell-allowlist).
+    // Pre-create the directory the gate's cwd-rooted `touch` needs.
+    std::fs::create_dir_all(dir.join(".usr")).unwrap();
     dir
 }
 
@@ -83,6 +87,13 @@ fn scoped_env<'a>(
         ("USR_GATE_FIXTURES_DIR", fixtures),
         ("USR_GATE_BASELINE", baseline),
         ("USR_GATE_ESTATE", estate_absent),
+        // Hermetic land-tripwire fixtures use deterministic
+        // `true` / `touch` / `rm` shell hooks (all on the G9
+        // allowlist); opt in to the trusted-pin path so the gate
+        // actually executes the mutation-kill cycle instead of
+        // failing closed on the new shell-injection guard
+        // (oracle-k30w).
+        ("USR_GATE_TRUST_PINS", "1"),
     ]
 }
 

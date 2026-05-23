@@ -1,5 +1,4 @@
-//! Doctor surface for [`BindingPlan`] — bindings-coverage report
-//! (`PLSQL-BG-013`).
+//! Doctor surface for [`BindingPlan`] — bindings-coverage report.
 //!
 //! Aggregates per-routine binding-emission status into a stable JSON
 //! shape so a developer can ask: "is my package well-supported by

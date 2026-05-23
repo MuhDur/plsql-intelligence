@@ -1,8 +1,7 @@
 //! Concrete syntax tree and abstract syntax tree types.
 //!
 //! These types define the public AST / CST surface for the parser frontend.
-//! They will be expanded with full node hierarchies by downstream beads
-//! (`PLSQL-PARSE-004` through `PLSQL-PARSE-011`), but the structural
+//! Node hierarchies will be expanded over time, but the structural
 //! definitions — [`ConcreteSyntaxTree`], [`Ast`], [`TokenTape`], [`TriviaTable`]
 //! — are settled here.
 //!
@@ -16,13 +15,13 @@
 //!   delimiter positions are not preserved.  Pretty-printing from the AST
 //!   produces *equivalent* but not *byte-identical* output.
 //!
-//! # Spanned invariant (PLSQL-PARSE-010)
+//! # Spanned invariant
 //!
 //! Every AST node **MUST** carry a source [`Span`].  The [`Spanned`] trait
-//! formalises this requirement.  All new AST node types added by downstream
-//! beads must implement [`Spanned`].  This is enforced by code review, not
-//! by a compile-time lint (Rust's type system cannot express "every variant
-//! of an enum has a `span` field").
+//! formalises this requirement.  All new AST node types must implement
+//! [`Spanned`].  This is enforced by code review, not by a compile-time
+//! lint (Rust's type system cannot express "every variant of an enum has
+//! a `span` field").
 
 use std::collections::BTreeMap;
 
@@ -178,8 +177,7 @@ impl Spanned for SourceFile {
 /// recognize (plan §7.2).  The `Unknown` variant satisfies R13 — no
 /// uncertainty is silently dropped.
 ///
-/// **Every variant MUST carry a `span` field** (Spanned invariant,
-/// PLSQL-PARSE-010).
+/// **Every variant MUST carry a `span` field** (Spanned invariant).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AstDecl {
     /// A PL/SQL package specification.
@@ -201,12 +199,12 @@ pub enum AstDecl {
     /// A DDL statement (CREATE / ALTER / DROP / GRANT).
     ///
     /// `antlr_rule_path` is a bounded, `>`-joined path of ANTLR
-    /// *grammar rule names* (never source text or identifiers — see
-    /// [`crate::ast`] / `PLSQL-USR-001 §2.1`) identifying the
-    /// grammar position the DDL was recognised at. `None` when the
-    /// declaration did not originate from a real ANTLR parse tree
-    /// (e.g. the text-scanner fallback). It is a plain `String`, so
-    /// no ANTLR generated type crosses the crate boundary (R20).
+    /// *grammar rule names* (never source text or identifiers)
+    /// identifying the grammar position the DDL was recognised at.
+    /// `None` when the declaration did not originate from a real
+    /// ANTLR parse tree (e.g. the text-scanner fallback). It is a
+    /// plain `String`, so no ANTLR generated type crosses the crate
+    /// boundary (R20).
     Ddl {
         kind: String,
         span: Span,
@@ -240,22 +238,20 @@ impl Spanned for AstDecl {
     }
 }
 
-/// A statement inside a routine / anonymous block body
-/// (`PLSQL-PARSE-005`).
+/// A statement inside a routine / anonymous block body.
 ///
 /// This is the **syntactic** projection of a statement body — one
 /// step before `plsql_ir::Statement` (the semantic IR). The
 /// parser frontend only recognises the shape; name resolution +
 /// flow happen in Layer 2. `Unknown` satisfies R13.
 ///
-/// Every variant carries a `span` (Spanned invariant,
-/// PLSQL-PARSE-010).
+/// Every variant carries a `span` (Spanned invariant).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AstStatement {
     /// `NULL;`
     Null { span: Span },
     /// `target := <rhs>;` — RHS kept as raw text for the IR
-    /// lowering (`PLSQL-IR-004`) to re-parse.
+    /// lowering layer to re-parse.
     Assignment {
         target: String,
         rhs_text: String,
@@ -285,8 +281,8 @@ pub enum AstStatement {
     /// An embedded SQL DML statement (`SELECT`/`INSERT`/`UPDATE`/
     /// `DELETE`/`MERGE`). `raw_text` is the verbatim statement source
     /// slice so the IR layer can recover table/column read/write
-    /// dependencies (`PLSQL-DEP-003`). Empty when the backend could
-    /// only classify the verb.
+    /// dependencies. Empty when the backend could only classify the
+    /// verb.
     Sql {
         verb: String,
         raw_text: String,
@@ -315,15 +311,14 @@ impl Spanned for AstStatement {
     }
 }
 
-/// A PL/SQL expression node (`PLSQL-PARSE-006`).
+/// A PL/SQL expression node.
 ///
 /// The **syntactic** expression projection — binary ops,
 /// function / procedure calls, cursor + attribute references,
 /// literals, bind / substitution placeholders. One step before
 /// `plsql_ir::Expr` (the semantic IR). `Unknown` satisfies R13.
 ///
-/// Every variant carries a `span` (Spanned invariant
-/// PLSQL-PARSE-010).
+/// Every variant carries a `span` (Spanned invariant).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AstExpr {
     /// A literal (number / string / `NULL` / `TRUE` / `FALSE`),
@@ -379,14 +374,13 @@ impl Spanned for AstExpr {
     }
 }
 
-/// A type declaration (`PLSQL-PARSE-007`).
+/// A type declaration.
 ///
 /// The **syntactic** projection of `CREATE TYPE … AS OBJECT`,
 /// `TABLE OF` / `VARRAY` collection types, and PL/SQL
 /// `TYPE … IS RECORD` declarations. Attribute / element text is
-/// kept raw for the bindgen layer (PLSQL-BG-003) to resolve.
-/// `Unknown` satisfies R13; every variant Spanned
-/// (PLSQL-PARSE-010).
+/// kept raw for the bindgen layer to resolve. `Unknown` satisfies
+/// R13; every variant is Spanned.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AstTypeDecl {
     /// `CREATE [OR REPLACE] TYPE <name> AS OBJECT ( … )`.

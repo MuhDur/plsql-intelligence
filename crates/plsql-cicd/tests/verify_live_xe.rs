@@ -1,5 +1,4 @@
-//! Live Oracle XE 23ai integration test for `verify <changeset>`
-//! (`PLSQL-CICD-005`, oracle-m941).
+//! Live Oracle XE 23ai integration test for `verify <changeset>`.
 //!
 //! Gated behind the `live-xe` feature flag so the default test profile
 //! (no Docker, no `LD_LIBRARY_PATH`) doesn't try to reach a container

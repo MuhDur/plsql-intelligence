@@ -1,4 +1,4 @@
-//! `plsql-bindgen` — `BindingPlan` IR for the bindings generator (PLSQL-BG-000).
+//! `plsql-bindgen` — `BindingPlan` IR for the bindings generator.
 //!
 //! Input: a semantic model of a PL/SQL package (resolved signatures, parameter
 //! modes, return types). Output: a per-package `BindingPlan` describing the
@@ -114,7 +114,7 @@ pub struct RustTypeRef {
 /// `plsql-output` so the bindings generator can surface unsupported edges
 /// without losing detail.
 ///
-/// Implements `PLSQL-BG-011`. The `code` field is set from a
+/// Implements. The `code` field is set from a
 /// [`BindingDiagnosticCode`] so callers get a stable, exhaustive vocabulary
 /// of unsupported-construct identifiers; `BindingDiagnostic::new_unsupported`
 /// uses the enum's per-code message and suggested manual workaround so the
@@ -194,10 +194,9 @@ pub enum BindingSeverity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingDiagnosticCode {
     /// `BG_UNSUPPORTED_REF_CURSOR` — PL/SQL `REF CURSOR` return without an
-    /// explicit row-shape override (plan §13.5; `PLSQL-BG-008`).
+    /// explicit row-shape override (plan §13.5).
     RefCursor,
-    /// `BG_UNSUPPORTED_PIPELINED` — pipelined function (plan §13.5;
-    /// `PLSQL-BG-009`).
+    /// `BG_UNSUPPORTED_PIPELINED` — pipelined function (plan §13.5).
     PipelinedFunction,
     /// `BG_UNSUPPORTED_BOOLEAN` — PL/SQL `BOOLEAN` parameter not bindable by
     /// the current driver.

@@ -1,4 +1,4 @@
-//! `analyze_project` foundation tool (PLSQL-MCP-003).
+//! `analyze_project` foundation tool.
 //!
 //! Loads the engine, runs the canonical analysis pipeline
 //! ([`plsql_engine::analyze_project`]) over a project root, and

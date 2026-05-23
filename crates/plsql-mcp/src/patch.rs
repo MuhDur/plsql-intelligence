@@ -1,7 +1,7 @@
-//! `patch_package` tool (`PLSQL-MCP-LIVE-012`).
+//! `patch_package` tool.
 //!
 //! Targeted REPLACE-based package edit that mirrors a private-estate
-//! `oracle-mcp patch_package` flow. The tool runs in two modes:
+//! patch_package` flow. The tool runs in two modes:
 //!
 //! * **dry-run** — synthesises the `CREATE OR REPLACE PACKAGE [BODY]`
 //!   DDL bytes from the supplied source, mints a single-use approval
@@ -17,8 +17,8 @@
 //!
 //! The module is intentionally pure: it does not touch a live Oracle
 //! handle. The actual `EXECUTE IMMEDIATE` (or equivalent driver call)
-//! is the responsibility of `PLSQL-MCP-LIVE-014` (`create_or_replace`)
-//! plus a future bead that wires both into the per-tool engine.
+//! lives in `create_or_replace`; a separate adapter wires both into
+//! the per-tool engine.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

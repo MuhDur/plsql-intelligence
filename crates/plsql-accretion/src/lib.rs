@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 //! `plsql-accretion` — the USR (Uncertainty-Sourced Repair) loop
-//! library (Layer 5, `PLSQL-USR-001`).
+//! library (Layer 5).
 //!
 //! Turns the engine's honest-uncertainty exhaust (parse errors,
 //! typed `UnknownReason`s, un-lowered DDL) into a self-healing
@@ -64,7 +64,7 @@ pub use ledger::{
 pub use proposer::{
     CANDIDATE_DIFF_SCHEMA, CandidateDiff, CannedBackend, CompletionBackend,
     DeterministicStubProposer, HonestyManifest, LlmProposer, PatchProposer, ProposerError,
-    R20_PATH_PREFIXES, RegressionTest, path_is_r20_safe,
+    R20_PATH_PREFIXES, RegressionTest, SubprocessBackend, path_is_r20_safe,
 };
 
 use thiserror::Error;

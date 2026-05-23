@@ -1,4 +1,4 @@
-//! Dynamic SQL evidence model (PLSQL-SYM-005).
+//! Dynamic SQL evidence model.
 //!
 //! PL/SQL programs that build SQL at runtime via `EXECUTE
 //! IMMEDIATE`, `DBMS_SQL`, or `OPEN cursor FOR <text>` create

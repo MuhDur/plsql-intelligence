@@ -1,5 +1,4 @@
-//! Oracle date/time wrapper types with a configurable backend
-//! (`PLSQL-BG-016`).
+//! Oracle date/time wrapper types with a configurable backend.
 //!
 //! Plan §12.3 maps Oracle's temporal types to dedicated Rust wrappers
 //! instead of eagerly normalizing into `chrono` types. The reason: Oracle's

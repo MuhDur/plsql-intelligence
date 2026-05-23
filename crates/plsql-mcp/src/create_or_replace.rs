@@ -1,4 +1,4 @@
-//! `create_or_replace` tool (`PLSQL-MCP-LIVE-014`).
+//! `create_or_replace` tool.
 //!
 //! Full-DDL deployment surface under per-operation approval. Unlike
 //! [`crate::patch`] which synthesises the `CREATE OR REPLACE PACKAGE
@@ -199,6 +199,54 @@ pub fn classify_kind(ddl: &str) -> Result<String, CreateOrReplaceError> {
     Err(CreateOrReplaceError::UnsupportedKind { kind })
 }
 
+/// Parse the owner schema named in a `CREATE OR REPLACE … <schema>.<name>`
+/// DDL header.
+///
+/// Returns `Ok(Some(schema))` when the object name is schema-qualified
+/// (`OWNER.OBJECT`), `Ok(None)` when it is unqualified (the DDL targets
+/// the current schema), and an error when the input is not a recognised
+/// `CREATE OR REPLACE <kind>` shape. The returned schema is upper-cased
+/// to match Oracle's dictionary normalisation of unquoted identifiers.
+///
+/// Used by `execute_approved` to derive the cross-schema
+/// guard's `target_schema` from the byte-verified DDL rather than an
+/// unverified caller-supplied field. `TRIGGER` / `VIEW` headers may
+/// carry extra clauses, but the object name still immediately follows
+/// the kind keyword, so the same head-token scan applies.
+pub fn parse_target_schema(ddl: &str) -> Result<Option<String>, CreateOrReplaceError> {
+    let kind = classify_kind(ddl)?;
+
+    let trimmed = ddl.trim_start();
+    let upper = trimmed.to_ascii_uppercase();
+    // `classify_kind` already proved the prefix; strip it the same way.
+    let rest = upper
+        .strip_prefix("CREATE OR REPLACE ")
+        .or_else(|| upper.strip_prefix("CREATE OR REPLACE\t"))
+        .or_else(|| upper.strip_prefix("CREATE OR REPLACE\n"))
+        .unwrap_or(&upper)
+        .trim_start();
+    // Strip the (already-validated) kind keyword.
+    let after_kind = rest.strip_prefix(kind.as_str()).unwrap_or(rest).trim_start();
+
+    // The object name is the next token. It ends at the first
+    // whitespace or `(` (e.g. a parameter list for PROCEDURE/FUNCTION).
+    let name_token = after_kind
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()
+        .unwrap_or("");
+    if name_token.is_empty() {
+        return Ok(None);
+    }
+    // `OWNER.OBJECT` ⇒ the owner is everything before the first `.`.
+    match name_token.split_once('.') {
+        Some((owner, object)) if !owner.is_empty() && !object.is_empty() => {
+            Ok(Some(owner.to_string()))
+        }
+        // No dot, or a malformed dotted form — treat as unqualified.
+        _ => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,6 +401,52 @@ mod tests {
             let got = classify_kind(&ddl).unwrap();
             assert_eq!(got, kind);
         }
+    }
+
+    #[test]
+    fn parse_target_schema_extracts_qualified_owner() {
+        // oracle-jy0w: the owner schema is parsed straight from the
+        // verified DDL header, upper-cased.
+        assert_eq!(
+            parse_target_schema(
+                "CREATE OR REPLACE PACKAGE BODY ANALYTICS.INVOICE_PKG AS\nBEGIN\nEND;"
+            )
+            .unwrap(),
+            Some("ANALYTICS".to_string())
+        );
+        assert_eq!(
+            parse_target_schema("create or replace view billing.v AS SELECT 1 FROM dual;")
+                .unwrap(),
+            Some("BILLING".to_string())
+        );
+        assert_eq!(
+            parse_target_schema(
+                "CREATE OR REPLACE PROCEDURE ops.do_it(p IN NUMBER) AS BEGIN NULL; END;"
+            )
+            .unwrap(),
+            Some("OPS".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_target_schema_returns_none_for_unqualified() {
+        assert_eq!(
+            parse_target_schema(
+                "CREATE OR REPLACE PACKAGE BODY INVOICE_PKG AS\nBEGIN\nEND;"
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_target_schema("create or replace function f RETURN NUMBER AS BEGIN RETURN 1; END;")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_target_schema_rejects_non_create_or_replace() {
+        assert!(parse_target_schema("DROP TABLE billing.t;").is_err());
     }
 
     #[test]

@@ -1,5 +1,4 @@
-//! One-off generator for `corpus/lab/snapshots/` pre-computed fixtures
-//! (`PLSQL-LAB-005`).
+//! One-off generator for `corpus/lab/snapshots/` pre-computed fixtures.
 //!
 //! Run with:
 //!
@@ -8,7 +7,7 @@
 //! ```
 //!
 //! Emits two snapshot JSON documents into `corpus/lab/snapshots/` so
-//! downstream beads (LIN, CICD, MCP) can run against a stable estate
+//! downstream crates (LIN, CICD, MCP) can run against a stable estate
 //! without needing a live Oracle connection.
 
 use std::path::Path;

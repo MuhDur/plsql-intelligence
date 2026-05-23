@@ -1,4 +1,4 @@
-//! Column-level edge extraction (PLSQL-DEP-004).
+//! Column-level edge extraction.
 //!
 //! Consumes a populated [`SqlStatementModel`] (SQLSEM-002 tables
 //! plus SQLSEM-003 columns) and emits typed column-granular

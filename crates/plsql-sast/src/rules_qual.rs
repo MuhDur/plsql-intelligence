@@ -1,5 +1,5 @@
 //! Quality (`QUAL`) SAST rules backed by the `ExceptionHandler`
-//! fact family (PLSQL-SAST-010 / PLSQL-SAST-013).
+//! fact family.
 //!
 //! These rules live in their own file (not `rules.rs`) so the SAST
 //! rule surface can be extended by multiple agents without

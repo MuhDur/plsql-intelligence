@@ -1,6 +1,6 @@
 //! Integration test: §1.4 DROP COLUMN hero demo — "know what breaks before you
 //! DROP COLUMN customers.legacy_segment" end-to-end via live-DB tools against
-//! the Oracle XE 23ai container (`PLSQL-LAB-008 / oracle-yd96`).
+//! the Oracle XE 23ai container (` / `).
 //!
 //! ## Scenario (corpus/lab/hero_diff_dropcol)
 //!

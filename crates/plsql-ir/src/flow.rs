@@ -1,5 +1,5 @@
 //! Value-flow, taint, constant, value-set, and string-shape
-//! models (PLSQL-FLOW-001).
+//! models.
 //!
 //! Downstream SAST and lineage layers reason about *how* values
 //! propagate, not just *whether* a name binds. This module
@@ -16,9 +16,10 @@
 //!   (literal / interpolated-with-prefix / fully-opaque).
 //! * [`ValueFlow`] — the per-name aggregate the passes return.
 //!
-//! Population happens in PLSQL-FLOW-002+. This bead ships the
-//! types + serde + small helpers so the consumers (SAST,
-//! bindings, doc) program against a stable surface today.
+//! Population happens in the intra- / inter-procedural flow passes.
+//! This module ships the types + serde + small helpers so the
+//! consumers (SAST, bindings, doc) program against a stable surface
+//! today.
 //!
 //! ## /oracle evidence
 //!

@@ -1,4 +1,4 @@
-//! Dialect-mismatch diagnostics for the parser (PLSQL-DIALECT-003).
+//! Dialect-mismatch diagnostics for the parser.
 //!
 //! When the grammar recognizes a token that maps to an `OracleFeature` that is
 //! not available on the run's `OracleTargetVersion`, the parser emits a

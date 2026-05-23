@@ -268,10 +268,12 @@ Tool binaries: `tools/usr-loop` (the USR Loop orchestrator),
 `tools/corpus-license-check`, `tools/corpus-bench`, `tools/corpus-grow`.
 
 The MCP server (`plsql-mcp`) is a single crate. It completes the MCP
-handshake and advertises the full tool surface over `tools/list`
-(foundation static-analysis tools, change-impact and release-gate tools,
-and the feature-gated live-DB surface); per-tool `tools/call` execution is
-being wired in incrementally (see Limitations).
+handshake, advertises the full tool surface over `tools/list`, and
+dispatches `tools/call` end-to-end: static-analysis and change-impact
+tools execute in-process; live-DB tools dispatch and degrade with a
+typed `RuntimeStateRequired` response when no active Oracle connection
+is configured. A lockstep test enforces that every tool the registry
+advertises has a dispatch arm.
 
 ---
 
@@ -407,10 +409,11 @@ cargo run -p plan-lint -- --doctor     # health summary
 ## Limitations
 
 - Pre-1.0: the API can move at any time before 1.0.
-- The MCP server completes the protocol handshake and advertises every
-  tool over `tools/list`; per-tool `tools/call` execution wiring is still
-  in progress, so a live MCP client can discover the surface before every
-  tool is individually callable over the wire.
+- Live-DB MCP tools dispatch over `tools/call` but require an active
+  Oracle connection to execute; without one they return a typed
+  `RuntimeStateRequired` response naming the missing runtime state, by
+  design — agents can plan a session against the full advertised
+  surface without an Oracle being attached.
 - The USR Loop proposer does not auto-merge. It produces proven
   candidates; the proof is automatic and complete, the landing decision is
   gated by that proof and the repo's normal review (per `D3`).

@@ -1,4 +1,4 @@
-//! Doctor surface for [`DocSet`] (`PLSQL-DOC-011`).
+//! Doctor surface for [`DocSet`].
 //!
 //! Aggregates per-object documentation coverage so a developer can ask:
 //! "is my schema's doc-comment surface complete?" The shape follows the

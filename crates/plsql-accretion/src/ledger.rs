@@ -1,5 +1,5 @@
 //! The append-only, content-addressed USR ledger (spec §2.1 / §4 /
-//! §1 I-PROVENANCE, `PLSQL-USR-001`).
+//! §1 I-PROVENANCE).
 //!
 //! Every cluster the loop acts on gets one [`LedgerEntry`] recording
 //! the full 3-hop provenance chain:
@@ -34,12 +34,71 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::instrument;
 
 use crate::cluster::GapCluster;
 use crate::gap::{RepairClass, sha256_hex};
+
+/// Suffix appended to a ledger filename to obtain the sidecar advisory
+/// lock path. The sidecar is created lazily on the first append and
+/// kept alongside the ledger so the lock travels with the directory
+/// it guards.
+const LOCK_SUFFIX: &str = ".lock";
+
+/// RAII guard: holds an `fs2` advisory exclusive lock on a sidecar
+/// file. Dropping the guard closes the file handle, which releases
+/// the lock — including if the lock holder panics or returns early
+/// with `?`.
+///
+/// We open `<ledger>.lock` (not the ledger file itself) so the lock
+/// is decoupled from the JSONL append handle. The lock is **exclusive**
+/// across both threads in this process and other processes on the
+/// same host: `fs2::FileExt::lock_exclusive` translates to `flock(2)`
+/// (Unix) / `LockFileEx` (Windows), so two concurrent `usr-loop`
+/// invocations against the same `.usr/ledger/` directory serialize
+/// here before either one reads the chain tip.
+struct LedgerLockGuard {
+    // Held only for its Drop side-effect (file close → unlock).
+    _file: File,
+}
+
+impl LedgerLockGuard {
+    /// Acquire an exclusive advisory lock on `<ledger_path>.lock`.
+    /// Blocks until the lock is granted, then returns a guard.
+    fn acquire(ledger_path: &Path) -> Result<Self, LedgerError> {
+        let lock_path = lock_path_for(ledger_path);
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| {
+                LedgerError::Io(format!(
+                    "open ledger lock {}: {e}",
+                    lock_path.display()
+                ))
+            })?;
+        // Blocking exclusive lock. Released on Drop (file close).
+        FileExt::lock_exclusive(&file).map_err(|e| {
+            LedgerError::Io(format!(
+                "lock ledger sidecar {}: {e}",
+                lock_path.display()
+            ))
+        })?;
+        Ok(Self { _file: file })
+    }
+}
+
+/// Sidecar lock path for a given ledger file: `<ledger>.lock`.
+fn lock_path_for(ledger_path: &Path) -> PathBuf {
+    let mut s = ledger_path.as_os_str().to_owned();
+    s.push(LOCK_SUFFIX);
+    PathBuf::from(s)
+}
 
 /// Filename of the append-only ledger inside `.usr/ledger/`.
 pub const LEDGER_FILENAME: &str = "ledger.jsonl";
@@ -243,6 +302,17 @@ impl Ledger {
     /// re-acting on the same cluster never grows or corrupts the
     /// chain.
     ///
+    /// **Concurrency-safe (cross-thread and cross-process).** The
+    /// `iter() → compute parent → write` critical section is held
+    /// under a `fs2` advisory exclusive lock on a sidecar
+    /// `<ledger>.lock` file. Two concurrent `usr-loop` invocations
+    /// against the same `.usr/ledger/` directory therefore serialize
+    /// here; without the lock both invocations would read the same
+    /// tip and write conflicting `parent_entry_id`s, leaving the
+    /// chain in a `ChainBroken` state that bricks every future
+    /// append. The lock releases when the guard drops (function
+    /// return, `?`, or panic).
+    ///
     /// There is intentionally **no** update/delete counterpart:
     /// append-only is a structural property of this API, not a
     /// runtime check (then *also* proven by `verify_chain`).
@@ -252,6 +322,10 @@ impl Ledger {
     /// [`LedgerError::Parse`] on failure.
     #[instrument(level = "debug", skip(self, body))]
     pub fn append(&self, body: LedgerBody) -> Result<EntryId, LedgerError> {
+        // Hold the advisory lock across the entire read-modify-write
+        // critical section — anything less reintroduces the TOCTOU.
+        let _guard = LedgerLockGuard::acquire(&self.path)?;
+
         let existing = self.iter()?;
         let parent = existing
             .last()
@@ -561,11 +635,22 @@ impl AccretionLedger {
     /// history). The new entry's parent is the prior tip's id (or
     /// [`GENESIS_PARENT`]).
     ///
+    /// **Concurrency-safe (cross-thread and cross-process)** by the
+    /// same `<ledger>.lock` sidecar mechanism as [`Ledger::append`]:
+    /// the `iter → compute parent → write` window is held under a
+    /// `fs2` advisory exclusive lock, so two concurrent appends
+    /// against the same directory serialize and the chain remains
+    /// monotonic.
+    ///
     /// # Errors
     /// [`LedgerError::Io`] / [`LedgerError::Serialize`] /
     /// [`LedgerError::Parse`] on failure.
     #[instrument(level = "debug", skip(self, index))]
     pub fn append(&self, git_ref: &str, index: AccretionIndex) -> Result<EntryId, LedgerError> {
+        // Hold the advisory lock across the entire read-modify-write
+        // critical section — same hazard, same fix as Ledger::append.
+        let _guard = LedgerLockGuard::acquire(&self.path)?;
+
         let existing = self.iter()?;
         let parent = existing
             .last()

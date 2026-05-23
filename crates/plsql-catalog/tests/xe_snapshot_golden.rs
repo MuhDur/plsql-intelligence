@@ -1,5 +1,5 @@
 //! Integration test: extract a catalog snapshot from the live Oracle XE 23ai
-//! container and compare it against a committed golden (`PLSQL-CAT-008`).
+//! container and compare it against a committed golden.
 //!
 //! Gated behind the `live-xe` feature flag so the default test profile
 //! (no Docker, no live Oracle) doesn't try to reach a container that isn't

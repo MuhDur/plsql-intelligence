@@ -1,4 +1,4 @@
-//! Bounded-depth guard for the re-lowering walks (`oracle-v4wa`).
+//! Bounded-depth guard for the re-lowering walks.
 //!
 //! Both [`crate::extract_call_sites`] and
 //! [`crate::extract_table_accesses`] descend through control-flow
@@ -18,7 +18,7 @@
 //! [`plsql_core::UnknownReason::AnalysisRecursionLimit`] +
 //! `Diagnostic` with provenance, and the rest of the analysis
 //! continues (R13: honest degradation, never crash, never hide
-//! uncertainty — the oracle-bh4p anti-pattern is *not* to cap
+//! uncertainty — the anti-pattern is *not* to cap
 //! silently).
 
 /// Maximum re-lowering recursion depth. Real well-formed PL/SQL

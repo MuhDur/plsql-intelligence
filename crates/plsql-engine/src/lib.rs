@@ -34,11 +34,10 @@ pub mod config {
         pub enabled: bool,
         pub mode: CacheMode,
         pub directory: Option<PathBuf>,
-        /// PLSQL-PERF-001: when `true`, the run is persisted to
-        /// the cache in its **compact** form
-        /// ([`AnalysisRun::compact`]) — heavy, re-derivable
-        /// payloads (catalog snapshot, dependency graph) are
-        /// dropped so long-lived caches stay small. Opt-in;
+        /// When `true`, the run is persisted to the cache in its
+        /// **compact** form ([`AnalysisRun::compact`]) — heavy,
+        /// re-derivable payloads (catalog snapshot, dependency graph)
+        /// are dropped so long-lived caches stay small. Opt-in;
         /// `false` (default) persists the full run unchanged.
         pub compact_persisted: bool,
     }
@@ -135,11 +134,11 @@ pub mod model {
         /// Parser backend that produced `parse_results` (provenance
         /// for the doctor's backend block). Empty for a no-op run.
         pub parser_backend: String,
-        /// Cache outcome (PLSQL-ENG-003B): `None` ⇒ artifact
-        /// caching was not active (no cache dir / disabled);
-        /// `Some(true)` ⇒ this run was served from the
-        /// content+profile-keyed plsql-store cache; `Some(false)`
-        /// ⇒ cache active but missed (run computed + stored).
+        /// Cache outcome: `None` ⇒ artifact caching was not active
+        /// (no cache dir / disabled); `Some(true)` ⇒ this run was
+        /// served from the content+profile-keyed plsql-store cache;
+        /// `Some(false)` ⇒ cache active but missed (run computed
+        /// + stored).
         #[serde(default)]
         pub cache_outcome: Option<bool>,
         pub project: ProjectModel,
@@ -156,7 +155,7 @@ pub mod model {
     }
 
     impl AnalysisRun {
-        /// PLSQL-PERF-001 — the **compact** persisted form.
+        /// Return the **compact** persisted form of this run.
         ///
         /// Drops the two heavy, fully re-derivable payloads — the
         /// `CatalogSnapshot` (re-extractable from the catalog
@@ -221,8 +220,8 @@ pub const ENGINE_DOCTOR_SCHEMA: plsql_output::SchemaDescriptor = plsql_output::S
 };
 
 /// Schema for the [`EngineFullDoctorReport`] envelope (the
-/// backend/catalog/cache/fact/graph/completeness block,
-/// PLSQL-ENG-005). Distinct from both schemas above.
+/// backend/catalog/cache/fact/graph/completeness block). Distinct
+/// from both schemas above.
 pub const ENGINE_FULL_DOCTOR_SCHEMA: plsql_output::SchemaDescriptor =
     plsql_output::SchemaDescriptor {
         id: "plsql.engine.doctor_full",
@@ -230,18 +229,18 @@ pub const ENGINE_FULL_DOCTOR_SCHEMA: plsql_output::SchemaDescriptor =
         description: "Full engine doctor report (PLSQL-ENG-005)",
     };
 
-/// Schema for the [`MemoryProfile`] envelope (PLSQL-PERF-002).
-/// Distinct from the other doctor schemas so a consumer can
-/// discriminate via `matches_schema`.
+/// Schema for the [`MemoryProfile`] envelope. Distinct from the
+/// other doctor schemas so a consumer can discriminate via
+/// `matches_schema`.
 pub const ENGINE_MEMORY_SCHEMA: plsql_output::SchemaDescriptor = plsql_output::SchemaDescriptor {
     id: "plsql.engine.memory_profile",
     version: plsql_output::SchemaVersion::new(1, 0, 0),
     description: "Engine memory/footprint profile (PLSQL-PERF-002)",
 };
 
-/// `plsql-engine doctor --memory` payload (PLSQL-PERF-002): the
-/// serialized footprint of an [`AnalysisRun`], the footprint of
-/// its [`compact`](AnalysisRun::compact) form, and the per-section
+/// `plsql-engine doctor --memory` payload: the serialized footprint
+/// of an [`AnalysisRun`], the footprint of its
+/// [`compact`](AnalysisRun::compact) form, and the per-section
 /// breakdown of the two heavy evictable payloads. Sizes are the
 /// byte length of the canonical JSON serialization — deterministic
 /// and reproducible (R10/R11), not a live RSS sample.
@@ -327,8 +326,8 @@ pub struct EngineDoctorReport {
     pub catalog_available: bool,
     pub plscope_available: bool,
     pub diagnostic_count: usize,
-    /// Honest headline (oracle-bh4p): never `Clean` on a
-    /// low-extraction run even when the file tally looks pristine.
+    /// Honest headline: never `Clean` on a low-extraction run even
+    /// when the file tally looks pristine.
     pub posture: plsql_core::CompletenessPosture,
     /// Top-level objects the classifier could not lower.
     pub objects_unrecognized: usize,
@@ -368,19 +367,18 @@ pub fn engine_doctor_envelope(
 pub enum SectionStatus {
     /// Data is present and reported.
     Reported,
-    /// The producing stage is owned by a separate, not-yet-closed
-    /// bead; the section is intentionally empty (not "healthy").
+    /// The producing stage is owned by a separate, not-yet-wired
+    /// component; the section is intentionally empty (not "healthy").
     NotWired,
 }
 
-/// Full `plsql-engine doctor` report (`PLSQL-ENG-005`): the
-/// backend / catalog / cache / fact-store / graph / completeness
-/// blocks, derived purely from an [`AnalysisRun`] artifact.
+/// Full `plsql-engine doctor` report: the backend / catalog /
+/// cache / fact-store / graph / completeness blocks, derived
+/// purely from an [`AnalysisRun`] artifact.
 ///
-/// Sections whose inputs are not in the artifact (cache hit
-/// ratio — owned by the still-open `PLSQL-ENG-003`) report
-/// [`SectionStatus::NotWired`] rather than a fabricated `0.0`
-/// that would read as "healthy" (R13).
+/// Sections whose inputs are not in the artifact (e.g. the cache
+/// hit ratio, not yet wired) report [`SectionStatus::NotWired`]
+/// rather than a fabricated `0.0` that would read as "healthy" (R13).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EngineFullDoctorReport {
     pub schema_id: String,
@@ -448,7 +446,7 @@ pub fn engine_full_doctor_envelope(
 }
 
 /// Schema-version compatibility verdict for an
-/// [`AnalysisArtifactManifest`] (`PLSQL-ENG-001`).
+/// [`AnalysisArtifactManifest`].
 ///
 /// A consumer that produced its tooling against schema version
 /// `consumer` reading an artifact tagged `produced` is:
@@ -550,14 +548,14 @@ type AnalysisRunIdInner = u64;
 /// explicitly classified become `Statement::Unrecognized` with the raw text,
 /// satisfying R13 (typed uncertainty, never silent drops).
 /// Build the typed honest-degradation diagnostic for a unit whose
-/// re-lowering walk hit the bounded recursion cap (`oracle-v4wa`).
+/// re-lowering walk hit the bounded recursion cap.
 ///
-/// This is the R13 / oracle-bh4p posture: a malformed or
-/// parser-recovered unit whose `IF`/`LOOP` body text fails to
-/// strictly shrink across re-lowering passes would otherwise grow
-/// the stack unbounded and SIGABRT the whole project analyse. We
-/// instead degrade *that nested body* honestly — carrying the
-/// typed [`plsql_core::UnknownReason::AnalysisRecursionLimit`] with
+/// This is the R13 posture: a malformed or parser-recovered unit
+/// whose `IF`/`LOOP` body text fails to strictly shrink across
+/// re-lowering passes would otherwise grow the stack unbounded and
+/// SIGABRT the whole project analyse. We instead degrade *that
+/// nested body* honestly — carrying the typed
+/// [`plsql_core::UnknownReason::AnalysisRecursionLimit`] with
 /// provenance (which unit, which file, which walk, how many bodies)
 /// — and continue the rest of the analysis. Pushed into
 /// `run.diagnostics` *before* the completeness report is finalised
@@ -677,17 +675,16 @@ fn ast_stmts_to_ir(ast_stmts: &[plsql_parser::ast::AstStatement]) -> Vec<plsql_i
 /// Run the canonical analysis pipeline
 /// (`project → parse → catalog → IR → symbols → privileges →
 /// sqlsem → flow → facts → depgraph`) and emit a populated
-/// [`AnalysisRun`] with an honest [`CompletenessReport`]
-/// (`PLSQL-ENG-002`).
+/// [`AnalysisRun`] with an honest [`CompletenessReport`].
 ///
 /// ## Honest partial completeness (R13)
 ///
 /// This is the orchestration *spine*. Stages whose deep analysis
-/// is owned by their own (open) beads — live-catalog extraction,
-/// SQL-semantic modelling, inter-procedural flow, fact minting,
-/// dependency-edge construction — are wired but currently yield
-/// empty summaries. The pipeline never *fabricates* counts: the
-/// emitted [`CompletenessReport`] reports exactly what was
+/// is owned by their own follow-up components — live-catalog
+/// extraction, SQL-semantic modelling, inter-procedural flow, fact
+/// minting, dependency-edge construction — are wired but currently
+/// yield empty summaries. The pipeline never *fabricates* counts:
+/// the emitted [`CompletenessReport`] reports exactly what was
 /// established (`catalog_available`, `plscope_available`, parsed
 /// vs. recovered, object totals) so a consumer can see the
 /// boundary instead of mistaking "not yet wired" for "analysed
@@ -1687,11 +1684,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// oracle-bh4p / Phase 2: the CompletenessReport must tell the
-    /// TRUTH. A tree full of garbage the classifier cannot lower
-    /// MUST NOT present as clean — and it must surface the
-    /// unrecognized-object + diagnostic counts; the not-yet-wired
-    /// gap metrics must serialise honestly as `unmeasured`, never 0.
+    /// The CompletenessReport must tell the TRUTH. A tree full of
+    /// garbage the classifier cannot lower MUST NOT present as
+    /// clean — and it must surface the unrecognized-object +
+    /// diagnostic counts; the not-yet-wired gap metrics must
+    /// serialise honestly as `unmeasured`, never 0.
     #[test]
     fn bh4p_low_extraction_run_reports_honest_non_clean_completeness() {
         let base = std::env::temp_dir().join(format!(
@@ -1818,12 +1815,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// oracle-v4wa regression: analysing the minimized public
+    /// Regression: analysing the minimized public
     /// `SELECT … FOR UPDATE` fixture must NOT abort (no
     /// stack-overflow / SIGABRT). It must complete and surface the
     /// typed `AnalysisRecursionLimit` degradation with provenance,
-    /// and the completeness posture must NOT read Clean (the
-    /// oracle-bh4p anti-pattern of silently hiding the truncation).
+    /// and the completeness posture must NOT read Clean (no
+    /// silently hiding the truncation).
     #[test]
     fn oracle_v4wa_for_update_degrades_instead_of_stack_overflow() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

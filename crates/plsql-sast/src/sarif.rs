@@ -1,5 +1,4 @@
-//! SARIF 2.1.0 output formatter (PLSQL-SAST-028's consumer;
-//! PLSQL-SAST-023).
+//! SARIF 2.1.0 output formatter.
 //!
 //! Renders a [`ScanReport`](crate::ScanReport) as a SARIF 2.1.0
 //! log (OASIS `sarif-schema-2.1.0`) so findings load into GitHub

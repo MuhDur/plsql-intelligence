@@ -1,4 +1,4 @@
-//! Bounded inter-procedural parameter/return flow (PLSQL-FLOW-003).
+//! Bounded inter-procedural parameter/return flow.
 //!
 //! FLOW-002 propagates taint within one routine. This pass joins
 //! routines: when routine A calls routine B, the taint of A's

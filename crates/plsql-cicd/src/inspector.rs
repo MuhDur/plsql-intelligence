@@ -1,5 +1,4 @@
-//! Read-only Oracle connection layer for the CI/CD cascade
-//! (`PLSQL-CICD-004`).
+//! Read-only Oracle connection layer for the CI/CD cascade.
 //!
 //! `predict --mode catalog-aware` / `live-snapshot` and `verify` need to
 //! consult the target database for object existence and current DDL.

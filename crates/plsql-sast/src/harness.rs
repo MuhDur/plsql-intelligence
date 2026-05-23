@@ -1,4 +1,4 @@
-//! SAST scan harness (PLSQL-SAST-002).
+//! SAST scan harness.
 //!
 //! Loads the Layer-2 analysis outputs (a `FactStore`, a
 //! per-unit `FlowEnv`, and a completeness snapshot mapped from

@@ -1,5 +1,5 @@
 //! `%TYPE` / `%ROWTYPE` anchor resolution against the Layer-2 symbol
-//! table (`PLSQL-BG-006`).
+//! table.
 //!
 //! PL/SQL anchored declarations resolve at compile time:
 //!
@@ -13,7 +13,7 @@
 //! a [`ResolvedAnchor`] discriminated by what we found. Anything we
 //! cannot resolve from the local DeclTable surfaces as
 //! `Unresolved(...)` with a typed reason — never `panic!` — so the
-//! caller (PLSQL-BG-002 type-mapping consumer + downstream bindgen)
+//! caller (type-mapping consumer + downstream bindgen)
 //! can decide how to render the bindings.
 //!
 //! Cross-references: PL/SQL Language Reference §2.5 "Using %TYPE
@@ -32,8 +32,8 @@ use crate::table::DeclTable;
 pub enum ResolvedAnchor {
     /// `%TYPE` resolved to a variable or column. `ty` is the
     /// underlying type carried by the source declaration (may itself
-    /// still be `TypeRef::Unresolved` — type-mapping happens in
-    /// PLSQL-BG-002).
+    /// still be `TypeRef::Unresolved` — type-mapping happens in a
+    /// later pass).
     Type {
         anchor_kind: AnchorKind,
         source_decl: DeclId,

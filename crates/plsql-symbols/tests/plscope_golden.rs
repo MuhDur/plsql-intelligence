@@ -1,12 +1,12 @@
-//! PL/Scope-backed golden tests (PLSQL-PLSCOPE-DIFF-002).
+//! PL/Scope-backed golden tests.
 //!
 //! Locks the [`diff_plscope`] alignment against a checked-in
 //! PL/Scope ground-truth fixture. The "PL/Scope side" is the row
 //! set Oracle's `ALL_IDENTIFIERS` produces for a known unit when
 //! compiled with `plscope_settings = 'IDENTIFIERS:ALL'` — captured
 //! once and committed so the test is deterministic and runs with
-//! no database (the bead's "where available" clause: the live-XE
-//! path below is `#[ignore]`d unless an instance is wired up via
+//! no database (the "where available" clause: the live-XE path
+//! below is `#[ignore]`d unless an instance is wired up via
 //! `ORACLE_XE_DSN`, but the golden always runs).
 //!
 //! The "our side" is driven through the *real* resolver
@@ -244,7 +244,7 @@ fn golden_detects_a_recall_regression() {
 }
 
 /// Live Oracle XE path — only runs when an XE instance is wired
-/// up. Default `cargo test` skips it (the bead is "...against
+/// up. Default `cargo test` skips it (the contract is "...against
 /// Oracle XE *where available*"); the golden tests above provide
 /// the always-on, DB-free regression lock.
 #[test]

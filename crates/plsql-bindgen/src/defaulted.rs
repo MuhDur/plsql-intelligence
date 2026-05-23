@@ -1,5 +1,5 @@
 //! `Defaulted<T>` semantics for IN parameters carrying DEFAULT
-//! expressions (PLSQL-BG-010).
+//! expressions.
 //!
 //! PL/SQL distinguishes three states for an IN parameter whose
 //! declaration ships a `DEFAULT` clause:

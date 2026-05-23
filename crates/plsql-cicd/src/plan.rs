@@ -1,4 +1,4 @@
-//! `plan <changeset>` (PLSQL-CICD-003).
+//! `plan <changeset>`.
 //!
 //! Consumes a `(ChangeSet, InvalidationPrediction)` pair and emits
 //! a topologically-sorted [`DeploymentPlan`]: the ordered DDL +

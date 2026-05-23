@@ -1,10 +1,9 @@
-//! Feed dynamic-SQL `StringShape` into `DynamicSqlEvidence`
-//! (PLSQL-FLOW-004).
+//! Feed dynamic-SQL `StringShape` into `DynamicSqlEvidence`.
 //!
 //! FLOW-001/FLOW-002 compute a [`plsql_ir::StringShape`] for the
 //! variable that feeds an `EXECUTE IMMEDIATE` / `OPEN FOR`
 //! statement. This module joins that shape with the
-//! [`DynamicSqlEvidence`] recorded by PLSQL-SYM-005 and produces
+//! [`DynamicSqlEvidence`] recorded by and produces
 //! an [`EnrichedDynamicSql`] carrying a *refined* confidence.
 //!
 //! The string shape sharpens the opacity verdict the recogniser

@@ -1,8 +1,7 @@
 #![forbid(unsafe_code)]
 
 //! `plsql-bindgen` CLI — turns a `BindingPlan` (JSON on stdin or
-//! from `--input <path>`) into a generated Rust source file
-//! (`PLSQL-BG-012`).
+//! from `--input <path>`) into a generated Rust source file.
 //!
 //! Flags:
 //!
@@ -56,6 +55,7 @@ const CAPABILITIES_CONTRACT_VERSION: u32 = 1;
 
 /// Sorted list of all valid flag names (used in error messages).
 const VALID_FLAGS: &[&str] = &[
+    "-V",
     "-h",
     "--capabilities",
     "--help",
@@ -65,6 +65,7 @@ const VALID_FLAGS: &[&str] = &[
     "--robot-docs",
     "--robot-json",
     "--target",
+    "--version",
 ];
 
 #[derive(Debug, Serialize)]
@@ -172,6 +173,11 @@ fn main() -> ExitCode {
         }
     };
 
+    if parsed.version {
+        println!("plsql-bindgen {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+
     if parsed.capabilities {
         let doc = capabilities_json();
         println!("{}", serde_json::to_string_pretty(&doc).unwrap());
@@ -253,6 +259,7 @@ struct ParsedArgs {
     capabilities: bool,
     robot_docs: bool,
     help: bool,
+    version: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
@@ -264,6 +271,7 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "-h" | "--help" => out.help = true,
+            "-V" | "--version" => out.version = true,
             "--capabilities" => out.capabilities = true,
             "--robot-docs" => out.robot_docs = true,
             "--input" => {
@@ -446,5 +454,35 @@ mod tests {
         let args: Vec<String> = vec!["--robot-docs".to_string()];
         let parsed = parse_args(&args).unwrap();
         assert!(parsed.robot_docs);
+    }
+
+    /// `--version` and `-V` are the universally expected flags for printing
+    /// the binary version; both must parse successfully and set the version
+    /// flag so the main loop can emit `plsql-bindgen <version>` and exit 0.
+    /// Regression test for the unknown-flag rejection observed before the
+    /// handler was added.
+    #[test]
+    fn version_flag_parses_long_and_short() {
+        for arg in ["--version", "-V"] {
+            let args: Vec<String> = vec![arg.to_string()];
+            let parsed =
+                parse_args(&args).unwrap_or_else(|e| panic!("{arg} should parse, got: {e}"));
+            assert!(parsed.version, "{arg} should set version flag");
+        }
+    }
+
+    /// `--version` / `-V` must appear in the published valid-flag list so the
+    /// error message for genuinely-unknown flags is honest about what the CLI
+    /// accepts.
+    #[test]
+    fn version_flags_are_in_valid_flags_list() {
+        assert!(
+            VALID_FLAGS.contains(&"--version"),
+            "VALID_FLAGS must include --version"
+        );
+        assert!(
+            VALID_FLAGS.contains(&"-V"),
+            "VALID_FLAGS must include -V"
+        );
     }
 }

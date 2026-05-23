@@ -1,4 +1,4 @@
-//! Optional support-bundle encryption envelope (PLSQL-SUPPORT-002).
+//! Optional support-bundle encryption envelope.
 //!
 //! `SUPPORT-001` produces a plaintext JSON `SupportBundle`. This
 //! module wraps the serialised form in an [`EncryptedBundleEnvelope`]

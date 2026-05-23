@@ -4,7 +4,13 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Subprocess-based Java ANTLR ParseBackend for plsql-intelligence (PLSQL-PARSE-000B)"
+# Inert historical spike — the parser-backend tournament loser. It builds
+# and its tests pass, but by design it produces no real parse (worker
+# output decoding was never wired). Kept in the workspace for CI coverage
+# only; `publish = false` keeps it out of any crates.io release. The
+# crate-level docs in src/lib.rs carry the full rationale.
+publish = false
+description = "Inert historical spike: a subprocess Java ANTLR parser-backend prototype (parser-backend tournament loser — never produces a real parse, not a usable crate)"
 
 [dependencies]
 plsql-core = { path = "../plsql-core" }

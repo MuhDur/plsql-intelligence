@@ -1,4 +1,4 @@
-//! Stage [C] — CLUSTER / DEDUP (spec §2 step [C], `PLSQL-USR-001`).
+//! Stage [C] — CLUSTER / DEDUP (spec §2 step [C]).
 //!
 //! `N` estate occurrences of the *same gap class* collapse to
 //! exactly **one** [`GapCluster`]. The clustering key is the

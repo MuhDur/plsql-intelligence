@@ -1,8 +1,8 @@
-//! Optional TCP transport for remote MCP agents (`PLSQL-MCP-008`).
+//! Optional TCP transport for remote MCP agents.
 //!
-//! By default `plsql-mcp` speaks JSON-RPC 2.0 over stdio
-//! (`PLSQL-MCP-002`). For remote agent sessions an operator may
-//! want to bind a TCP socket and accept one client at a time.
+//! By default `plsql-mcp` speaks JSON-RPC 2.0 over stdio. For
+//! remote agent sessions an operator may want to bind a TCP socket
+//! and accept one client at a time.
 //! This module ships the parsed `--listen` flag configuration,
 //! validates the bind target, and exposes a thin runtime hook
 //! the binary can call to enter the accept-loop.
@@ -19,18 +19,25 @@
 //! * Close on EOF or first I/O error.
 //!
 //! Refusals (in `parse_listen_target`):
-//! * Public-internet binds (`0.0.0.0:*`, `::`) are **refused by
-//!   default**. The operator must pass an explicit
-//!   `--allow-public-bind` to override — the goal is to prevent
-//!   an accidental copy-paste from exposing the MCP surface to
-//!   the open net.
+//! * **Loopback-only by default**. Only `127.0.0.0/8`
+//!   and `::1` bind without a flag. *Every* non-loopback target —
+//!   `0.0.0.0`/`::`, RFC 1918 private ranges (`10/8`, `172.16/12`,
+//!   `192.168/16`), IPv4 link-local (`169.254/16`), IPv6 ULA
+//!   (`fc00::/7`) and link-local (`fe80::/10`), and public IPs —
+//!   is **refused** unless the operator passes an explicit
+//!   `--allow-public-bind`. This transport carries no
+//!   authentication (no token, no TLS, no peer check), so on a
+//!   shared LAN/VPC/container network "private" is not "trusted":
+//!   any co-resident host that can reach the socket drives the
+//!   full tool surface. The loopback default matches the module's
+//!   "one agent per process / local dev transport" model.
 //!
 //! ## /oracle evidence
 //!
 //! * `DATABASE-REFERENCE.md` PL/SQL routing — the protocol layer
 //!   atop this transport is `mcp_protocol::handle_request_line`,
 //!   which defers per-tool dispatch to the `ToolRegistry`
-//!   populated by the foundation live-DB beads. This module
+//!   populated by the foundation live-DB modules. This module
 //!   doesn't change Oracle behaviour; it changes how the agent
 //!   reaches the engine.
 
@@ -56,14 +63,15 @@ pub enum TcpConfigError {
     #[error("--listen target {raw:?} is not a valid <host>:<port> pair: {detail}")]
     InvalidSocket { raw: String, detail: String },
     #[error(
-        "--listen target {raw:?} binds to a public-internet address; pass --allow-public-bind to override"
+        "--listen target {raw:?} is not a loopback address; the MCP transport is unauthenticated, so any non-loopback bind (including RFC1918/link-local private ranges) exposes the full tool surface to every host that can reach it — pass --allow-public-bind to override"
     )]
     PublicBindRefused { raw: String },
 }
 
-/// Parse a `--listen <host:port>` value. `allow_public_bind`
-/// disables the default refusal of `0.0.0.0` / `::` /
-/// non-loopback non-private targets.
+/// Parse a `--listen <host:port>` value. By default only loopback
+/// (`127.0.0.0/8`, `::1`) is accepted; `allow_public_bind` lifts
+/// the refusal for **any** non-loopback target — RFC 1918 /
+/// link-local private ranges included.
 pub fn parse_listen_target(
     raw: &str,
     allow_public_bind: bool,
@@ -90,21 +98,23 @@ pub fn parse_listen_target(
     })
 }
 
-/// Treat loopback and RFC 1918 / unique-local addresses as
-/// "safe by default". Everything else (including `0.0.0.0` /
-/// `::`) requires the explicit opt-in flag.
+/// Treat **only loopback** (`127.0.0.0/8`, `::1`) as safe by
+/// default. Every non-loopback target — including
+/// RFC 1918 private space (`10/8`, `172.16/12`, `192.168/16`),
+/// IPv4 link-local (`169.254/16`), IPv6 unique-local (`fc00::/7`)
+/// and link-local (`fe80::/10`), and any public address — requires
+/// the explicit `--allow-public-bind` opt-in.
+///
+/// Rationale: this is an *unauthenticated* JSON-RPC transport
+/// (no token, no TLS, no peer check). On a shared LAN, corporate
+/// VPN subnet, cloud VPC, or multi-tenant container network,
+/// "private" is not "trusted" — any co-resident host that can
+/// reach the `ip:port` drives the full tool surface. Reachability
+/// must not equal authorization, so the safe default is the
+/// loopback model the module's "one agent per process" posture
+/// already assumes.
 fn is_safe_bind(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
-        IpAddr::V6(v6) => {
-            // Loopback or unique-local (fc00::/7) or link-local.
-            v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00 || is_v6_link_local(v6)
-        }
-    }
-}
-
-fn is_v6_link_local(v6: std::net::Ipv6Addr) -> bool {
-    (v6.segments()[0] & 0xffc0) == 0xfe80
+    ip.is_loopback()
 }
 
 /// Pretty-print the listen target for the doctor / startup log.
@@ -113,7 +123,7 @@ pub fn describe(target: &ListenTarget) -> String {
     let safety = if target.allow_public_bind {
         "public-bind-allowed"
     } else {
-        "loopback-or-private-only"
+        "loopback-only"
     };
     format!("tcp://{} ({safety})", target.socket)
 }
@@ -236,22 +246,53 @@ mod tests {
     }
 
     #[test]
-    fn private_rfc1918_accepted_without_override() {
-        // 10.0.0.0/8 is RFC 1918 private space.
-        let t = parse_listen_target("10.0.1.5:9000", false).unwrap();
-        assert_eq!(t.socket.port(), 9000);
+    fn private_rfc1918_refused_without_override() {
+        // oracle-e1ro: RFC 1918 (10/8, 172.16/12, 192.168/16) is
+        // "private" but not "trusted" — a co-resident host on a
+        // shared LAN/VPC/container network can drive the whole
+        // unauthenticated tool surface. The default is now
+        // loopback-only; any RFC 1918 bind requires the explicit
+        // `--allow-public-bind` opt-in.
+        for raw in ["10.0.1.5:9000", "172.16.0.1:9000", "192.168.1.10:9000"] {
+            let err = parse_listen_target(raw, false).unwrap_err();
+            assert!(
+                matches!(err, TcpConfigError::PublicBindRefused { .. }),
+                "{raw} must be refused without --allow-public-bind"
+            );
+        }
     }
 
     #[test]
-    fn link_local_accepted_without_override() {
-        let t = parse_listen_target("169.254.1.1:9000", false).unwrap();
-        assert_eq!(t.socket.port(), 9000);
+    fn link_local_refused_without_override() {
+        // oracle-e1ro: IPv4 link-local (169.254/16) is reachable
+        // by any co-resident host and must not bind by default.
+        let err = parse_listen_target("169.254.1.1:9000", false).unwrap_err();
+        assert!(matches!(err, TcpConfigError::PublicBindRefused { .. }));
     }
 
     #[test]
-    fn unique_local_v6_accepted_without_override() {
-        let t = parse_listen_target("[fc00::1]:9000", false).unwrap();
-        assert_eq!(t.socket.port(), 9000);
+    fn unique_local_v6_refused_without_override() {
+        // oracle-e1ro: IPv6 ULA (fc00::/7) is not loopback;
+        // default-deny applies.
+        let err = parse_listen_target("[fc00::1]:9000", false).unwrap_err();
+        assert!(matches!(err, TcpConfigError::PublicBindRefused { .. }));
+    }
+
+    #[test]
+    fn rfc1918_and_link_local_bind_with_override() {
+        // oracle-e1ro: the opt-in flag still unlocks the wider
+        // bind for operators who genuinely need it.
+        for raw in [
+            "10.0.1.5:9000",
+            "172.16.0.1:9000",
+            "192.168.1.10:9000",
+            "169.254.1.1:9000",
+            "[fc00::1]:9000",
+        ] {
+            let t = parse_listen_target(raw, true)
+                .unwrap_or_else(|e| panic!("{raw} should bind with override: {e}"));
+            assert!(t.allow_public_bind);
+        }
     }
 
     #[test]
@@ -291,7 +332,7 @@ mod tests {
         let t = parse_listen_target("127.0.0.1:9000", false).unwrap();
         let s = describe(&t);
         assert!(s.contains("tcp://"));
-        assert!(s.contains("loopback-or-private-only"));
+        assert!(s.contains("loopback-only"));
     }
 
     #[test]

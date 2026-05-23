@@ -1,5 +1,4 @@
-//! `verify <changeset>` against a scratch schema / disposable Oracle container
-//! (`PLSQL-CICD-005`, oracle-m941).
+//! `verify <changeset>` against a scratch schema / disposable Oracle container.
 //!
 //! # Purpose
 //!
@@ -35,9 +34,9 @@
 //! target that does not look like `VERIFY_T_*` is rejected with
 //! [`VerifyError::InPlaceVerificationRefused`] unless `allow_in_place` is
 //! explicitly set to `true` in [`VerifyOptions`]. The interactive confirmation
-//! flow for `--dangerously-verify-in-place` is a separate bead (`oracle-q2o8`)
-//! and is not implemented here — this module exposes the boolean seam so that
-//! bead can wire in without touching this file.
+//! flow for `--dangerously-verify-in-place` lives in the CLI driver — this
+//! module exposes the boolean seam so the driver can wire in without
+//! touching this file.
 //!
 //! # Scratch schema naming
 //!
@@ -67,12 +66,12 @@ use crate::CicdError;
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
-/// Errors emitted by the `verify` pipeline (`PLSQL-CICD-005`).
+/// Errors emitted by the `verify` pipeline.
 #[derive(Debug, Error)]
 pub enum VerifyError {
     /// `verify` refused to run against a schema that does not start with
     /// `VERIFY_T_` because `allow_in_place` is `false`. Use the
-    /// `--dangerously-verify-in-place` flag (oracle-q2o8) to enable this
+    /// `--dangerously-verify-in-place` flag to enable this
     /// after interactive confirmation.
     #[error(
         "verify refused to run against schema `{schema}` — it does not look like a scratch \
@@ -83,8 +82,7 @@ pub enum VerifyError {
 
     /// `--dangerously-verify-in-place` was passed but the operator did not
     /// retype the connected schema name verbatim at the interactive
-    /// confirmation prompt (`PLSQL-CICD-005A`, oracle-q2o8). The destructive
-    /// in-place path stays disabled.
+    /// confirmation prompt. The destructive in-place path stays disabled.
     #[error(
         "in-place verification NOT confirmed: operator typed `{got}` but the connected schema \
          is `{expected}` — they must match exactly. Aborting (in-place stays disabled)."
@@ -325,7 +323,7 @@ impl VerifyReport {
 pub struct VerifyOptions {
     /// When `false` (the default), `verify` refuses to run against any schema
     /// name that does not start with `VERIFY_T_`. Set to `true` only from the
-    /// interactive `--dangerously-verify-in-place` gate (oracle-q2o8).
+    /// interactive `--dangerously-verify-in-place` gate.
     pub allow_in_place: bool,
 
     /// Override the scratch schema name. If `None`, [`scratch_schema_name`] is
@@ -381,8 +379,7 @@ pub enum InPlaceDecision {
     Confirmed,
 }
 
-/// Interactive safety gate for destructive in-place DDL verification
-/// (`PLSQL-CICD-005A`).
+/// Interactive safety gate for destructive in-place DDL verification.
 ///
 /// `verify` runs against a throwaway `VERIFY_T_*` scratch schema by default;
 /// DDL implicitly commits, so an in-place run against a real schema is

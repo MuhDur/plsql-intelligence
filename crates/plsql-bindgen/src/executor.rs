@@ -1,5 +1,5 @@
 //! `OracleExecutor` trait — the sync-first execution model the bindings
-//! generator targets (PLSQL-BG-001).
+//! generator targets.
 //!
 //! Concrete implementations are out of scope of this crate; the trait lives
 //! here so generated wrappers can be parameterized over any driver that

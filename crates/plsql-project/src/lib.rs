@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 //! `plsql-project` — file discovery + manifest model for the
-//! plsql-intelligence engine (PLSQL-WS-007).
+//! plsql-intelligence engine.
 //!
 //! This crate is Layer 0 (foundations). It is responsible for two
 //! tasks that every higher layer needs:
@@ -20,9 +20,8 @@
 //!    paths are filtered by suffix-match against the manifest's
 //!    `ignore` globs (we do not pull in a globber dependency).
 //!
-//! Subsequent beads (`PLSQL-WS-008` — SQL*Plus statement splitter,
-//! `PLSQL-WS-009` — spec/body pairing + wrapped-source detection)
-//! build on these primitives.
+//! A SQL*Plus statement splitter and spec/body pairing + wrapped-source
+//! detection build on these primitives.
 //!
 //! ## /oracle evidence
 //!
@@ -82,7 +81,7 @@ pub struct ProjectManifest {
     /// qualify their object names.
     pub default_schema: Option<String>,
     /// Optional connection profile alias for live-DB tools
-    /// (PLSQL-MCP-LIVE-002 / -004). When `None`, the project is
+    /// (-004). When `None`, the project is
     /// static-only.
     pub connection_profile: Option<String>,
 }

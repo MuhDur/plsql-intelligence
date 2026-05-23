@@ -1,4 +1,4 @@
-//! Per-rule firing histogram doctor (`PLSQL-SAST-026`).
+//! Per-rule firing histogram doctor.
 //!
 //! Aggregates a [`ScanReport`](crate::ScanReport) into a stable,
 //! serde-able per-rule view so an operator can answer "which rules

@@ -1,4 +1,4 @@
-//! Call-site edge extraction (PLSQL-DEP-002).
+//! Call-site edge extraction.
 //!
 //! Walks a lowered statement body and pulls out every
 //! procedure / function invocation as a [`CallSite`]. The
@@ -68,10 +68,10 @@ pub enum CallContext {
 ///
 /// Backwards-compatible wrapper around
 /// [`extract_call_sites_bounded`]: the recursion is depth-guarded
-/// (`oracle-v4wa`) so a malformed unit whose re-lowered body fails
-/// to shrink can never stack-overflow. Callers that need to surface
-/// the typed [`plsql_core::UnknownReason::AnalysisRecursionLimit`]
-/// degradation should call [`extract_call_sites_bounded`] directly.
+/// so a malformed unit whose re-lowered body fails to shrink can
+/// never stack-overflow. Callers that need to surface the typed
+/// [`plsql_core::UnknownReason::AnalysisRecursionLimit`] degradation
+/// should call [`extract_call_sites_bounded`] directly.
 #[must_use]
 pub fn extract_call_sites(stmts: &[Statement]) -> Vec<CallSite> {
     extract_call_sites_bounded(stmts).0

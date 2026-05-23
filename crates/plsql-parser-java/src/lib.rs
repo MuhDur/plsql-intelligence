@@ -1,28 +1,43 @@
 #![forbid(unsafe_code)]
 
-//! Subprocess-based Java ANTLR [`ParseBackend`] (PLSQL-PARSE-000B).
+//! Subprocess-based Java ANTLR [`ParseBackend`] — **inert
+//! historical spike**.
 //!
-//! A production-fallback candidate backend that shells out to a
-//! Java ANTLR worker rather than parsing in-process. This crate
-//! owns the **Rust integration**: worker resolution, subprocess
-//! invocation, and — critically — the panic-free degradation
-//! path. The Java grammar/jar build is the parser-backend
-//! *tournament* (PLSQL-PARSE-000C) and the structured wire
-//! protocol that decodes the worker's output into a real
-//! `Ast`/CST is PLSQL-PARSE-000D; both are explicit follow-on
-//! beads and are intentionally **not** implemented here.
+//! ## Status: not a usable crate
 //!
-//! ## Contract honoured (R13 / `ParseBackend`)
+//! This crate is a **dead-end prototype**, kept in the tree for
+//! its history and CI coverage only. It is **not published**
+//! (`publish = false`) and **nothing in the workspace depends on
+//! it** — the live PL/SQL parser backend is `plsql-parser-antlr`,
+//! the parser-backend *tournament* winner. `plsql-parser-java`
+//! is the tournament **loser**.
 //!
-//! `ParseBackend::parse` MUST NOT panic on any input and MUST
-//! return a well-formed [`BackendParseResult`]. When the worker
-//! is unavailable (no jar configured, jar missing, `java`
-//! missing, spawn/exit failure, or — for now — *any* run, since
-//! output decoding is deferred to PARSE-000D) this backend
-//! returns an empty AST/CST plus a typed [`Diagnostic`] stating
-//! exactly why no parse was produced. It never fabricates an
-//! AST and never silently returns an empty-but-clean result
-//! (the gap is always diagnosed).
+//! By design it **never produces a real parse**: even on a
+//! fully successful Java-worker run, [`JavaAntlrBackend::parse`]
+//! discards the worker's output and returns a degraded,
+//! empty-but-diagnosed [`BackendParseResult`]. Decoding the
+//! worker's output into a real `Ast`/CST was the job of a
+//! follow-on effort (the parser-backend wire protocol in
+//! [`wire`]) that was never wired into `parse`. So
+//! regardless of input or environment, this backend yields no
+//! AST. Treat the crate as a frozen design artifact, not a
+//! component to build on or revive without re-doing that work.
+//!
+//! It is retained — rather than deleted — so the panic-free
+//! degradation path it pioneered, and the neutral wire-protocol
+//! sketch in [`wire`], stay on record and under test.
+//!
+//! ## What it *does* still demonstrate (R13 / `ParseBackend`)
+//!
+//! Even as a spike it honours the [`ParseBackend`] contract:
+//! `parse` MUST NOT panic on any input and MUST return a
+//! well-formed [`BackendParseResult`]. Whatever happens (no jar
+//! configured, jar missing, `java` missing, spawn/exit failure,
+//! or — always — a "successful" run whose output is never
+//! decoded), it returns an empty AST/CST plus a typed
+//! [`Diagnostic`] stating exactly why no parse was produced. It
+//! never fabricates an AST and never silently returns an
+//! empty-but-clean result — the gap is always diagnosed.
 
 pub mod wire;
 
@@ -80,7 +95,11 @@ impl JavaWorkerConfig {
     }
 }
 
-/// The subprocess Java ANTLR backend.
+/// The subprocess Java ANTLR backend — **inert spike**.
+///
+/// See the crate-level docs: this type's [`parse`](JavaAntlrBackend::parse)
+/// never produces a real parse, by design. It is not a usable
+/// parser backend; `plsql-parser-antlr` is.
 #[derive(Clone, Debug)]
 pub struct JavaAntlrBackend {
     config: JavaWorkerConfig,

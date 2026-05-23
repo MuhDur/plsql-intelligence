@@ -4,14 +4,12 @@
 //!
 //! Layer 2 of the dependency graph (plan.md §9). This crate hosts the
 //! [`DeclTable`] — the canonical store of every `Declaration` discovered
-//! during analysis — and (in later beads) the reference resolution
-//! strategies that map name-use sites to those declarations.
+//! during analysis — and the reference resolution strategies that map
+//! name-use sites to those declarations.
 //!
-//! `PLSQL-SYM-001` introduces [`DeclTable`] plus a registration API the
-//! IR lowering passes (`PLSQL-IR-003+`) feed into. Reference resolution
-//! strategies 1–7 land in `PLSQL-SYM-002` / `PLSQL-SYM-003` /
-//! `PLSQL-SYM-009`; overload resolution and catalog cross-checking land
-//! in `PLSQL-SYM-009` / `PLSQL-SYM-010`.
+//! Introduces [`DeclTable`] plus a registration API the IR lowering
+//! passes feed into. Reference-resolution strategies live alongside;
+//! overload resolution and catalog cross-checking are layered on top.
 
 mod catalog_feed;
 mod db_link;

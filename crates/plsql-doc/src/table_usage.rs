@@ -1,4 +1,4 @@
-//! Table-usage graph rendering (PLSQL-DOC-007).
+//! Table-usage graph rendering.
 //!
 //! Sibling of the call-graph renderer (DOC-006). Where the call
 //! graph shows routine-calls-routine edges, the table-usage graph
@@ -60,8 +60,13 @@ pub fn render_table_usage_svg(view: &TableUsageView) -> String {
             "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"0\" height=\"0\"></svg>",
         );
     }
-    let unit_count = view.units.len() as u32;
-    let column_count = view.columns.len().max(1) as u32;
+    // Saturating casts (oracle-kxb3 sibling): a view with
+    // >u32::MAX units (or columns) would wrap the SVG coordinate
+    // math with the legacy `as u32` cast. Saturate to `u32::MAX` so
+    // the worst we render is a clipped canvas, never a corrupted
+    // one.
+    let unit_count = u32::try_from(view.units.len()).unwrap_or(u32::MAX);
+    let column_count = u32::try_from(view.columns.len().max(1)).unwrap_or(u32::MAX);
 
     let table_height = PX_NODE_HEIGHT + column_count * 18 + 8;
     let units_block_height = unit_count.max(1) * (PX_NODE_HEIGHT + PX_VERT_GAP);

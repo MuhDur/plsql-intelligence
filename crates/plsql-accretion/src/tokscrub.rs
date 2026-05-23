@@ -1,5 +1,4 @@
-//! Grammar-position-preserving privacy scrub (spec §2.2,
-//! `PLSQL-USR-001`).
+//! Grammar-position-preserving privacy scrub (spec §2.2).
 //!
 //! The P2 builder originally re-synthesised a minimised candidate
 //! with `plsql_support::scrub_literals(ScrubThresholds::strict())`
@@ -248,7 +247,7 @@ pub fn structure_preserving_scrub(src: &str) -> Option<String> {
 
 /// The grammar-constant name of a [`TokenKind`] — a fixed language
 /// constant, **never** estate data. This is the alphabet of the
-/// spec §2.1 "token-kind sequence" (`PLSQL-USR-001`). It carries
+/// spec §2.1 "token-kind sequence". It carries
 /// zero source bytes (no text, no width, no offset) by construction:
 /// the value is a function of the *kind discriminant only*.
 #[must_use]
@@ -280,7 +279,7 @@ fn token_kind_name(kind: TokenKind) -> &'static str {
 /// analysis pipeline and the privacy scrub use) and return the
 /// deterministic sequence of grammar-constant **token-KIND** names
 /// — the spec §2.1 "token-kind sequence, never text" / §2[C]
-/// "token-shape hash" input (`PLSQL-USR-001`).
+/// "token-shape hash" input.
 ///
 /// **I-PRIVACY.** The output contains, by construction, *only*
 /// [`token_kind_name`] constants (`KW`, `ID`, `STR`, …). No token

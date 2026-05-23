@@ -1,4 +1,4 @@
-//! Parser-level delta-debugging shrinker (PLSQL-SUPPORT-011).
+//! Parser-level delta-debugging shrinker.
 //!
 //! Consumes a textual PL/SQL input plus a caller-supplied
 //! oracle ("does the bug still reproduce?") and returns the
@@ -15,10 +15,10 @@
 //! checks for a literal substring so we exercise the search
 //! without dragging in the parser.
 //!
-//! Granularity comes from the SQL*Plus statement splitter
-//! (PLSQL-WS-008) for statement-level shrinking; the line-based
-//! splitter ships here as a fallback that doesn't require
-//! `plsql-project` at the support layer.
+//! Granularity comes from the SQL*Plus statement splitter for
+//! statement-level shrinking; the line-based splitter ships here as
+//! a fallback that doesn't require `plsql-project` at the support
+//! layer.
 
 use serde::{Deserialize, Serialize};
 

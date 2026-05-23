@@ -1,4 +1,4 @@
-//! Struct emission for OBJECT types and records (PLSQL-BG-003).
+//! Struct emission for OBJECT types and records.
 //!
 //! The bindings generator emits a Rust `struct` for each PL/SQL ADT
 //! the analysed corpus exposes:
@@ -136,7 +136,7 @@ pub fn struct_for_record(
 
 /// Build a `StructBinding` for a `%ROWTYPE` anchor. The caller
 /// projects the resolved column list into `StructFieldBinding`s
-/// via the type-mapping layer (PLSQL-BG-002) before invoking this.
+/// via the type-mapping layer before invoking this.
 #[must_use]
 pub fn struct_for_rowtype(
     plsql_name: impl Into<String>,

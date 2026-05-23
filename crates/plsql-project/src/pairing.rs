@@ -1,5 +1,4 @@
-//! Package spec/body pair detection + wrapped-source detection
-//! (PLSQL-WS-009).
+//! Package spec/body pair detection + wrapped-source detection.
 //!
 //! Two related responsibilities live here:
 //!

@@ -1,15 +1,15 @@
 //! Declaration variants populated by AST→IR lowering.
 //!
-//! `PLSQL-IR-002` introduces the [`Declaration`] enum with one variant per
+//! This module introduces the [`Declaration`] enum with one variant per
 //! kind of named entity the engine reasons about. Each variant carries a
 //! shared [`DeclCommon`] payload (name, span, owning schema, optional
 //! parent declaration) plus a small number of variant-specific fields.
-//! The actual lowering from parser AST to these declarations lands in
-//! `PLSQL-IR-003` (top-level) and later beads; the registration pass
-//! (`DeclTable` + scope chain) lands in `PLSQL-SYM-001`.
+//! The actual lowering from parser AST to these declarations, together
+//! with the registration pass (`DeclTable` + scope chain), lives in the
+//! sibling lowering modules.
 //!
-//! Subsequent beads will refine the placeholder [`TypeRef`] payloads once
-//! type resolution (`PLSQL-SYM-010`) cross-checks against the catalog.
+//! Placeholder [`TypeRef`] payloads are narrowed into structured
+//! representations once type resolution cross-checks against the catalog.
 
 use plsql_core::{SchemaName, Span, SymbolId};
 use serde::{Deserialize, Serialize};
@@ -76,10 +76,10 @@ pub enum ParamMode {
 /// Type reference attached to typed declarations.
 ///
 /// Lowering produces [`TypeRef::Unresolved`] holding the raw source text;
-/// `PLSQL-SYM-010` resolves `%TYPE` / `%ROWTYPE` anchors against the
-/// catalog and later beads narrow `Unresolved` into a structured
-/// representation. Keeping this an enum from day one means downstream
-/// crates do not have to be re-shaped when richer resolution lands.
+/// later passes resolve `%TYPE` / `%ROWTYPE` anchors against the catalog
+/// and narrow `Unresolved` into a structured representation. Keeping this
+/// an enum from day one means downstream crates do not have to be
+/// re-shaped when richer resolution lands.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TypeRef {
     /// Raw type expression from source, awaiting resolution.
@@ -188,7 +188,7 @@ pub struct SequenceDecl {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SynonymDecl {
     pub common: DeclCommon,
-    /// Object the synonym resolves to once `PLSQL-SYM-003` runs.
+    /// Object the synonym resolves to once runs.
     pub target: Option<DeclId>,
     pub public_synonym: bool,
 }
@@ -205,9 +205,8 @@ pub struct TriggerDecl {
 
 /// Discriminated union of every kind of declaration the IR recognizes.
 ///
-/// New variants are additive within this bead's scope; reshape decisions
-/// are deferred to `PLSQL-IR-003` (top-level lowering) and the symbol
-/// resolution beads (`PLSQL-SYM-*`).
+/// New variants are additive; reshape decisions are deferred to
+/// top-level lowering and the symbol resolution layer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Declaration {
     Variable(VariableDecl),

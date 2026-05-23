@@ -1,4 +1,4 @@
-//! Token-level identifier rename pass (`PLSQL-SUPPORT-012`).
+//! Token-level identifier rename pass.
 //!
 //! Walks PL/SQL source text and rewrites every Oracle identifier (the
 //! `[A-Za-z][A-Za-z0-9_$#]*` token shape) deterministically through a

@@ -9,8 +9,9 @@
 //!
 //! The measurement test at the bottom wires the full
 //! `Antlr4RustBackend` → `plsql_ir::lower_top_level` pipeline and
-//! asserts that dep_graph edges > 0 and fact_store facts > 0 (PLSQL-IR
-//! semantic pipeline produces non-trivial output on real Oracle code).
+//! asserts that dep_graph edges > 0 and fact_store facts > 0
+//! (i.e. the IR semantic pipeline produces non-trivial output on real
+//! Oracle code).
 
 #![cfg(feature = "antlr-codegen")]
 

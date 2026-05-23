@@ -1,4 +1,4 @@
-//! SQL*Plus-aware statement splitter (PLSQL-WS-008).
+//! SQL*Plus-aware statement splitter.
 //!
 //! The splitter walks a SQL*Plus script and produces a sequence of
 //! [`Statement`]s. The lexer recognises:

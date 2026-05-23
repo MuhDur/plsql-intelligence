@@ -1,15 +1,15 @@
 //! `plsql-mcp` binary — foundation MCP adapter.
 //!
-//! `PLSQL-MCP-001` wires the CLI shape (`--robot-json`, `doctor` subcommand).
-//! `serve` reaches into the transport layer once the per-tool beads land
-//! (`PLSQL-MCP-002..PLSQL-MCP-LIVE-018`).
+//! Wires the CLI shape (`--robot-json`, `doctor` subcommand). `serve`
+//! reaches into the transport layer once per-tool implementations are
+//! present.
 
 #![forbid(unsafe_code)]
 
 use std::io::{BufReader, Write};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use plsql_mcp::config::McpConfig;
 use plsql_mcp::default_tool_registry;
@@ -19,6 +19,7 @@ use plsql_mcp::tcp;
 #[derive(Parser, Debug)]
 #[command(
     name = "plsql-mcp",
+    version,
     about = "Foundation MCP adapter for the PL/SQL Intelligence engine",
     long_about = "Speaks the Model Context Protocol over stdio (default). \
                   Surfaces the engine's foundation static-analysis tools and, \
@@ -47,9 +48,13 @@ enum Command {
         /// Optional TCP listen target instead of stdio.
         #[arg(long)]
         listen: Option<String>,
-        /// Permit binding a public-internet address (`0.0.0.0`, `::`,
-        /// or any non-loopback / non-private target). Off by default:
-        /// `--listen` refuses public binds unless this is given.
+        /// Permit binding a non-loopback address. Off by default:
+        /// `--listen` accepts only loopback (`127.0.0.0/8`, `::1`).
+        /// Any wider bind — `0.0.0.0`/`::`, RFC1918 private ranges
+        /// (`10/8`, `172.16/12`, `192.168/16`), link-local, or a
+        /// public IP — requires this flag. The MCP transport is
+        /// unauthenticated, so a non-loopback bind exposes the full
+        /// tool surface to every host that can reach the socket.
         #[arg(long)]
         allow_public_bind: bool,
     },
@@ -116,7 +121,23 @@ fn main() -> ExitCode {
         return run_robot_triage();
     }
 
-    let command = cli.command.unwrap_or(Command::Doctor);
+    // Bare invocation (no subcommand). Print help to stderr and exit 2 —
+    // matches clap's `print_help_and_exit_on_no_subcommand` pattern. Never
+    // silently run an undocumented doctor-equivalent on stdout; an MCP
+    // launcher that pipes stdin/stdout would otherwise get human text on
+    // stdout and a misleading exit 0. stdout stays empty so the
+    // stdout-is-data-only contract holds even for this error path.
+    let Some(command) = cli.command else {
+        let mut cmd = Cli::command();
+        // Write help to stderr (Axiom 4: diagnostics never go to stdout).
+        let _ = cmd.write_long_help(&mut std::io::stderr());
+        let _ = writeln!(std::io::stderr());
+        let _ = writeln!(
+            std::io::stderr(),
+            "no subcommand given — try `plsql-mcp doctor`, `plsql-mcp serve`, or `plsql-mcp --robot-triage`."
+        );
+        return ExitCode::from(2);
+    };
 
     match command {
         Command::Serve {
@@ -133,7 +154,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// Run the real MCP server loop (`PLSQL-MCP-002`).
+/// Run the real MCP server loop.
 ///
 /// * `listen == None` → stdio transport. Reads line-delimited JSON-RPC
 ///   from stdin, dispatches through the transport-agnostic protocol layer
@@ -185,8 +206,8 @@ fn run_serve(listen: Option<String>, allow_public_bind: bool, robot_json: bool) 
         }
         Some(raw) => {
             // Public-bind refusal stays the responsibility of
-            // `parse_listen_target`. The safe default (loopback/private
-            // only) holds unless the operator passes `--allow-public-bind`.
+            // `parse_listen_target`. The safe default (loopback-only)
+            // holds unless the operator passes `--allow-public-bind`.
             let target = match tcp::parse_listen_target(&raw, allow_public_bind) {
                 Ok(t) => t,
                 Err(e) => {
@@ -261,6 +282,10 @@ default live-Oracle tool surface (schema describe, query, audit).
   Launch: plsql-mcp serve
 * Optional: TCP listener — pass --listen <host:port> to bind a TCP socket.
   Launch: plsql-mcp serve --listen 127.0.0.1:7070
+  The TCP transport is UNAUTHENTICATED. --listen accepts only loopback
+  (127.0.0.0/8, ::1) by default; any wider bind (RFC1918/link-local
+  included) requires --allow-public-bind and exposes the full tool
+  surface to every host that can reach the socket.
 * All diagnostic output goes to stderr; stdout is data only.
 
 ## How an agent should drive plsql-mcp
@@ -413,26 +438,51 @@ fn run_doctor(robot_json: bool) -> ExitCode {
 }
 
 fn print_doctor_human(report: &DoctorReport) {
-    println!(
+    // Diagnostics — version banner, registered-tool count, and every
+    // finding row — go to stderr so the stdout-is-data-only contract
+    // (capabilities.stdout_contract, robot-docs handbook) holds in
+    // human mode as well as `--robot-json`. stdout carries only the
+    // final one-line structured summary so a wrapper like
+    // `plsql-mcp doctor | grep -q "blockers=0"` works without
+    // tripping over WARN / INFO noise.
+    eprintln!(
         "plsql-mcp {} (live-db: {}, transport: {}, safety: {:?})",
         report.binary_version,
         report.live_db_feature_enabled,
         report.transport,
         report.active_safety_profile
     );
-    println!("registered tools: {}", report.registered_tool_count);
+    eprintln!("registered tools: {}", report.registered_tool_count);
+    let mut blocker_count = 0usize;
+    let mut warning_count = 0usize;
+    let mut info_count = 0usize;
     for finding in &report.findings {
         let tag = match finding.severity {
             DoctorSeverity::Ok => "OK",
-            DoctorSeverity::Info => "INFO",
-            DoctorSeverity::Warning => "WARN",
-            DoctorSeverity::Blocker => "BLOCK",
+            DoctorSeverity::Info => {
+                info_count += 1;
+                "INFO"
+            }
+            DoctorSeverity::Warning => {
+                warning_count += 1;
+                "WARN"
+            }
+            DoctorSeverity::Blocker => {
+                blocker_count += 1;
+                "BLOCK"
+            }
         };
-        println!("[{tag}] {} — {}", finding.code, finding.summary);
+        eprintln!("[{tag}] {} — {}", finding.code, finding.summary);
         if let Some(remediation) = &finding.remediation {
-            println!("       → {remediation}");
+            eprintln!("       → {remediation}");
         }
     }
+    // Structured one-line summary on stdout. Reports every severity tier so
+    // a caller can grep for `blockers=0` without conflating a
+    // warning-but-no-blocker state with perfect health.
+    println!(
+        "doctor: blockers={blocker_count} warnings={warning_count} info={info_count}"
+    );
 }
 
 fn run_info(robot_json: bool) -> ExitCode {
@@ -893,6 +943,140 @@ mod tests {
             b["result"]["tools"]
                 .as_array()
                 .is_some_and(|t| !t.is_empty())
+        );
+    }
+
+    /// Bare invocation (no subcommand) must not silently behave like
+    /// `doctor`. Either it prints help (clap convention) or runs an
+    /// explicit, documented summary on **stderr** — never as undocumented
+    /// stdout-on-success. The contract: stdout stays empty so a caller
+    /// piping the binary into JSON-RPC or capturing stdout cannot mistake
+    /// the bare-invocation noise for data.
+    #[test]
+    fn bare_invocation_does_not_silently_run_doctor_on_stdout() {
+        use std::process::Command as PCommand;
+        let out = PCommand::new(bin())
+            .output()
+            .expect("run plsql-mcp with no args");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.stdout.is_empty(),
+            "bare invocation must not write to stdout (got: {stdout:?})"
+        );
+        // The user must see *something* — either clap's help or a brief
+        // summary pointing at the documented entry points. Either way,
+        // it lands on stderr.
+        assert!(
+            !stderr.trim().is_empty(),
+            "bare invocation must emit a usage hint on stderr (got nothing)"
+        );
+        // The summary must point an agent at the canonical commands so a
+        // user who runs the binary by mistake learns the next step.
+        let lc = stderr.to_ascii_lowercase();
+        assert!(
+            lc.contains("plsql-mcp") && (lc.contains("doctor") || lc.contains("serve")),
+            "bare-invocation hint must mention the canonical commands; got: {stderr:?}"
+        );
+    }
+
+    /// `doctor` (human mode) must honor the stdout-is-data-only contract
+    /// from `capabilities.stdout_contract` and the robot-docs handbook:
+    /// every WARN / INFO finding and the version banner go to stderr;
+    /// stdout is reserved for the structured summary (or empty when no
+    /// findings exist).
+    #[test]
+    fn doctor_human_mode_routes_findings_to_stderr_not_stdout() {
+        use std::process::Command as PCommand;
+        let out = PCommand::new(bin())
+            .arg("doctor")
+            .output()
+            .expect("run plsql-mcp doctor");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // No [WARN]/[INFO]/[BLOCK] tagged lines on stdout — that violates
+        // the documented stdout-is-data-only contract.
+        for tag in ["[WARN]", "[INFO]", "[BLOCK]"] {
+            assert!(
+                !stdout.contains(tag),
+                "doctor human mode must not write `{tag}` to stdout; got stdout={stdout:?}"
+            );
+        }
+        // The version banner ("plsql-mcp <version>") must not be on stdout
+        // either — it is a diagnostic header.
+        assert!(
+            !stdout.contains("plsql-mcp 0.")
+                && !stdout.contains("registered tools:"),
+            "doctor human mode must not write the version banner / tool-count line to stdout; got: {stdout:?}"
+        );
+        // Findings that DO exist on this host (e.g. missing connections.toml)
+        // must surface on stderr so an operator sees them.
+        assert!(
+            stderr.contains("plsql-mcp"),
+            "doctor human mode must emit at least the version banner on stderr; got: {stderr:?}"
+        );
+    }
+
+    /// `--robot-json` (machine mode) keeps the inverse contract: stdout
+    /// is the single JSON payload, stderr stays diagnostic. Pin both
+    /// halves so a future refactor cannot accidentally flip them.
+    #[test]
+    fn doctor_robot_json_keeps_stdout_as_data_only() {
+        use std::process::Command as PCommand;
+        let out = PCommand::new(bin())
+            .args(["doctor", "--robot-json"])
+            .output()
+            .expect("run plsql-mcp doctor --robot-json");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // Exactly one JSON document on stdout.
+        let trimmed = stdout.trim();
+        let parsed: serde_json::Value =
+            serde_json::from_str(trimmed).expect("doctor --robot-json must emit one JSON object");
+        assert_eq!(parsed["binary_name"], "plsql-mcp");
+        // The findings live inside the JSON, NOT as bare [WARN] lines.
+        for tag in ["[WARN]", "[INFO]"] {
+            assert!(
+                !stdout.contains(tag),
+                "robot-json stdout must contain only JSON; got tag `{tag}` in {stdout:?}"
+            );
+        }
+    }
+
+    /// Every Unix-style CLI accepts `--version`. clap auto-derives it from
+    /// the workspace package version when `#[command(version)]` is set.
+    /// Both forms (`--version` and `-V`) must work and print the version.
+    #[test]
+    fn version_flag_long_form_is_accepted() {
+        use std::process::Command as PCommand;
+        let out = PCommand::new(bin())
+            .arg("--version")
+            .output()
+            .expect("run plsql-mcp --version");
+        assert!(
+            out.status.success(),
+            "--version must exit 0; got status={:?}, stderr={:?}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(env!("CARGO_PKG_VERSION")),
+            "--version must print the package version; got stdout={stdout:?}"
+        );
+    }
+
+    #[test]
+    fn version_flag_short_form_is_accepted() {
+        use std::process::Command as PCommand;
+        let out = PCommand::new(bin())
+            .arg("-V")
+            .output()
+            .expect("run plsql-mcp -V");
+        assert!(out.status.success(), "-V must exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(env!("CARGO_PKG_VERSION")),
+            "-V must print the package version; got stdout={stdout:?}"
         );
     }
 

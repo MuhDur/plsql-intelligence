@@ -1,5 +1,4 @@
-//! End-to-end dep-graph test over a synthetic 30-package corpus
-//! (PLSQL-DEP-012).
+//! End-to-end dep-graph test over a synthetic 30-package corpus.
 //!
 //! Builds a deterministic [`DepGraph`] mimicking a 30-package schema
 //! and asserts two contracts an operator depends on:

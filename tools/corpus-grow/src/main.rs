@@ -1,8 +1,7 @@
 #![forbid(unsafe_code)]
 
 //! `corpus-grow` — synthetic PL/SQL generator that emits valid samples
-//! from a small library of grammar-derived pattern descriptions
-//! (PLSQL-PARSE-018).
+//! from a small library of grammar-derived pattern descriptions.
 //!
 //! Each pattern is a self-contained template that produces one
 //! deterministic .pks / .pkb / .sql file. Templates are intentionally
@@ -14,7 +13,7 @@
 //!
 //! This is a deterministic scaffold; randomness lives behind a fixed
 //! `--seed` so test runs reproduce bit-for-bit. Future expansion
-//! beads can introduce richer pattern families.
+//! passes can introduce richer pattern families.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -25,6 +24,155 @@ use serde::Serialize;
 
 const SCHEMA_ID: &str = "corpus-grow.manifest";
 const SCHEMA_VERSION: u32 = 1;
+
+/// Stable contract version for the `--capabilities` payload. Bump only
+/// on a breaking change to the JSON shape.
+const CAPABILITIES_CONTRACT_VERSION: u32 = 1;
+
+const DEFAULT_OUTPUT_ROOT: &str = "corpus/synthetic/grown";
+
+const VALID_FLAGS: &[&str] = &[
+    "-V",
+    "-h",
+    "--capabilities",
+    "--count",
+    "--help",
+    "--output",
+    "--output-root",
+    "--pattern",
+    "--quiet",
+    "--robot-docs",
+    "--robot-json",
+    "--seed",
+    "--version",
+];
+
+fn suggest_flag(unknown: &str, known: &[&'static str]) -> Option<&'static str> {
+    let mut best: Option<(usize, &'static str)> = None;
+    for cand in known {
+        let d = edit_distance(unknown, cand);
+        if d <= 2 && best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, *cand));
+        }
+    }
+    best.map(|(_, s)| s)
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (n, m) = (a.len(), b.len());
+    if n == 0 {
+        return m;
+    }
+    if m == 0 {
+        return n;
+    }
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut curr: Vec<usize> = vec![0; m + 1];
+    for i in 1..=n {
+        curr[0] = i;
+        for j in 1..=m {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[m]
+}
+
+fn capabilities_json() -> serde_json::Value {
+    let patterns: Vec<&'static str> = templates().keys().copied().collect();
+    serde_json::json!({
+        "binary": "corpus-grow",
+        "contract_version": CAPABILITIES_CONTRACT_VERSION,
+        "version": env!("CARGO_PKG_VERSION"),
+        "mode": "generate deterministic synthetic PL/SQL samples from a fixed pattern library",
+        "flags": {
+            "--output / --output-root": format!("output directory (default: ./{DEFAULT_OUTPUT_ROOT})"),
+            "--seed": "u64 seed (default: 1) — generation is fully deterministic",
+            "--count": "files per pattern (default: 1; must be > 0)",
+            "--pattern": "filter to a named pattern; repeatable; omit to emit every pattern",
+            "--robot-json": format!("emit a stable-schema JSON manifest on stdout ({SCHEMA_ID} v{SCHEMA_VERSION})"),
+            "--quiet": "suppress per-file lines in the human summary",
+            "--capabilities": "print this machine-readable agent contract as JSON and exit",
+            "--robot-docs": "print a paste-ready agent handbook and exit",
+            "--version / -V": "print `corpus-grow <version>` and exit",
+            "-h / --help": "print usage and exit"
+        },
+        "patterns": patterns,
+        "exit_codes": {
+            "0": "success",
+            "2": "invocation error (bad args, output dir cannot be created)"
+        },
+        "stdout_contract": "stdout carries the manifest (human summary or JSON envelope under --robot-json); diagnostics go to stderr",
+        "manifest_schema": { "id": SCHEMA_ID, "version": SCHEMA_VERSION }
+    })
+}
+
+fn robot_docs_text() -> String {
+    let patterns: Vec<&'static str> = templates().keys().copied().collect();
+    format!(
+        r#"corpus-grow agent handbook
+============================
+
+WHAT IT DOES
+  Emits deterministic synthetic PL/SQL samples from a fixed library of
+  grammar-derived patterns. Same seed → byte-identical output. Each
+  template targets one structural feature (package spec/body, standalone
+  procedure/function, synonym, view, trigger).
+
+CANONICAL INVOCATION
+  corpus-grow                                # write every pattern once (seed 1)
+  corpus-grow --seed 42 --count 5            # 5 files per pattern, seed 42
+  corpus-grow --pattern package_spec         # only one pattern
+  corpus-grow --output /tmp/grown --quiet    # alternate destination
+  corpus-grow --robot-json | jq '.generated' # stable JSON manifest
+
+ROBOT-JSON ENVELOPE
+  {{
+    "schema_id":      "{schema_id}",
+    "schema_version": {schema_version},
+    "output_root":    "...",
+    "seed":           N,
+    "pattern_count":  N,
+    "generated":      [ {{ "path": "...", "bytes": N, "pattern": "..." }} ]
+  }}
+
+PATTERNS
+  {patterns}
+
+FLAGS SUMMARY
+  --output <dir>     output directory (default: ./{default_root})
+  --seed <u64>       deterministic seed (default: 1)
+  --count <N>        files per pattern (default: 1)
+  --pattern <name>   filter to a pattern (repeatable)
+  --robot-json       stable-schema JSON manifest on stdout
+  --quiet            suppress per-file lines in human summary
+  --capabilities     machine-readable agent contract (JSON)
+  --robot-docs       this handbook
+  --version / -V     print corpus-grow <version>
+  -h / --help        usage summary
+
+EXIT CODES
+  0  success
+  2  invocation error (bad args, output dir cannot be created)
+
+DISCOVERY
+  corpus-grow --capabilities    versioned agent contract
+  corpus-grow --help            human usage summary
+
+NOTE
+  corpus-grow is a tiny generator; it has no `--robot-triage` mega-
+  command (the surface is narrow enough that `--capabilities` is
+  already a one-call bootstrap).
+"#,
+        schema_id = SCHEMA_ID,
+        schema_version = SCHEMA_VERSION,
+        default_root = DEFAULT_OUTPUT_ROOT,
+        patterns = patterns.join(", "),
+    )
+}
 
 type PatternFn = fn(u64) -> (String, String);
 type TemplateMap = BTreeMap<&'static str, PatternFn>;
@@ -113,10 +261,26 @@ fn main() -> ExitCode {
         Ok(a) => a,
         Err(msg) => {
             eprintln!("error: {msg}");
-            print_usage();
+            // Error-path diagnostic: keep on stderr.
+            let _ = print_usage_to(&mut std::io::stderr().lock());
             return ExitCode::from(2);
         }
     };
+
+    if args.version {
+        println!("corpus-grow {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+
+    if args.capabilities {
+        println!("{}", serde_json::to_string_pretty(&capabilities_json()).unwrap());
+        return ExitCode::SUCCESS;
+    }
+
+    if args.robot_docs {
+        print!("{}", robot_docs_text());
+        return ExitCode::SUCCESS;
+    }
 
     if let Err(err) = fs::create_dir_all(&args.output_root) {
         eprintln!("error: cannot create {}: {err}", args.output_root.display());
@@ -191,16 +355,22 @@ struct Args {
     patterns: Vec<String>,
     robot_json: bool,
     quiet: bool,
+    capabilities: bool,
+    robot_docs: bool,
+    version: bool,
 }
 
 fn parse_args(args: Vec<String>) -> Result<Args, String> {
     let mut out = Args {
-        output_root: PathBuf::from("corpus/synthetic/grown"),
+        output_root: PathBuf::from(DEFAULT_OUTPUT_ROOT),
         seed: 1,
         count: 1,
         patterns: Vec::new(),
         robot_json: false,
         quiet: false,
+        capabilities: false,
+        robot_docs: false,
+        version: false,
     };
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -236,34 +406,63 @@ fn parse_args(args: Vec<String>) -> Result<Args, String> {
             }
             "--robot-json" => out.robot_json = true,
             "--quiet" => out.quiet = true,
+            "--capabilities" => out.capabilities = true,
+            "--robot-docs" => out.robot_docs = true,
+            "-V" | "--version" => out.version = true,
             "-h" | "--help" => {
-                print_usage();
+                // POSIX: user-requested help is data, not a
+                // diagnostic — it goes to stdout so `--help | less`
+                // and `--help > file` work the way agents and humans
+                // both expect.
+                let _ = print_usage_to(&mut std::io::stdout().lock());
                 std::process::exit(0);
             }
-            other => return Err(format!("unknown argument {other:?}")),
+            other => {
+                let msg = match suggest_flag(other, VALID_FLAGS) {
+                    Some(hint) => format!(
+                        "unknown argument {other:?} (did you mean `{hint}`?)\nvalid flags: {}",
+                        VALID_FLAGS.join(", ")
+                    ),
+                    None => format!(
+                        "unknown argument {other:?}\nvalid flags: {}",
+                        VALID_FLAGS.join(", ")
+                    ),
+                };
+                return Err(msg);
+            }
         }
     }
     Ok(out)
 }
 
-fn print_usage() {
-    eprintln!(
+fn print_usage_to<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
+    writeln!(
+        w,
         "usage: corpus-grow [--output <dir>] [--seed <u64>] [--count <N>] [--pattern <name>]... [--robot-json] [--quiet]"
-    );
-    eprintln!();
-    eprintln!("Generates synthetic PL/SQL samples from a fixed pattern library.");
-    eprintln!();
-    eprintln!("Defaults: --output corpus/synthetic/grown, --seed 1, --count 1.");
-    eprintln!();
-    eprintln!("Patterns available:");
+    )?;
+    writeln!(w)?;
+    writeln!(w, "Generates synthetic PL/SQL samples from a fixed pattern library.")?;
+    writeln!(w)?;
+    writeln!(w, "Defaults: --output {DEFAULT_OUTPUT_ROOT}, --seed 1, --count 1.")?;
+    writeln!(w)?;
+    writeln!(w, "Patterns available:")?;
     for name in templates().keys() {
-        eprintln!("  {name}");
+        writeln!(w, "  {name}")?;
     }
-    eprintln!();
-    eprintln!("Pass `--pattern <name>` one or more times to filter; omit to emit");
-    eprintln!("every pattern.");
-    eprintln!();
-    eprintln!("Stable schema for the JSON manifest: {SCHEMA_ID} v{SCHEMA_VERSION}.");
+    writeln!(w)?;
+    writeln!(w, "Pass `--pattern <name>` one or more times to filter; omit to emit")?;
+    writeln!(w, "every pattern.")?;
+    writeln!(w)?;
+    writeln!(w, "Discovery flags:")?;
+    writeln!(
+        w,
+        "  --capabilities    Print the machine-readable agent contract as JSON and exit"
+    )?;
+    writeln!(w, "  --robot-docs      Print a paste-ready agent handbook and exit")?;
+    writeln!(w, "  -V, --version     Print corpus-grow <version> and exit")?;
+    writeln!(w)?;
+    writeln!(w, "Stable schema for the JSON manifest: {SCHEMA_ID} v{SCHEMA_VERSION}.")?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -319,5 +518,74 @@ mod tests {
         fs::write(&p, &body).unwrap();
         let read_back = fs::read_to_string(&p).unwrap();
         assert!(read_back.contains("pkg_grown_11"));
+    }
+
+    // ----------------------------------------------------------------
+    // Agent-ergonomics surface (capabilities / robot-docs / typo DYM).
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn capabilities_contract_is_pinned() {
+        let c = capabilities_json();
+        assert_eq!(c["binary"], "corpus-grow");
+        assert_eq!(c["contract_version"], CAPABILITIES_CONTRACT_VERSION);
+        assert_eq!(c["version"], env!("CARGO_PKG_VERSION"));
+        for key in ["flags", "exit_codes", "stdout_contract", "manifest_schema", "patterns"] {
+            assert!(c.get(key).is_some(), "capabilities missing key `{key}`");
+        }
+        let flags = c["flags"].as_object().unwrap();
+        for required in [
+            "--seed",
+            "--count",
+            "--robot-json",
+            "--capabilities",
+            "--robot-docs",
+            "--version / -V",
+        ] {
+            assert!(flags.contains_key(required), "missing flag `{required}`");
+        }
+        assert!(c["patterns"].as_array().unwrap().len() >= 7);
+    }
+
+    #[test]
+    fn capabilities_round_trips_as_single_line_json() {
+        let s = serde_json::to_string(&capabilities_json()).unwrap();
+        assert!(!s.contains('\n'));
+        let round: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(round["binary"], "corpus-grow");
+    }
+
+    #[test]
+    fn robot_docs_mentions_capabilities_and_patterns() {
+        let docs = robot_docs_text();
+        assert!(docs.contains("--capabilities"));
+        assert!(docs.contains(SCHEMA_ID));
+        assert!(docs.contains("package_spec"));
+    }
+
+    #[test]
+    fn version_flag_parses_long_and_short() {
+        for arg in ["--version", "-V"] {
+            let parsed = parse_args(vec![arg.into()])
+                .unwrap_or_else(|e| panic!("{arg} should parse, got: {e}"));
+            assert!(parsed.version, "{arg} should set version flag");
+        }
+    }
+
+    #[test]
+    fn unknown_flag_suggests_near_miss() {
+        let err = parse_args(vec!["--robotjson".into()]).unwrap_err();
+        assert!(err.contains("--robot-json"), "expected DYM hint; got: {err}");
+        assert!(err.contains("did you mean"));
+    }
+
+    #[test]
+    fn suggest_flag_finds_obvious_typos() {
+        assert_eq!(
+            suggest_flag("--robotjson", VALID_FLAGS),
+            Some("--robot-json")
+        );
+        assert_eq!(suggest_flag("--patern", VALID_FLAGS), Some("--pattern"));
+        assert_eq!(suggest_flag("--xyz-totally-unknown", VALID_FLAGS), None);
     }
 }

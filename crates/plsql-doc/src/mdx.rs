@@ -1,4 +1,4 @@
-//! Docusaurus-compatible MDX export (PLSQL-DOC-009).
+//! Docusaurus-compatible MDX export.
 //!
 //! Wraps the Markdown form produced by `render_package_markdown` /
 //! `render_object_markdown` with the front-matter and MDX-safe

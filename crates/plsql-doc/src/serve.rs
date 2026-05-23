@@ -1,4 +1,4 @@
-//! Local HTTP preview server (`PLSQL-DOC-010`).
+//! Local HTTP preview server.
 //!
 //! Minimal single-threaded synchronous HTTP/1.1 server using only
 //! `std::net`. No tokio, no third-party HTTP crate — the goal is a
@@ -19,9 +19,28 @@
 //! The server is intentionally tiny: it parses the request line,
 //! ignores headers, never reads request bodies, and returns
 //! `Connection: close` so the connection ends after one response.
+//!
+//! ## Bind safety
+//!
+//! The preview server has **no authentication** and serves
+//! rendered PL/SQL source, schema docs, and dependency graphs
+//! over plain HTTP. Binding it to anything other than loopback
+//! would expose that content to every host that can reach the
+//! `ip:port`. To make the "local-only" trust model a *control*
+//! rather than a comment, [`serve_preview_blocking`] **refuses**
+//! any non-loopback target — including `0.0.0.0` / `::`, RFC 1918
+//! private space (`10/8`, `172.16/12`, `192.168/16`), IPv4
+//! link-local (`169.254/16`), IPv6 unique-local (`fc00::/7`) and
+//! link-local (`fe80::/10`), and every routable public address —
+//! unless the caller passes `allow_public_bind = true`. This
+//! mirrors the deliberate public-bind refusal in
+//! `plsql-mcp::tcp::parse_listen_target` so the two TCP-serving
+//! crates in this workspace share one bind-safety posture; the
+//! `is_safe_bind` predicates in both crates are kept byte-aligned
+//! (loopback-only).
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 
 use crate::{
@@ -29,17 +48,108 @@ use crate::{
     render_object_markdown,
 };
 
+/// Why a requested preview bind address was refused.
+#[derive(Debug)]
+pub enum BindGuardError {
+    /// `addr` did not resolve to any socket address.
+    NoAddress,
+    /// The resolved target is a public-internet address and the
+    /// caller did not pass `allow_public_bind = true`. The
+    /// preview server has no authentication; binding it publicly
+    /// would expose unauthenticated source/schema content.
+    PublicBindRefused(SocketAddr),
+}
+
+impl std::fmt::Display for BindGuardError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BindGuardError::NoAddress => {
+                write!(f, "the requested address did not resolve to any socket")
+            }
+            BindGuardError::PublicBindRefused(s) => write!(
+                f,
+                "refusing to bind preview server to public-internet address {s}: \
+                 it serves unauthenticated source/schema content — pass \
+                 allow_public_bind=true to override"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BindGuardError {}
+
+impl From<BindGuardError> for std::io::Error {
+    fn from(e: BindGuardError) -> Self {
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)
+    }
+}
+
+/// Treat **only loopback** (`127.0.0.0/8`, `::1`) as safe by
+/// default. Every non-loopback target — including
+/// RFC 1918 private space (`10/8`, `172.16/12`, `192.168/16`),
+/// IPv4 link-local (`169.254/16`), IPv6 unique-local (`fc00::/7`)
+/// and link-local (`fe80::/10`), and any public address — requires
+/// the explicit `allow_public_bind` opt-in.
+///
+/// This is the same predicate `plsql-mcp::tcp::is_safe_bind`
+/// applies to the MCP TCP transport, kept deliberately identical
+/// so the two TCP-serving crates never diverge on what counts as
+/// a "local" bind. Rationale: this preview server is *unauthenticated*
+/// (no token, no TLS, no peer check) and serves rendered PL/SQL
+/// source and schema docs. On a shared LAN, corporate VPN subnet,
+/// cloud VPC, or multi-tenant container network, "private" is not
+/// "trusted" — any co-resident host that can reach the `ip:port`
+/// can pull the rendered source. Reachability must not equal
+/// authorization, so the safe default is the loopback model.
+#[must_use]
+pub fn is_safe_bind(ip: IpAddr) -> bool {
+    ip.is_loopback()
+}
+
+/// Resolve `addr` to a single socket address and enforce the
+/// public-bind guard. Returns the address to bind, or a
+/// [`BindGuardError`] if it does not resolve or is a public
+/// target the caller did not opt into.
+///
+/// When `allow_public_bind` is `true` the guard is skipped: the
+/// caller has explicitly accepted exposing the unauthenticated
+/// preview surface on a routable interface.
+pub fn guard_bind<A: ToSocketAddrs>(
+    addr: A,
+    allow_public_bind: bool,
+) -> Result<SocketAddr, BindGuardError> {
+    let resolved = addr
+        .to_socket_addrs()
+        .map_err(|_| BindGuardError::NoAddress)?
+        .next()
+        .ok_or(BindGuardError::NoAddress)?;
+    if !allow_public_bind && !is_safe_bind(resolved.ip()) {
+        return Err(BindGuardError::PublicBindRefused(resolved));
+    }
+    Ok(resolved)
+}
+
 /// Run the preview server on `addr`, blocking the caller forever.
-/// Returns only on a fatal `TcpListener::bind` error.
+/// Returns only on a fatal bind error.
 ///
 /// `set` is cloned into an `Arc` so the response handler can borrow it
 /// without lifetimes leaking into the server signature. `project_label`
 /// shows up in the index `<title>` and `<h1>`.
+///
+/// `allow_public_bind` controls the bind-safety guard: when
+/// `false` (the default posture), a non-loopback / non-private
+/// `addr` is refused with [`BindGuardError::PublicBindRefused`]
+/// — surfaced as a `PermissionDenied` I/O error — because the
+/// preview server has no authentication. Pass `true` only when
+/// you have deliberately decided to expose the rendered
+/// source/schema content on a routable interface.
 pub fn serve_preview_blocking<A: ToSocketAddrs>(
     addr: A,
     set: DocSet,
     project_label: impl Into<String>,
+    allow_public_bind: bool,
 ) -> std::io::Result<()> {
+    let addr = guard_bind(addr, allow_public_bind)?;
     let listener = TcpListener::bind(addr)?;
     let actual = listener.local_addr()?;
     eprintln!("[plsql-doc --serve] listening on http://{actual} — Ctrl+C to stop");
@@ -69,7 +179,9 @@ pub fn serve_preview_blocking<A: ToSocketAddrs>(
 
 /// Test-friendly variant: bind, accept exactly `n` connections, then
 /// return. Used by the unit tests below so they don't need a Ctrl+C
-/// to terminate.
+/// to terminate. Applies the same bind guard as
+/// [`serve_preview_blocking`] (`allow_public_bind = false`); the
+/// tests only ever bind `127.0.0.1`, so the guard is transparent.
 #[doc(hidden)]
 pub fn serve_preview_for_n<A: ToSocketAddrs>(
     addr: A,
@@ -77,6 +189,7 @@ pub fn serve_preview_for_n<A: ToSocketAddrs>(
     project_label: impl Into<String>,
     n: usize,
 ) -> std::io::Result<SocketAddr> {
+    let addr = guard_bind(addr, false)?;
     let listener = TcpListener::bind(addr)?;
     let actual = listener.local_addr()?;
     let state = Arc::new(ServerState {
@@ -389,5 +502,182 @@ mod tests {
         assert_eq!(parse_request_line("GET /foo HTTP/1.1\r\n"), ("GET", "/foo"));
         assert_eq!(parse_request_line("HEAD /\r\n"), ("HEAD", "/"));
         assert_eq!(parse_request_line(""), ("", "/"));
+    }
+
+    // ── Bind-safety guard ─────────────────────────────────────────────────
+    //
+    // The preview server has no authentication; the guard mirrors
+    // `plsql-mcp::tcp::parse_listen_target` so the two TCP-serving crates
+    // in this workspace agree on what counts as a "local" bind. The
+    // adversarial address set below is kept identical to the set the
+    // plsql-mcp tcp tests run against, so neither crate can quietly
+    // drift looser than the other.
+
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn is_safe_bind_accepts_loopback_v4() {
+        assert!(is_safe_bind(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn is_safe_bind_accepts_loopback_v6() {
+        assert!(is_safe_bind(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn is_safe_bind_rejects_rfc1918_private() {
+        // Mirrors plsql-mcp::tcp::private_rfc1918_refused_without_override:
+        // shared LAN / VPC / container network co-residents must not
+        // reach the unauthenticated preview surface by default.
+        for ip in [
+            IpAddr::V4(Ipv4Addr::new(10, 0, 1, 5)),
+            IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)),
+        ] {
+            assert!(!is_safe_bind(ip), "RFC1918 {ip} must NOT be safe by default");
+        }
+    }
+
+    #[test]
+    fn is_safe_bind_rejects_link_local_v4() {
+        assert!(!is_safe_bind(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))));
+    }
+
+    #[test]
+    fn is_safe_bind_rejects_unique_local_v6() {
+        assert!(!is_safe_bind(IpAddr::V6(Ipv6Addr::new(
+            0xfc00, 0, 0, 0, 0, 0, 0, 1
+        ))));
+    }
+
+    #[test]
+    fn is_safe_bind_rejects_link_local_v6() {
+        assert!(!is_safe_bind(IpAddr::V6(Ipv6Addr::new(
+            0xfe80, 0, 0, 0, 0, 0, 0, 1
+        ))));
+    }
+
+    #[test]
+    fn is_safe_bind_rejects_unspecified_v4() {
+        assert!(!is_safe_bind(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+    }
+
+    #[test]
+    fn is_safe_bind_rejects_unspecified_v6() {
+        assert!(!is_safe_bind(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+    }
+
+    #[test]
+    fn is_safe_bind_rejects_routable_public_v4() {
+        assert!(!is_safe_bind(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+    }
+
+    #[test]
+    fn guard_bind_refuses_rfc1918_without_override() {
+        for raw in [("10.0.1.5", 9000u16), ("172.16.0.1", 9000), ("192.168.1.10", 9000)] {
+            let err = guard_bind(raw, false)
+                .unwrap_err_or_else_msg(|| format!("{raw:?} must be refused without override"));
+            assert!(
+                matches!(err, BindGuardError::PublicBindRefused(_)),
+                "{raw:?} must be PublicBindRefused, got {err:?}"
+            );
+        }
+    }
+
+    // Tiny in-test helper: clearer panic than `.unwrap_err()` when
+    // the inner Result was unexpectedly Ok. Kept local to the test
+    // module so it never leaks into the public API.
+    trait UnwrapErrOrElse<T, E> {
+        fn unwrap_err_or_else_msg(self, msg: impl FnOnce() -> String) -> E;
+    }
+    impl<T: std::fmt::Debug, E> UnwrapErrOrElse<T, E> for Result<T, E> {
+        fn unwrap_err_or_else_msg(self, msg: impl FnOnce() -> String) -> E {
+            match self {
+                Err(e) => e,
+                Ok(v) => panic!("{} (got Ok({v:?}))", msg()),
+            }
+        }
+    }
+
+    #[test]
+    fn guard_bind_refuses_link_local_v4_without_override() {
+        let err = guard_bind(("169.254.1.1", 9000u16), false).unwrap_err();
+        assert!(matches!(err, BindGuardError::PublicBindRefused(_)));
+    }
+
+    #[test]
+    fn guard_bind_refuses_unique_local_v6_without_override() {
+        let err = guard_bind(("fc00::1", 9000u16), false).unwrap_err();
+        assert!(matches!(err, BindGuardError::PublicBindRefused(_)));
+    }
+
+    #[test]
+    fn guard_bind_allows_rfc1918_and_link_local_with_override() {
+        // Symmetric with plsql-mcp::tcp::rfc1918_and_link_local_bind_with_override.
+        // We resolve only; we do not bind, so the address need not be
+        // assigned to this host.
+        for raw in [
+            ("10.0.1.5", 9000u16),
+            ("172.16.0.1", 9000),
+            ("192.168.1.10", 9000),
+            ("169.254.1.1", 9000),
+            ("fc00::1", 9000),
+        ] {
+            let bound = guard_bind(raw, true)
+                .unwrap_or_else(|e| panic!("{raw:?} should resolve with override: {e}"));
+            assert!(!bound.ip().is_loopback());
+        }
+    }
+
+    #[test]
+    fn guard_bind_allows_loopback_without_override() {
+        let bound = guard_bind(("127.0.0.1", 0u16), false).unwrap();
+        assert!(bound.ip().is_loopback());
+    }
+
+    #[test]
+    fn guard_bind_refuses_unspecified_address_without_override() {
+        let err = guard_bind(("0.0.0.0", 8080u16), false).unwrap_err();
+        assert!(
+            matches!(err, BindGuardError::PublicBindRefused(_)),
+            "0.0.0.0 must be refused by default, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn guard_bind_refuses_routable_public_address_without_override() {
+        let err = guard_bind(("8.8.8.8", 8080u16), false).unwrap_err();
+        assert!(matches!(err, BindGuardError::PublicBindRefused(_)));
+    }
+
+    #[test]
+    fn guard_bind_allows_public_address_with_override() {
+        let bound = guard_bind(("0.0.0.0", 8080u16), true).unwrap();
+        assert!(bound.ip().is_unspecified());
+    }
+
+    #[test]
+    fn bind_guard_error_converts_to_permission_denied_io_error() {
+        let io: std::io::Error = BindGuardError::PublicBindRefused(SocketAddr::from((
+            [0, 0, 0, 0],
+            8080,
+        )))
+        .into();
+        assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn serve_preview_blocking_refuses_public_bind_by_default() {
+        // The behavioural contract: a public bind through the real
+        // entry point fails with a PermissionDenied error *before*
+        // any socket is opened — never silently exposed.
+        let err = serve_preview_blocking(("0.0.0.0", 0u16), fixture_set(), "billing", false)
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string().contains("public-internet"),
+            "error should explain the refusal: {err}"
+        );
     }
 }

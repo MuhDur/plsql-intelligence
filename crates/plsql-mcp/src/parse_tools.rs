@@ -1,4 +1,4 @@
-//! Parse/symbol foundation tools (PLSQL-MCP-004):
+//! Parse/symbol foundation tools:
 //! `parse_file`, `get_symbol`, `compile_check`, `inspect_profile`.
 //!
 //! All four are pure, read-only, no-live-DB foundation-static

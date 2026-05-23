@@ -1,7 +1,7 @@
 //! Deterministic snapshot tests for 20 representative PL/SQL
-//! constructs (PLSQL-PARSE-014).
+//! constructs.
 //!
-//! The bead asks for "Insta snapshot tests". `insta` is not a
+//! The contract is "Insta snapshot tests". `insta` is not a
 //! workspace dependency (and `plsql-parser-antlr` has no dev-deps
 //! / no serde), while the rest of this codebase locks golden
 //! output with inline assertions (deterministic, reviewable in

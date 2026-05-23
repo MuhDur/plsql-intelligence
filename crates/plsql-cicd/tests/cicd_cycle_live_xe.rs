@@ -1,5 +1,5 @@
 //! Live Oracle XE 23ai integration test for the full predict→plan→apply→verify
-//! cycle (`PLSQL-CICD-010`, oracle-fnsh).
+//! cycle.
 //!
 //! Exercises the complete Layer 5 pipeline against a running Oracle Free 23ai
 //! container:

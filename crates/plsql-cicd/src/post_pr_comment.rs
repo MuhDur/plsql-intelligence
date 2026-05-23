@@ -1,6 +1,6 @@
-//! `plsql post-pr-comment` subcommand library (`PLSQL-CICD-015`).
+//! `plsql post-pr-comment` subcommand library.
 //!
-//! Reads a [`PrCommentEnvelope`] (PLSQL-CICD-014, oracle-vvxw) and
+//! Reads a [`PrCommentEnvelope`] and
 //! returns a `PostPrCommentRequest` describing the platform-specific
 //! HTTP call needed to land the comment idempotently. We do NOT make
 //! the network call in this crate — the binary wrapper is responsible
@@ -63,7 +63,7 @@ pub struct PrCoordinates {
 }
 
 /// Find the existing comment (if any) whose body carries the given
-/// `html_marker` (`PLSQL-CICD-016` / oracle-usq7). Walks the iterator
+/// `html_marker`. Walks the iterator
 /// of `(comment_id, body)` tuples and returns the first match. Used
 /// by the binary wrapper to turn a CREATE into an EDIT for idempotent
 /// updates — one plsql-cicd comment per PR, edited in place.

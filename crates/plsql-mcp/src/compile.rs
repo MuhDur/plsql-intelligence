@@ -1,4 +1,4 @@
-//! `compile_with_warnings` tool (`PLSQL-MCP-LIVE-010`).
+//! `compile_with_warnings` tool.
 //!
 //! Wraps `ALTER ... COMPILE` with the session-level `PLSQL_WARNINGS =
 //! ENABLE:ALL` setting so every category of warning surfaces during the

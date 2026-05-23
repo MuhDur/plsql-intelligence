@@ -1,12 +1,12 @@
 //! `plsql-mcp doctor` data shape.
 //!
-//! `PLSQL-MCP-001` wires the subcommand and report struct.
-//! `PLSQL-MCP-LIVE-001` adds Instant Client detection (path + version
-//! heuristic from `LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH`, and `ORACLE_HOME`),
-//! `OracleConnection` backend reporting (`rust-oracle` Apache-2.0 today, plus
+//! Wires the subcommand and report struct, plus Instant Client
+//! detection (path + version heuristic from `LD_LIBRARY_PATH`,
+//! `DYLD_LIBRARY_PATH`, and `ORACLE_HOME`), `OracleConnection`
+//! backend reporting (`rust-oracle` Apache-2.0 today, plus a
 //! placeholder for the future `oracle-rs` opt-in), and the `live-db`
-//! build-status row. Connection profile validation + audit posture
-//! verification land in subsequent live-DB beads.
+//! build-status row. Connection profile validation + audit-posture
+//! verification land in the live-DB layers.
 
 use std::env;
 use std::path::PathBuf;
@@ -27,19 +27,18 @@ pub struct DoctorReport {
     pub active_safety_profile: SafetyProfile,
     pub registered_tool_count: usize,
     pub transport: String,
-    /// Detected Oracle Instant Client posture (`PLSQL-MCP-LIVE-001`).
+    /// Detected Oracle Instant Client posture.
     pub instant_client: InstantClientPosture,
-    /// Selected `OracleConnection` backend (`PLSQL-MCP-LIVE-001`).
+    /// Selected `OracleConnection` backend.
     pub oracle_connection_backend: OracleConnectionBackendInfo,
-    /// Audit posture configured for this run (`PLSQL-MCP-LIVE-003`).
+    /// Audit posture configured for this run.
     pub audit_posture: AuditPosture,
-    /// Per-connection write posture (`PLSQL-MCP-LIVE-017`) — derived from
+    /// Per-connection write posture — derived from
     /// registered `ConnectionProfile`s and the active session state. Empty
     /// when no connections are registered or `doctor_report` was called
     /// without a connection registry.
     pub connection_write_posture: Vec<ConnectionWritePostureRow>,
-    /// Protocol / transport / engine-cache / profile health
-    /// (`PLSQL-MCP-010`).
+    /// Protocol / transport / engine-cache / profile health.
     pub mcp_health: McpHealth,
     pub findings: Vec<DoctorFinding>,
 }
@@ -83,7 +82,7 @@ pub enum CacheReachability {
     NotConfigured,
 }
 
-/// Per-connection write posture row emitted by the doctor (`PLSQL-MCP-LIVE-017`).
+/// Per-connection write posture row emitted by the doctor.
 /// Captures whether each registered profile authorizes writes and why.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ConnectionWritePostureRow {
@@ -100,7 +99,7 @@ pub struct ConnectionWritePostureRow {
     pub posture_label: String,
 }
 
-/// What the doctor knows about the audit baseline (`PLSQL-MCP-LIVE-003`).
+/// What the doctor knows about the audit baseline.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AuditPosture {
     /// `DBMS_APPLICATION_INFO.SET_MODULE` is always invoked on a live tool
@@ -179,7 +178,7 @@ pub fn doctor_report(config: &McpConfig, registry: &ToolRegistry) -> DoctorRepor
 }
 
 /// Build the doctor report while also inspecting the connection registry
-/// for the `permanently_read_only` audit posture (`PLSQL-MCP-LIVE-009`).
+/// for the `permanently_read_only` audit posture.
 #[must_use]
 pub fn doctor_report_with_connections(
     config: &McpConfig,
@@ -228,7 +227,7 @@ pub fn doctor_report_with_connections(
                 "no MCP tools registered; the binary will respond to `tools/list` with an empty list.",
             ),
             remediation: Some(String::from(
-                "Per-tool beads (PLSQL-MCP-002..PLSQL-MCP-LIVE-018) populate the registry; this is expected for the bead skeleton.",
+                "Build the registry via `plsql_mcp::default_tool_registry()` — the canonical full surface. `ToolRegistry::new()` is a bare container intended only for tests; production code should never expose it directly.",
             )),
         });
     }

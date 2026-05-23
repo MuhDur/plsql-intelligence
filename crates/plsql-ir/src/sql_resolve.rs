@@ -1,6 +1,6 @@
-//! Table / alias resolution for embedded SQL (PLSQL-SQLSEM-002).
+//! Table / alias resolution for embedded SQL.
 //!
-//! PLSQL-SQLSEM-001 defined the empty [`SqlStatementModel`] shape.
+//! `sql_sem` defines the empty [`SqlStatementModel`] shape.
 //! This module is the population pass: given the raw SQL text of
 //! a `SELECT` / `INSERT` / `UPDATE` / `DELETE` / `MERGE`, it
 //! builds the `AliasScope` (alias → table) and classifies every
@@ -8,7 +8,7 @@
 //! emit precise column-level edges later.
 //!
 //! The recogniser is heuristic and line-shaped (no full SQL
-//! parser — that lands in a later parser bead). It handles the
+//! parser — that is the parser crate's job). It handles the
 //! common shapes the lab corpus exercises:
 //!
 //! * `FROM t [alias]`, `FROM s.t [alias]`, comma-joined lists.
@@ -27,7 +27,7 @@
 //!   JOIN / alias grammar.
 //! * `LOW-LEVEL-CATALOGS.md` Data Dictionary View Families —
 //!   `ALL_TAB_COLUMNS` is the server-side authority a later
-//!   bead cross-checks the resolved `(schema, table)` pairs
+//!   pass cross-checks the resolved `(schema, table)` pairs
 //!   against.
 
 use crate::sql_sem::{SqlSemanticVerb, SqlStatementModel, TableUsageKind, TableUse};
@@ -35,7 +35,7 @@ use crate::sql_sem::{SqlSemanticVerb, SqlStatementModel, TableUsageKind, TableUs
 /// Resolve table + alias structure from a single embedded SQL
 /// statement's raw text. Returns a populated
 /// [`SqlStatementModel`] (reads / writes columns are left for
-/// the column-resolution bead; this pass fills `tables` +
+/// the column-resolution pass; this pass fills `tables` +
 /// `alias_scope` + `verb`).
 #[must_use]
 pub fn resolve_sql(raw: &str) -> SqlStatementModel {

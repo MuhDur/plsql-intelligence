@@ -1,25 +1,42 @@
 #![forbid(unsafe_code)]
 
-//! Foundation MCP adapter for the PL/SQL Intelligence engine.
+//! Model Context Protocol server for the PL/SQL Intelligence engine.
 //!
-//! Implements the skeleton for `PLSQL-MCP-001`: workspace integration,
-//! transport-agnostic module layout, `--robot-json` and `doctor` subcommand
-//! wiring, and the `live-db` Cargo feature for optional Oracle connectivity
-//! (§13A.3 of `plan.md`). Per-tool engine integration lands in subsequent
-//! beads (`PLSQL-MCP-002..`).
+//! `plsql-mcp` is a single-binary MCP server that speaks JSON-RPC 2.0
+//! over stdio (default) or TCP (`serve --listen <host:port>`) and exposes
+//! the PL/SQL Intelligence engine as a structured tool surface an AI
+//! agent can call. The canonical surface — built by
+//! [`default_tool_registry`] — is fully populated: foundation
+//! static-analysis tools (parsing, project analysis, dependency graph
+//! queries, change analysis, SAST scans, doc lookup) plus, when the
+//! `live-db` Cargo feature is enabled, the read-only-by-default live
+//! Oracle tool surface (connection / safety management, schema
+//! describe, query, audit-emitting DDL with previewed approval tokens).
 //!
 //! ## Module layout
 //!
-//! - `config` — runtime configuration: connection profile, safety profile,
-//!   audit posture.
+//! - `config` — runtime configuration: transport, safety profile,
+//!   connection profile, audit posture.
 //! - `safety` — read-only-by-default guard, named safety profiles
 //!   (`static_only`, `inspect_only`, `ddl_guarded`,
-//!   `session_write_enabled`), and `permanently_read_only` hard guard.
-//! - `tools` — empty tool table populated by the per-tool beads.
-//! - `transport` — protocol-library-agnostic surface (stdio default, TCP
-//!   behind a flag). The MCP protocol library choice is deferred to
-//!   `PLSQL-MCP-002` so this crate compiles before that selection lands.
-//! - `doctor` — doctor report data shape used by the `doctor` subcommand.
+//!   `session_write_enabled`), and the `permanently_read_only` hard
+//!   guard.
+//! - `tools` — typed [`ToolRegistry`] / [`ToolDescriptor`]; the
+//!   canonical registry lives in [`default_tool_registry`].
+//! - `dispatch` — `tools/call` dispatcher with a tri-state outcome
+//!   (`Ran` / `RuntimeStateRequired` / `DispatchError`) so the protocol
+//!   layer never silently no-ops an unknown tool.
+//! - `mcp_protocol` — JSON-RPC 2.0 request / response handling and the
+//!   MCP `initialize` / `tools/list` / `tools/call` surface.
+//! - `tcp` — TCP accept loop and the shared `process_stream` pump the
+//!   stdio path reuses; loopback-only by default, wider binds require
+//!   `--allow-public-bind`.
+//! - `doctor` — diagnostic report (transport, Instant Client posture,
+//!   connection write-posture, profile sanity) consumed by both the
+//!   `doctor` subcommand and the `--robot-triage` mega-object.
+//! - `connections` — named connection profiles loaded from
+//!   `~/.plsql-mcp/connections.toml`, with structural
+//!   [`DbToolsAlias::probe`] for optional `~/.dbtools` mirroring.
 //!
 //! ## License
 //!
@@ -34,6 +51,7 @@ pub mod connections;
 pub mod create_or_replace;
 pub mod cross_schema;
 pub mod describe;
+pub mod dispatch;
 pub mod doctor;
 pub mod execute_approved;
 pub mod foundation_tools;
@@ -48,7 +66,6 @@ pub mod safety;
 pub mod source;
 pub mod tcp;
 pub mod tools;
-pub mod transport;
 pub mod trust;
 
 pub use analyze_project::{
@@ -88,8 +105,7 @@ pub use parse_tools::{
 };
 pub use trust::{TrustBlock, attach_trust_block, trust_block_value};
 
-/// Register the `execute_approved` + `deploy_ddl` tool descriptors
-/// (`PLSQL-MCP-LIVE-015`).
+/// Register the `execute_approved` + `deploy_ddl` tool descriptors.
 pub fn register_execute_approved_tools(registry: &mut ToolRegistry) {
     registry.register(ToolDescriptor {
         name: String::from("execute_approved"),
@@ -112,7 +128,7 @@ pub use patch::{
     synthesise_ddl, synthesise_view_ddl,
 };
 
-/// Register the `patch_view` tool descriptor (`PLSQL-MCP-LIVE-013`).
+/// Register the `patch_view` tool descriptor.
 pub fn register_patch_view_tool(registry: &mut ToolRegistry) {
     registry.register(ToolDescriptor {
         name: String::from("patch_view"),
@@ -128,8 +144,7 @@ pub use mcp_protocol::{
 };
 pub use preview::{PreviewError, PreviewRegistry, PreviewedDdl};
 
-/// Register the `create_or_replace` tool descriptor
-/// (`PLSQL-MCP-LIVE-014`).
+/// Register the `create_or_replace` tool descriptor.
 pub fn register_create_or_replace_tool(registry: &mut ToolRegistry) {
     registry.register(ToolDescriptor {
         name: String::from("create_or_replace"),
@@ -140,7 +155,7 @@ pub fn register_create_or_replace_tool(registry: &mut ToolRegistry) {
     });
 }
 
-/// Register the `patch_package` tool descriptor (`PLSQL-MCP-LIVE-012`).
+/// Register the `patch_package` tool descriptor.
 pub fn register_patch_package_tool(registry: &mut ToolRegistry) {
     registry.register(ToolDescriptor {
         name: String::from("patch_package"),
@@ -155,6 +170,10 @@ pub use describe::{
     DescribeColumn, DescribeConstraint, DescribeError, DescribeIndex, DescribeIndexResponse,
     DescribeTableResponse, DescribeTriggerResponse, DescribeViewResponse, run_describe_index,
     run_describe_table, run_describe_trigger, run_describe_view,
+};
+
+pub use dispatch::{
+    DispatchError, DispatchOutcome, RuntimeKind, dispatch_table, dispatch_tool,
 };
 
 pub use compile::{
@@ -173,16 +192,17 @@ pub use list_objects::{
 };
 
 pub use query::{
-    QueryCell, QueryColumnMeta, QueryError, QueryResponse, QueryRow, run_query, sanitize,
+    QueryCell, QueryColumnMeta, QueryError, QueryResponse, QueryRow, UNTRUSTED_DATA_NOTICE,
+    run_query, sanitize,
 };
 
-/// Register the read-only `query` tool descriptor (`PLSQL-MCP-LIVE-004`).
+/// Register the read-only `query` tool descriptor.
 pub fn register_query_tool(registry: &mut ToolRegistry) {
     registry.register(ToolDescriptor {
         name: String::from("query"),
         tier: ToolTier::FoundationLiveDb,
         summary: String::from(
-            "Run a SELECT / WITH against the active Oracle connection and return structured rows. K18 prompt-injection sanitization scrubs MCP / tool-call markers; LOB cells truncate to a per-call limit.",
+            "Run a SELECT / WITH against the active Oracle connection and return structured rows. Result cells are untrusted data: markup-shaped sequences are structurally neutralized (casing/spacing/unicode-robust) and the response carries an explicit data-envelope notice; LOB cells truncate to a per-call limit.",
         ),
     });
 }
@@ -233,9 +253,9 @@ pub fn default_tool_registry() -> ToolRegistry {
     r
 }
 
-/// Register the four safety-state tool descriptors
-/// (`PLSQL-MCP-LIVE-008`) into the given registry. Tools are
-/// `FoundationLiveDb` tier and gate every write the live-DB surface emits.
+/// Register the four safety-state tool descriptors into the given
+/// registry. Tools are `FoundationLiveDb` tier and gate every write
+/// the live-DB surface emits.
 pub fn register_safety_tools(registry: &mut ToolRegistry) {
     let descriptors = [
         (
@@ -264,9 +284,9 @@ pub fn register_safety_tools(registry: &mut ToolRegistry) {
     }
 }
 
-/// Register the five connection-management tool descriptors
-/// (`PLSQL-MCP-LIVE-002`) into the given tool registry. Idempotent — the
-/// underlying [`ToolRegistry`] deduplicates by name.
+/// Register the five connection-management tool descriptors into the
+/// given tool registry. Idempotent — the underlying [`ToolRegistry`]
+/// deduplicates by name.
 pub fn register_connection_tools(registry: &mut ToolRegistry) {
     let descriptors = [
         (

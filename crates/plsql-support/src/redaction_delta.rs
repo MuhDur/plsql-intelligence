@@ -1,4 +1,4 @@
-//! Redaction-delta manifest generator (`PLSQL-SUPPORT-014`).
+//! Redaction-delta manifest generator.
 //!
 //! Records *every transformation* that produced a redacted fixture
 //! from its original source. Designed to ship next to the fixture in

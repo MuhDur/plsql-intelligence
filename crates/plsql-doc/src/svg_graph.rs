@@ -1,4 +1,4 @@
-//! Inline SVG call-graph rendering from a dep-graph view (PLSQL-DOC-006).
+//! Inline SVG call-graph rendering from a dep-graph view.
 //!
 //! The documentation site embeds small SVG diagrams of a package /
 //! routine's call graph next to its object page. This module is the
@@ -67,10 +67,16 @@ pub fn render_call_graph_svg(view: &CallGraphView) -> String {
     }
     let layers = layer_nodes(view);
     let mut positions: HashMap<String, (u32, u32)> = HashMap::new();
-    let total_layers = layers.len() as u32;
+    // Saturating casts (oracle-kxb3 sibling): a graph with
+    // >u32::MAX layers (or one layer with >u32::MAX nodes) would
+    // wrap the SVG coordinate math with the legacy `as u32` cast.
+    // Saturate to `u32::MAX` so the worst we render is a clipped
+    // canvas, never a corrupted one.
+    let total_layers = u32::try_from(layers.len()).unwrap_or(u32::MAX);
     let mut max_per_layer = 0_u32;
     for col in &layers {
-        max_per_layer = max_per_layer.max(col.len() as u32);
+        let col_len = u32::try_from(col.len()).unwrap_or(u32::MAX);
+        max_per_layer = max_per_layer.max(col_len);
     }
 
     let width = PX_MARGIN * 2

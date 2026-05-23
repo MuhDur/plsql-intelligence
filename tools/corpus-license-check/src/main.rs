@@ -6,7 +6,7 @@
 //! refuses to pass if any committed file lacks a `[[file]]` entry, or
 //! if any entry points at a missing file.
 //!
-//! `PLSQL-WS-014`: this binary is wired into `ci.yml` (`PLSQL-WS-015`)
+//! this binary is wired into `ci.yml`
 //! to block PRs that vendor external corpora without recording the
 //! provenance + license + redistribution status the project promises.
 
@@ -23,6 +23,147 @@ const ENFORCED_ROOTS: &[&str] = &["public"];
 /// Stable schema identifier for the `--robot-json` report.
 const SCHEMA_ID: &str = "corpus-license-check.report";
 const SCHEMA_VERSION: u32 = 1;
+
+/// Stable contract version for the `--capabilities` payload.
+const CAPABILITIES_CONTRACT_VERSION: u32 = 1;
+
+const DEFAULT_CORPUS_ROOT: &str = "corpus";
+
+const VALID_FLAGS: &[&str] = &[
+    "-V",
+    "-h",
+    "--capabilities",
+    "--corpus-root",
+    "--doctor",
+    "--help",
+    "--robot-docs",
+    "--robot-json",
+    "--version",
+];
+
+fn suggest_flag(unknown: &str, known: &[&'static str]) -> Option<&'static str> {
+    let mut best: Option<(usize, &'static str)> = None;
+    for cand in known {
+        let d = edit_distance(unknown, cand);
+        if d <= 2 && best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, *cand));
+        }
+    }
+    best.map(|(_, s)| s)
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (n, m) = (a.len(), b.len());
+    if n == 0 {
+        return m;
+    }
+    if m == 0 {
+        return n;
+    }
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut curr: Vec<usize> = vec![0; m + 1];
+    for i in 1..=n {
+        curr[0] = i;
+        for j in 1..=m {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[m]
+}
+
+fn capabilities_json() -> serde_json::Value {
+    serde_json::json!({
+        "binary": "corpus-license-check",
+        "contract_version": CAPABILITIES_CONTRACT_VERSION,
+        "version": env!("CARGO_PKG_VERSION"),
+        "mode": "CI gate: every committed file under enforced corpus roots has a manifest.toml entry",
+        "enforced_roots": ENFORCED_ROOTS,
+        "flags": {
+            "--corpus-root": format!("path to the corpus directory (default: ./{DEFAULT_CORPUS_ROOT})"),
+            "--robot-json": format!("emit a stable-schema JSON report on stdout ({SCHEMA_ID} v{SCHEMA_VERSION})"),
+            "--doctor": "print a summary of policy + enforced-roots + counts",
+            "--capabilities": "print this machine-readable agent contract as JSON and exit",
+            "--robot-docs": "print a paste-ready agent handbook and exit",
+            "--version / -V": "print `corpus-license-check <version>` and exit",
+            "-h / --help": "print usage and exit"
+        },
+        "exit_codes": {
+            "0": "clean (every committed file has a manifest entry; no orphaned entries)",
+            "1": "one or more violations (missing entry, orphaned entry, invalid entry, incomplete support engagement)",
+            "2": "invocation error (bad args, unreadable manifest.toml)"
+        },
+        "stdout_contract": "stdout carries the report (human or JSON envelope under --robot-json); diagnostics go to stderr",
+        "report_schema": { "id": SCHEMA_ID, "version": SCHEMA_VERSION }
+    })
+}
+
+fn robot_docs_text() -> String {
+    format!(
+        r#"corpus-license-check agent handbook
+======================================
+
+WHAT IT DOES
+  Refuses to pass a CI run when corpus/public/ (and other enforced
+  roots) contains a committed file with no `[[file]]` entry in
+  manifest.toml — or vice versa, a manifest entry pointing at a missing
+  file. Also enforces structural fields on each entry (license,
+  source_url, redistribution_allowed) and the engagement-staging
+  layout under corpus/support-staging/.
+
+CANONICAL INVOCATION
+  corpus-license-check                                  # default ./{default_root}
+  corpus-license-check --corpus-root /alt               # alternate root
+  corpus-license-check --doctor                         # policy/counts summary
+  corpus-license-check --robot-json | jq .summary       # stable JSON report
+
+ROBOT-JSON ENVELOPE
+  {{
+    "schema_id":         "{schema_id}",
+    "schema_version":    {schema_version},
+    "corpus_root":       "...",
+    "enforced_roots":    [ ... ],
+    "policy":            {{ ... }},
+    "manifest_entry_count": N,
+    "summary":           {{ ... }},
+    "missing_entries":   [ ... ],
+    "missing_files":     [ ... ],
+    "invalid_entries":   [ ... ],
+    "incomplete_support_engagements": [ ... ],
+    "clean":             true|false
+  }}
+
+FLAGS SUMMARY
+  --corpus-root <path>  corpus directory (default: ./{default_root})
+  --robot-json          stable-schema JSON report on stdout
+  --doctor              policy + enforced-roots + counts summary
+  --capabilities        machine-readable agent contract (JSON)
+  --robot-docs          this handbook
+  --version / -V        print corpus-license-check <version>
+  -h / --help           usage summary
+
+EXIT CODES
+  0  clean
+  1  one or more violations
+  2  invocation error (bad args, unreadable manifest)
+
+DISCOVERY
+  corpus-license-check --capabilities    versioned agent contract
+  corpus-license-check --help            human usage summary
+
+NOTE
+  corpus-license-check is a narrow CI gate; it has no `--robot-triage`
+  mega-command (the surface is small enough that `--capabilities` is
+  already a one-call bootstrap).
+"#,
+        schema_id = SCHEMA_ID,
+        schema_version = SCHEMA_VERSION,
+        default_root = DEFAULT_CORPUS_ROOT,
+    )
+}
 
 #[derive(Debug, Deserialize)]
 struct Manifest {
@@ -61,7 +202,7 @@ struct Report {
     missing_entries: Vec<String>,
     missing_files: Vec<String>,
     invalid_entries: Vec<(String, String)>,
-    /// PLSQL-SUPPORT-015: subdirectories under `corpus/support-staging/`
+    /// subdirectories under `corpus/support-staging/`
     /// that lack a `redaction_delta.json` or `redacted/` directory.
     /// Reported as a per-engagement-path → list-of-missing-files map.
     incomplete_support_engagements: Vec<(String, Vec<String>)>,
@@ -103,7 +244,7 @@ struct RobotSummary {
     missing_entries: usize,
     missing_files: usize,
     invalid_entries: usize,
-    /// PLSQL-SUPPORT-015 counter.
+    /// counter.
     incomplete_support_engagements: usize,
 }
 
@@ -124,6 +265,9 @@ struct Args {
     corpus_root: Option<PathBuf>,
     robot_json: bool,
     doctor: bool,
+    capabilities: bool,
+    robot_docs: bool,
+    version: bool,
 }
 
 fn main() -> ExitCode {
@@ -131,11 +275,30 @@ fn main() -> ExitCode {
         Ok(a) => a,
         Err(err) => {
             eprintln!("error: {err}");
-            print_usage();
+            // Error-path diagnostic: keep on stderr.
+            let _ = print_usage_to(&mut std::io::stderr().lock());
             return ExitCode::from(2);
         }
     };
-    let corpus_root = args.corpus_root.unwrap_or_else(|| PathBuf::from("corpus"));
+
+    if args.version {
+        println!("corpus-license-check {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+
+    if args.capabilities {
+        println!("{}", serde_json::to_string_pretty(&capabilities_json()).unwrap());
+        return ExitCode::SUCCESS;
+    }
+
+    if args.robot_docs {
+        print!("{}", robot_docs_text());
+        return ExitCode::SUCCESS;
+    }
+
+    let corpus_root = args
+        .corpus_root
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CORPUS_ROOT));
 
     let manifest_path = corpus_root.join("manifest.toml");
     let manifest = match load_manifest(&manifest_path) {
@@ -214,33 +377,71 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             },
             "--robot-json" => out.robot_json = true,
             "--doctor" => out.doctor = true,
+            "--capabilities" => out.capabilities = true,
+            "--robot-docs" => out.robot_docs = true,
+            "-V" | "--version" => out.version = true,
             "-h" | "--help" => {
-                print_usage();
+                // POSIX: user-requested help is data, not a
+                // diagnostic — it goes to stdout so `--help | less`
+                // and `--help > file` work the way agents and humans
+                // both expect.
+                let _ = print_usage_to(&mut std::io::stdout().lock());
                 std::process::exit(0);
             }
-            other => return Err(format!("unknown argument {other:?}")),
+            other => {
+                let msg = match suggest_flag(other, VALID_FLAGS) {
+                    Some(hint) => format!(
+                        "unknown argument {other:?} (did you mean `{hint}`?)\nvalid flags: {}",
+                        VALID_FLAGS.join(", ")
+                    ),
+                    None => format!(
+                        "unknown argument {other:?}\nvalid flags: {}",
+                        VALID_FLAGS.join(", ")
+                    ),
+                };
+                return Err(msg);
+            }
         }
     }
     Ok(out)
 }
 
-fn print_usage() {
-    eprintln!("usage: corpus-license-check [--corpus-root <path>] [--robot-json] [--doctor]");
-    eprintln!();
-    eprintln!("Enforces that every committed file under enforced roots");
-    eprintln!("(currently: {ENFORCED_ROOTS:?}) has a `[[file]]` entry in");
-    eprintln!("manifest.toml.");
-    eprintln!();
-    eprintln!("Flags:");
-    eprintln!("  --corpus-root <path>  Path to the corpus directory (default: ./corpus)");
-    eprintln!("  --robot-json          Emit a stable-schema JSON report to stdout");
-    eprintln!("                        (schema_id={SCHEMA_ID}, schema_version={SCHEMA_VERSION})");
-    eprintln!("  --doctor              Print a summary of policy + enforced-roots + counts");
-    eprintln!();
-    eprintln!("Exit codes:");
-    eprintln!("  0  clean");
-    eprintln!("  1  one or more violations");
-    eprintln!("  2  invocation error (bad args, unreadable manifest, etc.)");
+fn print_usage_to<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
+    writeln!(
+        w,
+        "usage: corpus-license-check [--corpus-root <path>] [--robot-json] [--doctor]"
+    )?;
+    writeln!(w)?;
+    writeln!(w, "Enforces that every committed file under enforced roots")?;
+    writeln!(w, "(currently: {ENFORCED_ROOTS:?}) has a `[[file]]` entry in")?;
+    writeln!(w, "manifest.toml.")?;
+    writeln!(w)?;
+    writeln!(w, "Flags:")?;
+    writeln!(
+        w,
+        "  --corpus-root <path>  Path to the corpus directory (default: ./{DEFAULT_CORPUS_ROOT})"
+    )?;
+    writeln!(w, "  --robot-json          Emit a stable-schema JSON report to stdout")?;
+    writeln!(
+        w,
+        "                        (schema_id={SCHEMA_ID}, schema_version={SCHEMA_VERSION})"
+    )?;
+    writeln!(
+        w,
+        "  --doctor              Print a summary of policy + enforced-roots + counts"
+    )?;
+    writeln!(
+        w,
+        "  --capabilities        Print the machine-readable agent contract as JSON and exit"
+    )?;
+    writeln!(w, "  --robot-docs          Print a paste-ready agent handbook and exit")?;
+    writeln!(w, "  -V, --version         Print corpus-license-check <version> and exit")?;
+    writeln!(w)?;
+    writeln!(w, "Exit codes:")?;
+    writeln!(w, "  0  clean")?;
+    writeln!(w, "  1  one or more violations")?;
+    writeln!(w, "  2  invocation error (bad args, unreadable manifest, etc.)")?;
+    Ok(())
 }
 
 fn print_doctor(corpus_root: &Path, manifest: &Manifest, report: &Report) {
@@ -727,5 +928,83 @@ redistribution_allowed = false
             report.is_clean(),
             "live corpus violates corpus-license-check: {report:?}"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Agent-ergonomics surface (capabilities / robot-docs / typo DYM).
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn capabilities_contract_is_pinned() {
+        let c = capabilities_json();
+        assert_eq!(c["binary"], "corpus-license-check");
+        assert_eq!(c["contract_version"], CAPABILITIES_CONTRACT_VERSION);
+        assert_eq!(c["version"], env!("CARGO_PKG_VERSION"));
+        for key in [
+            "flags",
+            "exit_codes",
+            "stdout_contract",
+            "report_schema",
+            "enforced_roots",
+        ] {
+            assert!(c.get(key).is_some(), "capabilities missing key `{key}`");
+        }
+        let flags = c["flags"].as_object().unwrap();
+        for required in [
+            "--corpus-root",
+            "--robot-json",
+            "--doctor",
+            "--capabilities",
+            "--robot-docs",
+            "--version / -V",
+        ] {
+            assert!(flags.contains_key(required), "missing flag `{required}`");
+        }
+        assert_eq!(c["report_schema"]["id"], SCHEMA_ID);
+        assert!(c["exit_codes"]["1"].is_string());
+    }
+
+    #[test]
+    fn capabilities_round_trips_as_single_line_json() {
+        let s = serde_json::to_string(&capabilities_json()).unwrap();
+        assert!(!s.contains('\n'));
+        let round: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(round["binary"], "corpus-license-check");
+    }
+
+    #[test]
+    fn robot_docs_mentions_capabilities_and_schema() {
+        let docs = robot_docs_text();
+        assert!(docs.contains("--capabilities"));
+        assert!(docs.contains(SCHEMA_ID));
+    }
+
+    #[test]
+    fn version_flag_parses_long_and_short() {
+        for arg in ["--version", "-V"] {
+            let parsed = parse_args(vec![arg.to_string()])
+                .unwrap_or_else(|e| panic!("{arg} should parse, got: {e}"));
+            assert!(parsed.version, "{arg} should set version flag");
+        }
+    }
+
+    #[test]
+    fn unknown_flag_suggests_near_miss() {
+        let err = parse_args(vec!["--robotjson".to_string()]).unwrap_err();
+        assert!(err.contains("--robot-json"), "expected DYM hint; got: {err}");
+        assert!(err.contains("did you mean"));
+    }
+
+    #[test]
+    fn suggest_flag_finds_obvious_typos() {
+        assert_eq!(
+            suggest_flag("--robotjson", VALID_FLAGS),
+            Some("--robot-json")
+        );
+        assert_eq!(
+            suggest_flag("--corpsroot", VALID_FLAGS),
+            Some("--corpus-root")
+        );
+        assert_eq!(suggest_flag("--xyz-totally-unknown", VALID_FLAGS), None);
     }
 }

@@ -1,5 +1,5 @@
 //! `describe_table`, `describe_view`, `describe_trigger`, `describe_index`
-//! tools (`PLSQL-MCP-LIVE-006`).
+//! tools.
 //!
 //! Each tool returns a structured response — never free-text — so agents can
 //! reason about columns, constraints, indexes, comments, and partition state

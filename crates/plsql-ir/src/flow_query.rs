@@ -1,4 +1,4 @@
-//! Taint-path + string-shape query API (PLSQL-FLOW-005).
+//! Taint-path + string-shape query API.
 //!
 //! The SAST layer (Layer 3) and the dynamic-SQL consumers need
 //! to ask "is this name tainted, by what, and was it cleansed?"

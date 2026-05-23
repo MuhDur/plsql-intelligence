@@ -1,4 +1,4 @@
-//! PL/Scope reference diff (PLSQL-PLSCOPE-DIFF-001).
+//! PL/Scope reference diff.
 //!
 //! Oracle PL/Scope (`ALL_IDENTIFIERS` / `ALL_STATEMENTS`, gated by
 //! `plscope_settings = 'IDENTIFIERS:ALL'`) is the database's own

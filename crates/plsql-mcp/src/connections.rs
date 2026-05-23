@@ -1,4 +1,4 @@
-//! Connection-management surface for the live-DB tools (`PLSQL-MCP-LIVE-002`).
+//! Connection-management surface for the live-DB tools.
 //!
 //! `plsql-mcp` exposes five connection management tools — `list_connections`,
 //! `connect`, `disconnect`, `current_database`, and `switch_database` — that
@@ -65,14 +65,44 @@ pub struct DbToolsAlias {
 }
 
 impl DbToolsAlias {
-    /// Look up `alias` in the user's `~/.dbtools` store. The bead skeleton
-    /// performs only a structural check — does the file exist and contain a
-    /// section named after the alias? — and defers full parsing to the
-    /// concrete `connect` implementation in `PLSQL-MCP-LIVE-003`.
+    /// Look up `alias` in the user's `~/.dbtools` store with a *structural*
+    /// check.
+    ///
+    /// Probes, in order:
+    ///
+    /// * `dbtools.json` — JSON document; the alias must appear as a
+    ///   `name` field on a connection entry (object inside any
+    ///   array-valued key, or under `connections` / `aliases`).
+    /// * `.dbtools` and `.dbtools.conf` — INI-style file; the alias
+    ///   must appear as a `[section]` header on its own line, ignoring
+    ///   `;`- and `#`-prefixed comment lines.
+    ///
+    /// A raw substring match would mis-report
+    /// `available = true` whenever the alias text appeared anywhere in
+    /// the file — in a comment, inside a hostname or password, as a
+    /// prefix of another alias's name. The structural lookup avoids
+    /// every false positive of that form. Returns `available = false`
+    /// when none of the candidate files exist or the alias is not
+    /// present as a declared key. Full credential parsing remains the
+    /// responsibility of the live `connect` implementation; this probe
+    /// only proves "an entry named `alias` exists here."
     #[must_use]
     pub fn probe(alias: &str, home: &Path) -> Self {
-        let candidates = ["dbtools.json", ".dbtools", ".dbtools.conf"];
-        for candidate in candidates {
+        // JSON candidate first — it is the modern format.
+        let json_path = home.join("dbtools.json");
+        if json_path.is_file()
+            && let Ok(text) = std::fs::read_to_string(&json_path)
+            && json_contains_alias(&text, alias)
+        {
+            return Self {
+                alias: String::from(alias),
+                available: true,
+                connect_string: None,
+                source: Some(json_path),
+            };
+        }
+        // INI-style candidates.
+        for candidate in [".dbtools", ".dbtools.conf"] {
             let path = home.join(candidate);
             if !path.is_file() {
                 continue;
@@ -80,7 +110,7 @@ impl DbToolsAlias {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            if text.contains(alias) {
+            if ini_contains_alias_section(&text, alias) {
                 return Self {
                     alias: String::from(alias),
                     available: true,
@@ -98,9 +128,64 @@ impl DbToolsAlias {
     }
 }
 
-/// `~/.plsql-mcp/connections.toml` document layout
-/// (`PLSQL-MCP-LIVE-009`). Each `[[connection]]` table becomes a
-/// [`ConnectionProfile`].
+/// True when the JSON document declares a connection entry whose `name`
+/// field equals `alias`. Walks every array-typed value (typically
+/// `connections` or `aliases`) and inspects every object inside it. A
+/// match is the alias as a structural key, not a substring of an
+/// unrelated string field.
+fn json_contains_alias(text: &str, alias: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    json_value_contains_alias(&value, alias)
+}
+
+fn json_value_contains_alias(value: &serde_json::Value, alias: &str) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            // Direct key form: { "<alias>": { … } } at any nesting depth.
+            if map.contains_key(alias) {
+                return true;
+            }
+            // `name`/`alias` field equal to the target.
+            for key in ["name", "alias"] {
+                if map.get(key).and_then(|v| v.as_str()) == Some(alias) {
+                    return true;
+                }
+            }
+            // Recurse into every value.
+            map.values().any(|v| json_value_contains_alias(v, alias))
+        }
+        serde_json::Value::Array(items) => {
+            items.iter().any(|v| json_value_contains_alias(v, alias))
+        }
+        _ => false,
+    }
+}
+
+/// True when the INI-style text contains a `[<alias>]` section header on
+/// its own line. Skips blank lines and comment lines (`;` or `#`
+/// prefix). Comparison is exact — `[bill]` does NOT match an alias of
+/// `billing-dev`, and a commented-out `; [old-prod]` does NOT match.
+fn ini_contains_alias_section(text: &str, alias: &str) -> bool {
+    let target = format!("[{alias}]");
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+        if line == target {
+            return true;
+        }
+    }
+    false
+}
+
+/// `~/.plsql-mcp/connections.toml` document layout. Each
+/// `[[connection]]` table becomes a [`ConnectionProfile`].
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ConnectionsToml {
     #[serde(default, rename = "connection")]
@@ -397,5 +482,124 @@ connect_string = "//localhost/DEV"
         let probe = DbToolsAlias::probe("anything", Path::new("/nonexistent/dir"));
         assert!(!probe.available);
         assert!(probe.connect_string.is_none());
+    }
+
+    // ── Adversarial: a substring match against the raw file bytes would
+    // mis-report `available = true` whenever the alias text appears
+    // *anywhere* in the file (comment, hostname, another alias's prefix,
+    // a quoted password, …). The probe must look the alias up as a
+    // structural key, not a raw substring.
+
+    #[test]
+    fn dbtools_alias_probe_rejects_alias_only_in_a_comment() {
+        let tmp = temp_dir().join("plsql-mcp-test-dbtools-comment");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("dbtools.json");
+        // Alias `secret-prod` appears only in a comment-shaped string.
+        // A structural lookup must not consider it present.
+        fs::write(
+            &path,
+            r#"{
+              "connections": [
+                { "name": "billing-dev", "comment": "previously used secret-prod here" }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let probe = DbToolsAlias::probe("secret-prod", &tmp);
+        assert!(
+            !probe.available,
+            "comment-only matches must not report available=true"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dbtools_alias_probe_rejects_alias_as_substring_of_another_alias() {
+        let tmp = temp_dir().join("plsql-mcp-test-dbtools-substring");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("dbtools.json");
+        // `bill` is a prefix of the real alias `billing-dev`. A raw
+        // substring match would mark `bill` as present; a structural
+        // lookup must not.
+        fs::write(
+            &path,
+            r#"{ "connections": [{ "name": "billing-dev" }] }"#,
+        )
+        .unwrap();
+        let probe = DbToolsAlias::probe("bill", &tmp);
+        assert!(
+            !probe.available,
+            "prefix-of-another-alias must not report available=true"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dbtools_alias_probe_rejects_alias_only_in_a_hostname_or_password() {
+        let tmp = temp_dir().join("plsql-mcp-test-dbtools-host");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("dbtools.json");
+        // The token `marketing` shows up inside another connection's
+        // host/password fields but no entry is named `marketing`.
+        fs::write(
+            &path,
+            r#"{
+              "connections": [
+                { "name": "billing-dev",
+                  "host": "marketing.internal.example.com",
+                  "password": "marketing-shared-secret" }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let probe = DbToolsAlias::probe("marketing", &tmp);
+        assert!(
+            !probe.available,
+            "host/password substring must not report available=true"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dbtools_alias_probe_finds_alias_in_ini_style_file() {
+        let tmp = temp_dir().join("plsql-mcp-test-dbtools-ini");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join(".dbtools");
+        // INI-style: alias is a `[section]` header.
+        fs::write(
+            &path,
+            "; saved profiles\n\n[billing-dev]\nhost=db1.example.com\nport=1521\n\n[reporting]\nhost=db2.example.com\n",
+        )
+        .unwrap();
+        let probe = DbToolsAlias::probe("billing-dev", &tmp);
+        assert!(probe.available, "INI section header must be found");
+        assert_eq!(probe.source.as_deref(), Some(path.as_path()));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dbtools_alias_probe_rejects_ini_alias_as_substring_of_comment() {
+        let tmp = temp_dir().join("plsql-mcp-test-dbtools-ini-comment");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join(".dbtools.conf");
+        fs::write(
+            &path,
+            "; the [old-prod] section was retired last quarter\n\n[billing-dev]\nhost=db1.example.com\n",
+        )
+        .unwrap();
+        // `old-prod` appears only inside a `;` comment line. The probe
+        // must not report it as present.
+        let probe = DbToolsAlias::probe("old-prod", &tmp);
+        assert!(
+            !probe.available,
+            "commented-out section must not report available=true"
+        );
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

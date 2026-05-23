@@ -180,7 +180,7 @@ pub struct CatalogSnapshot {
     pub source: CatalogSource,
     pub interner: SymbolInterner,
     /// Database-wide edition tree from `ALL_EDITIONS`. Empty when EBR
-    /// is not in use. Sourced by PLSQL-CAT-NEW-3 / oracle-fmro.
+    /// is not in use.
     #[serde(default)]
     pub editions: Vec<Edition>,
 }
@@ -296,10 +296,10 @@ pub struct MissingPermissionReport {
 
 /// Structured doctor report for a `CatalogSnapshot`.
 ///
-/// Implements `PLSQL-CAT-007`. Consumers (`plsql catalog doctor --robot-json`,
-/// `plsql-mcp` foundation tools, and the planned `plsql doctor` umbrella
-/// surface) can render the report directly or wrap it in a
-/// `RobotJsonEnvelope` for stable, versioned output.
+/// Consumers (`plsql catalog doctor --robot-json`, `plsql-mcp` foundation
+/// tools, and the planned `plsql doctor` umbrella surface) can render the
+/// report directly or wrap it in a `RobotJsonEnvelope` for stable,
+/// versioned output.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CatalogDoctorReport {
     /// Identifier of the snapshot's origin (`live extraction via ...` or the
@@ -311,8 +311,8 @@ pub struct CatalogDoctorReport {
     pub object_counts: Vec<DoctorObjectCount>,
     pub capability_warnings: Vec<CapabilityWarning>,
     pub missing_permissions: Vec<MissingPermissionReport>,
-    /// Per-schema PL/Scope availability (`PLSQL-CAT-016`). Empty when the
-    /// snapshot has no PL/Scope detection wired.
+    /// Per-schema PL/Scope availability. Empty when the snapshot has no
+    /// PL/Scope detection wired.
     pub plscope_availability_per_schema: Vec<PlScopeAvailabilityRow>,
     /// Capability-bit copy for downstream consumers that don't want to read
     /// the full `CatalogSnapshot` to learn whether a query family worked.
@@ -325,10 +325,9 @@ pub struct CatalogDoctorReport {
     pub can_query_roles_and_grants: bool,
 }
 
-/// One row of the doctor report's per-schema PL/Scope availability summary
-/// (`PLSQL-CAT-016`). The `schema_name` is rendered through the snapshot's
-/// `SymbolInterner` so the report is stable across JSON snapshots and live
-/// extractions.
+/// One row of the doctor report's per-schema PL/Scope availability summary.
+/// The `schema_name` is rendered through the snapshot's `SymbolInterner` so
+/// the report is stable across JSON snapshots and live extractions.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PlScopeAvailabilityRow {
     pub schema_name: String,
@@ -1258,13 +1257,35 @@ pub fn export_snapshot_to_json(
 
 /// Load a catalog snapshot from a directory of DBMS_METADATA-exported .sql files.
 ///
-/// Scans `dir` for `.sql` files, reads each one, and attempts to classify the DDL
-/// statement to populate the catalog. Files that cannot be classified are recorded
-/// as diagnostics rather than errors (graceful degradation per R13).
+/// Load a `CatalogSnapshot` by classifying every `.sql` file under `dir` as a
+/// single top-level CREATE DDL statement (the shape `DBMS_METADATA.GET_DDL`
+/// emits when written per-object to disk).
 ///
-/// This is a skeleton implementation — full DDL parsing will be added when the
-/// parser (Layer 1) is complete. Currently records file contents as raw DDL text
-/// in `DbmsMetadataDdl` fields.
+/// For each file:
+///
+/// * The object kind is read from the leading `CREATE …` keyword
+///   (`TABLE` / `VIEW` / `PACKAGE` / `PROCEDURE` / `FUNCTION` /
+///   `SEQUENCE` / `TRIGGER` / `TYPE`); statements whose keyword does
+///   not match a known kind are skipped (graceful degradation per
+///   R13).
+/// * The owner schema is read from the optional `OWNER.OBJECT` prefix
+///   on the CREATE target. Unqualified statements (no `OWNER.`
+///   prefix) are filed under a stable `PUBLIC` schema interned through
+///   the regular interner — never `SymbolId::new(0)`, which would
+///   collide with whatever the first object name happens to be.
+/// * The raw file bytes are stored verbatim on
+///   [`ObjectCommon::ddl`] as a [`DbmsMetadataDdl`] so downstream
+///   consumers (doc generation, lineage, the doctor's
+///   ddl-extraction ratio) can inspect the exact source the catalog
+///   was derived from.
+///
+/// This classifier is keyword-shaped and does not parse arbitrary
+/// PL/SQL bodies — column definitions, parameter signatures, view
+/// projections and constraint details are *not* populated. When the
+/// full parser (Layer 1) lands, callers that need column- or
+/// signature-level fidelity should switch to that path; the
+/// `DbmsMetadataDdl` stored here is sufficient seed for re-parsing
+/// on demand without re-reading the disk.
 #[instrument(level = "info", skip_all, fields(dir = %dir.display()))]
 pub fn load_from_dbms_metadata_dir(dir: &std::path::Path) -> Result<CatalogSnapshot, CatalogError> {
     if !dir.is_dir() {
@@ -1279,21 +1300,25 @@ pub fn load_from_dbms_metadata_dir(dir: &std::path::Path) -> Result<CatalogSnaps
     let mut file_count = 0usize;
     let mut classified_count = 0usize;
 
-    let entries = fs::read_dir(dir)?;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("sql") {
-            continue;
-        }
+    // Collect + sort entries so the resulting snapshot (and its
+    // interner symbol ids) are deterministic across runs and
+    // platforms — `read_dir` ordering is unspecified.
+    let mut paths: Vec<std::path::PathBuf> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("sql"))
+        .collect();
+    paths.sort();
 
+    for path in paths {
         file_count += 1;
         let ddl_text = match fs::read_to_string(&path) {
             Ok(text) => text,
             Err(_) => continue,
         };
 
-        if let Some((schema, obj_name, obj)) = classify_ddl_stub(&ddl_text, &mut interner) {
+        if let Some((schema, obj_name, obj)) =
+            classify_dbms_metadata_ddl(&ddl_text, &mut interner)
+        {
             let schema_catalog = schemas.entry(schema).or_default();
             schema_catalog.objects.insert(obj_name, obj);
             classified_count += 1;
@@ -1330,207 +1355,423 @@ pub fn load_from_dbms_metadata_dir(dir: &std::path::Path) -> Result<CatalogSnaps
     })
 }
 
-/// Stub DDL classifier. Extracts schema, object name, and object type from DDL
-/// using simple keyword matching. Returns `None` for unclassifiable statements.
-fn classify_ddl_stub(
+/// Default schema name used when a CREATE statement has no `OWNER.`
+/// prefix. Interned through the regular interner so the resulting
+/// `SchemaName` has a real, resolvable text — never a collision with
+/// `SymbolId::new(0)`.
+const UNQUALIFIED_DDL_SCHEMA: &str = "PUBLIC";
+
+/// Classify a single per-file DDL statement into a `CatalogObject`.
+///
+/// Returns `None` for whitespace-only / comment-only files and for
+/// CREATE statements whose object kind keyword is not in the
+/// known set. The DDL bytes are preserved verbatim on
+/// [`ObjectCommon::ddl`] so downstream code can re-parse them as
+/// fidelity improves.
+fn classify_dbms_metadata_ddl(
     ddl_text: &str,
     interner: &mut SymbolInterner,
 ) -> Option<(SchemaName, ObjectName, CatalogObject)> {
-    let upper = ddl_text.trim().to_uppercase();
+    // Parse the DDL HEADER as a real token stream — never substring-match
+    // the whole DDL. Body / comment text that mentions `TABLE` etc. used
+    // to silently re-classify VIEWs and PROCEDUREs as tables.
+    let header = parse_create_header(ddl_text)?;
 
-    if upper.is_empty() || upper.starts_with("--") || upper.starts_with("SET ") {
+    // `PACKAGE BODY` / `TYPE BODY` are bodies — the spec's catalog row
+    // is the source of truth. Honest uncertainty: return None.
+    if matches!(header.kind, DdlKind::PackageBody | DdlKind::TypeBody | DdlKind::Unknown) {
         return None;
     }
 
-    // CREATE TABLE
-    if upper.starts_with("CREATE") && upper.contains("TABLE") {
-        let name = extract_create_name(&upper, "TABLE")?;
-        let sid = interner.intern(&name)?;
-        let schema = SchemaName::new(SymbolId::new(0));
-        let obj_name = ObjectName::new(sid);
-        return Some((
-            schema,
-            obj_name,
-            CatalogObject::Table(TableMetadata {
-                common: ObjectCommon {
-                    owner: schema,
-                    name: obj_name,
-                    object_type: ObjectType::Table,
-                    ..ObjectCommon::default()
-                },
-                ..TableMetadata::default()
-            }),
-        ));
-    }
+    let (owner_text, object_text) = extract_owner_and_name(&header.after_kind)?;
 
-    // CREATE [OR REPLACE] VIEW
-    if upper.starts_with("CREATE") && upper.contains("VIEW") {
-        let name = extract_create_name(&upper, "VIEW")?;
-        let sid = interner.intern(&name)?;
-        let schema = SchemaName::new(SymbolId::new(0));
-        let obj_name = ObjectName::new(sid);
-        return Some((
-            schema,
-            obj_name,
-            CatalogObject::View(ViewMetadata {
-                common: ObjectCommon {
-                    owner: schema,
-                    name: obj_name,
-                    object_type: ObjectType::View,
-                    ..ObjectCommon::default()
-                },
-                ..ViewMetadata::default()
-            }),
-        ));
-    }
+    let owner_text = owner_text.unwrap_or_else(|| UNQUALIFIED_DDL_SCHEMA.to_string());
+    let owner = interner.intern_schema_name(owner_text)?;
+    let name_sid = interner.intern(&object_text)?;
+    let obj_name = ObjectName::new(name_sid);
 
-    // CREATE PACKAGE (spec only, skip BODY)
-    if upper.starts_with("CREATE") && upper.contains("PACKAGE") && !upper.contains("PACKAGE BODY") {
-        let name = extract_create_name(&upper, "PACKAGE")?;
-        let sid = interner.intern(&name)?;
-        let schema = SchemaName::new(SymbolId::new(0));
-        let obj_name = ObjectName::new(sid);
-        return Some((
-            schema,
-            obj_name,
-            CatalogObject::Package(PackageMetadata {
-                common: ObjectCommon {
-                    owner: schema,
-                    name: obj_name,
-                    object_type: ObjectType::Package,
-                    ..ObjectCommon::default()
-                },
-                ..PackageMetadata::default()
-            }),
-        ));
-    }
+    let ddl = DbmsMetadataDdl {
+        ddl_text: ddl_text.to_string(),
+        normalized_ddl: Some(normalize_dbms_metadata_ddl(ddl_text)),
+        xml_text: None,
+    };
 
-    // CREATE [OR REPLACE] PROCEDURE
-    if upper.starts_with("CREATE") && upper.contains("PROCEDURE") {
-        let name = extract_create_name(&upper, "PROCEDURE")?;
-        let sid = interner.intern(&name)?;
-        let schema = SchemaName::new(SymbolId::new(0));
-        let obj_name = ObjectName::new(sid);
-        return Some((
-            schema,
-            obj_name,
-            CatalogObject::Procedure(ProcedureMetadata {
-                common: ObjectCommon {
-                    owner: schema,
-                    name: obj_name,
-                    object_type: ObjectType::Procedure,
-                    ..ObjectCommon::default()
-                },
-                signature: RoutineSignature {
-                    routine_name: obj_name,
-                    ..RoutineSignature::default()
-                },
-            }),
-        ));
-    }
+    let common = ObjectCommon {
+        owner,
+        name: obj_name,
+        object_type: header.kind.object_type(),
+        ddl: Some(ddl),
+        ..ObjectCommon::default()
+    };
 
-    // CREATE [OR REPLACE] FUNCTION
-    if upper.starts_with("CREATE") && upper.contains("FUNCTION") {
-        let name = extract_create_name(&upper, "FUNCTION")?;
-        let sid = interner.intern(&name)?;
-        let schema = SchemaName::new(SymbolId::new(0));
-        let obj_name = ObjectName::new(sid);
-        return Some((
-            schema,
-            obj_name,
-            CatalogObject::Function(FunctionMetadata {
-                common: ObjectCommon {
-                    owner: schema,
-                    name: obj_name,
-                    object_type: ObjectType::Function,
-                    ..ObjectCommon::default()
-                },
-                signature: RoutineSignature {
-                    routine_name: obj_name,
-                    ..RoutineSignature::default()
-                },
-                ..FunctionMetadata::default()
-            }),
-        ));
-    }
+    let object = match header.kind {
+        DdlKind::Table => CatalogObject::Table(TableMetadata {
+            common,
+            ..TableMetadata::default()
+        }),
+        DdlKind::View => CatalogObject::View(ViewMetadata {
+            common,
+            ..ViewMetadata::default()
+        }),
+        DdlKind::MaterializedView => CatalogObject::MaterializedView(MViewMetadata {
+            common,
+            ..MViewMetadata::default()
+        }),
+        DdlKind::Package => CatalogObject::Package(PackageMetadata {
+            common,
+            ..PackageMetadata::default()
+        }),
+        DdlKind::Procedure => CatalogObject::Procedure(ProcedureMetadata {
+            common,
+            signature: RoutineSignature {
+                routine_name: obj_name,
+                ..RoutineSignature::default()
+            },
+        }),
+        DdlKind::Function => CatalogObject::Function(FunctionMetadata {
+            common,
+            signature: RoutineSignature {
+                routine_name: obj_name,
+                ..RoutineSignature::default()
+            },
+            ..FunctionMetadata::default()
+        }),
+        DdlKind::Sequence => CatalogObject::Sequence(SequenceMetadata {
+            common,
+            ..SequenceMetadata::default()
+        }),
+        DdlKind::Trigger => CatalogObject::Trigger(TriggerMetadata {
+            common,
+            ..TriggerMetadata::default()
+        }),
+        DdlKind::Type => CatalogObject::Type(TypeMetadata {
+            common,
+            ..TypeMetadata::default()
+        }),
+        // Filtered above — the match is exhaustive only because we
+        // handle every concrete kind.
+        DdlKind::PackageBody | DdlKind::TypeBody | DdlKind::Unknown => return None,
+    };
 
-    // CREATE SEQUENCE
-    if upper.starts_with("CREATE") && upper.contains("SEQUENCE") {
-        let name = extract_create_name(&upper, "SEQUENCE")?;
-        let sid = interner.intern(&name)?;
-        let schema = SchemaName::new(SymbolId::new(0));
-        let obj_name = ObjectName::new(sid);
-        return Some((
-            schema,
-            obj_name,
-            CatalogObject::Sequence(SequenceMetadata {
-                common: ObjectCommon {
-                    owner: schema,
-                    name: obj_name,
-                    object_type: ObjectType::Sequence,
-                    ..ObjectCommon::default()
-                },
-                ..SequenceMetadata::default()
-            }),
-        ));
-    }
-
-    // CREATE [OR REPLACE] TRIGGER
-    if upper.starts_with("CREATE") && upper.contains("TRIGGER") {
-        let name = extract_create_name(&upper, "TRIGGER")?;
-        let sid = interner.intern(&name)?;
-        let schema = SchemaName::new(SymbolId::new(0));
-        let obj_name = ObjectName::new(sid);
-        return Some((
-            schema,
-            obj_name,
-            CatalogObject::Trigger(TriggerMetadata {
-                common: ObjectCommon {
-                    owner: schema,
-                    name: obj_name,
-                    object_type: ObjectType::Trigger,
-                    ..ObjectCommon::default()
-                },
-                ..TriggerMetadata::default()
-            }),
-        ));
-    }
-
-    // CREATE TYPE (not TYPE BODY)
-    if upper.starts_with("CREATE") && upper.contains("TYPE") && !upper.contains("TYPE BODY") {
-        let name = extract_create_name(&upper, "TYPE")?;
-        let sid = interner.intern(&name)?;
-        let schema = SchemaName::new(SymbolId::new(0));
-        let obj_name = ObjectName::new(sid);
-        return Some((
-            schema,
-            obj_name,
-            CatalogObject::Type(TypeMetadata {
-                common: ObjectCommon {
-                    owner: schema,
-                    name: obj_name,
-                    object_type: ObjectType::Type,
-                    ..ObjectCommon::default()
-                },
-                ..TypeMetadata::default()
-            }),
-        ));
-    }
-
-    None
+    Some((owner, obj_name, object))
 }
 
-/// Extract the object name after a keyword in a CREATE statement.
-fn extract_create_name(upper_ddl: &str, keyword: &str) -> Option<String> {
-    let pos = upper_ddl.find(keyword)?;
-    let after = &upper_ddl[pos + keyword.len()..].trim_start();
-    let after = after.strip_prefix("BODY").unwrap_or(after).trim_start();
-    let name = after.split_whitespace().next()?;
-    let name = name.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
-    if name.is_empty() {
+/// Object kinds the per-file DDL classifier recognizes. `Unknown`
+/// represents honest uncertainty (R13) — the header didn't tokenize
+/// into a kind we model. `PackageBody` / `TypeBody` are recognized
+/// separately so the classifier can skip them without confusing them
+/// with their specs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DdlKind {
+    Table,
+    View,
+    MaterializedView,
+    Package,
+    PackageBody,
+    Procedure,
+    Function,
+    Sequence,
+    Trigger,
+    Type,
+    TypeBody,
+    Unknown,
+}
+
+impl DdlKind {
+    fn object_type(self) -> ObjectType {
+        match self {
+            DdlKind::Table => ObjectType::Table,
+            DdlKind::View => ObjectType::View,
+            DdlKind::MaterializedView => ObjectType::MaterializedView,
+            DdlKind::Package | DdlKind::PackageBody => ObjectType::Package,
+            DdlKind::Procedure => ObjectType::Procedure,
+            DdlKind::Function => ObjectType::Function,
+            DdlKind::Sequence => ObjectType::Sequence,
+            DdlKind::Trigger => ObjectType::Trigger,
+            DdlKind::Type | DdlKind::TypeBody => ObjectType::Type,
+            DdlKind::Unknown => ObjectType::Unknown,
+        }
+    }
+}
+
+/// Parsed CREATE header: the typed `DdlKind` plus the upper-cased
+/// remainder of the DDL starting immediately after the kind tokens.
+/// Callers use `after_kind` to locate the `[OWNER.]NAME` — it has
+/// already been stripped of leading comments / whitespace / `CREATE`
+/// modifiers / kind tokens so a substring match in there cannot be
+/// fooled by body content.
+#[derive(Clone, Debug)]
+struct ParsedCreateHeader {
+    kind: DdlKind,
+    after_kind: String,
+}
+
+/// Parse the CREATE header of a raw DDL string.
+///
+/// Skips leading whitespace, `--` line comments, and `/* … */` block
+/// comments. Consumes `CREATE` then optional `OR REPLACE`, optional
+/// `FORCE` / `EDITIONABLE` / `NONEDITIONABLE` (in any order), then
+/// reads one or two tokens to form a [`DdlKind`] (multi-word kinds
+/// `MATERIALIZED VIEW`, `PACKAGE BODY`, `TYPE BODY` handled). Returns
+/// `None` only when the input has no `CREATE` token at all; an
+/// unrecognized kind word produces `DdlKind::Unknown` so callers can
+/// represent honest uncertainty (R13).
+fn parse_create_header(ddl: &str) -> Option<ParsedCreateHeader> {
+    let mut cursor = Cursor::new(ddl);
+    cursor.skip_ws_and_comments();
+
+    // Must start with `CREATE`.
+    if !cursor.consume_keyword("CREATE") {
         return None;
     }
-    Some(name.to_string())
+    cursor.skip_ws_and_comments();
+
+    // Optional `OR REPLACE`.
+    if cursor.consume_keyword("OR") {
+        cursor.skip_ws_and_comments();
+        // `OR` without `REPLACE` is malformed; let it fall through to
+        // kind parsing — the kind word won't match and we'll honestly
+        // return `Unknown`.
+        let _ = cursor.consume_keyword("REPLACE");
+        cursor.skip_ws_and_comments();
+    }
+
+    // Optional `FORCE` / `EDITIONABLE` / `NONEDITIONABLE` modifiers,
+    // any order, any subset.
+    loop {
+        if cursor.consume_keyword("FORCE")
+            || cursor.consume_keyword("NONEDITIONABLE")
+            || cursor.consume_keyword("EDITIONABLE")
+            || cursor.consume_keyword("NO")
+        {
+            cursor.skip_ws_and_comments();
+            continue;
+        }
+        break;
+    }
+
+    // Read the kind word (one token, possibly extended to two for
+    // `MATERIALIZED VIEW` / `PACKAGE BODY` / `TYPE BODY`).
+    let first = match cursor.consume_identifier() {
+        Some(tok) => tok,
+        None => {
+            return Some(ParsedCreateHeader {
+                kind: DdlKind::Unknown,
+                after_kind: cursor.upper_remainder(),
+            });
+        }
+    };
+    cursor.skip_ws_and_comments();
+
+    // Speculatively look at the second token without committing — only
+    // commit if it forms a known two-word kind.
+    let kind = match first.as_str() {
+        "MATERIALIZED" => {
+            if cursor.peek_keyword("VIEW") {
+                cursor.consume_keyword("VIEW");
+                cursor.skip_ws_and_comments();
+                DdlKind::MaterializedView
+            } else {
+                DdlKind::Unknown
+            }
+        }
+        "PACKAGE" => {
+            if cursor.peek_keyword("BODY") {
+                cursor.consume_keyword("BODY");
+                cursor.skip_ws_and_comments();
+                DdlKind::PackageBody
+            } else {
+                DdlKind::Package
+            }
+        }
+        "TYPE" => {
+            if cursor.peek_keyword("BODY") {
+                cursor.consume_keyword("BODY");
+                cursor.skip_ws_and_comments();
+                DdlKind::TypeBody
+            } else {
+                DdlKind::Type
+            }
+        }
+        "TABLE" => DdlKind::Table,
+        "VIEW" => DdlKind::View,
+        "PROCEDURE" => DdlKind::Procedure,
+        "FUNCTION" => DdlKind::Function,
+        "SEQUENCE" => DdlKind::Sequence,
+        "TRIGGER" => DdlKind::Trigger,
+        _ => DdlKind::Unknown,
+    };
+
+    Some(ParsedCreateHeader {
+        kind,
+        after_kind: cursor.upper_remainder(),
+    })
+}
+
+/// Hand-rolled byte cursor for the CREATE header tokenizer.
+///
+/// Only knows enough about SQL to skip whitespace / `--` line
+/// comments / `/* … */` block comments and to read alphabetic
+/// identifier keywords case-insensitively. It deliberately does
+/// **not** try to parse the whole DDL — every operation past the
+/// kind word is delegated to [`extract_owner_and_name`] working on
+/// the upper-cased remainder.
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            bytes: text.as_bytes(),
+            pos: 0,
+        }
+    }
+
+    fn skip_ws_and_comments(&mut self) {
+        loop {
+            // Skip ASCII whitespace.
+            while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_whitespace() {
+                self.pos += 1;
+            }
+            // `--` line comment.
+            if self.pos + 1 < self.bytes.len()
+                && self.bytes[self.pos] == b'-'
+                && self.bytes[self.pos + 1] == b'-'
+            {
+                self.pos += 2;
+                while self.pos < self.bytes.len() && self.bytes[self.pos] != b'\n' {
+                    self.pos += 1;
+                }
+                continue;
+            }
+            // `/* … */` block comment.
+            if self.pos + 1 < self.bytes.len()
+                && self.bytes[self.pos] == b'/'
+                && self.bytes[self.pos + 1] == b'*'
+            {
+                self.pos += 2;
+                while self.pos + 1 < self.bytes.len()
+                    && !(self.bytes[self.pos] == b'*' && self.bytes[self.pos + 1] == b'/')
+                {
+                    self.pos += 1;
+                }
+                if self.pos + 1 < self.bytes.len() {
+                    self.pos += 2; // consume the closing `*/`
+                } else {
+                    self.pos = self.bytes.len(); // unterminated — end-of-input
+                }
+                continue;
+            }
+            break;
+        }
+    }
+
+    /// Returns true if the next identifier token matches `kw`
+    /// case-insensitively (and is followed by a non-identifier
+    /// character or end-of-input). Does not advance the cursor.
+    fn peek_keyword(&self, kw: &str) -> bool {
+        let end = self.pos + kw.len();
+        if end > self.bytes.len() {
+            return false;
+        }
+        if !self.bytes[self.pos..end].eq_ignore_ascii_case(kw.as_bytes()) {
+            return false;
+        }
+        // Word boundary check — `CREATEDOC` must not match `CREATE`.
+        if end < self.bytes.len() {
+            let next = self.bytes[end];
+            if next == b'_' || next.is_ascii_alphanumeric() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn consume_keyword(&mut self, kw: &str) -> bool {
+        if self.peek_keyword(kw) {
+            self.pos += kw.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Consume the next bare ASCII identifier (letters / digits /
+    /// underscore, must start with a letter) and return it
+    /// upper-cased. Returns `None` if the cursor is not on an
+    /// identifier start character — e.g. a quoted identifier or a
+    /// punctuation token. Quoted identifiers in the header position
+    /// (the kind word) are not legal Oracle DDL so we don't bother.
+    fn consume_identifier(&mut self) -> Option<String> {
+        if self.pos >= self.bytes.len() {
+            return None;
+        }
+        let first = self.bytes[self.pos];
+        if !first.is_ascii_alphabetic() {
+            return None;
+        }
+        let start = self.pos;
+        while self.pos < self.bytes.len() {
+            let b = self.bytes[self.pos];
+            if b.is_ascii_alphanumeric() || b == b'_' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        let raw = std::str::from_utf8(&self.bytes[start..self.pos]).ok()?;
+        Some(raw.to_ascii_uppercase())
+    }
+
+    /// Return the rest of the input from the current cursor position,
+    /// upper-cased. Used to hand off to [`extract_owner_and_name`].
+    fn upper_remainder(&self) -> String {
+        std::str::from_utf8(&self.bytes[self.pos..])
+            .unwrap_or("")
+            .to_ascii_uppercase()
+    }
+}
+
+/// Extract the optional `OWNER` and the bare `OBJECT` name from the
+/// upper-cased remainder that follows the parsed `CREATE <KIND>`
+/// header. Strips surrounding quotes (so `CREATE TABLE "HR"."EMP"`
+/// works) and trailing punctuation / parenthesis that the column
+/// list would attach. Operates on the post-header slice only — never
+/// on the body — so it can't be fooled by `TABLE` appearing later.
+fn extract_owner_and_name(after_kind: &str) -> Option<(Option<String>, String)> {
+    let after = after_kind.trim_start();
+
+    let token = after.split_whitespace().next()?;
+    // Drop a trailing `(` and any column-list punctuation that may abut
+    // the identifier.
+    let token = token
+        .trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '.' && c != '"');
+    if token.is_empty() {
+        return None;
+    }
+
+    // Split on `.` for `OWNER.NAME`. Tolerate quoted identifiers by
+    // stripping surrounding `"`.
+    let mut parts = token.split('.').map(|p| p.trim_matches('"'));
+    let first = parts.next()?;
+    let second = parts.next();
+
+    let (owner, name) = match second {
+        Some(name) if !name.is_empty() => (Some(first.to_string()), name.to_string()),
+        _ => (None, first.to_string()),
+    };
+    // The name must be a real identifier (alphanumeric / `_`).
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    if let Some(owner) = &owner {
+        if owner.is_empty() || !owner.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return None;
+        }
+    }
+    Some((owner, name))
 }
 #[instrument(level = "trace", skip(conn, request))]
 pub fn load_snapshot_from_connection<C: OracleConnection>(
@@ -1626,25 +1867,24 @@ pub struct SchemaCatalog {
     pub dependencies: Vec<CatalogDependency>,
     pub plscope: Option<PlScopeSnapshot>,
     /// Database links owned by this schema. Public links live in the
-    /// synthetic `PUBLIC` schema. Sourced from `ALL_DB_LINKS`
-    /// (PLSQL-CAT-NEW-1 / oracle-rr4y).
+    /// synthetic `PUBLIC` schema. Sourced from `ALL_DB_LINKS`.
     #[serde(default)]
     pub db_links: Vec<DatabaseLink>,
     /// Per-object COMMENT ON TABLE / VIEW text. Sourced from
-    /// `ALL_TAB_COMMENTS` (PLSQL-CAT-NEW-5 / oracle-grs0).
+    /// `ALL_TAB_COMMENTS`.
     #[serde(default)]
     pub table_comments: Vec<TableComment>,
     /// Per-column COMMENT ON COLUMN text. Sourced from
-    /// `ALL_COL_COMMENTS` (PLSQL-CAT-NEW-5 / oracle-grs0).
+    /// `ALL_COL_COMMENTS`.
     #[serde(default)]
     pub column_comments: Vec<ColumnComment>,
     /// Editioning views owned by this schema (the views that mask the
     /// underlying base table in an EBR shop). Sourced from
-    /// `ALL_EDITIONING_VIEWS` (PLSQL-CAT-NEW-3 / oracle-fmro).
+    /// `ALL_EDITIONING_VIEWS`.
     #[serde(default)]
     pub editioning_views: Vec<EditioningView>,
     /// VPD/RLS policies attached to objects in this schema. Sourced
-    /// from `ALL_POLICIES` (PLSQL-CAT-NEW-2 / oracle-c0gg).
+    /// from `ALL_POLICIES`.
     #[serde(default)]
     pub vpd_policies: Vec<VpdPolicy>,
 }
@@ -1685,7 +1925,7 @@ fn resolve_schema_filters(
 }
 
 /// Fetch the canonical DDL + XML representation of a single object via
-/// `DBMS_METADATA`. Implements `PLSQL-CAT-015`.
+/// `DBMS_METADATA`.
 ///
 /// Callers usually batch via [`populate_dbms_metadata_ddl`] which iterates
 /// every object in a `CatalogSnapshot` after the structural loaders have
@@ -1867,10 +2107,9 @@ pub fn object_type_to_dbms_metadata_value(object_type: ObjectType) -> Option<&'s
 }
 
 /// Probe an `OracleConnection` for the dictionary surface it can actually
-/// reach. Implements `PLSQL-CAT-017` — the loader records `CatalogCapabilities`
-/// from real probe outcomes instead of optimistic defaults, so downstream
-/// consumers can render an accurate doctor report and the right
-/// `MissingPermissionReport` rows.
+/// reach. The loader records `CatalogCapabilities` from real probe outcomes
+/// instead of optimistic defaults, so downstream consumers can render an
+/// accurate doctor report and the right `MissingPermissionReport` rows.
 ///
 /// The probes are intentionally cheap (`WHERE rownum = 0` / `BEGIN ... END`
 /// blocks that no-op) and resilient to permission errors: each probe falls
@@ -2602,8 +2841,7 @@ order by owner, type_name, attr_no
     Ok(())
 }
 
-/// Load `ALL_DB_LINKS` rows into [`SchemaCatalog::db_links`]
-/// (PLSQL-CAT-NEW-1 / oracle-rr4y).
+/// Load `ALL_DB_LINKS` rows into [`SchemaCatalog::db_links`].
 ///
 /// Both private (owned by a user schema) and public (`OWNER = PUBLIC`)
 /// links are fetched in a single query. The schema filter is applied as
@@ -2637,10 +2875,10 @@ order by owner, db_link
     Ok(())
 }
 
-/// Load `ALL_POLICIES` rows into [`SchemaCatalog::vpd_policies`]
-/// (PLSQL-CAT-NEW-2 / oracle-c0gg). One row per (object, policy_group,
-/// policy_name) triple. Filters to enabled and disabled policies alike
-/// because lineage needs to know about disabled ones as deployment-debt.
+/// Load `ALL_POLICIES` rows into [`SchemaCatalog::vpd_policies`].
+/// One row per (object, policy_group, policy_name) triple. Filters to
+/// enabled and disabled policies alike because lineage needs to know
+/// about disabled ones as deployment-debt.
 fn load_catalog_vpd_policies<C: OracleConnection>(
     conn: &C,
     snapshot: &mut CatalogSnapshot,
@@ -2675,9 +2913,9 @@ order by object_owner, object_name, policy_group, policy_name
     Ok(())
 }
 
-/// Load `ALL_EDITIONS` into [`CatalogSnapshot::editions`]
-/// (PLSQL-CAT-NEW-3 / oracle-fmro). The edition tree is database-wide
-/// (not per-schema) so this loader takes no schema filter.
+/// Load `ALL_EDITIONS` into [`CatalogSnapshot::editions`]. The edition
+/// tree is database-wide (not per-schema) so this loader takes no schema
+/// filter.
 fn load_catalog_editions<C: OracleConnection>(
     conn: &C,
     snapshot: &mut CatalogSnapshot,
@@ -2697,7 +2935,7 @@ order by edition_name
 }
 
 /// Load `ALL_EDITIONING_VIEWS` rows into
-/// [`SchemaCatalog::editioning_views`] (PLSQL-CAT-NEW-3 / oracle-fmro).
+/// [`SchemaCatalog::editioning_views`].
 fn load_catalog_editioning_views<C: OracleConnection>(
     conn: &C,
     snapshot: &mut CatalogSnapshot,
@@ -2723,9 +2961,8 @@ order by owner, view_name
     Ok(())
 }
 
-/// Load `ALL_TAB_COMMENTS` rows into [`SchemaCatalog::table_comments`]
-/// (PLSQL-CAT-NEW-5 / oracle-grs0). Filters NULL comments at the source
-/// to keep the snapshot compact.
+/// Load `ALL_TAB_COMMENTS` rows into [`SchemaCatalog::table_comments`].
+/// Filters NULL comments at the source to keep the snapshot compact.
 fn load_catalog_table_comments<C: OracleConnection>(
     conn: &C,
     snapshot: &mut CatalogSnapshot,
@@ -2754,8 +2991,8 @@ order by owner, table_name
     Ok(())
 }
 
-/// Load `ALL_COL_COMMENTS` rows into [`SchemaCatalog::column_comments`]
-/// (PLSQL-CAT-NEW-5 / oracle-grs0). Filters NULL comments at the source.
+/// Load `ALL_COL_COMMENTS` rows into [`SchemaCatalog::column_comments`].
+/// Filters NULL comments at the source.
 fn load_catalog_column_comments<C: OracleConnection>(
     conn: &C,
     snapshot: &mut CatalogSnapshot,
@@ -3627,10 +3864,10 @@ fn apply_type_attr_row(
     Ok(())
 }
 
-/// Apply a single `ALL_DB_LINKS` row into the snapshot
-/// (PLSQL-CAT-NEW-1 / oracle-rr4y). Ensures the owning schema entry
-/// exists (lazily creates it) so a `PUBLIC` row lands even when no
-/// other catalog object has been recorded for that synthetic schema.
+/// Apply a single `ALL_DB_LINKS` row into the snapshot. Ensures the
+/// owning schema entry exists (lazily creates it) so a `PUBLIC` row
+/// lands even when no other catalog object has been recorded for that
+/// synthetic schema.
 fn apply_db_link_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<(), CatalogError> {
     let owner_text = row.require_text("OWNER")?;
     let link_name_text = row.require_text("DB_LINK")?;
@@ -3657,7 +3894,7 @@ fn apply_db_link_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<
     Ok(())
 }
 
-/// Apply a single `ALL_POLICIES` row (PLSQL-CAT-NEW-2 / oracle-c0gg).
+/// Apply a single `ALL_POLICIES` row.
 fn apply_vpd_policy_row(
     snapshot: &mut CatalogSnapshot,
     row: &OracleRow,
@@ -3717,7 +3954,7 @@ fn apply_vpd_policy_row(
     Ok(())
 }
 
-/// Apply a single `ALL_EDITIONS` row (PLSQL-CAT-NEW-3 / oracle-fmro).
+/// Apply a single `ALL_EDITIONS` row.
 fn apply_edition_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<(), CatalogError> {
     let edition_name = row.require_text("EDITION_NAME")?.to_string();
     let parent_edition_name = optional_nonblank_text(row, "PARENT_EDITION_NAME").map(String::from);
@@ -3733,8 +3970,7 @@ fn apply_edition_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<
     Ok(())
 }
 
-/// Apply a single `ALL_EDITIONING_VIEWS` row
-/// (PLSQL-CAT-NEW-3 / oracle-fmro).
+/// Apply a single `ALL_EDITIONING_VIEWS` row.
 fn apply_editioning_view_row(
     snapshot: &mut CatalogSnapshot,
     row: &OracleRow,
@@ -3774,8 +4010,7 @@ fn apply_editioning_view_row(
     Ok(())
 }
 
-/// Apply a single `ALL_TAB_COMMENTS` row into the snapshot
-/// (PLSQL-CAT-NEW-5 / oracle-grs0).
+/// Apply a single `ALL_TAB_COMMENTS` row into the snapshot.
 fn apply_table_comment_row(
     snapshot: &mut CatalogSnapshot,
     row: &OracleRow,
@@ -3810,8 +4045,7 @@ fn apply_table_comment_row(
     Ok(())
 }
 
-/// Apply a single `ALL_COL_COMMENTS` row into the snapshot
-/// (PLSQL-CAT-NEW-5 / oracle-grs0).
+/// Apply a single `ALL_COL_COMMENTS` row into the snapshot.
 fn apply_column_comment_row(
     snapshot: &mut CatalogSnapshot,
     row: &OracleRow,
@@ -4532,7 +4766,6 @@ pub struct SynonymTarget {
 /// the policy function (PF_OWNER.PACKAGE.FUNCTION) is the predicate
 /// generator that Oracle invokes at parse time to inject a WHERE clause
 /// into reads (and optional ones into INSERT/UPDATE/DELETE).
-/// (PLSQL-CAT-NEW-2 / oracle-c0gg)
 ///
 /// Lineage flags VPD-protected objects with
 /// `UnknownReason::DbLinkRemoteObject` reused-as-marker pending a
@@ -4564,7 +4797,7 @@ pub struct VpdPolicy {
 
 /// Edition entry from `ALL_EDITIONS` — the per-database edition tree
 /// used by Oracle Edition-Based Redefinition (EBR). Linked into
-/// [`CatalogSnapshot::editions`] (PLSQL-CAT-NEW-3 / oracle-fmro).
+/// [`CatalogSnapshot::editions`].
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Edition {
     /// Edition name (Oracle identifiers are case-preserving but case-
@@ -4579,7 +4812,7 @@ pub struct Edition {
 
 /// Editioning view from `ALL_EDITIONING_VIEWS` — a view that masks an
 /// editioned table during EBR cutovers. Linked into
-/// [`SchemaCatalog::editioning_views`] (PLSQL-CAT-NEW-3 / oracle-fmro).
+/// [`SchemaCatalog::editioning_views`].
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EditioningView {
     /// Owning schema.
@@ -4592,7 +4825,7 @@ pub struct EditioningView {
 
 /// Documentation comment attached to a table, view, or materialized
 /// view via `COMMENT ON TABLE owner.name IS '...'`. Sourced from
-/// `ALL_TAB_COMMENTS` (PLSQL-CAT-NEW-5 / oracle-grs0).
+/// `ALL_TAB_COMMENTS`.
 ///
 /// `plsql-docgen` consumes these to render description text alongside
 /// object docs; dependency analysis does not interact with them.
@@ -4613,7 +4846,7 @@ pub struct TableComment {
 
 /// Documentation comment attached to a column via
 /// `COMMENT ON COLUMN owner.table.column IS '...'`. Sourced from
-/// `ALL_COL_COMMENTS` (PLSQL-CAT-NEW-5 / oracle-grs0).
+/// `ALL_COL_COMMENTS`.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ColumnComment {
     /// Owning schema.
@@ -4626,8 +4859,7 @@ pub struct ColumnComment {
     pub comments: String,
 }
 
-/// Database link metadata sourced from `ALL_DB_LINKS`
-/// (PLSQL-CAT-NEW-1 / oracle-rr4y).
+/// Database link metadata sourced from `ALL_DB_LINKS`.
 ///
 /// PL/SQL code that references `remote_object@my_link` resolves through
 /// one of these entries. Public links have `owner = PUBLIC`. Lineage uses
@@ -5138,9 +5370,9 @@ mod tests {
         row
     }
 
-    /// Probe queries issued by `negotiate_capabilities` (PLSQL-CAT-017). Every
-    /// mock test that wants the live-extraction loader to behave normally
-    /// should prepend these to its `expected_queries` so each probe succeeds.
+    /// Probe queries issued by `negotiate_capabilities`. Every mock test
+    /// that wants the live-extraction loader to behave normally should
+    /// prepend these to its `expected_queries` so each probe succeeds.
     fn capability_probe_expectations() -> Vec<QueryExpectation> {
         [
             "from all_objects where rownum = 0",
@@ -6820,6 +7052,107 @@ mod tests {
         );
     }
 
+    /// DDL with a qualified `OWNER.OBJECT` prefix must be filed under the
+    /// real owner schema, never collapsed to a single shared bucket. A
+    /// multi-schema DBMS_METADATA dump that lands under one schema would
+    /// silently lose cross-schema topology.
+    #[test]
+    fn load_from_dbms_metadata_dir_records_real_schema_owner() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("hr_employees.sql"),
+            "CREATE TABLE hr.employees (id NUMBER PRIMARY KEY);",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("billing_invoices.sql"),
+            "CREATE TABLE billing.invoices (id NUMBER, amount NUMBER(12,2));",
+        )
+        .unwrap();
+        let snapshot = load_from_dbms_metadata_dir(root).unwrap();
+
+        // Two distinct owner schemas must be present — not collapsed.
+        let schema_names: std::collections::HashSet<String> = snapshot
+            .schemas
+            .keys()
+            .filter_map(|s| snapshot.interner.resolve(s.symbol()).map(str::to_string))
+            .collect();
+        assert!(
+            schema_names.contains("HR"),
+            "HR schema bucket must exist; got {schema_names:?}"
+        );
+        assert!(
+            schema_names.contains("BILLING"),
+            "BILLING schema bucket must exist; got {schema_names:?}"
+        );
+
+        // Each schema bucket holds exactly its own object — never the
+        // other's.
+        for (schema, bucket) in &snapshot.schemas {
+            let name = snapshot.interner.resolve(schema.symbol()).unwrap();
+            assert_eq!(
+                bucket.objects.len(),
+                1,
+                "{name} bucket must hold exactly one object"
+            );
+        }
+    }
+
+    /// Unqualified CREATE statements (no owner prefix) must land in a
+    /// stable named schema (e.g. `PUBLIC`) interned through the regular
+    /// interner — never `SymbolId::new(0)` which collides with whatever
+    /// the first interner entry happens to be.
+    #[test]
+    fn load_from_dbms_metadata_dir_uses_named_default_schema_for_unqualified_ddl() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("customers.sql"),
+            "CREATE TABLE customers (id NUMBER, name VARCHAR2(100));",
+        )
+        .unwrap();
+        let snapshot = load_from_dbms_metadata_dir(root).unwrap();
+
+        let schema_names: std::collections::HashSet<String> = snapshot
+            .schemas
+            .keys()
+            .filter_map(|s| snapshot.interner.resolve(s.symbol()).map(str::to_string))
+            .collect();
+        assert!(
+            schema_names.contains("PUBLIC"),
+            "default schema bucket (PUBLIC) must exist for unqualified DDL; got {schema_names:?}"
+        );
+    }
+
+    /// The classifier must actually record the raw DDL text on the
+    /// produced `CatalogObject` — the original docstring promised this
+    /// and downstream consumers (doc generation, lineage) rely on it.
+    #[test]
+    fn load_from_dbms_metadata_dir_records_raw_ddl_text_on_object() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let raw = "CREATE TABLE hr.orders (id NUMBER PRIMARY KEY, total NUMBER(12,2));";
+        std::fs::write(root.join("orders.sql"), raw).unwrap();
+        let snapshot = load_from_dbms_metadata_dir(root).unwrap();
+
+        let bucket = snapshot
+            .schemas
+            .values()
+            .find(|b| !b.objects.is_empty())
+            .expect("at least one schema bucket with an object");
+        let obj = bucket.objects.values().next().unwrap();
+        let common = match obj {
+            CatalogObject::Table(t) => &t.common,
+            other => panic!("expected Table, got {other:?}"),
+        };
+        let ddl = common
+            .ddl
+            .as_ref()
+            .expect("CatalogObject must carry its raw DDL text");
+        assert_eq!(ddl.ddl_text, raw, "ddl_text must round-trip the source DDL");
+    }
+
     #[test]
     fn load_snapshot_populates_object_metadata_and_dependency_rows() {
         let object_rows = vec![
@@ -7671,5 +8004,194 @@ mod tests {
         // Recommendations are inert for JSON snapshots — the capability bits
         // were already frozen at extraction time.
         assert!(report.missing_permissions.is_empty());
+    }
+
+    // ----------------------------------------------------------------------
+    // DDL kind classifier (header tokenizer, not body substring).
+    //
+    // Regression bar: the prior implementation substring-matched on the full
+    // upper-cased DDL, so any object whose body or comments mentioned
+    // `TABLE` was silently filed as a Table. Real public surface, real
+    // silent data corruption.
+    // ----------------------------------------------------------------------
+
+    /// Drive the per-file DDL through the public loader and return the
+    /// single (`ObjectType`, `CatalogObject`) pair it classifies into.
+    /// Panics on anything but exactly one classified object — every test
+    /// below feeds exactly one DDL so the helper stays obvious.
+    fn classify_single(ddl: &str) -> (ObjectType, CatalogObject) {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("obj.sql"), ddl).unwrap();
+        let snapshot = load_from_dbms_metadata_dir(dir.path()).unwrap();
+        let mut found: Vec<CatalogObject> = snapshot
+            .schemas
+            .values()
+            .flat_map(|s| s.objects.values().cloned())
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "expected exactly one classified object for DDL: {ddl}"
+        );
+        let obj = found.remove(0);
+        let common = match &obj {
+            CatalogObject::Table(m) => &m.common,
+            CatalogObject::View(m) => &m.common,
+            CatalogObject::MaterializedView(m) => &m.common,
+            CatalogObject::Sequence(m) => &m.common,
+            CatalogObject::Type(m) => &m.common,
+            CatalogObject::Package(m) => &m.common,
+            CatalogObject::Procedure(m) => &m.common,
+            CatalogObject::Function(m) => &m.common,
+            CatalogObject::Trigger(m) => &m.common,
+            CatalogObject::SchedulerJob(m) => &m.common,
+            CatalogObject::EditioningView(m) => &m.common,
+        };
+        (common.object_type, obj)
+    }
+
+    /// A VIEW whose body merely mentions the word `TABLE` must classify as
+    /// a View, never a Table. The prior substring matcher silently filed
+    /// such views as tables — real catalog corruption visible to every
+    /// downstream consumer.
+    #[test]
+    fn classify_view_with_table_in_body_is_view_not_table() {
+        let ddl =
+            "CREATE OR REPLACE VIEW hr.v_emp AS SELECT * FROM hr.emp WHERE 'TABLE'='TABLE';";
+        let (kind, obj) = classify_single(ddl);
+        assert_eq!(
+            kind,
+            ObjectType::View,
+            "VIEW with 'TABLE' literal in body must classify as View, got {kind:?}",
+        );
+        assert!(
+            matches!(obj, CatalogObject::View(_)),
+            "expected CatalogObject::View, got {obj:?}",
+        );
+    }
+
+    /// A TRIGGER body that touches a TABLE must classify as Trigger.
+    #[test]
+    fn classify_trigger_with_table_in_body_is_trigger() {
+        let ddl = "CREATE OR REPLACE TRIGGER hr.t_audit \
+                   AFTER INSERT ON hr.employees \
+                   BEGIN INSERT INTO hr.audit_table VALUES (:NEW.id); END;";
+        let (kind, _obj) = classify_single(ddl);
+        assert_eq!(kind, ObjectType::Trigger);
+    }
+
+    /// A PROCEDURE body that touches a TABLE must classify as Procedure.
+    #[test]
+    fn classify_procedure_with_table_in_body_is_procedure() {
+        let ddl = "CREATE OR REPLACE PROCEDURE hr.p_load \
+                   AS BEGIN INSERT INTO hr.staging_table SELECT * FROM hr.src; END;";
+        let (kind, _obj) = classify_single(ddl);
+        assert_eq!(kind, ObjectType::Procedure);
+    }
+
+    /// A FUNCTION body that touches a TABLE must classify as Function.
+    #[test]
+    fn classify_function_with_table_in_body_is_function() {
+        let ddl = "CREATE OR REPLACE FUNCTION hr.f_count RETURN NUMBER \
+                   AS n NUMBER; BEGIN SELECT COUNT(*) INTO n FROM hr.big_table; RETURN n; END;";
+        let (kind, _obj) = classify_single(ddl);
+        assert_eq!(kind, ObjectType::Function);
+    }
+
+    /// `PACKAGE BODY` is a body, not a spec — the classifier returns the
+    /// spec only, so a body file must produce zero classified objects
+    /// (not a Package, never a Table just because the body mentions one).
+    #[test]
+    fn classify_package_body_with_table_is_not_package_or_table() {
+        let ddl = "CREATE OR REPLACE PACKAGE BODY hr.billing_api AS \
+                   PROCEDURE charge IS BEGIN INSERT INTO hr.charges_table VALUES (1); END; END;";
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("body.sql"), ddl).unwrap();
+        let snapshot = load_from_dbms_metadata_dir(dir.path()).unwrap();
+        let total: usize = snapshot.schemas.values().map(|s| s.objects.len()).sum();
+        assert_eq!(
+            total, 0,
+            "PACKAGE BODY must not produce a classified object (got {total})",
+        );
+    }
+
+    /// `MATERIALIZED VIEW` must classify as `ObjectType::MaterializedView`,
+    /// never as a plain View (substring match on `VIEW` would do the
+    /// wrong thing).
+    #[test]
+    fn classify_materialized_view_is_materialized_view_not_view() {
+        let ddl =
+            "CREATE MATERIALIZED VIEW hr.mv_emp_summary AS SELECT dept, COUNT(*) FROM hr.emp GROUP BY dept;";
+        let (kind, obj) = classify_single(ddl);
+        assert_eq!(
+            kind,
+            ObjectType::MaterializedView,
+            "MATERIALIZED VIEW must classify as MaterializedView, got {kind:?}",
+        );
+        assert!(
+            matches!(obj, CatalogObject::MaterializedView(_)),
+            "expected CatalogObject::MaterializedView, got {obj:?}",
+        );
+    }
+
+    /// Leading block comment that contains `CREATE TABLE …` must NOT
+    /// fool the classifier — the real CREATE is for a VIEW.
+    #[test]
+    fn classify_view_with_leading_block_comment_mentioning_create_table_is_view() {
+        let ddl = "/* comment with CREATE TABLE x; */\n\
+                   CREATE OR REPLACE VIEW hr.v_dept AS SELECT * FROM hr.dept;";
+        let (kind, _obj) = classify_single(ddl);
+        assert_eq!(kind, ObjectType::View);
+    }
+
+    /// Leading line comments that mention `CREATE TABLE` must NOT fool
+    /// the classifier.
+    #[test]
+    fn classify_procedure_with_leading_line_comments_is_procedure() {
+        let ddl = "-- CREATE TABLE oops (x NUMBER);\n\
+                   -- another line mentioning VIEW and TABLE\n\
+                   CREATE OR REPLACE PROCEDURE hr.p_noop AS BEGIN NULL; END;";
+        let (kind, _obj) = classify_single(ddl);
+        assert_eq!(kind, ObjectType::Procedure);
+    }
+
+    /// `EDITIONABLE` / `NONEDITIONABLE` / `FORCE` modifiers between
+    /// `CREATE [OR REPLACE]` and the KIND must be skipped — they are
+    /// not the object kind.
+    #[test]
+    fn classify_editionable_view_is_view() {
+        let ddl =
+            "CREATE OR REPLACE EDITIONABLE VIEW hr.v_emp AS SELECT * FROM hr.emp;";
+        let (kind, _obj) = classify_single(ddl);
+        assert_eq!(kind, ObjectType::View);
+    }
+
+    /// Quoted identifiers for owner/name must not break the
+    /// header-tokenizer-based classifier.
+    #[test]
+    fn classify_quoted_table_owner_name_is_table() {
+        let ddl = "CREATE TABLE \"HR\".\"EMP\" (id NUMBER);";
+        let (kind, _obj) = classify_single(ddl);
+        assert_eq!(kind, ObjectType::Table);
+    }
+
+    /// Plain CREATE TABLE still works (negative-of-negative regression).
+    #[test]
+    fn classify_plain_table_is_table() {
+        let ddl = "CREATE TABLE hr.orders (id NUMBER PRIMARY KEY, total NUMBER(12,2));";
+        let (kind, obj) = classify_single(ddl);
+        assert_eq!(kind, ObjectType::Table);
+        assert!(matches!(obj, CatalogObject::Table(_)));
+    }
+
+    /// A PACKAGE spec that mentions VIEW / TABLE in a comment or
+    /// procedure name must classify as Package.
+    #[test]
+    fn classify_package_spec_mentioning_view_and_table_is_package() {
+        let ddl = "CREATE OR REPLACE PACKAGE hr.report_api AS \
+                   -- builds a VIEW over a TABLE \n\
+                   PROCEDURE rebuild_view_from_table; END;";
+        let (kind, _obj) = classify_single(ddl);
+        assert_eq!(kind, ObjectType::Package);
     }
 }

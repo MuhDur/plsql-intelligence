@@ -1,4 +1,4 @@
-//! Semantic model for embedded SQL statements (PLSQL-SQLSEM-001).
+//! Semantic model for embedded SQL statements.
 //!
 //! `plsql_ir::Statement::Sql` carries the raw SQL text. This
 //! module adds the typed structure downstream lineage needs:
@@ -9,15 +9,14 @@
 //!
 //! Population happens in two passes:
 //!
-//! 1. A heuristic recogniser (out of scope for this bead — lands
-//!    in PLSQL-SQLSEM-002) walks the raw SQL and emits the
-//!    structural pieces.
-//! 2. The IR canonicaliser (PLSQL-IR-006) is responsible for
+//! 1. A heuristic recogniser (out of scope for this module) walks
+//!    the raw SQL and emits the structural pieces.
+//! 2. The IR canonicaliser is responsible for
 //!    fully-qualifying every `TableUse.table` and
 //!    `ColumnUse.column` reference once the alias scope has
 //!    been resolved.
 //!
-//! This bead ships only the types + the constructor helpers so
+//! This module ships only the types + the constructor helpers so
 //! the downstream consumers (lineage, doc, bindings) can program
 //! against a stable surface today.
 //!
@@ -28,8 +27,8 @@
 //!   semantics come from the SQL Language Reference chapter
 //!   the PL/SQL Language Reference defers to.
 //! * `LOW-LEVEL-CATALOGS.md` Data Dictionary View Families —
-//!   `ALL_TAB_COLUMNS` is the server-side authority a future
-//!   bead will use to cross-check `ColumnUse.column` against
+//!   `ALL_TAB_COLUMNS` is the server-side authority later
+//!   passes use to cross-check `ColumnUse.column` against
 //!   the table's declared columns.
 
 use serde::{Deserialize, Serialize};

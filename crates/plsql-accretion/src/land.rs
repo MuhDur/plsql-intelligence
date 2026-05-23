@@ -1,5 +1,5 @@
 //! `land.rs` — stage **[F] LAND + LEDGER** / **[F'] QUARANTINE**
-//! (spec §2[F]/[F'], §7, §10 P6, `PLSQL-USR-001`).
+//! (spec §2[F]/[F'], §7, §10 P6).
 //!
 //! The final functional stage of the loop. Given a [`CandidateDiff`]
 //! that the §3 gate has already **ACCEPTed** (all nine stages PASS),
@@ -15,7 +15,7 @@
 //! 4. re-measures (the caller wires the §4 tripwire).
 //!
 //! On a gate **REJECT** → **[F'] QUARANTINE**: a provenanced
-//! quarantine artifact (the spec §7 bead) naming the failing stage +
+//! quarantine artifact (spec §7) naming the failing stage +
 //! the MinFixture is filed; **nothing is landed**, the gate is
 //! **never weakened**, and an unproven candidate **never** reaches
 //! the corpus. On an I-PRIVACY abort (G8) nothing is persisted at all
@@ -63,9 +63,9 @@ pub enum LandError {
     Gate(#[from] GateError),
 
     /// The candidate was **not** ACCEPTed by the §3 gate. This is the
-    /// [F'] quarantine path — the caller files the provenanced bead;
-    /// nothing is landed and the gate was never weakened. Carries the
-    /// quarantine record so the caller can persist/file it.
+    /// [F'] quarantine path — the caller persists the provenanced
+    /// record; nothing is landed and the gate was never weakened.
+    /// Carries the quarantine record so the caller can persist/file it.
     #[error(
         "land: candidate REJECTED at stage {} — quarantined, NOT landed, gate not weakened (spec §7)",
         .0.failing_stage
@@ -91,8 +91,8 @@ pub enum LandError {
     Serialize(#[from] serde_json::Error),
 }
 
-/// The provenanced quarantine artifact (spec §7 "[F'] quarantine as
-/// open bead"). Filed when the gate REJECTs a candidate. It names the
+/// The provenanced quarantine artifact (spec §7 "[F'] open
+/// quarantine"). Filed when the gate REJECTs a candidate. It names the
 /// failing stage + the MinFixture so the loop can iterate (it is
 /// allowed to need >1 candidate) without ever weakening the gate.
 ///
@@ -111,7 +111,7 @@ pub struct QuarantineRecord {
     /// The FIRST non-PASS gate stage (fail-closed stops there).
     pub failing_stage: String,
     /// The representative MinFixture ids the candidate carried
-    /// (provenance hop-3) — so the bead reproduces the gap.
+    /// (provenance hop-3) — so the quarantine record reproduces the gap.
     pub min_fixtures: Vec<String>,
     /// The originating estate-run id (provenance hop-1).
     pub estate_run_id: String,
@@ -221,15 +221,14 @@ fn quarantine_of(
 }
 
 /// Persist the quarantine record as a provenanced artifact under
-/// `.usr/quarantine/<id>.json` and, when `br` is available, file it
-/// as a bead too (matching the repo's bead machinery). Content-
-/// addressed: re-filing the same rejection is idempotent. **Never**
-/// persisted on an I-PRIVACY abort (spec §1 fail-safe — nothing
-/// touches disk).
+/// `.usr/quarantine/<id>.json` and, when an issue tracker CLI is
+/// available, file a tracker entry too. Content-addressed: re-filing
+/// the same rejection is idempotent. **Never** persisted on an
+/// I-PRIVACY abort (spec §1 fail-safe — nothing touches disk).
 ///
 /// # Errors
 /// [`LandError::CorpusIo`] / [`LandError::Serialize`] on a write
-/// failure (the bead filing is best-effort and never fails the
+/// failure (the tracker filing is best-effort and never fails the
 /// quarantine — the on-disk artifact is the durable record).
 #[instrument(level = "debug", skip(record))]
 pub fn persist_quarantine(
@@ -258,11 +257,12 @@ pub fn persist_quarantine(
     Ok(path)
 }
 
-/// File the quarantine as a bead via the repo's `br` CLI (the same
+/// File the quarantine via the repo's issue-tracker CLI (the same
 /// machinery used elsewhere in this repo). Best-effort + idempotent:
 /// the title is content-addressed by the quarantine id so re-filing
-/// is a no-op duplicate the operator can dedupe; a missing `br` is a
-/// silent honest skip (the JSON artifact is the source of truth).
+/// is a no-op duplicate the operator can dedupe; a missing tracker
+/// CLI is a silent honest skip (the JSON artifact is the source of
+/// truth).
 #[instrument(level = "trace", skip(record))]
 fn file_quarantine_bead(repo_root: &Path, record: &QuarantineRecord) {
     let title = format!(
@@ -403,9 +403,9 @@ fn add_fixture_to_corpus(
 /// (`landed_patch` = the `signature → commit` rollback anchor) +
 /// return the receipt. On REJECT → [`LandError::Quarantined`]
 /// carrying the provenanced [`QuarantineRecord`] (the caller files
-/// the bead; the gate is NEVER weakened, NOTHING is landed). On a G8
-/// I-PRIVACY abort the quarantine is marked `privacy_abort` and the
-/// caller persists nothing (spec §1 fail-safe).
+/// the quarantine; the gate is NEVER weakened, NOTHING is landed).
+/// On a G8 I-PRIVACY abort the quarantine is marked `privacy_abort`
+/// and the caller persists nothing (spec §1 fail-safe).
 ///
 /// Atomic + idempotent + deterministic: re-landing the same accepted
 /// candidate is a no-op (content-addressed corpus file + idempotent

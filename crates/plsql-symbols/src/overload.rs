@@ -1,4 +1,4 @@
-//! Overload identity + call resolution (PLSQL-SYM-009).
+//! Overload identity + call resolution.
 //!
 //! Oracle allows several subprograms to share a name inside a
 //! package (or as standalone routines that a synonym fans into).

@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! `plsql-lineage` — lineage query/result types (PLSQL-LIN-001).
+//! `plsql-lineage` — lineage query/result types.
 //!
 //! Defines the shape of lineage queries the engine accepts and the result
 //! shape it returns. Concrete graph-walking lives in the engine module; this
@@ -7,67 +7,64 @@
 //! renderers.
 //!
 //! `--robot-json` envelope helpers for every lineage operation live near
-//! the bottom of this file (`PLSQL-LIN-009`); they wrap the result types
-//! in versioned `plsql-output::RobotJsonEnvelope` so the CLI, MCP, and CI
-//! gate consumers see stable schema IDs (R5, R10).
+//! the bottom of this file; they wrap the result types in versioned
+//! `plsql-output::RobotJsonEnvelope` so the CLI, MCP, and CI gate
+//! consumers see stable schema IDs (R5, R10).
 
 use plsql_output::{RobotJsonEnvelope, SchemaDescriptor, SchemaVersion};
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
-/// Schema descriptor for the `impact(node)` operation output
-/// (`PLSQL-LIN-002`).
+/// Schema descriptor for the `impact(node)` operation output.
 pub const IMPACT_SCHEMA: SchemaDescriptor = SchemaDescriptor {
     id: "plsql.lineage.impact",
     version: SchemaVersion::new(1, 0, 0),
     description: "Downstream impact traversal result with confidence aggregation",
 };
 
-/// Schema descriptor for the `dependencies(node)` operation output
-/// (`PLSQL-LIN-003` upstream traversal).
+/// Schema descriptor for the `dependencies(node)` upstream traversal.
 pub const DEPENDENCIES_SCHEMA: SchemaDescriptor = SchemaDescriptor {
     id: "plsql.lineage.dependencies",
     version: SchemaVersion::new(1, 0, 0),
     description: "Upstream dependency traversal result",
 };
 
-/// Schema descriptor for `classify-change` (`PLSQL-LIN-000`).
+/// Schema descriptor for `classify-change`.
 pub const CLASSIFY_CHANGE_SCHEMA: SchemaDescriptor = SchemaDescriptor {
     id: "plsql.lineage.classify_change",
     version: SchemaVersion::new(1, 0, 0),
     description: "Semantic change-set classification across two analysis runs",
 };
 
-/// Schema descriptor for the lineage doctor report (`PLSQL-LIN-011`).
+/// Schema descriptor for the lineage doctor report.
 pub const DOCTOR_SCHEMA: SchemaDescriptor = SchemaDescriptor {
     id: "plsql.lineage.doctor",
     version: SchemaVersion::new(1, 0, 0),
     description: "Lineage graph completeness + low-confidence inventory",
 };
 
-/// Schema descriptor for customer-facing explain output (`PLSQL-LIN-014`).
+/// Schema descriptor for customer-facing explain output.
 pub const EXPLAIN_SCHEMA: SchemaDescriptor = SchemaDescriptor {
     id: "plsql.lineage.explain",
     version: SchemaVersion::new(1, 0, 0),
     description: "Customer-facing explanation of a lineage edge, node, or path",
 };
 
-/// Schema descriptor for `recompile_order` plans (`PLSQL-LIN-006`).
+/// Schema descriptor for `recompile_order` plans.
 pub const RECOMPILE_ORDER_SCHEMA: SchemaDescriptor = SchemaDescriptor {
     id: "plsql.lineage.recompile_order",
     version: SchemaVersion::new(1, 0, 0),
     description: "Topological recompile order for a set of changed PL/SQL objects",
 };
 
-/// Schema descriptor for `callers(proc)` results (`PLSQL-LIN-004`).
+/// Schema descriptor for `callers(proc)` results.
 pub const CALLERS_SCHEMA: SchemaDescriptor = SchemaDescriptor {
     id: "plsql.lineage.callers",
     version: SchemaVersion::new(1, 0, 0),
     description: "Direct callers of a PL/SQL routine, filtered to Calls edges",
 };
 
-/// Schema descriptor for `column_readers` / `column_writers` results
-/// (`PLSQL-LIN-004`).
+/// Schema descriptor for `column_readers` / `column_writers` results.
 pub const COLUMN_ACCESS_SCHEMA: SchemaDescriptor = SchemaDescriptor {
     id: "plsql.lineage.column_access",
     version: SchemaVersion::new(1, 0, 0),
@@ -93,8 +90,7 @@ pub const LINEAGE_SCHEMAS: [SchemaDescriptor; 14] = [
     ORPHAN_CANDIDATES_SCHEMA,
 ];
 
-/// Schema descriptor for the customer-facing `compare-oracle-deps`
-/// report (`PLSQL-LIN-016`).
+/// Schema descriptor for the customer-facing `compare-oracle-deps` report.
 pub const COMPARE_ORACLE_DEPS_SCHEMA: SchemaDescriptor = SchemaDescriptor {
     id: "plsql.lineage.compare_oracle_deps",
     version: SchemaVersion::new(1, 0, 0),
@@ -155,8 +151,8 @@ pub struct LineageResult {
     /// Nodes reached during traversal, each with the *best* (most certain)
     /// confidence the engine could prove across any path from the anchor.
     /// Populated by impact/dependency walks that aggregate confidence
-    /// along paths (PLSQL-LIN-002); upstream `dependencies` and other
-    /// per-edge walks leave this empty.
+    /// along paths; upstream `dependencies` and other per-edge walks
+    /// leave this empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub affected_nodes: Vec<AffectedNode>,
 }
@@ -445,9 +441,31 @@ use std::path::Path;
 
 /// Classify changes between two git refs in a repository.
 ///
-/// Walks the diff between `from` and `to` commits, emitting a `SemanticChangeSet`.
-/// This is a stub — full semantic classification requires the parser (Layer 1).
-/// Currently classifies by file extension and diff status.
+/// Shells out to `git diff --name-status <from> <to>` rooted at
+/// `repo`, walks the output, and emits a [`SemanticChangeSet`] of
+/// per-file [`ChangeRecord`] variants:
+///
+/// * `A` (added)    → [`ChangeRecord::Created`]
+/// * `D` (deleted)  → [`ChangeRecord::Dropped`]
+/// * `M` (modified) → [`ChangeRecord::Body`] with `git:<ref>` hashes
+///   on either side; body bytes are NOT diffed by this function.
+/// * `R*` / `C*` (rename / copy with similarity score) → a paired
+///   `Dropped(old)` + `Created(new)` so downstream consumers do not
+///   accidentally treat a rename as a body change.
+///
+/// Files that don't look like PL/SQL sources (recognised by
+/// extension: `.sql`, `.pks`, `.pkb`, `.plsql`, etc.) are filtered
+/// out. The returned changeset stamps `old_run_id` and
+/// `new_run_id` with the supplied refs so downstream lineage
+/// consumers can correlate it with run artifacts.
+///
+/// This is a structural classifier: it summarises the diff envelope
+/// (which objects appeared / disappeared / changed) without parsing
+/// the changed bodies. Body-level semantic classification (which
+/// columns / signatures / SQL statements changed inside an `M`
+/// record) is the parser's job and is intentionally out of scope
+/// here; see [`classify_dir_diff`] for the directory-comparison
+/// sibling with the same structural contract.
 pub fn classify_git_diff(
     repo: &Path,
     from: &str,
@@ -860,15 +878,14 @@ pub fn dependencies(graph: &DepGraph, node: &NodeId, max_depth: Option<u32>) -> 
     result
 }
 
-/// Summary report emitted by [`doctor`] (`PLSQL-LIN-011`).
+/// Summary report emitted by [`doctor`].
 ///
 /// Counts give the customer-facing Trust Block its raw inputs (plan
 /// §1.5): how complete is the graph, how much of it is exact vs.
 /// heuristic vs. unknown, and which `UnknownReason` discriminators
-/// dominate the inventory. Specific low-confidence samples land in a
-/// later bead (`LIN-018` orphan-candidate sampling); this report is
-/// the counts-only foundation every consumer (CLI doctor command, CI
-/// gate, MCP tool, sales-demo Trust Block) reads from.
+/// dominate the inventory. This report is the counts-only foundation
+/// every consumer (CLI doctor command, CI gate, MCP tool, sales-demo
+/// Trust Block) reads from.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LineageDoctorReport {
     pub node_count: usize,
@@ -907,8 +924,7 @@ impl LineageDoctorReport {
     }
 }
 
-/// Compute a graph-completeness + low-confidence inventory report
-/// (`PLSQL-LIN-011`).
+/// Compute a graph-completeness + low-confidence inventory report.
 #[must_use]
 #[instrument(level = "trace", skip(graph))]
 pub fn doctor(graph: &DepGraph) -> LineageDoctorReport {
@@ -1130,7 +1146,7 @@ pub fn explain_envelope(explanation: LineageExplanation) -> RobotJsonEnvelope<Li
     RobotJsonEnvelope::new(EXPLAIN_SCHEMA, explanation)
 }
 
-/// Output of `recompile_order` (`PLSQL-LIN-006`).
+/// Output of `recompile_order`.
 ///
 /// `order` lists logical object IDs in the sequence Oracle will accept
 /// recompilation. Each object's dependencies (those also in the input
@@ -1261,9 +1277,9 @@ pub fn recompile_order_envelope(plan: RecompilePlan) -> RobotJsonEnvelope<Recomp
     RobotJsonEnvelope::new(RECOMPILE_ORDER_SCHEMA, plan)
 }
 
-/// Wrap an [`impact`] result in the versioned robot-JSON envelope
-/// (`PLSQL-LIN-009`). Consumers should serialize the returned envelope
-/// directly via `serde_json::to_string`.
+/// Wrap an [`impact`] result in the versioned robot-JSON envelope.
+/// Consumers should serialize the returned envelope directly via
+/// `serde_json::to_string`.
 #[must_use]
 #[instrument(level = "trace", skip(result))]
 pub fn impact_envelope(result: LineageResult) -> RobotJsonEnvelope<LineageResult> {
@@ -1344,10 +1360,8 @@ impl Confidence {
 /// the same node, the node's `path_confidence` is the maximum (the
 /// engine reports the strongest proof it can support).
 ///
-/// `PLSQL-LIN-002`. Consumers in subsequent beads:
-/// `LIN-004 callers`, `LIN-005 unsafe-paths`, `LIN-007 what-breaks`,
-/// `LIN-008 HTML impact subgraph`, `LIN-010 GraphML export`,
-/// `LIN-014 explain`.
+/// Consumers include `callers`, `unsafe-paths`, `what-breaks`,
+/// the HTML impact subgraph, GraphML export, and `explain`.
 pub fn impact(graph: &DepGraph, node: &NodeId, max_depth: Option<u32>) -> LineageResult {
     let selector = NodeSelector::NodeId(*node);
     let anchor_node = match graph.resolve_node(&selector) {
@@ -1534,8 +1548,8 @@ pub struct ColumnAccessResult {
 /// this routine?". Triggers / type methods that fire on this routine
 /// also surface here.
 ///
-/// `PLSQL-LIN-004`. Consumers: `plsql-doc`, `plsql-scan` reachability,
-/// CLI `lineage callers` subcommand.
+/// Consumers: `plsql-doc`, `plsql-scan` reachability, CLI
+/// `lineage callers` subcommand.
 #[must_use]
 pub fn callers(graph: &DepGraph, target: &NodeSelector) -> CallersResult {
     let Ok(target_node) = graph.resolve_node(target) else {
@@ -1699,7 +1713,7 @@ pub fn column_access_envelope(result: ColumnAccessResult) -> RobotJsonEnvelope<C
 // evidence to audit tickets.
 // ---------------------------------------------------------------------------
 
-/// Schema descriptor for `unsafe-paths(from, to)` results (`PLSQL-LIN-005`).
+/// Schema descriptor for `unsafe-paths(from, to)` results.
 pub const UNSAFE_PATHS_SCHEMA: SchemaDescriptor = SchemaDescriptor {
     id: "plsql.lineage.unsafe_paths",
     version: SchemaVersion::new(1, 0, 0),
@@ -1749,7 +1763,7 @@ pub struct UnsafePathsResult {
 /// confidence is `Unknown` — both indicate that the depgraph could
 /// not prove the relationship without runtime evidence.
 ///
-/// `PLSQL-LIN-005`. Used by:
+/// Used by:
 /// - the lineage CLI's `unsafe-paths` subcommand
 /// - the SAST reachability rule for dynamic SQL
 /// - the customer Trust Block dynamic-SQL audit section
@@ -2420,8 +2434,8 @@ pub fn impact_to_html(result: &LineageResult) -> String {
 /// from plan §1.5). Wraps `impact_to_html` and splices in a
 /// three-column comparison table at the bottom.
 ///
-/// `PLSQL-LIN-017`. Uses the same SVG / summary as `impact_to_html`
-/// plus a `<section aria-label="oracle-vs-engine">` listing the
+/// Uses the same SVG / summary as `impact_to_html` plus a
+/// `<section aria-label="oracle-vs-engine">` listing the
 /// `CompareOracleDepsReport` categories.
 #[must_use]
 pub fn impact_to_html_with_compare(
@@ -2566,8 +2580,6 @@ pub struct KindMismatchEntry {
 /// snapshot pair. Wraps `DepGraph::cross_check_with_catalog` and
 /// renames the report's classification vocabulary into the "Oracle sees
 /// / engine sees / uncertain" framing the customer-facing surface uses.
-///
-/// `PLSQL-LIN-016`.
 #[must_use]
 pub fn compare_oracle_deps(
     graph: &DepGraph,
@@ -2670,8 +2682,6 @@ pub const ORPHAN_CANDIDATES_SCHEMA: SchemaDescriptor = SchemaDescriptor {
 ///   `assume_incomplete_augmentation` is true (catalog grants /
 ///   synonyms / scheduler / DB-link aren't loaded yet, so the
 ///   absence of inbound edges cannot prove non-use)
-///
-/// `PLSQL-LIN-019`.
 #[must_use]
 pub fn detect_orphans(
     graph: &DepGraph,
@@ -2743,7 +2753,7 @@ pub fn detect_orphans_envelope(
     RobotJsonEnvelope::new(ORPHAN_CANDIDATES_SCHEMA, report)
 }
 
-/// Schema for the orphan-report doctor check (PLSQL-LIN-023).
+/// Schema for the orphan-report doctor check.
 pub const ORPHAN_DOCTOR_SCHEMA: SchemaDescriptor = SchemaDescriptor {
     id: "plsql.lineage.orphan_doctor",
     version: SchemaVersion::new(1, 0, 0),
@@ -2772,8 +2782,7 @@ pub struct OrphanDoctorReport {
     pub hints: Vec<String>,
 }
 
-/// Compute a doctor check over an orphan-candidates report
-/// (`PLSQL-LIN-023`).
+/// Compute a doctor check over an orphan-candidates report.
 ///
 /// Verifies:
 /// * Freshness — `observation_window` populated and at least 30 days

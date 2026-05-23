@@ -1,7 +1,6 @@
-//! `Resolution` reporting w/ strategy trace + Evidence records
-//! (PLSQL-SYM-006).
+//! `Resolution` reporting w/ strategy trace + Evidence records.
 //!
-//! Wraps the `ResolvedRef` payload from PLSQL-SYM-002 + SYM-003
+//! Wraps the `ResolvedRef` payload from + SYM-003
 //! with a verbose audit trail: which strategies the resolver
 //! tried before it succeeded, which decl ids were considered and
 //! rejected, and a structured `Evidence` record per candidate so

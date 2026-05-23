@@ -1,4 +1,4 @@
-//! Reference resolution strategies 1–3 (PLSQL-SYM-002).
+//! Reference resolution strategies 1–3.
 //!
 //! When a PL/SQL routine body references a name, the resolver
 //! walks the three on-PL/SQL-spec resolution strategies in
@@ -13,8 +13,8 @@
 //!    types, synonyms) in the routine's owning schema.
 //!
 //! Strategies 4+ (synonym-following, public-synonym, cross-schema
-//! grants, invoker-rights resolution) land in PLSQL-SYM-003 and
-//! PLSQL-SYM-009. The resolver always tries strategies in order
+//! grants, invoker-rights resolution) land in and
+//! The resolver always tries strategies in order
 //! and returns the first hit — Oracle's name-resolution rule.
 //!
 //! ## /oracle evidence
@@ -25,7 +25,7 @@
 //! * `LOW-LEVEL-CATALOGS.md` Data Dictionary View Families —
 //!   `ALL_OBJECTS` is the live-DB authority for strategy-3
 //!   resolution; the offline resolver below consults the
-//!   in-process `DeclTable` populated by `PLSQL-SYM-001`.
+//!   in-process `DeclTable`.
 
 use plsql_core::SymbolInterner;
 use plsql_ir::{DeclId, DeclKind, Declaration};

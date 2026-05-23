@@ -1,4 +1,4 @@
-//! MCP stdio protocol layer (`PLSQL-MCP-002`).
+//! MCP stdio protocol layer.
 //!
 //! MCP (Model Context Protocol) wraps JSON-RPC 2.0 over stdio. This
 //! module is the pure protocol layer: it parses request frames,
@@ -27,10 +27,9 @@
 //! ## /oracle evidence
 //!
 //! * `DATABASE-REFERENCE.md` PL/SQL routing — the per-tool dispatch
-//!   defers to the `ToolRegistry` populated by the foundation
-//!   live-DB beads (PLSQL-MCP-LIVE-002 / -004 / -011 / -012 /
-//!   -013 / -014 / -015 / -016). This module is the transport
-//!   shim above those tools, not an Oracle behaviour change.
+//!   defers to the `ToolRegistry` populated by the foundation and
+//!   live-DB tool registrations. This module is the transport shim
+//!   above those tools, not an Oracle behaviour change.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -208,31 +207,77 @@ fn handle_tools_call(
     params: Option<&Value>,
     registry: &ToolRegistry,
 ) -> JsonRpcResponse {
+    use crate::dispatch::{DispatchError, DispatchOutcome, dispatch_tool};
+
     let Some(params) = params else {
         return JsonRpcResponse::err(id, -32602, "tools/call requires params");
     };
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return JsonRpcResponse::err(id, -32602, "tools/call params missing `name`");
     };
-    let Some(_tool) = registry.tools.iter().find(|t| t.name == name) else {
+    // The tool must be advertised — `tools/list` and `tools/call`
+    // share `registry` as the single source of truth.
+    if !registry.tools.iter().any(|t| t.name == name) {
         return JsonRpcResponse::err(id, -32601, format!("tool not found: {name}"));
-    };
-    // The per-tool runtime dispatchers land in the individual
-    // MCP-LIVE-* beads. Until they wire into this dispatcher we
-    // return a structured "not yet executable" payload so a
-    // client can verify discovery without panicking.
-    JsonRpcResponse::ok(
-        id,
-        serde_json::json!({
-            "content": [{
-                "type": "text",
-                "text": format!(
-                    "tool {name} is registered but execution is gated on the per-tool MCP-LIVE wiring; consult the tool descriptor for the call shape."
-                ),
-            }],
-            "isError": false,
-        }),
-    )
+    }
+
+    // `arguments` is optional per MCP; a missing object means "no
+    // arguments", which the per-tool Request types accept or reject
+    // on their own terms.
+    let empty = Value::Object(Default::default());
+    let arguments = params.get("arguments").unwrap_or(&empty);
+
+    // oracle-l65d: dispatch into the real `run_*` implementation.
+    // `dispatch_tool` is the single dispatch table; it deserializes
+    // the arguments into the tool's Request type and either runs the
+    // tool (self-contained static analysis) or returns an honest
+    // "runtime state required" outcome for tools that need a live
+    // connection / loaded graph / preview session.
+    match dispatch_tool(name, arguments) {
+        Ok(DispatchOutcome::Ran(structured)) => JsonRpcResponse::ok(
+            id,
+            tool_result(&structured_text(name, &structured), false, Some(structured)),
+        ),
+        Ok(DispatchOutcome::RuntimeStateRequired(kind)) => {
+            // Wired, arguments validated — but the runtime state is
+            // absent. Honest error *result* (transport-level call
+            // succeeded; the tool reports it cannot run here).
+            JsonRpcResponse::ok(id, tool_result(&kind.message(name), true, None))
+        }
+        Err(DispatchError::UnknownTool(tool)) => {
+            // Registry/dispatch drift — should be impossible (the
+            // lockstep test guards it), but never panic.
+            JsonRpcResponse::err(id, -32601, format!("tool not found: {tool}"))
+        }
+        Err(DispatchError::InvalidArguments { tool, detail }) => JsonRpcResponse::err(
+            id,
+            -32602,
+            format!("invalid arguments for tool `{tool}`: {detail}"),
+        ),
+    }
+}
+
+/// Build an MCP `tools/call` result object: a human-readable
+/// `content` text block, the `isError` flag, and (for tools that
+/// ran) the machine-readable `structuredContent` payload.
+fn tool_result(text: &str, is_error: bool, structured: Option<Value>) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "content".into(),
+        serde_json::json!([{ "type": "text", "text": text }]),
+    );
+    obj.insert("isError".into(), Value::Bool(is_error));
+    if let Some(s) = structured {
+        obj.insert("structuredContent".into(), s);
+    }
+    Value::Object(obj)
+}
+
+/// One-line human summary for a tool that ran. The full result is
+/// always in `structuredContent`; this is the `content` text the
+/// MCP spec also wants present.
+fn structured_text(name: &str, structured: &Value) -> String {
+    format!("tool `{name}` executed; structured result: {structured}")
 }
 
 #[cfg(test)]
@@ -305,11 +350,114 @@ mod tests {
     }
 
     #[test]
-    fn tools_call_for_registered_tool_returns_text_content() {
-        let r = registry_with_query();
+    fn tools_call_parse_file_runs_real_parser_over_the_wire() {
+        // oracle-l65d: a `parse_file` call must reach the real
+        // `run_parse_file` implementation and return a structured
+        // parse result — not a static "execution gated" placeholder.
+        let r = crate::default_tool_registry();
         let resp = handle_request(
             &req(
-                4,
+                40,
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "parse_file",
+                    "arguments": {
+                        "source": "CREATE OR REPLACE PACKAGE p AS PROCEDURE q; END;\n/\n"
+                    }
+                })),
+            ),
+            &r,
+        )
+        .unwrap();
+        let result = resp.result.expect("ok result");
+        assert_eq!(result["isError"], Value::Bool(false));
+        // The structured tool output carries the real ParseFileResponse.
+        let sc = &result["structuredContent"];
+        assert!(
+            sc["declaration_count"].as_u64().unwrap() >= 1,
+            "real parser counted declarations: {sc:?}"
+        );
+        assert_eq!(sc["recovered"], Value::Bool(false));
+    }
+
+    #[test]
+    fn tools_call_compile_check_reports_real_diagnostics() {
+        // A clean source must come back clean=true through the wire.
+        let r = crate::default_tool_registry();
+        let resp = handle_request(
+            &req(
+                41,
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "compile_check",
+                    "arguments": {
+                        "source": "CREATE PROCEDURE pr IS BEGIN NULL; END;\n/\n"
+                    }
+                })),
+            ),
+            &r,
+        )
+        .unwrap();
+        let sc = resp.result.unwrap()["structuredContent"].clone();
+        assert_eq!(sc["clean"], Value::Bool(true));
+        assert_eq!(sc["error_count"].as_u64().unwrap(), 0);
+    }
+
+    #[test]
+    fn tools_call_analyze_project_runs_pipeline_over_the_wire() {
+        // analyze_project takes a project_root path in its arguments —
+        // a fully self-contained static tool. An empty root is a clean
+        // zero run, not an error.
+        let r = crate::default_tool_registry();
+        let resp = handle_request(
+            &req(
+                42,
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "analyze_project",
+                    "arguments": {"project_root": ""}
+                })),
+            ),
+            &r,
+        )
+        .unwrap();
+        let result = resp.result.expect("ok result");
+        assert_eq!(result["isError"], Value::Bool(false));
+        assert_eq!(result["structuredContent"]["file_count"].as_u64().unwrap(), 0);
+    }
+
+    #[test]
+    fn tools_call_bad_arguments_returns_invalid_params() {
+        // oracle-l65d: arguments that do not deserialize into the
+        // tool's Request type are a proper -32602, never a panic.
+        let r = crate::default_tool_registry();
+        let resp = handle_request(
+            &req(
+                43,
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "parse_file",
+                    "arguments": {"wrong_field": 123}
+                })),
+            ),
+            &r,
+        )
+        .unwrap();
+        let err = resp.error.expect("invalid arguments => error");
+        assert_eq!(err.code, -32602);
+    }
+
+    #[test]
+    fn tools_call_live_db_tool_degrades_honestly_without_a_connection() {
+        // oracle-l65d: a live-DB tool (`query`) IS wired — it has a
+        // dispatch arm — but with no active connection it must return
+        // a typed, honest result, never a panic and never a fake
+        // success. `isError` is true; the message names the missing
+        // runtime state.
+        let r = crate::default_tool_registry();
+        let resp = handle_request(
+            &req(
+                44,
                 "tools/call",
                 Some(serde_json::json!({
                     "name": "query",
@@ -319,10 +467,74 @@ mod tests {
             &r,
         )
         .unwrap();
-        let result = resp.result.unwrap();
-        assert_eq!(result["isError"], Value::Bool(false));
-        let text = result["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("query"));
+        let result = resp.result.expect("a result, not a transport error");
+        assert_eq!(
+            result["isError"],
+            Value::Bool(true),
+            "no-connection is an honest error result"
+        );
+        let text = result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_lowercase();
+        assert!(
+            text.contains("connection") || text.contains("live-db") || text.contains("runtime"),
+            "message must name the missing runtime state: {text:?}"
+        );
+    }
+
+    #[test]
+    fn tools_call_live_db_arguments_still_validated_before_gating() {
+        // Even a gated live-DB tool deserializes its arguments first:
+        // malformed arguments are -32602, not a generic gate message.
+        let r = crate::default_tool_registry();
+        let resp = handle_request(
+            &req(
+                45,
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "query",
+                    "arguments": {"sql": 12345}
+                })),
+            ),
+            &r,
+        )
+        .unwrap();
+        assert_eq!(resp.error.expect("bad args => error").code, -32602);
+    }
+
+    #[test]
+    fn every_registered_tool_has_a_dispatch_arm() {
+        // oracle-l65d: the dispatch table and default_tool_registry()
+        // must stay in lockstep — a tool advertised over tools/list
+        // that has no dispatch arm is a wire gap.
+        let r = crate::default_tool_registry();
+        for tool in &r.tools {
+            let resp = handle_request(
+                &req(
+                    99,
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": tool.name,
+                        "arguments": {}
+                    })),
+                ),
+                &r,
+            )
+            .expect("a response");
+            // A dispatched tool answers with EITHER a result (ran, or
+            // honestly gated, or arg-validation result) OR a -32602
+            // invalid-params error for the empty arguments. What it
+            // must NEVER do is answer -32601 "tool not found": that
+            // would mean the tool is registered but not dispatched.
+            if let Some(err) = &resp.error {
+                assert_ne!(
+                    err.code, -32601,
+                    "tool `{}` is registered but has no dispatch arm",
+                    tool.name
+                );
+            }
+        }
     }
 
     #[test]

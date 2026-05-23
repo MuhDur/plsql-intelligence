@@ -1,5 +1,4 @@
-//! End-to-end resolution test over a 10-package synthetic schema
-//! (PLSQL-SYM-008).
+//! End-to-end resolution test over a 10-package synthetic schema.
 //!
 //! Builds a synthetic schema `HR` containing ten top-level packages
 //! `PKG_01 .. PKG_10`, each exposing one public procedure
@@ -15,7 +14,7 @@
 //!   `Unresolved`, never a panic.
 //!
 //! Source-text *parsing* into IR `Declaration`s is gated on
-//! `PLSQL-PARSE-005` (`lower.rs` for statement bodies); until that
+//! (`lower.rs` for statement bodies); until that
 //! lands the synthetic schema is constructed through the IR
 //! `Declaration` + `SymbolInterner` API, which is the same shape the
 //! lowering pass will feed the [`DeclTable`] with. The resolution

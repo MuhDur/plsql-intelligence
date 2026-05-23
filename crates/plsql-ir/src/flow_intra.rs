@@ -1,13 +1,13 @@
-//! Intra-procedural assignment + expression flow (PLSQL-FLOW-002).
+//! Intra-procedural assignment + expression flow.
 //!
 //! Walks a lowered statement body and propagates [`ValueFlow`]
 //! facts (FLOW-001) through assignments and expressions inside a
 //! single routine. The pass is deliberately a *may*-analysis
 //! over a flat statement list: it does not model branch joins
-//! precisely (that needs a CFG, a later bead) — it conservatively
-//! merges every assignment's RHS flow into the LHS via
-//! `ValueSet::join`, which is sound for taint / string-shape
-//! over-approximation.
+//! precisely (that needs a CFG, scheduled for a later pass) —
+//! it conservatively merges every assignment's RHS flow into the
+//! LHS via `ValueSet::join`, which is sound for taint /
+//! string-shape over-approximation.
 //!
 //! Outputs a `FlowEnv` mapping each assigned name to its
 //! accumulated `ValueFlow`. SAST consumes this to answer "does

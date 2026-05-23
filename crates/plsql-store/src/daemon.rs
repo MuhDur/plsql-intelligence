@@ -1,4 +1,4 @@
-//! `plsqld` request handler (PLSQL-STORE-DAEMON-002).
+//! `plsqld` request handler.
 //!
 //! The pure, fully-tested core of the optional local daemon:
 //! one framed [`DaemonRequest`] line in, one framed

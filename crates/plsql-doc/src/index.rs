@@ -1,9 +1,9 @@
-//! Schema-index page renderer (`PLSQL-DOC-008`).
+//! Schema-index page renderer.
 //!
 //! Emits a Markdown + HTML index that lists every documented object in
 //! a `DocSet`, grouped by kind and sorted by `object_id`. Each row links
 //! to the per-object page rendered by `render_object_markdown` /
-//! `render_object_html` (PLSQL-DOC-004/-005).
+//! `render_object_html` (-005).
 //!
 //! Search affordances:
 //!
@@ -39,7 +39,7 @@ use crate::{DocSet, ObjectDoc};
 /// ```
 ///
 /// One section per distinct `kind`, sorted alphabetically. Objects in
-/// each section are sorted by `object_id`. (PLSQL-DOC-008 / oracle-vqu.)
+/// each section are sorted by `object_id`.
 #[must_use]
 pub fn render_schema_index_markdown(set: &DocSet, project_label: &str) -> String {
     let mut out = String::new();
@@ -81,7 +81,6 @@ pub fn render_schema_index_markdown(set: &DocSet, project_label: &str) -> String
 /// Render a [`DocSet`] as an HTML schema-index page with a client-side
 /// search input. The input filters `<tr>` rows by matching against the
 /// `data-object-id` attribute; no build pipeline needed.
-/// (PLSQL-DOC-008 / oracle-vqu.)
 #[must_use]
 pub fn render_schema_index_html(set: &DocSet, project_label: &str) -> String {
     let mut out = String::new();
@@ -153,7 +152,7 @@ fn group_by_kind(set: &DocSet) -> BTreeMap<String, Vec<&ObjectDoc>> {
 
 /// Render the index plus every per-object page in a single Markdown
 /// bundle. Convenient one-shot for the `plsql-doc --serve` preview
-/// server (PLSQL-DOC-010): one render call per request, no caching
+/// server: one render call per request, no caching
 /// shenanigans needed.
 #[must_use]
 pub fn render_full_markdown_bundle(set: &DocSet, project_label: &str) -> String {

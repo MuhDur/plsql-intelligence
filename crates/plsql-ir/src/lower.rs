@@ -1,4 +1,4 @@
-//! AST → IR lowering for top-level declarations (`PLSQL-IR-003`).
+//! AST → IR lowering for top-level declarations.
 //!
 //! Walks `plsql_parser::Ast::root.declarations` and produces a
 //! [`LoweredFile`] containing one [`Declaration`] per recognized
@@ -14,8 +14,8 @@
 //!    diagnostic so the engine's `CompletenessReport` reflects the
 //!    unclassified region instead of dropping it.
 //! 4. `AstDecl::Ddl` is currently informational — the rule engine that
-//!    classifies `CREATE / ALTER / DROP / GRANT` lands in the catalog +
-//!    ChangeSet beads; here we record the verb in a diagnostic and let
+//!    classifies `CREATE / ALTER / DROP / GRANT` lives in the catalog +
+//!    ChangeSet layers; here we record the verb in a diagnostic and let
 //!    callers decide.
 
 use plsql_core::{Diagnostic, Evidence, Severity, SymbolInterner};
@@ -24,7 +24,7 @@ use plsql_parser::ast::AstDecl;
 use tracing::instrument;
 
 /// The evidence code + attribute key the USR-loop capture
-/// (`plsql_accretion::gap::antlr_rule_path_of`, `PLSQL-USR-001
+/// (`plsql_accretion::gap::antlr_rule_path_of`
 /// §2.1`) reads to recover the ANTLR grammar position a repairable
 /// diagnostic arose at. Keeping the contract in one place means the
 /// producer (here) and the consumer (capture) cannot drift.

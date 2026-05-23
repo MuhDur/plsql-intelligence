@@ -1,10 +1,10 @@
-//! Emit declaration / reference / call facts (PLSQL-FACT-002) plus
-//! privilege / dynamic-SQL / unknown facts (PLSQL-FACT-004).
+//! Emit declaration / reference / call facts plus
+//! privilege / dynamic-SQL / unknown facts.
 //!
 //! Bridges the semantic-layer extractors (calls, dml-edges,
 //! privilege model, dynamic-SQL evidence, opacity reasons) and
 //! the declaration table into the normalized [`Fact`] stream
-//! defined by PLSQL-FACT-001. Each emitter takes the typed
+//! defined by. Each emitter takes the typed
 //! per-family input + a [`FactProvenance`] and pushes minted
 //! facts into a [`FactStore`].
 //!
@@ -95,7 +95,7 @@ pub fn emit_call_facts(
 }
 
 /// Emit one `Privilege` fact per resolved `(grantee, privilege,
-/// on)` triple (PLSQL-FACT-004). The triple *is* the evidence:
+/// on)` triple. The triple *is* the evidence:
 /// who can do what to which object. Returns the post-dedup count.
 pub fn emit_privilege_facts<I>(store: &mut FactStore, prov: &FactProvenance, grants: I) -> usize
 where
@@ -117,7 +117,7 @@ where
 }
 
 /// Emit one `DynamicSqlEvidence` fact per recognised dynamic-SQL
-/// site (PLSQL-FACT-004). `site` carries the evidence — typically
+/// site. `site` carries the evidence — typically
 /// the logical id of the unit plus a fragment/classification
 /// summary from `DynamicSqlEvidence`.
 pub fn emit_dynamic_sql_facts<I>(store: &mut FactStore, prov: &FactProvenance, sites: I) -> usize
@@ -133,7 +133,7 @@ where
 }
 
 /// Emit one `Opacity` fact per `(target_logical_id, reason)` pair
-/// (PLSQL-FACT-004) — the "unknown" family. `reason` is the
+///  — the "unknown" family. `reason` is the
 /// evidence string (typically a stringified `UnknownReason`) so a
 /// consumer can explain *why* the analyser could not see through
 /// the target.
@@ -280,9 +280,9 @@ pub fn scan_exception_handlers(unit_logical_id: &str, source: &str) -> Vec<Excep
     sites
 }
 
-/// Emit one `ExceptionHandler` fact per detected handler
-/// (PLSQL-SAST-FACTS) so QUAL001 / QUAL004 can consume them via
-/// `by_kind` like every other fact-based rule.
+/// Emit one `ExceptionHandler` fact per detected handler so
+/// QUAL001 / QUAL004 can consume them via `by_kind` like every
+/// other fact-based rule.
 pub fn emit_exception_handler_facts<I>(
     store: &mut FactStore,
     prov: &FactProvenance,
@@ -306,7 +306,7 @@ where
     store.len() - before
 }
 
-/// One detected cursor `FOR` loop (PLSQL-SAST-FACTS-LOOP).
+/// One detected cursor `FOR` loop.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CursorForLoopSite {
     pub unit_logical_id: String,
@@ -316,9 +316,9 @@ pub struct CursorForLoopSite {
     pub has_body_dml: bool,
 }
 
-/// One routine body with no recognized instrumentation call
-/// (PLSQL-SAST-FACTS-LOOP). Reports *absence* only — STYLE001
-/// (opt-in) decides whether that is a finding.
+/// One routine body with no recognized instrumentation call.
+/// Reports *absence* only — STYLE001 (opt-in) decides whether
+/// that is a finding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MissingInstrumentationSite {
     pub unit_logical_id: String,
@@ -430,8 +430,8 @@ pub fn scan_missing_instrumentation(
     }]
 }
 
-/// Emit one `CursorForLoop` fact per site (PLSQL-SAST-FACTS-LOOP),
-/// mirroring [`emit_exception_handler_facts`].
+/// Emit one `CursorForLoop` fact per site, mirroring
+/// [`emit_exception_handler_facts`].
 pub fn emit_cursor_for_loop_facts<I>(
     store: &mut FactStore,
     prov: &FactProvenance,
@@ -455,8 +455,7 @@ where
     store.len() - before
 }
 
-/// Emit one `MissingInstrumentation` fact per site
-/// (PLSQL-SAST-FACTS-LOOP).
+/// Emit one `MissingInstrumentation` fact per site.
 pub fn emit_missing_instrumentation_facts<I>(
     store: &mut FactStore,
     prov: &FactProvenance,
@@ -479,7 +478,7 @@ where
 }
 
 /// One string literal that is, by strong syntactic context, a
-/// hardcoded secret (PLSQL-SAST-005 / SEC003).
+/// hardcoded secret (SEC003).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HardcodedCredentialSite {
     pub unit_logical_id: String,
@@ -607,7 +606,7 @@ where
 }
 
 /// One unit declaring invoker's rights (`AUTHID CURRENT_USER`)
-/// (PLSQL-SAST-006 / SEC004).
+/// (SEC004).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvokerRightsSite {
     pub unit_logical_id: String,

@@ -1,4 +1,4 @@
-//! Trust Block (PLSQL-MCP-007, plan §1.5).
+//! Trust Block (plan §1.5).
 //!
 //! Every successful MCP response carries `result.meta.trust_block`
 //! so an agent never consumes an answer without the provenance

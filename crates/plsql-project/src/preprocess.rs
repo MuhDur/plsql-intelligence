@@ -1,4 +1,4 @@
-//! PL/SQL conditional-compilation preprocessor (PLSQL-WS-010).
+//! PL/SQL conditional-compilation preprocessor.
 //!
 //! Oracle's PL/SQL supports `$IF` / `$ELSIF` / `$ELSE` / `$END`
 //! and `$ERROR` directives that select which lines of source are

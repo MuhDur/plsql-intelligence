@@ -1,24 +1,28 @@
-//! `plsql support minimize-repro` skeleton (PLSQL-SUPPORT-010).
+//! Structural minimisation-plan template for support bundles.
 //!
 //! When a customer ships a `SupportBundle` containing a failing
 //! input, support needs to whittle it down to the smallest
-//! reproducer before filing an upstream bug. This module is the
-//! pure planning layer that the CLI wraps; the actual ddmin /
-//! delta-debug loop lands in a follow-up bead.
+//! reproducer before filing an upstream bug. This module emits a
+//! deterministic, content-independent *plan template* describing
+//! the canonical strategy ordering an operator (or downstream
+//! worker) should follow when shrinking each blob; it performs no
+//! byte-level minimisation itself.
 //!
-//! The skeleton's job is twofold:
+//! Concretely, [`minimize_repro_plan`] does two things:
 //!
-//! 1. **Refuse non-redacted input.** Every input blob we are about
-//!    to minimise must carry a positive `redactions_applied` count
-//!    OR an explicit `allow_unredacted` flag. The default is to
-//!    refuse, preserving the SUPPORT-001 invariant that no
+//! 1. **Refuses non-redacted input.** Every input blob carried by
+//!    the bundle must have a positive `redactions_applied` count OR
+//!    an explicit `allow_unredacted` flag. The default is to
+//!    refuse, preserving the support-bundle invariant that no
 //!    pre-redaction content escapes the customer's machine.
-//! 2. **Plan the minimisation.** Walk each input and emit a
-//!    `MinimizationPlan` describing the strategy — line-removal,
-//!    statement-removal, identifier-renaming — along with a
-//!    suggested ordinal for each step. The actual byte-level
-//!    minimisation isn't implemented here; the consumer drives the
-//!    plan via a separate worker.
+//! 2. **Emits a [`MinimizationPlan`].** For each input blob the
+//!    plan lists the canonical strategy sequence
+//!    ([`MinimizationStrategy`]) with stable ordinals. The plan is
+//!    a structural template — the strategy ordering does not vary
+//!    by input — and is intended for downstream consumers
+//!    (operators, ddmin workers, support tooling) that drive the
+//!    actual shrinking. Module-local shrinkers live in sibling
+//!    modules such as [`crate::shrink`] and [`crate::rename`].
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -83,10 +87,16 @@ pub enum MinimizationStrategy {
 const SCHEMA_ID: &str = "plsql.support.minimize_repro";
 const SCHEMA_VERSION: u32 = 1;
 
-/// Plan a minimisation pass over `bundle`. Refuses any input blob
-/// whose `redactions_applied == 0` unless `allow_unredacted` is
-/// `true`. Returns the plan or the first failing blob's name.
-pub fn plan_minimize(
+/// Emit the canonical minimisation-plan template for `bundle`.
+///
+/// Refuses any input blob whose `redactions_applied == 0` unless
+/// `allow_unredacted` is `true`; on refusal, returns the first
+/// failing blob's name. The returned [`MinimizationPlan`] is a
+/// content-independent template — for every accepted input the same
+/// fixed strategy ordering is emitted with stable ordinals — and is
+/// intended for downstream consumers (operators, ddmin workers)
+/// that drive the actual byte-level shrinking.
+pub fn minimize_repro_plan(
     bundle: &SupportBundle,
     allow_unredacted: bool,
 ) -> Result<MinimizationPlan, MinimizeError> {
@@ -101,7 +111,7 @@ pub fn plan_minimize(
         });
     }
 
-    let inputs = bundle.inputs.iter().map(plan_for_blob).collect();
+    let inputs = bundle.inputs.iter().map(canonical_plan_for_blob).collect();
 
     Ok(MinimizationPlan {
         schema_id: SCHEMA_ID.into(),
@@ -111,7 +121,13 @@ pub fn plan_minimize(
     })
 }
 
-fn plan_for_blob(blob: &NamedBlob) -> MinimizationInput {
+/// Build the canonical strategy sequence for a single blob.
+///
+/// The ordering is fixed and does not vary by `blob` content; the
+/// per-blob name / sha / redaction count are carried through so a
+/// downstream worker can route each step back to the originating
+/// input.
+fn canonical_plan_for_blob(blob: &NamedBlob) -> MinimizationInput {
     let steps = vec![
         MinimizationStep {
             ordinal: 1,
@@ -176,21 +192,21 @@ mod tests {
         let mut b = SupportBundleBuilder::new("1.0", "t", RedactionManifest::empty());
         b.operator_note("x").unwrap();
         let bundle = b.build();
-        let err = plan_minimize(&bundle, false).unwrap_err();
+        let err = minimize_repro_plan(&bundle, false).unwrap_err();
         assert_eq!(err, MinimizeError::NoInputs);
     }
 
     #[test]
     fn unredacted_input_rejected_by_default() {
         let bundle = bundle_with(vec![], "SELECT * FROM HR.EMPLOYEES");
-        let err = plan_minimize(&bundle, false).unwrap_err();
+        let err = minimize_repro_plan(&bundle, false).unwrap_err();
         assert!(matches!(err, MinimizeError::UnredactedInput { name } if name == "repro.sql"));
     }
 
     #[test]
     fn unredacted_input_allowed_with_override() {
         let bundle = bundle_with(vec![], "SELECT * FROM HR.EMPLOYEES");
-        let plan = plan_minimize(&bundle, true).unwrap();
+        let plan = minimize_repro_plan(&bundle, true).unwrap();
         assert_eq!(plan.inputs.len(), 1);
         assert!(plan.allow_unredacted);
     }
@@ -198,7 +214,7 @@ mod tests {
     #[test]
     fn redacted_input_accepted_without_override() {
         let bundle = bundle_with(vec![rule("HR.")], "SELECT * FROM HR.EMPLOYEES");
-        let plan = plan_minimize(&bundle, false).unwrap();
+        let plan = minimize_repro_plan(&bundle, false).unwrap();
         assert_eq!(plan.inputs.len(), 1);
         assert!(!plan.allow_unredacted);
         assert!(plan.inputs[0].redactions_applied > 0);
@@ -207,7 +223,7 @@ mod tests {
     #[test]
     fn plan_emits_five_steps_in_canonical_order() {
         let bundle = bundle_with(vec![rule("HR.")], "SELECT * FROM HR.EMPLOYEES");
-        let plan = plan_minimize(&bundle, false).unwrap();
+        let plan = minimize_repro_plan(&bundle, false).unwrap();
         let strategies: Vec<MinimizationStrategy> =
             plan.inputs[0].steps.iter().map(|s| s.strategy).collect();
         assert_eq!(
@@ -228,7 +244,7 @@ mod tests {
     #[test]
     fn plan_carries_schema_id_and_version() {
         let bundle = bundle_with(vec![rule("HR.")], "HR.X");
-        let plan = plan_minimize(&bundle, false).unwrap();
+        let plan = minimize_repro_plan(&bundle, false).unwrap();
         assert_eq!(plan.schema_id, "plsql.support.minimize_repro");
         assert_eq!(plan.schema_version, 1);
     }
@@ -243,14 +259,14 @@ mod tests {
         // Second blob has no HR. so no redactions hit it.
         b.add_input("b.sql", "SELECT 1 FROM dual");
         let bundle = b.build();
-        let err = plan_minimize(&bundle, false).unwrap_err();
+        let err = minimize_repro_plan(&bundle, false).unwrap_err();
         assert!(matches!(err, MinimizeError::UnredactedInput { name } if name == "b.sql"));
     }
 
     #[test]
     fn plan_serialises_round_trip() {
         let bundle = bundle_with(vec![rule("HR.")], "HR.X");
-        let plan = plan_minimize(&bundle, false).unwrap();
+        let plan = minimize_repro_plan(&bundle, false).unwrap();
         let json = serde_json::to_string(&plan).unwrap();
         let back: MinimizationPlan = serde_json::from_str(&json).unwrap();
         assert_eq!(back, plan);

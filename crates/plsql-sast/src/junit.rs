@@ -1,4 +1,4 @@
-//! JUnit XML output formatter (PLSQL-SAST-024).
+//! JUnit XML output formatter.
 //!
 //! Renders a [`ScanReport`](crate::ScanReport) as a JUnit-style
 //! XML document so SAST results show up in CI test panes

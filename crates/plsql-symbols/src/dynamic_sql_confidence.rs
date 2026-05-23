@@ -1,6 +1,6 @@
-//! Confidence scoring for dynamic-SQL edges (PLSQL-DEP-007).
+//! Confidence scoring for dynamic-SQL edges.
 //!
-//! A dynamic-SQL call site (recognised by PLSQL-SYM-005's
+//! A dynamic-SQL call site (recognised by 's
 //! [`DynamicSqlEvidence`]) yields candidate dependency edges, but
 //! how much the engine trusts those edges depends on *how*
 //! dynamic the statement is. This module maps a

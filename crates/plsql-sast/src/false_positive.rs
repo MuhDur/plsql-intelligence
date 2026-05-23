@@ -1,4 +1,4 @@
-//! False-positive measurement harness (PLSQL-SAST-027).
+//! False-positive measurement harness.
 //!
 //! A *negative corpus* is PL/SQL known to be clean for a given
 //! rule set. By definition **every** finding produced on it is a

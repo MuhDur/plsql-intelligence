@@ -1,4 +1,4 @@
-//! Scripted MCP client integration test (PLSQL-MCP-009).
+//! Scripted MCP client integration test.
 //!
 //! Drives `plsql-mcp` exactly as a real MCP client would — one
 //! newline-delimited JSON-RPC request at a time through
@@ -6,16 +6,16 @@
 //! tool surface, and golden-asserts the structural invariants of
 //! every response.
 //!
-//! "Golden snapshot" here follows the workspace idiom (see
-//! PLSQL-PARSE-014): deterministic structural assertions on the
-//! canonical JSON rather than an `insta` dependency. Every
+//! "Golden snapshot" here follows the workspace idiom:
+//! deterministic structural assertions on the canonical JSON rather
+//! than an `insta` dependency. Every
 //! invariant that must never silently regress is pinned:
 //! JSON-RPC framing, id echo, the MCP-007 trust block on every
 //! success, and the exact registered foundation tool set.
 
 use plsql_mcp::{
-    ToolRegistry, handle_request_line, register_analyze_project_tool, register_foundation_tools,
-    register_graph_tools,
+    ToolRegistry, default_tool_registry, handle_request_line, register_analyze_project_tool,
+    register_foundation_tools, register_graph_tools,
 };
 
 /// The foundation tool surface a scripted client should see.
@@ -115,6 +115,86 @@ fn responses_are_deterministic_across_runs() {
     let a = call(&reg, line);
     let b = call(&reg, line);
     assert_eq!(a, b, "identical request -> byte-identical response");
+}
+
+#[test]
+fn tools_call_parse_file_executes_a_real_tool_over_the_wire() {
+    // oracle-l65d: a `tools/call` for a self-contained static tool
+    // must reach the real `run_parse_file` and return a structured
+    // parse result over the wire — not a placeholder. This is the
+    // headline "fully wired" assertion, exercised through the exact
+    // `handle_request_line` path a real MCP client uses.
+    let reg = default_tool_registry();
+    let resp = call(
+        &reg,
+        concat!(
+            r#"{"jsonrpc":"2.0","id":50,"method":"tools/call","params":"#,
+            r#"{"name":"parse_file","arguments":"#,
+            r#"{"source":"CREATE OR REPLACE PACKAGE p AS PROCEDURE q; END;\n/\n"}}}"#,
+        ),
+    );
+    assert_eq!(resp["id"], 50);
+    assert!(resp["error"].is_null(), "parse_file must not error");
+    let result = &resp["result"];
+    assert_eq!(result["isError"], false);
+    // The real ParseFileResponse rode back in structuredContent.
+    assert!(
+        result["structuredContent"]["declaration_count"]
+            .as_u64()
+            .unwrap()
+            >= 1,
+        "real parser counted declarations: {result}"
+    );
+    // MCP-007 trust block still attached to the wired result.
+    assert_eq!(
+        result["meta"]["trust_block"]["schema_id"],
+        "plsql.mcp.trust_block"
+    );
+}
+
+#[test]
+fn tools_call_live_db_tool_returns_an_honest_gated_result_over_the_wire() {
+    // oracle-l65d: a live-DB tool (`query`) is wired — it dispatches
+    // — but with no connection it returns a typed, honest error
+    // result over the wire. Never a panic, never a fake success.
+    let reg = default_tool_registry();
+    let resp = call(
+        &reg,
+        concat!(
+            r#"{"jsonrpc":"2.0","id":51,"method":"tools/call","params":"#,
+            r#"{"name":"query","arguments":{"sql":"SELECT 1 FROM dual"}}}"#,
+        ),
+    );
+    assert_eq!(resp["id"], 51);
+    assert!(resp["error"].is_null(), "transport call itself succeeds");
+    assert_eq!(
+        resp["result"]["isError"], true,
+        "no connection => honest error result"
+    );
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_lowercase();
+    assert!(
+        text.contains("connection") || text.contains("live-db"),
+        "gated message names the missing runtime: {text}"
+    );
+}
+
+#[test]
+fn tools_call_bad_arguments_returns_invalid_params_over_the_wire() {
+    // oracle-l65d: un-deserializable arguments are a proper -32602
+    // JSON-RPC error, never a panic.
+    let reg = default_tool_registry();
+    let resp = call(
+        &reg,
+        concat!(
+            r#"{"jsonrpc":"2.0","id":52,"method":"tools/call","params":"#,
+            r#"{"name":"parse_file","arguments":{"source":99}}}"#,
+        ),
+    );
+    assert_eq!(resp["id"], 52);
+    assert_eq!(resp["error"]["code"], -32602);
 }
 
 #[test]

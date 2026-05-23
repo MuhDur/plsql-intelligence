@@ -1,7 +1,7 @@
 //! Named safety profiles for the live-DB tool surface (§13A.3).
 //!
-//! `PLSQL-MCP-001` introduced the [`SafetyProfile`] enum.
-//! `PLSQL-MCP-LIVE-008` adds the session-state surface that wraps it:
+//! introduced the [`SafetyProfile`] enum.
+//! adds the session-state surface that wraps it:
 //! [`SessionSafetyState`] tracks the active profile, the read-only-by-default
 //! posture, the active `enable_writes` token (single-use, time-limited per
 //! plan §13A.3), and the `permanently_read_only` hard guard.
@@ -103,8 +103,8 @@ pub struct SessionSafetyState {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EnableWritesToken {
     /// Opaque token string the operator inspects. Format is implementation-
-    /// defined; the bead skeleton uses a URL-safe random-looking string the
-    /// caller supplies.
+    /// defined; the reference implementation expects a URL-safe,
+    /// random-looking string supplied by the caller.
     pub token: String,
     /// Connection profile the token authorizes writes against.
     pub connection: String,

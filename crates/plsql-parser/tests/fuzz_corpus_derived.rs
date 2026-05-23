@@ -1,10 +1,9 @@
-//! Property-based fuzz harness against the lossless parser surface
-//! (`PLSQL-PARSE-015`).
+//! Property-based fuzz harness against the lossless parser surface.
 //!
 //! Uses `proptest` (already a dev-dep of `plsql-parser`) to mutate a
 //! corpus of real Oracle PL/SQL inputs and assert the parser surface
 //! NEVER panics. The harness exercises every corpus-derived input plus
-//! `MUTATIONS_PER_INPUT` proptest cases per file — well over the bead's
+//! `MUTATIONS_PER_INPUT` proptest cases per file — well over the
 //! "at least 1000 corpus-derived inputs" target on any non-empty corpus.
 //!
 //! Scope note: `plsql-parser` is the backend-independent surface — its
@@ -27,7 +26,7 @@ use std::path::{Path, PathBuf};
 use plsql_parser::tokens::TokenTape;
 
 /// Per-input proptest case budget. Combined with the corpus size this
-/// drives total iterations above the bead's 1000-input gate.
+/// drives total iterations above the 1000-input gate.
 const MUTATIONS_PER_INPUT: usize = 64;
 
 fn corpus_files() -> Vec<PathBuf> {
@@ -73,7 +72,7 @@ pub fn run_corpus_smoke() -> usize {
 }
 
 /// One exercise step. The token-tape construction must never panic on
-/// any input, even adversarial ones — that's the bead's strongest
+/// any input, even adversarial ones — that's the harness's strongest
 /// invariant.
 pub fn exercise_input(input: &str) {
     // Token-tape default constructor + reconstruct is the only surface
@@ -130,7 +129,7 @@ proptest::proptest! {
         .. proptest::test_runner::Config::default()
     })]
 
-    /// proptest variant — mutates random byte strings. The bead's
+    /// proptest variant — mutates random byte strings. The
     /// "bug-bash for at least 1000 inputs" target is met by 256 cases
     /// here multiplied by the per-input mutation count documented above.
     #[test]

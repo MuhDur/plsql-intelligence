@@ -185,6 +185,58 @@ fn path_query_human_output_reports_directed_chain() {
     assert!(stdout.contains("[2] Writes billing.claims -> billing.claim_audit"));
 }
 
+/// `plsql-depgraph doctor` (and `query` / `explain`) without
+/// `--graph` must teach the user how to produce a graph artifact,
+/// not just report that the arg is missing. The error wording is a
+/// stable agent-facing contract: regressing it back to a bare
+/// "missing required `--graph`" line silently breaks an agent that
+/// hits this code path and was relying on the canonical pipeline
+/// hint to recover.
+#[test]
+fn missing_graph_error_points_at_plsql_engine_analyze() {
+    for subcommand in [
+        vec!["doctor"],
+        vec!["query", "cycle-detect"],
+        vec!["explain", "--node-id", "1"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_plsql-depgraph"))
+            .args(&subcommand)
+            .output()
+            .expect("cli should run");
+
+        assert!(
+            !output.status.success(),
+            "subcommand {:?} should fail without --graph",
+            subcommand
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "subcommand {:?} should exit 2 (invocation failure); got {:?}",
+            subcommand,
+            output.status.code()
+        );
+        let stderr = String::from_utf8(output.stderr).expect("stderr should be utf-8");
+
+        // The original "missing required `--graph <PATH|->`" string
+        // is preserved (so consumers grepping for it still find it),
+        // but the message must ALSO point at how to produce the
+        // graph artifact.
+        assert!(
+            stderr.contains("--graph"),
+            "stderr should mention --graph; got: {stderr}"
+        );
+        assert!(
+            stderr.contains("plsql-engine analyze"),
+            "stderr should teach how to produce a graph artifact via `plsql-engine analyze`; got: {stderr}"
+        );
+        assert!(
+            stderr.contains("--out"),
+            "stderr should reference the --out flag that writes the AnalysisRun artifact; got: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn doctor_robot_json_reports_low_confidence_edge_inventory() {
     let graph_file = write_graph();

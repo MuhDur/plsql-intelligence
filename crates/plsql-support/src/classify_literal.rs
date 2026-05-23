@@ -1,4 +1,4 @@
-//! Literal classifier (PLSQL-SUPPORT-003).
+//! Literal classifier.
 //!
 //! Given the *value* of a string/numeric literal lifted out of PL/SQL
 //! source, decide what kind of thing it is: credential-like, SQL-like,

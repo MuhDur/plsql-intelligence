@@ -1,8 +1,8 @@
-//! Doctor subcommand for the CI/CD cascade (`PLSQL-CICD-009`).
+//! Doctor subcommand for the CI/CD cascade.
 //!
-//! Given a `ChangeSet` (optionally plus its `InvalidationPrediction` from
-//! `PLSQL-CICD-002`), the doctor emits a structured "customer changeset
-//! health" report: object counts by kind, predicted invalidations by
+//! Given a `ChangeSet` (optionally plus its `InvalidationPrediction`),
+//! the doctor emits a structured "customer changeset health" report:
+//! object counts by kind, predicted invalidations by
 //! reason, uncertainty inventory, deployment-risk classification, and a
 //! short list of remediation hints. The shape is designed so an MCP /
 //! CLI / HTML renderer can render the same data without re-deriving any

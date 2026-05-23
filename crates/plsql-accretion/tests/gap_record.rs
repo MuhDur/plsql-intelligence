@@ -1,4 +1,4 @@
-//! P1 acceptance tests for stage [A] (`PLSQL-USR-001`).
+//! P1 acceptance tests for stage [A].
 //!
 //! These are the spec's named gates; none may be weakened to pass.
 

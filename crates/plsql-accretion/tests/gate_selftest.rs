@@ -1,5 +1,5 @@
 //! `gate_selftest.rs` — THE adversarial trio (spec §3 "Adversarial
-//! self-test" + §8 "the single most important test"), PLSQL-USR-001
+//! self-test" + §8 "the single most important test")
 //! P4.
 //!
 //! These tests feed the **REAL** §3 gate (the exact
@@ -81,6 +81,12 @@ fn scoped_env<'a>(
         ("USR_GATE_FIXTURES_DIR", fixtures),
         ("USR_GATE_BASELINE", baseline),
         ("USR_GATE_ESTATE", estate_absent),
+        // Adversarial gate fixtures use the documented `true` /
+        // `touch` / `rm` hooks; opt in to the trusted-pin path
+        // so G9 actually executes the mutation-kill cycle on the
+        // good cases (oracle-k30w shell-injection guard otherwise
+        // refuses by default).
+        ("USR_GATE_TRUST_PINS", "1"),
     ]
 }
 

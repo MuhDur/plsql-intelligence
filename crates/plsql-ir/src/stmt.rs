@@ -1,9 +1,9 @@
-//! IR for PL/SQL statement bodies (PLSQL-IR-004).
+//! IR for PL/SQL statement bodies.
 //!
 //! Adds the [`Statement`] enum and a heuristic lowering pass that
 //! turns a raw statement-body source slice into a sequence of IR
 //! statements. The full AST→IR lowering will wire `lower_statement`
-//! against the actual parser tree once `PLSQL-PARSE-005` (statement-
+//! against the actual parser tree once (statement-
 //! body lowering in the parser) lands. Until then, this module
 //! ships:
 //!
@@ -40,12 +40,12 @@ pub enum Statement {
     Null,
     /// `target := expr;` — captures the LHS target name and the
     /// raw RHS expression text. Sub-expression lowering happens
-    /// in a later bead (`PLSQL-IR-005`).
+    /// in a later pass.
     Assignment { target: String, rhs_text: String },
     /// `IF cond THEN … [ELSIF …] [ELSE …] END IF;`. We capture the
     /// condition text per arm + the body source slice; full body
-    /// lowering re-enters `lower_statement_body` on each slice when
-    /// the parser bead wires it.
+    /// lowering re-enters `lower_statement_body` on each slice once
+    /// the parser wires it.
     If {
         arms: Vec<IfArm>,
         else_body_text: Option<String>,

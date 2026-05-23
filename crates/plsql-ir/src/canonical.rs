@@ -1,4 +1,4 @@
-//! IR canonicalization (PLSQL-IR-006).
+//! IR canonicalization.
 //!
 //! Walks an [`Expr`] / [`Statement`] tree and applies two
 //! normalising passes so downstream consumers (lineage, bindgen,
@@ -32,7 +32,7 @@
 //! * `LOW-LEVEL-CATALOGS.md` Data Dictionary View Families —
 //!   `ALL_OBJECTS` is the server-side authority for whether a
 //!   fully-qualified name actually exists; the offline canonicaliser
-//!   defers that cross-check to PLSQL-SYM-009.
+//!   defers that cross-check to a later stage.
 
 use serde::{Deserialize, Serialize};
 

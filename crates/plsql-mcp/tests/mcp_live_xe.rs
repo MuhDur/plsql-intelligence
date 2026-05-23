@@ -1,4 +1,4 @@
-//! Integration test: every live-DB tool E2E against Oracle XE 23ai (`PLSQL-MCP-LIVE-018`).
+//! Integration test: every live-DB tool E2E against Oracle XE 23ai.
 //!
 //! Gated behind the `live-xe` feature flag so the default test profile
 //! (no Docker, no `LD_LIBRARY_PATH`) doesn't try to reach a container that

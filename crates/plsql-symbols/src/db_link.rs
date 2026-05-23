@@ -1,4 +1,4 @@
-//! DB-link reference recording (PLSQL-SYM-004).
+//! DB-link reference recording.
 //!
 //! Oracle's database-link feature lets a PL/SQL routine reference
 //! an object in a remote database by appending `@<link_name>` to
@@ -21,7 +21,7 @@
 //!   the local PL/SQL compiler.
 //! * `LOW-LEVEL-CATALOGS.md` Data Dictionary View Families —
 //!   `ALL_DB_LINKS` is the local-side view that lists known
-//!   db-link names; a future bead can cross-check our recorded
+//!   db-link names; a later pass can cross-check our recorded
 //!   refs against it.
 
 use serde::{Deserialize, Serialize};

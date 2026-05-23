@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! `plsql-doc` — type definitions for the documentation generator (PLSQL-DOC-001).
+//! `plsql-doc` — type definitions for the documentation generator.
 //!
 //! These are the canonical types consumed by the documentation generator and any
 //! downstream report renderer. They are intentionally minimal at this layer; the

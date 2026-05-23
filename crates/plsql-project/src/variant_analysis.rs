@@ -1,11 +1,10 @@
-//! Variant-analysis mode for conditional-compilation regions
-//! (PLSQL-WS-010A).
+//! Variant-analysis mode for conditional-compilation regions.
 //!
-//! WS-010 ships a "selected source" view: a single profile drives a
-//! single preprocessor pass. WS-010A complements it with the
-//! "variant" view — every feasible combination of conditional
-//! branches gets its own selected source, so downstream
-//! lineage / impact analysis can report branch-specific edges.
+//! The base "selected source" view runs a single profile through a
+//! single preprocessor pass. The variant view complements it —
+//! every feasible combination of conditional branches gets its own
+//! selected source, so downstream lineage / impact analysis can
+//! report branch-specific edges.
 //!
 //! ## Strategy
 //!

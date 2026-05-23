@@ -1,8 +1,8 @@
-//! `get_object_source`, `get_clob`, and `get_errors` tools (`PLSQL-MCP-LIVE-007`).
+//! `get_object_source`, `get_clob`, and `get_errors` tools.
 //!
 //! All three are read-only ALL_*/USER_* queries. `get_object_source` and
 //! `get_clob` route their textual output through the same K18 sanitizer
-//! used by `query` (`PLSQL-MCP-LIVE-004`). `get_errors` returns a
+//! used by `query`. `get_errors` returns a
 //! structured shape from `USER_ERRORS` / `ALL_ERRORS` instead of free text
 //! so agents can reason about line / column / position numerically.
 

@@ -1362,8 +1362,8 @@ impl DepGraph {
     /// rows from `snapshot`, classifying each pair as a match,
     /// `OurExtra`, `OracleOnly`, `KindMismatch`, or `ExpectedGap`.
     ///
-    /// `PLSQL-DEP-014`. Used by:
-    /// - `lineage compare-oracle-deps` customer report (`LIN-016`)
+    /// Used by:
+    /// - `lineage compare-oracle-deps` customer report
     /// - completeness gates in `plsql-engine` doctor output
     #[must_use]
     #[instrument(level = "trace", skip(self, snapshot, interner))]
@@ -1375,7 +1375,7 @@ impl DepGraph {
         catalog_cross_check(self, snapshot, interner)
     }
 
-    /// Record a DB-link dependency edge (`PLSQL-DEP-008`).
+    /// Record a DB-link dependency edge.
     ///
     /// A `name@dblink` reference crosses into a remote database
     /// whose metadata is unreachable from offline analysis, so

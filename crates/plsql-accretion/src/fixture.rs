@@ -1,4 +1,4 @@
-//! Stage [B] — MINIMIZE + PRIVACY-PROVE (spec §2.2, `PLSQL-USR-001`).
+//! Stage [B] — MINIMIZE + PRIVACY-PROVE (spec §2.2).
 //!
 //! Turns a captured [`GapRecord`] plus the *original* span source
 //! into a [`MinFixture`]: the smallest synthetic `.sql` snippet that
@@ -516,11 +516,17 @@ fn privacy_residue_clean(original: &str, redacted: &str) -> bool {
         // An estate-class token MUST be a synthetic alias. The
         // synthetic for a string keeps its `'…'` delimiters and for
         // a quoted-id its `"…"`; strip those before the shape check.
+        //
+        // Numeric synthetics are EXACTLY the two fixed numerals
+        // `tokscrub::synthesise` emits for a `NumericLiteral` — `7`
+        // (integer subtype) and `7.0` (float subtype). There is no
+        // broad "any all-digits token" clause: an arbitrary all-digit
+        // numeral (a 16-digit card number, an SSN, an account id, a
+        // salary) is, by definition, an UN-scrubbed original numeral
+        // and must fail closed. If a future synthetic numeral shape
+        // is added to `synthesise`, enumerate it explicitly here.
         let body = text.trim_matches('\'').trim_matches('"');
-        let is_synth = is_synthetic_alias(body)
-            || body == "7"
-            || body == "7.0"
-            || (!body.is_empty() && body.chars().all(|c| c.is_ascii_digit() || c == '.'));
+        let is_synth = is_synthetic_alias(body) || body == "7" || body == "7.0";
         if !is_synth {
             // A surviving identifier / literal that is NOT a
             // synthetic alias is an original-byte leak. Fail closed.
@@ -540,7 +546,10 @@ fn privacy_residue_clean(original: &str, redacted: &str) -> bool {
 ///
 /// Both bodies are a one-way `sha256(salt ‖ class ‖ original)`
 /// truncation: the hex carries no original byte. Numeric synthetics
-/// (`7` / `7.0`) are pure digits and handled by the digit branch.
+/// are the two fixed literals `7` / `7.0` and are matched
+/// explicitly by the caller — there is deliberately no broad
+/// all-digits clause (an arbitrary all-digit numeral is an
+/// un-scrubbed original ⇒ fails the residue proof).
 #[must_use]
 fn is_synthetic_alias(w: &str) -> bool {
     if let Some(hex) = w.strip_prefix("id_") {
@@ -1048,6 +1057,36 @@ mod tests {
         let original = "select a from b";
         let redacted = "SELECT mysteryword FROM id_0123456789ab";
         assert!(!privacy_residue_clean(original, redacted));
+    }
+
+    #[test]
+    fn residue_scan_rejects_unscrubbed_card_number() {
+        // I-PRIVACY: `tokscrub::synthesise` only ever emits the fixed
+        // numerals `7` / `7.0` for a NumericLiteral. An all-digit
+        // multi-digit token (a 16-digit card number, an SSN, an
+        // account id) is therefore, by definition, an UN-scrubbed
+        // original numeral — it MUST fail the positive residue proof.
+        let original = "select pan from cards where pan = 4111111111111111";
+        let redacted = "SELECT id_0123456789ab FROM id_ffeeddccbbaa \
+                        WHERE id_aabbccddeeff = 4111111111111111";
+        assert!(
+            !privacy_residue_clean(original, redacted),
+            "an un-scrubbed 16-digit card number must fail the residue proof"
+        );
+    }
+
+    #[test]
+    fn residue_scan_rejects_unscrubbed_decimal_numeral() {
+        // A multi-digit decimal numeral (a salary, a balance) is also
+        // an un-scrubbed original — only the fixed `7.0` synthetic is
+        // a legitimate float alias.
+        let original = "select bal from acct where bal = 98765.43";
+        let redacted = "SELECT id_0123456789ab FROM id_ffeeddccbbaa \
+                        WHERE id_aabbccddeeff = 98765.43";
+        assert!(
+            !privacy_residue_clean(original, redacted),
+            "an un-scrubbed multi-digit decimal numeral must fail the residue proof"
+        );
     }
 
     #[test]

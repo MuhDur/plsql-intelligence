@@ -1,6 +1,6 @@
-//! P3 unit/integration tests (spec §2 step [C], §2.1, §4,
-//! `PLSQL-USR-001`): clustering/dedup, the append-only tamper-evident
-//! ledger, and the corpus-only accretion index.
+//! P3 unit/integration tests (spec §2 step [C], §2.1, §4):
+//! clustering/dedup, the append-only tamper-evident ledger, and
+//! the corpus-only accretion index.
 //!
 //! These do NOT touch the frozen `gap.rs` signature, the
 //! `SignatureOracle`, or `fixture.rs` scrub/privacy — they consume

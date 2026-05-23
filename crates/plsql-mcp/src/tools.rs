@@ -28,7 +28,7 @@ pub struct ToolDescriptor {
     pub summary: String,
 }
 
-/// Minimal registry that per-tool beads populate.
+/// Minimal registry that per-tool modules populate.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ToolRegistry {
     pub tools: Vec<ToolDescriptor>,

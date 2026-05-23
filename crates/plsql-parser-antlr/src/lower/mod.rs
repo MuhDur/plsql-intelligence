@@ -30,7 +30,10 @@ use plsql_parser::ast::{Ast, AstDecl, AstExpr, AstStatement, AstTypeDecl, Source
 /// preceded by `CREATE` are not yet recognized (that's PARSE-005+).
 pub fn lower_source(source: &str, file_id: FileId) -> Ast {
     let declarations = scan_declarations(source, file_id);
-    let total_len = source.len() as u32;
+    // Saturating cast (oracle-kxb3 sibling): the legacy `as u32`
+    // wraps for a >u32::MAX source, producing a tiny span that
+    // overlaps every diagnostic. Saturate to `u32::MAX`.
+    let total_len = u32::try_from(source.len()).unwrap_or(u32::MAX);
 
     let root = SourceFile {
         span: Span::new(
@@ -294,7 +297,7 @@ fn lower_type(
 /// mirrors the ANTLR `create_<obj>` rule-name shape so a
 /// text-scanner-path gap and a parse-tree-path gap for the *same*
 /// DDL class share the same `antlr_rule_path` (maximises dedup;
-/// `PLSQL-USR-001 §2.1`, I-PRIVACY).
+/// §2.1`, I-PRIVACY).
 const DDL_OBJECT_KEYWORDS: &[&str] = &[
     "TABLE",
     "INDEX",
@@ -513,7 +516,7 @@ fn lower_simple_ddl(
 /// plus `END IF` / `END LOOP` / `END CASE`). An inner semicolon
 /// inside *any* of those blocks therefore does not split the
 /// statement: the whole control-flow body stays one chunk so its
-/// nested DML is recovered intact (oracle-hbhm).
+/// nested DML is recovered intact.
 #[must_use]
 pub fn lower_statement_body(body: &str, file_id: FileId, base_offset: usize) -> Vec<AstStatement> {
     let mut out: Vec<AstStatement> = Vec::new();
@@ -916,9 +919,8 @@ fn split_top_level_bin<'a, 'b>(
 
 /// Lower a `CREATE TYPE` / collection / `TYPE … IS RECORD`
 /// source slice into the syntactic [`AstTypeDecl`]. Attribute /
-/// element / field text is kept raw for the bindgen layer
-/// (PLSQL-BG-003) to resolve. `Unknown` (R13) for anything
-/// unclassifiable.
+/// element / field text is kept raw for the bindgen layer to
+/// resolve. `Unknown` (R13) for anything unclassifiable.
 #[must_use]
 pub fn lower_type_decl(decl: &str, file_id: FileId, base_offset: usize) -> AstTypeDecl {
     let text = decl.trim();

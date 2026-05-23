@@ -1,15 +1,14 @@
 #![forbid(unsafe_code)]
 
 //! `plsql-sast` — static-analysis security rule engine
-//! (Layer 3, PLSQL-SAST-001).
+//! (Layer 3).
 //!
-//! This bead defines the rule-engine *contract*: the [`Rule`]
+//! This module defines the rule-engine *contract*: the [`Rule`]
 //! trait every check implements, the [`ScanContext`] a rule
 //! reads from, the [`Finding`] it emits, and the
 //! [`RuleSkippedDiagnostic`] it records when it cannot run
-//! soundly (R13 — no silent drops). Concrete rules
-//! (`PLSQL-SAST-002+`) implement `Rule`; the engine driver
-//! (`PLSQL-SAST-0xx`) walks a registry and aggregates results.
+//! soundly (R13 — no silent drops). Concrete rules implement
+//! `Rule`; the engine driver walks a registry and aggregates results.
 //!
 //! Layering: Layer 3 depends on Layer 2's `plsql-ir`
 //! (`FlowQuery`, `FactStore`) — never the reverse. The

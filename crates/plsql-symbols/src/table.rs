@@ -1,9 +1,9 @@
 //! Canonical store of [`Declaration`] values keyed by stable [`DeclId`].
 //!
-//! `PLSQL-SYM-001` scope: a data structure with append-only registration,
+//! Provides a data structure with append-only registration,
 //! random-access lookup, ordered iteration, and per-kind / per-name
-//! indices that downstream resolution passes (`PLSQL-SYM-002+`) will
-//! query. The DeclTable owns `DeclId` allocation; callers must register
+//! indices that downstream resolution passes can query. The
+//! DeclTable owns `DeclId` allocation; callers must register
 //! a declaration to obtain its identity rather than minting `DeclId`s
 //! themselves. Parents must be registered before their children so the
 //! `parent` reference inside each child's [`DeclCommon`] is already
@@ -103,8 +103,8 @@ impl DeclTable {
 
     /// Declarations sharing a given source name (case-folded `SymbolId`).
     ///
-    /// Overload resolution and shadowing rules are handled by later
-    /// resolution-strategy beads; this lookup is the raw input.
+    /// Overload resolution and shadowing rules are handled by the
+    /// resolution-strategy passes; this lookup is the raw input.
     #[must_use]
     #[instrument(level = "trace", skip(self))]
     pub fn by_name(&self, name: SymbolId) -> Vec<DeclId> {

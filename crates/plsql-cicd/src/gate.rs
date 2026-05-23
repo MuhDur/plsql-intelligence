@@ -1,4 +1,4 @@
-//! `gate <changeset>` (PLSQL-CICD-006).
+//! `gate <changeset>`.
 //!
 //! Applies a `.plsql-cicd-policy.toml` policy file to an
 //! [`InvalidationPrediction`] and decides whether the deployment
@@ -129,8 +129,8 @@ pub enum GateError {
     Parse(String),
 }
 
-/// Load a policy from a TOML string. The CLI bead (PLSQL-CICD-007)
-/// pairs this with a file reader.
+/// Load a policy from a TOML string. The CLI pairs this with a file
+/// reader.
 pub fn parse_policy(toml_text: &str) -> Result<GatePolicy, GateError> {
     toml::from_str(toml_text).map_err(|e| GateError::Parse(e.to_string()))
 }
@@ -165,7 +165,7 @@ pub struct PrComment {
     /// A single line summarising the decision. Safe to use as a PR
     /// check-run title (≤ 100 chars).
     pub headline: String,
-    /// Stable HTML marker the downstream comment-poster (`PLSQL-CICD-016`)
+    /// Stable HTML marker the downstream comment-poster
     /// keys on for idempotent updates: one comment per PR, edited in
     /// place across runs.
     pub html_marker: String,
@@ -270,18 +270,29 @@ pub fn run_gate(prediction: &InvalidationPrediction, policy: &GatePolicy) -> Gat
     let mut failures: Vec<GateFailure> = Vec::new();
 
     if let Some(cap) = policy.max_invalidations {
-        let observed = prediction.predicted_invalidations.len() as u32;
+        // **Saturating cast (oracle-kxb3).** `.len()` is `usize` and
+        // on 64-bit targets a >u32::MAX-item batch would wrap to a
+        // small u32 with the legacy `as u32` cast, silently bypassing
+        // the cap. Saturate to `u32::MAX` so the gate's safety logic
+        // still fires (the policy's `Option<u32>` cap is preserved
+        // for backward compatibility; widening it would change the
+        // serialized shape downstream callers depend on).
+        let observed = u32::try_from(prediction.predicted_invalidations.len())
+            .unwrap_or(u32::MAX);
         if observed > cap {
             failures.push(GateFailure::InvalidationsExceeded { cap, observed });
         }
     }
 
     for blocked in &policy.blocked_kinds {
-        let observed_count = prediction
-            .predicted_invalidations
-            .iter()
-            .filter(|p| p.object_type.eq_ignore_ascii_case(blocked))
-            .count() as u32;
+        let observed_count = u32::try_from(
+            prediction
+                .predicted_invalidations
+                .iter()
+                .filter(|p| p.object_type.eq_ignore_ascii_case(blocked))
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
         if observed_count > 0 {
             failures.push(GateFailure::BlockedKindHit {
                 kind: blocked.clone(),
@@ -292,11 +303,14 @@ pub fn run_gate(prediction: &InvalidationPrediction, policy: &GatePolicy) -> Gat
 
     if let Some(floor) = policy.min_confidence {
         let floor_level = floor.as_level();
-        let observed_count = prediction
-            .predicted_invalidations
-            .iter()
-            .filter(|p| confidence_below_floor(&p.confidence.level, floor_level))
-            .count() as u32;
+        let observed_count = u32::try_from(
+            prediction
+                .predicted_invalidations
+                .iter()
+                .filter(|p| confidence_below_floor(&p.confidence.level, floor_level))
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
         if observed_count > 0 {
             failures.push(GateFailure::ConfidenceBelowFloor {
                 floor,
@@ -306,11 +320,14 @@ pub fn run_gate(prediction: &InvalidationPrediction, policy: &GatePolicy) -> Gat
     }
 
     for blocked_reason in &policy.blocking_unknown_reasons {
-        let observed_count = prediction
-            .uncertainties
-            .iter()
-            .filter(|u| unknown_reason_name(&u.reason) == blocked_reason.as_str())
-            .count() as u32;
+        let observed_count = u32::try_from(
+            prediction
+                .uncertainties
+                .iter()
+                .filter(|u| unknown_reason_name(&u.reason) == blocked_reason.as_str())
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
         if observed_count > 0 {
             failures.push(GateFailure::BlockingUnknownReasonHit {
                 reason: blocked_reason.clone(),
@@ -642,6 +659,34 @@ mod tests {
         let a = serde_json::to_string(&render_pr_comment(&decision)).unwrap();
         let b = serde_json::to_string(&render_pr_comment(&decision)).unwrap();
         assert_eq!(a, b, "PR-comment envelope must be byte-stable");
+    }
+
+    /// **Saturating cast regression.** The four
+    /// `len()/count()` narrowings in [`run_gate`] used to be a plain
+    /// `as u32` cast — on a 64-bit target, a >u32::MAX-item batch
+    /// would wrap to a small u32 and silently bypass the cap. We
+    /// cannot allocate 4B items in a unit test; instead pin the
+    /// saturation arithmetic itself, which is the load-bearing piece
+    /// the fix replaces the truncating cast with.
+    #[test]
+    fn saturating_cast_does_not_wrap_at_u32_boundary() {
+        // 2^32 — the smallest usize that overflows u32.
+        let just_over: usize = (u32::MAX as usize).saturating_add(1);
+        // The legacy `as u32` cast wraps to 0 here; the fix saturates.
+        let saturated = u32::try_from(just_over).unwrap_or(u32::MAX);
+        assert_eq!(
+            saturated,
+            u32::MAX,
+            "the (u32::MAX + 1)-item case must saturate to u32::MAX, never wrap to 0"
+        );
+        // Equally explicit upper bound.
+        let saturated_max = u32::try_from(usize::MAX).unwrap_or(u32::MAX);
+        assert_eq!(saturated_max, u32::MAX);
+
+        // Sanity: in-range values still round-trip losslessly.
+        for n in [0_u32, 1, 100, u32::MAX] {
+            assert_eq!(u32::try_from(n as usize).unwrap_or(u32::MAX), n);
+        }
     }
 
     #[test]

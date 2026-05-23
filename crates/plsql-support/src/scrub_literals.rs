@@ -1,4 +1,4 @@
-//! Literal scrubbing pass (PLSQL-SUPPORT-013).
+//! Literal scrubbing pass.
 //!
 //! Walks PL/SQL source text and replaces every long string literal,
 //! numeric literal, and date literal with a placeholder. Used after

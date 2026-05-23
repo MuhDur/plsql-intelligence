@@ -1,11 +1,11 @@
-//! End-to-end test (`PLSQL-DOC-012`).
+//! End-to-end test.
 //!
 //! Walks every `.pks` / `.pkb` fixture under `corpus/synthetic/` and
 //! `corpus/lab/`, extracts doc-comments, builds a synthetic `DocSet`,
 //! renders the full bundle, and asserts:
 //!
 //! 1. At least 30 packages are present in aggregate
-//!    (the bead's floor — `verify impact(table) ⊇ expected_set`-style
+//!    (the contract floor — `verify impact(table) ⊇ expected_set`-style
 //!    bar but for doc coverage).
 //! 2. The full HTML bundle contains exactly one `<article>` per
 //!    documented object (no duplicates).

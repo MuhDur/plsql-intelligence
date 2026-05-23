@@ -1,4 +1,4 @@
-//! Privilege-ambiguity feed (PLSQL-PRIV-002).
+//! Privilege-ambiguity feed.
 //!
 //! The privilege resolver ([`crate::resolve_privileges`]) records two
 //! kinds of "can't decide statically" outcome:

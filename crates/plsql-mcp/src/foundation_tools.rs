@@ -1,4 +1,4 @@
-//! Foundation tools (PLSQL-MCP-006): `dynamic_sql_evidence`,
+//! Foundation tools: `dynamic_sql_evidence`,
 //! `completeness_report`, `doc_lookup`.
 //!
 //! All three are pure, read-only, no-live-DB foundation-static

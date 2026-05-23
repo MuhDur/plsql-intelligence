@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 //! `usr-loop` — the USR (Uncertainty-Sourced Repair) loop
-//! orchestrator (`PLSQL-USR-001`, through Phase P6).
+//! orchestrator (through Phase P6).
 //!
 //! Subcommands (stages [A]–[G], spec §2):
 //!
@@ -15,7 +15,7 @@
 //! * `land <candidate> --fixture <min.sql>` — [F]: gate-prove then
 //!   atomically land (apply + corpus pin + exactly one ledger entry,
 //!   `signature → commit` rollback anchor) OR [F'] quarantine on
-//!   REJECT (provenanced bead; gate never weakened).
+//!   REJECT (provenanced record; gate never weakened).
 //! * `ledger {append|verify|index|tripwire}` — the append-only
 //!   content-addressed Ledger + the §4 monotonic accretion tripwire.
 //! * `doctor` — crate/schema versions + dependency posture (R11).
@@ -48,17 +48,31 @@ use plsql_accretion::{
 use plsql_engine::{AnalysisRequest, analyze_project};
 use plsql_output::{RobotJsonEnvelope, SchemaDescriptor, SchemaVersion};
 
-/// USR loop orchestrator (PLSQL-USR-001).
+/// USR loop orchestrator.
 #[derive(Parser, Debug)]
-#[command(name = "usr-loop", version, about, long_about = None)]
+#[command(
+    name = "usr-loop",
+    version,
+    about,
+    long_about = None,
+    after_help = "DISCOVERY:\n  usr-loop capabilities     machine-readable agent contract (JSON)\n  usr-loop robot-docs       agent handbook — start here if you are an AI\n  usr-loop --robot-triage   one-shot bootstrap (capabilities + health + quick_ref)"
+)]
 struct Cli {
     /// Emit a single-line machine-readable robot-JSON envelope
     /// (R10). Default is a pretty multi-line envelope.
     #[arg(long, global = true)]
     robot_json: bool,
 
+    /// One-shot agent bootstrap. Emits a single JSON mega-object
+    /// {capabilities, health, quick_ref} on stdout and exits — short-
+    /// circuits any subcommand. Exit 0 normally; exit 2 if the doctor
+    /// reports a blocker. Mirrors the `plsql-mcp --robot-triage` shape
+    /// so agents can use the same bootstrap recipe for every CLI.
+    #[arg(long, global = true)]
+    robot_triage: bool,
+
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -70,7 +84,7 @@ enum Command {
         /// byte is ever copied out).
         estate_path: PathBuf,
     },
-    /// Scan → capture → minimise → **cluster/dedup** an estate and
+    /// Scan → capture → minimise → cluster/dedup an estate and
     /// emit the deduped `GapCluster` batch (stage [C], spec §2).
     Cluster {
         /// Path to the estate / project root (read-in-place; no
@@ -112,12 +126,12 @@ enum Command {
         /// Path to the candidate diff to gate.
         candidate_diff: PathBuf,
     },
-    /// **Stage [F] LAND** (spec §2[F], §10 P6). Run the REAL §3 gate
+    /// Stage [F] LAND (spec §2[F], §10 P6). Run the REAL §3 gate
     /// on a proposed candidate; on ACCEPT apply it, add the MinFixture
     /// to the committed regression corpus + a pinned test, append
     /// EXACTLY ONE content-addressed ledger entry (signature→commit
     /// for `git revert` rollback). On REJECT → [F'] quarantine: a
-    /// provenanced bead naming the failing stage; NOT landed, gate
+    /// provenanced record naming the failing stage; NOT landed, gate
     /// NEVER weakened. Exit 0 = landed; 3 = quarantined (spec-correct,
     /// not a bug); 4 = gate sha-pin abort; 9 = I-PRIVACY abort.
     Land {
@@ -133,6 +147,16 @@ enum Command {
     /// Report crate/schema versions and dependency posture (R11).
     /// Exit 2 on any blocker.
     Doctor,
+    /// Print the machine-readable agent contract (binary, version,
+    /// subcommands, exit-code dictionary, global flags, stdout
+    /// contract) as JSON and exit. An agent should read this instead
+    /// of guessing the surface. Use `--robot-json` for compact
+    /// single-line output.
+    Capabilities,
+    /// Print a paste-ready agent handbook to stdout: what usr-loop is,
+    /// how to drive stages [A]–[G], the exit-code dictionary, and
+    /// explicit pointers to `capabilities` / `doctor` / `--robot-triage`.
+    RobotDocs,
 }
 
 /// Versioned robot-JSON schema for a [`GateOutcome`]
@@ -143,6 +167,23 @@ const GATE_OUTCOME_SCHEMA: SchemaDescriptor = SchemaDescriptor {
     version: SchemaVersion::new(1, 0, 0),
     description: "USR §3 conformance-gate verdict — fail-closed, sha-pinned (PLSQL-USR-001)",
 };
+
+/// Versioned robot-JSON schema for a structured CLI error envelope
+/// (`plsql.usr.error_envelope` v1). Emitted on stdout (matching the
+/// success-envelope contract) in `--robot-json` mode for every error
+/// path so `usr-loop --robot-json … | jq .` pipelines do not break.
+/// The matching human-readable diagnostic is still echoed to stderr.
+const ERROR_ENVELOPE_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+    id: "plsql.usr.error_envelope",
+    version: SchemaVersion::new(1, 0, 0),
+    description: "USR runtime error envelope — code, message, optional path/remediation",
+};
+
+/// Stable contract version for the `capabilities` payload. Bump only on
+/// a breaking change to the JSON shape; the pinned regression test
+/// (`capabilities_contract_is_pinned`) will fail if the shape drifts
+/// without this being bumped.
+const CAPABILITIES_CONTRACT_VERSION: u32 = 1;
 
 /// Versioned robot-JSON schema for a [`plsql_accretion::LandReceipt`]
 /// / quarantine outcome (`plsql.usr.land_outcome` v1). Mirrors the
@@ -164,14 +205,14 @@ enum LedgerAction {
     },
     /// Verify the full tamper-evident hash chain. Exit 1 if broken.
     Verify,
-    /// Recompute and print the §4 accretion index from a **public
-    /// corpus** scan (never the private estate) and append it nowhere — it
+    /// Recompute and print the §4 accretion index from a public
+    /// corpus scan (never the private estate) and append it nowhere — it
     /// is a pure, reproducible read.
     Index {
         /// Public benchmark corpus root (e.g. `corpus/synthetic`).
         corpus_path: PathBuf,
     },
-    /// **§4 monotonic tripwire** (spec §4, §1 I-MONOTONIC-VALUE).
+    /// §4 monotonic tripwire (spec §4, §1 I-MONOTONIC-VALUE).
     /// Compute `coverage_index` over the frozen public benchmark set
     /// (never the private estate) PLUS `distinct_resolved_gap_signatures` from
     /// the provenance Ledger, append it to the append-only
@@ -194,7 +235,25 @@ enum LedgerAction {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match cli.command {
+
+    // --robot-triage short-circuits any subcommand: emit the mega
+    // bootstrap object (capabilities + health + quick_ref) and exit
+    // before evaluating the subcommand. Mirrors the plsql-mcp shape.
+    if cli.robot_triage {
+        return run_robot_triage(cli.robot_json);
+    }
+
+    let Some(command) = cli.command else {
+        // Bare invocation: usr-loop with no subcommand. Print help to
+        // stderr and exit 2 — keep stdout pure for `--robot-json` pipes.
+        eprintln!(
+            "usr-loop: no subcommand given — try `usr-loop scan <estate>`, `usr-loop doctor`, or `usr-loop --robot-triage`."
+        );
+        eprintln!("run `usr-loop --help` for the full subcommand list.");
+        return ExitCode::from(2);
+    };
+
+    match command {
         Command::Scan { estate_path } => run_scan(&estate_path, cli.robot_json),
         Command::Cluster { estate_path } => run_cluster(&estate_path, cli.robot_json),
         Command::Propose {
@@ -211,14 +270,316 @@ fn main() -> ExitCode {
         Command::Gate { candidate_diff } => run_gate_cmd(&candidate_diff, cli.robot_json),
         Command::Land { candidate, fixture } => run_land_cmd(&candidate, &fixture, cli.robot_json),
         Command::Doctor => run_doctor(cli.robot_json),
+        Command::Capabilities => run_capabilities(cli.robot_json),
+        Command::RobotDocs => {
+            print!("{}", robot_docs_text());
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+/// Emit a structured error envelope to stdout in `--robot-json` mode
+/// (so `usr-loop --robot-json … | jq .` pipelines see structured
+/// output instead of an empty stdout). The human-readable diagnostic
+/// is ALWAYS echoed to stderr — agents and humans both see something.
+/// `code` is a short stable token (e.g. `"estate_not_found"`); the
+/// schema is `plsql.usr.error_envelope` v1.
+fn emit_error_envelope(
+    robot_json: bool,
+    code: &str,
+    message: &str,
+    path: Option<&Path>,
+    remediation: Option<&str>,
+) {
+    eprintln!("usr-loop: {message}");
+    if !robot_json {
+        return;
+    }
+    let payload = serde_json::json!({
+        "kind": "error",
+        "code": code,
+        "message": message,
+        "path": path.map(|p| p.display().to_string()),
+        "remediation": remediation,
+    });
+    let env = RobotJsonEnvelope::new(ERROR_ENVELOPE_SCHEMA, payload);
+    if let Ok(s) = serde_json::to_string(&env) {
+        println!("{s}");
+    }
+}
+
+/// Build the `capabilities` contract document. Factored out so the
+/// schema can be pinned by a unit test without spawning the binary.
+fn capabilities_json() -> serde_json::Value {
+    serde_json::json!({
+        "binary": "usr-loop",
+        "contract_version": CAPABILITIES_CONTRACT_VERSION,
+        "version": env!("CARGO_PKG_VERSION"),
+        "global_flags": {
+            "--robot-json": "emit a single-line machine-readable robot-JSON envelope on stdout instead of human-readable text; diagnostics always on stderr",
+            "--robot-triage": "one-shot bootstrap: emit {capabilities, health, quick_ref} on stdout and exit; exit 2 if doctor reports a blocker"
+        },
+        "subcommands": {
+            "scan": "stage [A]+[B]: analyze read-in-place + capture honest-uncertainty gaps + privacy-prove MinFixtures; emit plsql.usr.gap_record v1",
+            "cluster": "stage [C]: deduped GapCluster batch (plsql.usr.gap_cluster v1)",
+            "propose": "stage [D]: CandidateDiff (never applied) or honest unrepairable refusal (spec §7)",
+            "gate": "stage [E]: content-pinned §3 conformance gate (fail-closed, sha-pinned)",
+            "land": "stage [F]: gate-prove then atomically land OR quarantine on REJECT (spec §7 [F'])",
+            "ledger": "append-only content-addressed Ledger ops {append|verify|index|tripwire}",
+            "doctor": "crate/schema versions + dependency posture; exit 2 on blocker",
+            "capabilities": "print this machine-readable agent contract as JSON and exit",
+            "robot-docs": "print a paste-ready agent handbook to stdout (plain text)"
+        },
+        "schemas": {
+            "gap_record":     { "id": GAP_RECORD_SCHEMA.id,     "version": GAP_RECORD_SCHEMA.version.to_string() },
+            "gap_cluster":    { "id": GAP_CLUSTER_SCHEMA.id,    "version": GAP_CLUSTER_SCHEMA.version.to_string() },
+            "candidate_diff": { "id": CANDIDATE_DIFF_SCHEMA.id, "version": CANDIDATE_DIFF_SCHEMA.version.to_string() },
+            "gate_outcome":   { "id": GATE_OUTCOME_SCHEMA.id,   "version": GATE_OUTCOME_SCHEMA.version.to_string() },
+            "land_outcome":   { "id": LAND_OUTCOME_SCHEMA.id,   "version": LAND_OUTCOME_SCHEMA.version.to_string() },
+            "error_envelope": { "id": ERROR_ENVELOPE_SCHEMA.id, "version": ERROR_ENVELOPE_SCHEMA.version.to_string() }
+        },
+        "exit_codes": {
+            "0": "success (incl. `propose` honest unrepairable refusal — spec §7, not a failure)",
+            "1": "runtime error (engine analyze failed, serialization failed, bad path)",
+            "2": "doctor blocker / bare invocation (no subcommand) / --robot-triage blocker",
+            "3": "gate REJECT / land quarantined (spec §7 [F'] — NOT landed, gate not weakened)",
+            "4": "gate sha-pin mismatch or script missing (immutability abort)",
+            "9": "gate/land I-PRIVACY abort (G8 estate-byte leak; nothing persisted)"
+        },
+        "stdout_contract": "stdout is data only; all diagnostics (and error envelopes are mirrored here as well as stdout) go to stderr"
+    })
+}
+
+/// Build the agent handbook as a `String`. Factored out for unit tests.
+fn robot_docs_text() -> String {
+    format!(
+        r#"# usr-loop agent handbook
+
+## What is usr-loop?
+usr-loop (v{version}) is the USR (Uncertainty-Sourced Repair) loop
+orchestrator. It walks stages [A]–[G]: analyze an Oracle estate
+read-in-place, capture honest-uncertainty gaps, minimise + privacy-prove
+MinFixtures, cluster/dedup, propose a candidate repair, gate it through
+the content-pinned §3 conformance gate, and land OR quarantine. No
+estate byte is ever copied out; every artifact is content-addressed
+and provenanced through the append-only Ledger.
+
+## How an agent should drive usr-loop
+1. Bootstrap (one round-trip):     usr-loop --robot-triage
+   Returns JSON {{capabilities, health, quick_ref}}. Parse it.
+   Exit 2 means a blocker — do not proceed.
+2. Full contract:                   usr-loop capabilities
+   Versioned agent contract (JSON). Pin `contract_version`; bump
+   signals a breaking shape change.
+3. Health check:                    usr-loop doctor --robot-json
+   Returns the doctor JSON {{schemas, dependency_posture, blockers}}.
+4. Stages [A]-[F]:
+   usr-loop scan     <estate>                                 # capture gaps
+   usr-loop cluster  <estate>                                 # dedup
+   usr-loop propose  <estate> [--cluster-id <sig>]            # candidate
+   usr-loop gate     <candidate.json>                         # §3 gate
+   usr-loop land     <candidate.json> --fixture <min.sql>     # land/quarantine
+5. Ledger:                          usr-loop ledger {{append|verify|index|tripwire}} …
+6. Handbook (this text):            usr-loop robot-docs
+
+## Robot-JSON envelope shape
+Every robot-JSON response is a versioned envelope:
+  {{
+    "format":         "plsql-robot-json",
+    "schema_id":      "plsql.usr.<surface>",
+    "schema_version": {{ "major": N, "minor": N, "patch": N }},
+    "payload":        {{ ... }}
+  }}
+Parse `schema_id` + `schema_version` before trusting the payload.
+
+## Error envelope (robot-json mode)
+On every runtime error path under `--robot-json`, a single-line
+`plsql.usr.error_envelope` v1 object is also emitted on stdout so
+`| jq .` pipelines never see an empty stdout. The same human-readable
+diagnostic is echoed to stderr.
+  payload = {{ "kind": "error", "code": "<token>", "message": "<text>",
+               "path": "<path?>", "remediation": "<hint?>" }}
+
+## Exit-code dictionary
+  0  success (incl. `propose` honest unrepairable refusal — spec §7)
+  1  runtime error (engine analyze failed, serialization failed, bad path)
+  2  doctor blocker / bare invocation / --robot-triage blocker
+  3  gate REJECT / land quarantined (spec §7 [F'] — NOT landed)
+  4  gate sha-pin mismatch or script missing (immutability abort)
+  9  gate/land I-PRIVACY abort (G8 leak; nothing persisted)
+
+## Global flags
+  --robot-json     compact single-line JSON envelopes on stdout
+  --robot-triage   one-shot bootstrap (capabilities + health + quick_ref)
+
+## Discovery
+  usr-loop capabilities             machine-readable agent contract
+  usr-loop robot-docs               this handbook
+  usr-loop --help                   full subcommand reference
+"#,
+        version = env!("CARGO_PKG_VERSION"),
+    )
+}
+
+fn run_capabilities(robot_json: bool) -> ExitCode {
+    let doc = capabilities_json();
+    let rendered = if robot_json {
+        serde_json::to_string(&doc)
+    } else {
+        serde_json::to_string_pretty(&doc)
+    };
+    match rendered {
+        Ok(s) => {
+            println!("{s}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            emit_error_envelope(
+                robot_json,
+                "serialize_failed",
+                &format!("capabilities serialization failed: {e}"),
+                None,
+                None,
+            );
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Build the doctor JSON report (extracted so `--robot-triage` can
+/// embed it without re-printing). Returns (report, blocker_count).
+fn doctor_report_json() -> (serde_json::Value, usize) {
+    // P1 dependency posture: the crate depends only on
+    // plsql-core/-engine/-output (R20, one-directional). No blocker
+    // condition exists in P1 (capture is infallible by construction).
+    let blockers: Vec<&str> = Vec::new();
+    let report = serde_json::json!({
+        "tool": "usr-loop",
+        "version": env!("CARGO_PKG_VERSION"),
+        "library": "plsql-accretion",
+        "phase": "P6",
+        "schema": {
+            "gap_record":  { "id": GAP_RECORD_SCHEMA.id,  "version": GAP_RECORD_SCHEMA.version.to_string() },
+            "gap_cluster": { "id": GAP_CLUSTER_SCHEMA.id, "version": GAP_CLUSTER_SCHEMA.version.to_string() },
+        },
+        "subcommands": ["scan", "cluster", "propose", "ledger {append|verify|index|tripwire}", "gate", "land", "doctor", "capabilities", "robot-docs"],
+        "candidate_diff_schema": {
+            "id": CANDIDATE_DIFF_SCHEMA.id,
+            "version": CANDIDATE_DIFF_SCHEMA.version.to_string(),
+        },
+        "gate": {
+            "script": plsql_accretion::GATE_SCRIPT_REL,
+            "sha_manifest": plsql_accretion::GATE_SHA256_PATH,
+            "stages": plsql_accretion::GATE_STAGES,
+            "schema": {
+                "id": GATE_OUTCOME_SCHEMA.id,
+                "version": GATE_OUTCOME_SCHEMA.version.to_string(),
+            },
+        },
+        "dependency_posture": {
+            "layer": 5,
+            "depends_on": [
+                "plsql-core", "plsql-engine", "plsql-output",
+                "plsql-parser", "plsql-parser-antlr", "plsql-support",
+            ],
+            "one_directional": true,
+            "reverse_deps": 0,
+        },
+        "exit_codes": {
+            "0": "success (incl. `propose` honest unrepairable refusal — spec §7, not a failure)",
+            "1": "runtime error",
+            "2": "doctor blocker (degraded posture)",
+            "3": "gate REJECT / land quarantined (spec §7 [F'] — NOT landed, gate not weakened; spec-correct, not a bug)",
+            "4": "gate sha-pin mismatch or script missing (immutability abort)",
+            "9": "gate/land I-PRIVACY abort (G8 leak; nothing persisted)",
+        },
+        "blockers": blockers,
+        "status": if blockers.is_empty() { "ok" } else { "degraded" },
+    });
+    (report, blockers.len())
+}
+
+/// `--robot-triage` mega-bootstrap. Emit a single object combining
+/// capabilities + health + quick_ref. Exit 2 if doctor reports a
+/// blocker (same convention as `plsql-mcp --robot-triage`).
+fn run_robot_triage(robot_json: bool) -> ExitCode {
+    let (health, blocker_count) = doctor_report_json();
+    let quick_ref = serde_json::json!([
+        {
+            "description": "bootstrap (capabilities + health + quick_ref in one call)",
+            "invocation": "usr-loop --robot-triage"
+        },
+        {
+            "description": "full versioned agent contract",
+            "invocation": "usr-loop capabilities"
+        },
+        {
+            "description": "machine-readable health check",
+            "invocation": "usr-loop doctor --robot-json"
+        },
+        {
+            "description": "stage [A]+[B] — capture gaps + privacy-prove fixtures",
+            "invocation": "usr-loop --robot-json scan <estate>"
+        },
+        {
+            "description": "stage [C] — deduped clusters",
+            "invocation": "usr-loop --robot-json cluster <estate>"
+        },
+        {
+            "description": "stage [D] — propose candidate diff (never applied)",
+            "invocation": "usr-loop --robot-json propose <estate>"
+        },
+        {
+            "description": "stage [E] — run §3 conformance gate on a candidate",
+            "invocation": "usr-loop --robot-json gate <candidate.json>"
+        },
+        {
+            "description": "stage [F] — land or quarantine a candidate (spec §7 [F'])",
+            "invocation": "usr-loop --robot-json land <candidate.json> --fixture <min.sql>"
+        },
+        {
+            "description": "append-only Ledger ops",
+            "invocation": "usr-loop --robot-json ledger {append|verify|index|tripwire} ..."
+        }
+    ]);
+    let mega = serde_json::json!({
+        "capabilities": capabilities_json(),
+        "health": health,
+        "quick_ref": quick_ref,
+    });
+    let rendered = if robot_json {
+        serde_json::to_string(&mega)
+    } else {
+        serde_json::to_string_pretty(&mega)
+    };
+    match rendered {
+        Ok(s) => println!("{s}"),
+        Err(e) => {
+            emit_error_envelope(
+                robot_json,
+                "serialize_failed",
+                &format!("robot-triage serialization failed: {e}"),
+                None,
+                None,
+            );
+            return ExitCode::from(1);
+        }
+    }
+    if blocker_count > 0 {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
 fn run_scan(estate_path: &Path, robot_json: bool) -> ExitCode {
     if !estate_path.exists() {
-        eprintln!(
-            "usr-loop: estate path does not exist: {}",
-            estate_path.display()
+        emit_error_envelope(
+            robot_json,
+            "estate_not_found",
+            &format!("estate path does not exist: {}", estate_path.display()),
+            Some(estate_path),
+            Some("pass an existing PL/SQL estate or project root"),
         );
         return ExitCode::from(1);
     }
@@ -235,7 +596,13 @@ fn run_scan(estate_path: &Path, robot_json: bool) -> ExitCode {
     let run = match analyze_project(req) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("usr-loop: engine analyze failed: {e}");
+            emit_error_envelope(
+                robot_json,
+                "engine_analyze_failed",
+                &format!("engine analyze failed: {e}"),
+                Some(estate_path),
+                None,
+            );
             return ExitCode::from(1);
         }
     };
@@ -265,7 +632,13 @@ fn run_scan(estate_path: &Path, robot_json: bool) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("usr-loop: gap-record serialization failed: {e}");
+            emit_error_envelope(
+                robot_json,
+                "serialize_failed",
+                &format!("gap-record serialization failed: {e}"),
+                Some(estate_path),
+                None,
+            );
             ExitCode::from(1)
         }
     }
@@ -277,11 +650,15 @@ fn run_scan(estate_path: &Path, robot_json: bool) -> ExitCode {
 /// runtime error (already reported to stderr) with the exit code.
 fn scan_and_minimize(
     estate_path: &Path,
+    robot_json: bool,
 ) -> Result<(Vec<plsql_accretion::GapRecord>, String, PathBuf), ExitCode> {
     if !estate_path.exists() {
-        eprintln!(
-            "usr-loop: estate path does not exist: {}",
-            estate_path.display()
+        emit_error_envelope(
+            robot_json,
+            "estate_not_found",
+            &format!("estate path does not exist: {}", estate_path.display()),
+            Some(estate_path),
+            Some("pass an existing PL/SQL estate or project root"),
         );
         return Err(ExitCode::from(1));
     }
@@ -293,7 +670,13 @@ fn scan_and_minimize(
     let run = match analyze_project(req) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("usr-loop: engine analyze failed: {e}");
+            emit_error_envelope(
+                robot_json,
+                "engine_analyze_failed",
+                &format!("engine analyze failed: {e}"),
+                Some(estate_path),
+                None,
+            );
             return Err(ExitCode::from(1));
         }
     };
@@ -305,7 +688,7 @@ fn scan_and_minimize(
 }
 
 fn run_cluster(estate_path: &Path, robot_json: bool) -> ExitCode {
-    let (records, _run_id, repo_root) = match scan_and_minimize(estate_path) {
+    let (records, _run_id, repo_root) = match scan_and_minimize(estate_path, robot_json) {
         Ok(v) => v,
         Err(code) => return code,
     };
@@ -325,7 +708,13 @@ fn run_cluster(estate_path: &Path, robot_json: bool) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("usr-loop: gap-cluster serialization failed: {e}");
+            emit_error_envelope(
+                robot_json,
+                "serialize_failed",
+                &format!("gap-cluster serialization failed: {e}"),
+                Some(estate_path),
+                None,
+            );
             ExitCode::from(1)
         }
     }
@@ -349,7 +738,7 @@ fn select_cluster<'a>(
 }
 
 /// `usr-loop propose` — stage [D]. Scan→cluster the estate, select a
-/// cluster, run the **deterministic stub proposer**, and emit the
+/// cluster, run the deterministic stub proposer, and emit the
 /// CandidateDiff (or the honest `unrepairable` refusal, spec §7).
 /// NEVER applies the diff (landing is P6).
 fn run_propose(
@@ -358,17 +747,23 @@ fn run_propose(
     _from_scan: bool,
     robot_json: bool,
 ) -> ExitCode {
-    let (records, run_id, repo_root) = match scan_and_minimize(estate_path) {
+    let (records, run_id, repo_root) = match scan_and_minimize(estate_path, robot_json) {
         Ok(v) => v,
         Err(code) => return code,
     };
     let sizes = fixture_sizes_from_store(&repo_root);
     let clusters = cluster_gaps_with(&records, DEFAULT_MAX_REPRESENTATIVES, &sizes);
     let Some(target) = select_cluster(&clusters, cluster_id) else {
-        eprintln!(
-            "usr-loop: no cluster matched (clusters={}, selector={:?})",
-            clusters.len(),
-            cluster_id
+        emit_error_envelope(
+            robot_json,
+            "no_cluster_matched",
+            &format!(
+                "no cluster matched (clusters={}, selector={:?})",
+                clusters.len(),
+                cluster_id
+            ),
+            Some(estate_path),
+            Some("omit --cluster-id to propose for the highest-occurrence cluster, or rescan and pick a frozen signature prefix from `usr-loop cluster <estate>`"),
         );
         return ExitCode::from(1);
     };
@@ -421,7 +816,7 @@ fn ledger_dir() -> PathBuf {
 fn run_ledger(action: LedgerAction, robot_json: bool) -> ExitCode {
     match action {
         LedgerAction::Append { estate_path } => {
-            let (records, run_id, repo_root) = match scan_and_minimize(&estate_path) {
+            let (records, run_id, repo_root) = match scan_and_minimize(&estate_path, robot_json) {
                 Ok(v) => v,
                 Err(code) => return code,
             };
@@ -430,7 +825,13 @@ fn run_ledger(action: LedgerAction, robot_json: bool) -> ExitCode {
             let ledger = match Ledger::open(ledger_dir()) {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!("usr-loop: ledger open failed: {e}");
+                    emit_error_envelope(
+                        robot_json,
+                        "ledger_open_failed",
+                        &format!("ledger open failed: {e}"),
+                        None,
+                        None,
+                    );
                     return ExitCode::from(1);
                 }
             };
@@ -438,7 +839,13 @@ fn run_ledger(action: LedgerAction, robot_json: bool) -> ExitCode {
             for c in &clusters {
                 let body = LedgerBody::from_cluster(&run_id, c);
                 if let Err(e) = ledger.append(body) {
-                    eprintln!("usr-loop: ledger append failed: {e}");
+                    emit_error_envelope(
+                        robot_json,
+                        "ledger_append_failed",
+                        &format!("ledger append failed: {e}"),
+                        None,
+                        None,
+                    );
                     return ExitCode::from(1);
                 }
                 appended += 1;
@@ -456,7 +863,13 @@ fn run_ledger(action: LedgerAction, robot_json: bool) -> ExitCode {
             let ledger = match Ledger::open(ledger_dir()) {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!("usr-loop: ledger open failed: {e}");
+                    emit_error_envelope(
+                        robot_json,
+                        "ledger_open_failed",
+                        &format!("ledger open failed: {e}"),
+                        None,
+                        None,
+                    );
                     return ExitCode::from(1);
                 }
             };
@@ -506,9 +919,15 @@ fn run_tripwire(
 ) -> ExitCode {
     use plsql_accretion::{AccretionLedger, BenchmarkRecord, Ledger, compute_accretion_index};
     if !corpus_path.exists() {
-        eprintln!(
-            "usr-loop: benchmark corpus path does not exist: {}",
-            corpus_path.display()
+        emit_error_envelope(
+            robot_json,
+            "corpus_not_found",
+            &format!(
+                "benchmark corpus path does not exist: {}",
+                corpus_path.display()
+            ),
+            Some(corpus_path),
+            Some("pass a frozen public benchmark corpus root (e.g. corpus/synthetic)"),
         );
         return ExitCode::from(1);
     }
@@ -522,7 +941,13 @@ fn run_tripwire(
     let run = match analyze_project(req) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("usr-loop: engine analyze failed: {e}");
+            emit_error_envelope(
+                robot_json,
+                "engine_analyze_failed",
+                &format!("engine analyze failed: {e}"),
+                Some(corpus_path),
+                None,
+            );
             return ExitCode::from(1);
         }
     };
@@ -531,7 +956,13 @@ fn run_tripwire(
     let ledger = match Ledger::open(ledger_dir()) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("usr-loop: ledger open failed: {e}");
+            emit_error_envelope(
+                robot_json,
+                "ledger_open_failed",
+                &format!("ledger open failed: {e}"),
+                None,
+                None,
+            );
             return ExitCode::from(1);
         }
     };
@@ -547,7 +978,13 @@ fn run_tripwire(
             v
         }
         Err(e) => {
-            eprintln!("usr-loop: ledger read failed: {e}");
+            emit_error_envelope(
+                robot_json,
+                "ledger_read_failed",
+                &format!("ledger read failed: {e}"),
+                None,
+                None,
+            );
             return ExitCode::from(1);
         }
     };
@@ -564,13 +1001,25 @@ fn run_tripwire(
     let acc = match AccretionLedger::open(ledger_dir()) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("usr-loop: accretion ledger open failed: {e}");
+            emit_error_envelope(
+                robot_json,
+                "accretion_ledger_open_failed",
+                &format!("accretion ledger open failed: {e}"),
+                None,
+                None,
+            );
             return ExitCode::from(1);
         }
     };
     let entries_before = acc.iter().map(|v| v.len()).unwrap_or(0);
     if let Err(e) = acc.append(git_ref, index.clone()) {
-        eprintln!("usr-loop: accretion ledger append failed: {e}");
+        emit_error_envelope(
+            robot_json,
+            "accretion_ledger_append_failed",
+            &format!("accretion ledger append failed: {e}"),
+            None,
+            None,
+        );
         return ExitCode::from(1);
     }
     // 4. Monotonic assertion vs the baseline ref.
@@ -620,13 +1069,16 @@ fn run_tripwire(
     exit
 }
 
-/// Compute the §4 accretion index from a **public corpus** scan
+/// Compute the §4 accretion index from a public corpus scan
 /// (never the private estate — the metric must be reproducible by anyone).
 fn run_index(corpus_path: &Path, robot_json: bool) -> ExitCode {
     if !corpus_path.exists() {
-        eprintln!(
-            "usr-loop: corpus path does not exist: {}",
-            corpus_path.display()
+        emit_error_envelope(
+            robot_json,
+            "corpus_not_found",
+            &format!("corpus path does not exist: {}", corpus_path.display()),
+            Some(corpus_path),
+            Some("pass a public benchmark corpus root (e.g. corpus/synthetic)"),
         );
         return ExitCode::from(1);
     }
@@ -638,7 +1090,13 @@ fn run_index(corpus_path: &Path, robot_json: bool) -> ExitCode {
     let run = match analyze_project(req) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("usr-loop: engine analyze failed: {e}");
+            emit_error_envelope(
+                robot_json,
+                "engine_analyze_failed",
+                &format!("engine analyze failed: {e}"),
+                Some(corpus_path),
+                None,
+            );
             return ExitCode::from(1);
         }
     };
@@ -683,7 +1141,13 @@ fn print_json(value: &serde_json::Value, robot_json: bool) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("usr-loop: serialization failed: {e}");
+            emit_error_envelope(
+                robot_json,
+                "serialize_failed",
+                &format!("serialization failed: {e}"),
+                None,
+                None,
+            );
             ExitCode::from(1)
         }
     }
@@ -697,9 +1161,12 @@ fn print_json(value: &serde_json::Value, robot_json: bool) -> ExitCode {
 fn run_gate_cmd(candidate: &Path, robot_json: bool) -> ExitCode {
     let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     if !candidate.is_file() {
-        eprintln!(
-            "usr-loop: candidate diff not found: {}",
-            candidate.display()
+        emit_error_envelope(
+            robot_json,
+            "candidate_not_found",
+            &format!("candidate diff not found: {}", candidate.display()),
+            Some(candidate),
+            Some("first run `usr-loop --robot-json propose <estate>` to emit a candidate JSON"),
         );
         return ExitCode::from(3);
     }
@@ -744,9 +1211,12 @@ fn run_gate_cmd(candidate: &Path, robot_json: bool) -> ExitCode {
 fn run_land_cmd(candidate_path: &Path, fixture_path: &Path, robot_json: bool) -> ExitCode {
     let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let Ok(raw) = std::fs::read_to_string(candidate_path) else {
-        eprintln!(
-            "usr-loop: candidate not readable: {}",
-            candidate_path.display()
+        emit_error_envelope(
+            robot_json,
+            "candidate_not_readable",
+            &format!("candidate not readable: {}", candidate_path.display()),
+            Some(candidate_path),
+            None,
         );
         return ExitCode::from(1);
     };
@@ -755,12 +1225,24 @@ fn run_land_cmd(candidate_path: &Path, fixture_path: &Path, robot_json: bool) ->
     let candidate: CandidateDiff = match parse_candidate(&raw) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("usr-loop: cannot parse candidate diff: {e}");
+            emit_error_envelope(
+                robot_json,
+                "candidate_parse_failed",
+                &format!("cannot parse candidate diff: {e}"),
+                Some(candidate_path),
+                None,
+            );
             return ExitCode::from(1);
         }
     };
     let Ok(fixture_src) = std::fs::read_to_string(fixture_path) else {
-        eprintln!("usr-loop: fixture not readable: {}", fixture_path.display());
+        emit_error_envelope(
+            robot_json,
+            "fixture_not_readable",
+            &format!("fixture not readable: {}", fixture_path.display()),
+            Some(fixture_path),
+            None,
+        );
         return ExitCode::from(1);
     };
     let fixture = LandFixture {
@@ -887,62 +1369,9 @@ fn emit_envelope(
 }
 
 fn run_doctor(robot_json: bool) -> ExitCode {
-    // P1 dependency posture: the crate depends only on
-    // plsql-core/-engine/-output (R20, one-directional). No blocker
-    // condition exists in P1 (capture is infallible by
-    // construction), so doctor reports a healthy posture and exits
-    // 0. The exit-2 path is wired and documented for the phases
-    // that add fallible subsystems (gate, ledger).
-    let report = serde_json::json!({
-        "tool": "usr-loop",
-        "version": env!("CARGO_PKG_VERSION"),
-        "library": "plsql-accretion",
-        "phase": "P6",
-        "schema": {
-            "gap_record": {
-                "id": GAP_RECORD_SCHEMA.id,
-                "version": GAP_RECORD_SCHEMA.version.to_string(),
-            },
-            "gap_cluster": {
-                "id": GAP_CLUSTER_SCHEMA.id,
-                "version": GAP_CLUSTER_SCHEMA.version.to_string(),
-            },
-        },
-        "subcommands": ["scan", "cluster", "propose", "ledger {append|verify|index|tripwire}", "gate", "land", "doctor"],
-        "candidate_diff_schema": {
-            "id": CANDIDATE_DIFF_SCHEMA.id,
-            "version": CANDIDATE_DIFF_SCHEMA.version.to_string(),
-        },
-        "gate": {
-            "script": plsql_accretion::GATE_SCRIPT_REL,
-            "sha_manifest": plsql_accretion::GATE_SHA256_PATH,
-            "stages": plsql_accretion::GATE_STAGES,
-            "schema": {
-                "id": GATE_OUTCOME_SCHEMA.id,
-                "version": GATE_OUTCOME_SCHEMA.version.to_string(),
-            },
-        },
-        "dependency_posture": {
-            "layer": 5,
-            "depends_on": [
-                "plsql-core", "plsql-engine", "plsql-output",
-                "plsql-parser", "plsql-parser-antlr", "plsql-support",
-            ],
-            "one_directional": true,
-            "reverse_deps": 0,
-        },
-        "exit_codes": {
-            "0": "success (incl. `propose` honest unrepairable refusal — spec §7, not a failure)",
-            "1": "runtime error",
-            "2": "doctor blocker (degraded posture)",
-            "3": "gate REJECT / land quarantined (spec §7 [F'] — NOT landed, gate not weakened; spec-correct, not a bug)",
-            "4": "gate sha-pin mismatch or script missing (immutability abort)",
-            "9": "gate/land I-PRIVACY abort (G8 leak; nothing persisted)",
-        },
-        "blockers": [],
-        "status": "ok",
-    });
-
+    // Reuse the shared `doctor_report_json` helper so the `doctor`
+    // subcommand and the `--robot-triage` mega-call cannot diverge.
+    let (report, blocker_count) = doctor_report_json();
     let rendered = if robot_json {
         serde_json::to_string(&report)
     } else {
@@ -951,11 +1380,210 @@ fn run_doctor(robot_json: bool) -> ExitCode {
     match rendered {
         Ok(s) => {
             println!("{s}");
-            ExitCode::SUCCESS
+            if blocker_count > 0 {
+                ExitCode::from(2)
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         Err(e) => {
-            eprintln!("usr-loop: doctor serialization failed: {e}");
+            emit_error_envelope(
+                robot_json,
+                "serialize_failed",
+                &format!("doctor serialization failed: {e}"),
+                None,
+                None,
+            );
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Drift-guard for the `capabilities` agent contract. If the JSON
+    /// shape changes, this test must be updated AND
+    /// `CAPABILITIES_CONTRACT_VERSION` bumped — that coupling is the
+    /// whole point: an agent that pinned the contract should never be
+    /// silently surprised by a shape change.
+    #[test]
+    fn capabilities_contract_is_pinned() {
+        let c = capabilities_json();
+        assert_eq!(c["binary"], "usr-loop");
+        assert_eq!(c["contract_version"], CAPABILITIES_CONTRACT_VERSION);
+        assert_eq!(c["version"], env!("CARGO_PKG_VERSION"));
+        for key in [
+            "global_flags",
+            "subcommands",
+            "schemas",
+            "exit_codes",
+            "stdout_contract",
+        ] {
+            assert!(c.get(key).is_some(), "capabilities missing key `{key}`");
+        }
+        let subs = c["subcommands"].as_object().unwrap();
+        for required in [
+            "scan",
+            "cluster",
+            "propose",
+            "gate",
+            "land",
+            "ledger",
+            "doctor",
+            "capabilities",
+            "robot-docs",
+        ] {
+            assert!(
+                subs.contains_key(required),
+                "missing subcommand `{required}`"
+            );
+        }
+        // Exit-code dictionary must cover at least every code the CLI returns.
+        for code in ["0", "1", "2", "3", "4", "9"] {
+            assert!(
+                c["exit_codes"][code].is_string(),
+                "exit_codes missing `{code}`"
+            );
+        }
+        // Schema descriptors must include the error envelope schema so
+        // agents can pin the error shape.
+        assert!(c["schemas"]["error_envelope"]["id"].is_string());
+    }
+
+    #[test]
+    fn capabilities_is_single_line_in_robot_mode() {
+        let s = serde_json::to_string(&capabilities_json()).unwrap();
+        assert!(!s.contains('\n'), "robot-json must be single-line");
+        let round: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(round["binary"], "usr-loop");
+    }
+
+    #[test]
+    fn robot_docs_mentions_canonical_anchors() {
+        let docs = robot_docs_text();
+        for required in [
+            "capabilities",
+            "doctor",
+            "--robot-triage",
+            "--robot-json",
+            "error_envelope",
+        ] {
+            assert!(
+                docs.contains(required),
+                "robot-docs must mention `{required}`"
+            );
+        }
+    }
+
+    /// Capabilities subcommand list must match the `Command` enum
+    /// variants — any new variant that is NOT added to
+    /// `capabilities_json` will be caught here.
+    #[test]
+    fn capabilities_subcommand_set_matches_clap() {
+        let cap_keys: std::collections::BTreeSet<String> = capabilities_json()["subcommands"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        let mut clap_names: std::collections::BTreeSet<String> = Cli::command()
+            .get_subcommands()
+            .map(|s| s.get_name().to_string())
+            .collect();
+        // `help` is auto-injected by clap; do not require it in the
+        // capabilities document.
+        clap_names.remove("help");
+        assert_eq!(
+            cap_keys, clap_names,
+            "capabilities subcommands must match clap enum variants"
+        );
+    }
+
+    /// `--robot-triage` output must be a single object with the three
+    /// top-level keys and the embedded capabilities must agree with
+    /// the standalone `capabilities` surface.
+    #[test]
+    fn robot_triage_payload_shape() {
+        let (health, _blockers) = doctor_report_json();
+        let mega = serde_json::json!({
+            "capabilities": capabilities_json(),
+            "health": health,
+            "quick_ref": serde_json::Value::Array(vec![]),
+        });
+        let s = serde_json::to_string(&mega).unwrap();
+        let round: serde_json::Value = serde_json::from_str(&s).unwrap();
+        for key in ["capabilities", "health", "quick_ref"] {
+            assert!(round.get(key).is_some(), "triage missing `{key}`");
+        }
+        assert_eq!(round["capabilities"]["binary"], "usr-loop");
+        assert_eq!(round["health"]["tool"], "usr-loop");
+    }
+
+    /// Drift-guard for the `plsql.usr.error_envelope` v1 shape. An
+    /// agent that pins this schema must never be surprised by a
+    /// silent shape change.
+    #[test]
+    fn error_envelope_shape_is_pinned() {
+        let payload = serde_json::json!({
+            "kind": "error",
+            "code": "estate_not_found",
+            "message": "estate path does not exist: /nonexistent",
+            "path": "/nonexistent",
+            "remediation": "pass an existing PL/SQL estate or project root",
+        });
+        let env = RobotJsonEnvelope::new(ERROR_ENVELOPE_SCHEMA, payload);
+        let s = serde_json::to_string(&env).unwrap();
+        // Single-line JSON (robot-mode invariant).
+        assert!(!s.contains('\n'));
+        let round: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(round["format"], "plsql-robot-json");
+        assert_eq!(round["schema_id"], "plsql.usr.error_envelope");
+        assert_eq!(round["schema_version"]["major"], 1);
+        assert_eq!(round["payload"]["kind"], "error");
+        assert_eq!(round["payload"]["code"], "estate_not_found");
+        assert!(round["payload"]["message"].is_string());
+    }
+
+    /// Help text rendered by clap for the top-level subcommand
+    /// summary must NOT contain literal Markdown bold markers
+    /// (`**foo**`) — clap renders them verbatim in plain TTY output,
+    /// producing noisy `**Stage [F] LAND**` tokens.
+    #[test]
+    fn clap_help_is_markdown_free() {
+        let mut cmd = Cli::command();
+        let mut buf = Vec::new();
+        cmd.write_long_help(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            !text.contains("**"),
+            "clap help must not leak Markdown bold markers (`**`):\n{text}"
+        );
+    }
+
+    /// Clap's built-in suggestions must give a "did you mean" hint
+    /// for a near-miss like `--robotjson`. This is on by default in
+    /// clap v4 but the test pins it so a future Cargo dep bump that
+    /// disables it does not silently regress agent UX.
+    #[test]
+    fn clap_typo_suggests_robot_json() {
+        let err = Cli::try_parse_from(["usr-loop", "--robotjson", "doctor"]).unwrap_err();
+        let s = err.to_string();
+        assert!(
+            s.contains("--robot-json") || s.contains("similar"),
+            "clap should suggest --robot-json for --robotjson typo; got: {s}"
+        );
+    }
+
+    #[test]
+    fn clap_typo_suggests_subcommand() {
+        let err = Cli::try_parse_from(["usr-loop", "doctorx"]).unwrap_err();
+        let s = err.to_string();
+        assert!(
+            s.contains("doctor") || s.contains("similar"),
+            "clap should suggest `doctor` for `doctorx` typo; got: {s}"
+        );
     }
 }

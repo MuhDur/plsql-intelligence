@@ -1,4 +1,4 @@
-//! Layering shim for fact emission (PLSQL-FACT-002 support).
+//! Layering shim for fact emission (support).
 //!
 //! `plsql-symbols::DeclTable` is the real declaration source,
 //! but `plsql-symbols` depends on `plsql-ir` — not the reverse.

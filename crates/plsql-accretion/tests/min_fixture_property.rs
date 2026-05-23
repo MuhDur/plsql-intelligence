@@ -1,4 +1,4 @@
-//! P2 property test (spec §8 property row, `PLSQL-USR-001`).
+//! P2 property test (spec §8 property row).
 //!
 //! For arbitrary synthetic inputs that produce a repairable
 //! `GapRecord`, `build_min_fixture` either returns a fixture that is

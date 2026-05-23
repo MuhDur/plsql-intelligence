@@ -1,10 +1,10 @@
-//! Object-page renderer for packages (`PLSQL-DOC-004`).
+//! Object-page renderer for packages.
 //!
 //! Emits Markdown and HTML object pages from a [`ObjectDoc`]. The
 //! Markdown variant is the primary surface — downstream Docusaurus
-//! export (`PLSQL-DOC-009`) consumes the same string. The HTML variant
-//! is a deliberately minimal renderer suitable for `plsql-doc --serve`
-//! (`PLSQL-DOC-010`); rich templating lands later.
+//! export consumes the same string. The HTML variant is a
+//! deliberately minimal renderer suitable for `plsql-doc --serve`;
+//! rich templating lands later.
 //!
 //! Conventions:
 //!
@@ -23,7 +23,7 @@ use crate::{DocComment, ObjectDoc};
 /// Dispatch to the right renderer for the object's `kind`. Tables,
 /// views, triggers, sequences, and similar SQL objects route through
 /// [`render_sql_object_markdown`]; packages fall through to
-/// [`render_package_markdown`]. (PLSQL-DOC-005 / oracle-dvj)
+/// [`render_package_markdown`].
 #[must_use]
 pub fn render_object_markdown(doc: &ObjectDoc) -> String {
     match doc.kind.as_str() {
@@ -34,8 +34,7 @@ pub fn render_object_markdown(doc: &ObjectDoc) -> String {
     }
 }
 
-/// HTML dispatch analogue of [`render_object_markdown`]
-/// (PLSQL-DOC-005 / oracle-dvj).
+/// HTML dispatch analogue of [`render_object_markdown`].
 #[must_use]
 pub fn render_object_html(doc: &ObjectDoc) -> String {
     match doc.kind.as_str() {
@@ -52,7 +51,6 @@ pub fn render_object_html(doc: &ObjectDoc) -> String {
 /// section headings (`## Columns`, `## Indexes`, `## Constraints`,
 /// `## Triggers` — surfaced from tagged comments when present).
 ///
-/// (PLSQL-DOC-005 / oracle-dvj.)
 #[must_use]
 pub fn render_sql_object_markdown(doc: &ObjectDoc) -> String {
     let mut out = String::new();
@@ -124,8 +122,7 @@ pub fn render_sql_object_markdown(doc: &ObjectDoc) -> String {
     out
 }
 
-/// HTML analogue of [`render_sql_object_markdown`]
-/// (PLSQL-DOC-005 / oracle-dvj).
+/// HTML analogue of [`render_sql_object_markdown`].
 #[must_use]
 pub fn render_sql_object_html(doc: &ObjectDoc) -> String {
     let mut out = String::new();
@@ -411,7 +408,7 @@ pub fn render_package_markdown(doc: &ObjectDoc) -> String {
 
 /// Render an [`ObjectDoc`] as a minimal HTML object page. Embeds the
 /// Markdown rendering inline as an `<article>` with manual HTML escape;
-/// rich templating belongs to a future bead (`PLSQL-DOC-009`/`010`).
+/// rich templating is reserved for a later pass.
 #[must_use]
 pub fn render_package_html(doc: &ObjectDoc) -> String {
     let mut out = String::new();

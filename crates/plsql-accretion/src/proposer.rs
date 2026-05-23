@@ -1,5 +1,4 @@
-//! `proposer.rs` — stage [D] PATCH PROPOSER (spec §2[D], §10 P5,
-//! `PLSQL-USR-001`).
+//! `proposer.rs` — stage [D] PATCH PROPOSER (spec §2[D], §10 P5).
 //!
 //! Given a [`GapCluster`] (+ its representative MinFixtures + the
 //! originating `estate_run_id` for provenance), a [`PatchProposer`]
@@ -39,10 +38,17 @@
 //! gate-runnable candidate for the realistic top private-estate gap classes (or
 //! honestly REFUSES — `unrepairable` — per §7 when no honest
 //! deterministic candidate exists; a refusal is correct behavior, not
-//! a failure). [`LlmProposer`] is the same trait behind a
-//! [`CompletionBackend`] abstraction so it is testable WITHOUT
-//! network (inject a canned backend); the production backend is a
-//! documented integration point that shells a local model CLI.
+//! a failure). It is the proposer every USR-loop CLI uses.
+//!
+//! [`LlmProposer`] is the **optional, bring-your-own-backend** path:
+//! the same [`PatchProposer`] trait, with the model call abstracted
+//! behind a [`CompletionBackend`] so the proposer itself stays
+//! network-free and deterministically testable. It is not the default
+//! and is not wired into any CLI. Two backends ship in-tree:
+//! [`CannedBackend`] (fixed reply, for tests) and [`SubprocessBackend`]
+//! (the production integration point — it shells any model CLI on the
+//! host, prompt on stdin, reply on stdout). See [`SubprocessBackend`]
+//! for a worked wiring example; this crate ships no network code.
 
 use plsql_output::{RobotJsonEnvelope, SchemaDescriptor, SchemaVersion};
 use serde::{Deserialize, Serialize};
@@ -88,8 +94,8 @@ pub const R20_PATH_PREFIXES: &[&str] = &[
 #[derive(Debug, Error)]
 pub enum ProposerError {
     /// No honest deterministic candidate exists for this cluster. The
-    /// caller treats this as an `unrepairable`-for-now bead (spec
-    /// §7) — a correct refusal, **not** a failure (R13 / §9).
+    /// caller treats this as `unrepairable`-for-now (spec §7) —
+    /// a correct refusal, **not** a failure (R13 / §9).
     #[error(
         "no honest deterministic candidate for cluster {signature}: {reason} — filed unrepairable (spec §7, not a failure)"
     )]
@@ -304,8 +310,8 @@ pub trait PatchProposer {
     /// `estate_run_id`, the engine is at `commit`).
     ///
     /// # Errors
-    /// [`ProposerError::Unrepairable`] (honest refusal — file an
-    /// `unrepairable` bead, spec §7), [`ProposerError::R20Violation`]
+    /// [`ProposerError::Unrepairable`] (honest refusal — file as
+    /// `unrepairable`, spec §7), [`ProposerError::R20Violation`]
     /// (the proposer's own out-of-scope output, rejected before the
     /// gate), or a serialization error.
     fn propose(
@@ -556,6 +562,14 @@ impl PatchProposer for DeterministicStubProposer {
         // proves for real (revert ⇒ test must FAIL ⇒ mutation-killed).
         // The marker file is content-addressed by signature so two
         // candidates never collide (I-DETERMINISM, hermetic).
+        // The marker lives under `.usr/` (a repo-root directory the
+        // gate's working dir guarantees — `usr-loop scan` creates it
+        // before any gate run, and hermetic tests pre-create it next
+        // to their `corpus/` and `fixtures/` dirs). Keeping the
+        // marker inside `.usr/` lets each pinning hook be a SINGLE
+        // simple command (no `&&`-chains), so it clears the G9
+        // shell-allowlist (oracle-k30w) without any unsafe
+        // metacharacters.
         let test_marker = format!(
             ".usr/usr_pin_{}",
             &cluster.signature[..16.min(cluster.signature.len())]
@@ -570,11 +584,11 @@ impl PatchProposer for DeterministicStubProposer {
             // removes it ⇒ `cmd` FAILs ⇒ the test is genuinely
             // mutation-killed (spec §3.G9 — never vacuous). `restore`
             // re-establishes the patched state so the gate leaves a
-            // clean tree.
-            setup: format!("mkdir -p .usr && touch \"{test_marker}\""),
-            cmd: format!("test -f \"{test_marker}\""),
-            revert: format!("rm -f \"{test_marker}\""),
-            restore: format!("mkdir -p .usr && touch \"{test_marker}\""),
+            // clean tree. Each hook is a single allowlisted program.
+            setup: format!("touch {test_marker}"),
+            cmd: format!("test -f {test_marker}"),
+            revert: format!("rm -f {test_marker}"),
+            restore: format!("touch {test_marker}"),
         };
 
         // Extraction story (D3 inequality, kept honest by
@@ -641,14 +655,41 @@ impl PatchProposer for DeterministicStubProposer {
 }
 
 // =====================================================================
-// LlmProposer — same trait, model call abstracted behind a backend so
-// it is testable WITHOUT network (spec §10 P5 "real and pluggable").
+// LlmProposer — the OPTIONAL, bring-your-own-backend proposer. The
+// model call is abstracted behind a [`CompletionBackend`] so the
+// proposer itself stays network-free and deterministically testable
+// (spec §10 P5 "real and pluggable").
+//
+// ## Status: optional path — NOT the default, NOT wired into any CLI
+//
+// The default, network-free proposer is [`DeterministicStubProposer`];
+// every USR-loop CLI (`usr-loop propose`) uses it. `LlmProposer` is the
+// opt-in path for callers who want a model in the loop. Two backends
+// ship in-tree:
+//
+// * [`CannedBackend`] — a fixed-reply backend for tests / replay.
+// * [`SubprocessBackend`] — the **production integration point**: it
+//   shells any model CLI on the host, piping the repair prompt to the
+//   process's stdin and reading the reply from its stdout. Point it at
+//   `ollama run <model>`, `llm`, `llamafile`, or your own wrapper.
+//
+// Wiring a model is therefore a two-liner — see [`SubprocessBackend`]
+// for a worked example. There is no network code in this crate: the
+// integration is process-level, the model lives entirely behind the
+// CLI you name.
 // =====================================================================
 
-/// The model-call abstraction. Production wires a backend that shells
-/// a local model CLI (documented integration point); tests inject a
-/// canned deterministic backend. **No network in tests or the
-/// default path** — the default proposer is the stub, never the LLM.
+/// The model-call abstraction. The proposer is generic over this trait
+/// so it never itself talks to a network or a process — a backend does.
+///
+/// Implementors that ship here:
+/// * [`CannedBackend`] — fixed reply, for tests / deterministic replay.
+/// * [`SubprocessBackend`] — shells a model CLI (the production path).
+///
+/// Bring-your-own: implement this trait over any client (an in-process
+/// model, an HTTP call, a different IPC) and hand it to
+/// [`LlmProposer::new`]. The proposer holds it to the **identical**
+/// R20 + D3 honesty bar the stub meets.
 pub trait CompletionBackend {
     /// Given a fully-formed repair prompt, return the model's raw
     /// reply. `Err` ⇒ the proposer refuses (fail-closed).
@@ -679,6 +720,107 @@ impl CompletionBackend for CannedBackend {
     }
 }
 
+/// **The production [`CompletionBackend`] integration point.** Shells
+/// an arbitrary model CLI on the host: the repair prompt is written to
+/// the child's stdin, the reply is read from its stdout. Any non-zero
+/// exit, an un-spawnable binary, or non-UTF-8 output is a fail-closed
+/// `Err` — the proposer maps it to a refusal, never a fabricated
+/// candidate.
+///
+/// This crate ships **no** network code: the model runs entirely
+/// behind whatever CLI you name, so the integration surface is a
+/// single process boundary you fully control.
+///
+/// # Wiring a model (the worked example the trait doc promises)
+///
+/// ```no_run
+/// use plsql_accretion::proposer::{LlmProposer, PatchProposer, SubprocessBackend};
+/// # use plsql_accretion::cluster::GapCluster;
+/// # fn demo(cluster: &GapCluster) {
+/// // Point it at any local model CLI — here, `ollama run`.
+/// let backend = SubprocessBackend::new("ollama", ["run", "llama3"]);
+/// let proposer = LlmProposer::new(backend);
+/// let candidate = proposer.propose(cluster, "estate_run_id", "commit_sha");
+/// # let _ = candidate;
+/// # }
+/// ```
+///
+/// The CLI must read the prompt from **stdin** and write the
+/// `# usr-gate:` manifest + pins + unified diff to **stdout** (the
+/// same reply contract [`CannedBackend`] supplies). A wrapper script
+/// is the usual way to adapt a model that does not natively do that.
+#[derive(Clone, Debug)]
+pub struct SubprocessBackend {
+    program: String,
+    args: Vec<String>,
+}
+
+impl SubprocessBackend {
+    /// Wrap a model CLI. `program` is the executable (looked up on
+    /// `PATH`); `args` are fixed leading arguments (e.g.
+    /// `["run", "llama3"]`). The repair prompt is supplied on stdin,
+    /// never as an argument — so an arbitrarily long prompt is safe.
+    pub fn new<S, I, A>(program: S, args: I) -> Self
+    where
+        S: Into<String>,
+        I: IntoIterator<Item = A>,
+        A: Into<String>,
+    {
+        Self {
+            program: program.into(),
+            args: args.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl CompletionBackend for SubprocessBackend {
+    fn complete(&self, prompt: &str) -> Result<String, String> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new(&self.program)
+            .args(&self.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("model CLI {:?} could not be spawned: {e}", self.program))?;
+        // Write the prompt to stdin, then drop the handle so the child
+        // sees EOF (a model CLI blocks reading until EOF).
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| "model CLI stdin pipe unavailable".to_string())?
+            .write_all(prompt.as_bytes())
+            .map_err(|e| format!("writing prompt to model CLI {:?} failed: {e}", self.program))?;
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("model CLI {:?} did not complete: {e}", self.program))?;
+        if !out.status.success() {
+            // A non-zero model CLI is a refusal — never a guess.
+            return Err(format!(
+                "model CLI {:?} exited non-zero ({}): {}",
+                self.program,
+                out.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        String::from_utf8(out.stdout)
+            .map_err(|e| format!("model CLI {:?} produced non-UTF-8 output: {e}", self.program))
+    }
+
+    fn tag(&self) -> String {
+        // Provenance: the basename of the model CLI, so a landed
+        // candidate's `proposer` field names what produced it.
+        let base = self
+            .program
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&self.program);
+        format!("llm:{base}")
+    }
+}
+
 /// The LLM-assisted proposer (spec §2[D]). It formats the cluster +
 /// representative MinFixture into a repair prompt, asks the injected
 /// [`CompletionBackend`], parses the reply into a [`CandidateDiff`],
@@ -691,9 +833,9 @@ pub struct LlmProposer<B: CompletionBackend> {
 }
 
 impl<B: CompletionBackend> LlmProposer<B> {
-    /// Wrap a [`CompletionBackend`]. The production constructor
-    /// injects a local-model-CLI backend; tests inject
-    /// [`CannedBackend`].
+    /// Wrap a [`CompletionBackend`]. For a model in the loop, inject a
+    /// [`SubprocessBackend`] (the production integration point); for
+    /// tests / deterministic replay, inject a [`CannedBackend`].
     pub fn new(backend: B) -> Self {
         Self { backend }
     }
@@ -1056,6 +1198,66 @@ mod tests {
         .propose(&c, "r", "c")
         .unwrap_err();
         assert!(matches!(e, ProposerError::UnparseableReply(_)), "{e:?}");
+    }
+
+    #[test]
+    fn subprocess_backend_shells_a_model_cli_and_returns_its_stdout() {
+        // The production integration point: a `CompletionBackend`
+        // that shells a configurable model CLI. We point it at a
+        // hermetic stand-in (`cat`) so the test is network-free and
+        // deterministic — `cat` echoes the piped prompt verbatim,
+        // proving the prompt reaches the CLI on stdin and the CLI's
+        // stdout reaches the proposer.
+        let backend = SubprocessBackend::new("cat", std::iter::empty::<&str>());
+        let reply = backend.complete("hello model").expect("cat echoes stdin");
+        assert_eq!(reply, "hello model");
+        assert_eq!(backend.tag(), "llm:cat");
+    }
+
+    #[test]
+    fn subprocess_backend_nonzero_exit_is_a_refusal() {
+        // A model CLI that exits non-zero (rate-limited, crashed,
+        // misconfigured) must be a fail-closed refusal — never a
+        // fabricated reply.
+        let backend = SubprocessBackend::new("false", std::iter::empty::<&str>());
+        assert!(backend.complete("anything").is_err());
+    }
+
+    #[test]
+    fn subprocess_backend_missing_binary_is_a_refusal() {
+        // A model CLI binary that does not exist is a refusal, not a
+        // panic — the proposer maps it to a clean `UnparseableReply`.
+        let backend =
+            SubprocessBackend::new("usr-no-such-model-cli-xyzzy", std::iter::empty::<&str>());
+        assert!(backend.complete("anything").is_err());
+    }
+
+    #[test]
+    fn llm_proposer_runs_end_to_end_over_a_subprocess_backend() {
+        // The full production path: LlmProposer wired to a real
+        // SubprocessBackend, fed by a hermetic CLI stand-in that
+        // emits a gate-shaped reply. Proves the integration point is
+        // genuinely reachable — not just a trait with no impl.
+        let c = cluster(Some("text_scan>drop"), "IR_DDL_NOT_LOWERED", &["fx1"]);
+        let reply = format!(
+            "# usr-gate: repair-class=l signature={sig} diagnostics-resolved=1 \
+             extracted-semantics-delta=2 posture=preserved\n\
+             # usr-gate-pins-cmd: true\n# usr-gate-pins-revert: true\n\
+             # usr-gate-pins-restore: true\n\
+             # usr-gate-test-path: crates/plsql-parser-antlr/src/lower/t.rs\n\
+             --- a/crates/plsql-parser-antlr/src/lower/mod.rs\n\
+             +++ b/crates/plsql-parser-antlr/src/lower/mod.rs\n@@ -0,0 +1,1 @@\n+// arm\n",
+            sig = c.signature
+        );
+        // `printf '%s'` ignores stdin and prints the fixed reply —
+        // a deterministic stand-in for a real model CLI.
+        let backend = SubprocessBackend::new("printf", ["%s".to_string(), reply]);
+        let cand = LlmProposer::new(backend)
+            .propose(&c, "run", "commit")
+            .expect("subprocess-backed LLM proposer produces a candidate");
+        assert_eq!(cand.repair_class, RepairClass::Lowering);
+        assert_eq!(cand.proposer, "llm:printf");
+        cand.validate_r20().expect("R20 holds");
     }
 
     #[test]

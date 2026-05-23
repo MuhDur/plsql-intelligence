@@ -2,10 +2,9 @@
 
 //! Foundational types for the CI/CD recompilation cascade (Layer 5).
 //!
-//! See `plan.md` §15 (CI/CD Recompilation Cascade) and `PLSQL-CICD-001` for
-//! the bead this crate seeds. This file intentionally defines types only —
-//! `predict`, `plan`, `gate`, and `verify` land in their own beads
-//! (`PLSQL-CICD-002`..`PLSQL-CICD-010`).
+//! See `plan.md` §15 (CI/CD Recompilation Cascade). This file
+//! intentionally defines types only — `predict`, `plan`, `gate`, and
+//! `verify` live in their own modules.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -124,11 +123,11 @@ pub struct ChangedObject {
 
 /// A proposed Oracle deployment change set.
 ///
-/// Inputs flow into `predict` (PLSQL-CICD-002), `plan` (PLSQL-CICD-003),
-/// `gate` (PLSQL-CICD-006), and `verify` (PLSQL-CICD-005). The `ChangeSet`
+/// Inputs flow into `predict`, `plan`,
+/// `gate`, and `verify`. The `ChangeSet`
 /// itself is a pure data structure — building a `ChangeSet` from a
-/// `ChangeSetOrigin` is a separate Layer 4 lineage classifier responsibility
-/// (`PLSQL-LIN-007A`).
+/// `ChangeSetOrigin` is a separate Layer 4 lineage classifier
+/// responsibility.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ChangeSet {
     pub origin: Option<ChangeSetOrigin>,
@@ -261,8 +260,8 @@ pub struct UncertaintyRecord {
 
 /// The prediction artifact for a `ChangeSet`.
 ///
-/// Consumed by `plsql cicd plan` (PLSQL-CICD-003), `plsql cicd gate`
-/// (PLSQL-CICD-006), and `plsql cicd verify` (PLSQL-CICD-005).
+/// Consumed by `plsql cicd plan`, `plsql cicd gate`, and
+/// `plsql cicd verify`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct InvalidationPrediction {
     pub mode: PredictMode,
@@ -384,8 +383,8 @@ impl DeploymentPlan {
 }
 
 /// Errors that the future Layer 5 operations (`predict`, `plan`, `gate`,
-/// `verify`) will raise. Kept here so downstream beads can build on a stable
-/// error surface without re-introducing one.
+/// `verify`) will raise. Kept here so downstream crates can build on a
+/// stable error surface without re-introducing one.
 #[derive(Debug, Error)]
 pub enum CicdError {
     #[error("changeset has no inputs")]

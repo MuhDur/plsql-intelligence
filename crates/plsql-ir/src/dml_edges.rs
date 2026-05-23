@@ -1,11 +1,10 @@
-//! Reads / Writes edge extraction at the table level (PLSQL-DEP-003).
+//! Reads / Writes edge extraction at the table level.
 //!
 //! Walks the embedded SQL statements in a lowered body and pulls
 //! out the table-level read / write dependencies. The dependency-
 //! graph layer turns each [`TableAccess`] into a `Reads` or
 //! `Writes` edge; this module does the extraction from the
-//! `Statement::Sql` raw text + the `SqlStatementModel` shape
-//! (PLSQL-SQLSEM-001).
+//! `Statement::Sql` raw text + the `SqlStatementModel` shape.
 //!
 //! Read / write classification follows the SQL verb:
 //!
@@ -53,7 +52,7 @@ pub enum AccessKind {
 ///
 /// Backwards-compatible wrapper around
 /// [`extract_table_accesses_bounded`]: the recursion is
-/// depth-guarded (`oracle-v4wa`) so a malformed unit whose
+/// depth-guarded so a malformed unit whose
 /// re-lowered `IF`/`LOOP` body fails to shrink can never
 /// stack-overflow. Callers that need to surface the typed
 /// [`plsql_core::UnknownReason::AnalysisRecursionLimit`]

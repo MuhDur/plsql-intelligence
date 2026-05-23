@@ -1,4 +1,4 @@
-//! Stable finding fingerprints (PLSQL-SAST-028).
+//! Stable finding fingerprints.
 //!
 //! Two SHA-256 digests per [`Finding`](crate::Finding), mirroring
 //! the `sha256:`/`fact:` discipline the fact stream uses:

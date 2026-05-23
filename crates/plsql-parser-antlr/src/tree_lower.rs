@@ -69,7 +69,11 @@ pub fn lower_parse_tree(source: &str, file_id: FileId, diagnostics: &mut Vec<Dia
         ));
     }
 
-    let total_len = source.len() as u32;
+    // Saturating cast (oracle-kxb3 sibling): a >u32::MAX source
+    // would wrap with `as u32` and produce a tiny span overlapping
+    // every diagnostic. Saturate to `u32::MAX` so the worst we do
+    // on a >4 GiB input is clip the trailing span; we never wrap.
+    let total_len = u32::try_from(source.len()).unwrap_or(u32::MAX);
     let file_span = make_span(file_id, 0, total_len);
 
     // Build the full parser (lexer + token stream + parser).
@@ -855,8 +859,14 @@ fn extract_text(source: &str, start_incl: isize, stop_incl: isize) -> String {
 
 /// Build a [`Span`] from ANTLR inclusive token byte offsets.
 fn ctx_span(start_incl: isize, stop_incl: isize, file_id: FileId, source: &str) -> Span {
-    let s = start_incl.max(0) as u32;
-    let e = ((stop_incl.max(0) as u32) + 1).min(source.len() as u32);
+    // Saturating cast (oracle-kxb3 sibling): for a >u32::MAX source
+    // the trailing `source.len() as u32` would wrap and clip every
+    // span. Saturate to `u32::MAX` (worst case: trailing spans clip
+    // at the u32 horizon — never wrap).
+    let s = u32::try_from(start_incl.max(0)).unwrap_or(u32::MAX);
+    let stop_u32 = u32::try_from(stop_incl.max(0)).unwrap_or(u32::MAX);
+    let len_u32 = u32::try_from(source.len()).unwrap_or(u32::MAX);
+    let e = stop_u32.saturating_add(1).min(len_u32);
     make_span(file_id, s, e)
 }
 

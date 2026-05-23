@@ -229,7 +229,7 @@ pub enum UnknownReason {
     /// than walked unbounded (which would stack-overflow / abort).
     AnalysisRecursionLimit,
     /// Response had MCP / tool-call markers scrubbed before being returned
-    /// to the agent. Tracks `PLSQL-MCP-LIVE-004`'s K18 prompt-injection
+    /// to the agent. Tracks 's K18 prompt-injection
     /// sanitization step so downstream consumers know the row text was
     /// rewritten.
     ResponseSanitized,

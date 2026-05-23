@@ -1,6 +1,5 @@
 //! Integration test: §1.4 hero demo — "know what breaks before you change Oracle PL/SQL"
-//! end-to-end via live-DB tools against the synthetic-lab Oracle XE deployment
-//! (`PLSQL-MCP-LIVE-019 / oracle-6hlb`).
+//! end-to-end via live-DB tools against the synthetic-lab Oracle XE deployment.
 //!
 //! ## Scenario (corpus/lab/hero_diff)
 //!
@@ -149,7 +148,7 @@ mod live {
     /// The full scrubbed agent transcript saved as the golden snapshot.
     #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
     pub struct AgentTranscript {
-        /// Always `"PLSQL-MCP-LIVE-019"` — stable.
+        /// Always `""` — stable.
         pub bead: String,
         /// Always `"hero_demo"` — stable.
         pub scenario: String,

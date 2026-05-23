@@ -1,10 +1,10 @@
-//! Integration tests for PLSQL-DIALECT-002 — verify the dialect-mismatch
+//! Integration tests for — verify the dialect-mismatch
 //! diagnostic surface covers SQL `BOOLEAN`, PL/SQL `VECTOR`, `SPARSE VECTOR`,
 //! vector arithmetic, and the package `RESETTABLE` clause.
 //!
 //! The ANTLR grammar does not yet emit dedicated tokens for any of these
-//! features (PLSQL-PARSE-* beads are still landing), so the tests here focus
-//! on the diagnostic surface introduced in PLSQL-DIALECT-003:
+//! features, so the tests here focus on the diagnostic surface introduced
+//! in:
 //! `unsupported_dialect_feature_diagnostic` and
 //! `unsupported_dialect_feature_remediation`. As soon as the grammar emits
 //! tokens for any of these constructs the same helpers can be plugged in at

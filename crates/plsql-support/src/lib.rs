@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Support-bundle exporter (PLSQL-SUPPORT-001).
+//! Support-bundle exporter.
 //!
 //! When a customer hits a bug in the plsql-intelligence engine the
 //! support team needs a reproducible artefact: the run inputs, the
@@ -42,10 +42,11 @@ pub use classify_literal::{LiteralClass, LiteralClassification, classify_literal
 pub use encrypt::{
     EncryptError, EncryptedBundleEnvelope, Encryptor, NullEncryptor, encrypt_bundle,
 };
-pub use minimize_repro::{
-    MinimizationInput, MinimizationPlan, MinimizationStep, MinimizationStrategy, MinimizeError,
-    plan_minimize,
-};
+// Note: `minimize_repro` is intentionally NOT re-exported at the crate
+// root. The module emits a structural plan template (canonical
+// strategy ordering), not actual byte-level minimisation; consumers
+// that want it must opt in explicitly via `plsql_support::minimize_repro::*`
+// so the limited scope is visible at the call site.
 pub use redaction_delta::{
     DeltaConfig, DeltaStep, RedactionDeltaManifest, record_redaction_delta, verify_redaction_delta,
 };
@@ -54,7 +55,7 @@ pub use scrub_literals::{ScrubStats, ScrubThresholds, scrub_literals};
 pub use shrink::{Granularity, ReproOracle, ShrinkResult, shrink_lines, shrink_with_chunks};
 
 /// The exportable bundle. Serialises to JSON; the caller decides
-/// whether to wrap it in an archive (PLSQL-SUPPORT-002 will add
+/// whether to wrap it in an archive (a later helper will add
 /// optional age/PGP encryption).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupportBundle {
@@ -98,7 +99,7 @@ pub struct NamedBlob {
 /// Caller-supplied redaction policy. Every rule has a name (used
 /// in audit reports) and a literal substring or regex-shaped
 /// pattern that the redactor substitutes with the rule's
-/// `replacement`. For PLSQL-SUPPORT-001 we keep the matcher
+/// `replacement`. For we keep the matcher
 /// substring-only to avoid the regex crate; regex support lands
 /// in -002 if needed.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

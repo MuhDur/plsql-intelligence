@@ -1,5 +1,5 @@
 //! `GapRecord` — the provenance-only artifact emitted by stage [A]
-//! of the USR loop (spec §2.1, `PLSQL-USR-001`).
+//! of the USR loop (spec §2.1).
 //!
 //! A `GapRecord` records *that* the engine was honestly uncertain
 //! and *enough structure to cluster and minimize the gap later* —
@@ -93,7 +93,7 @@ impl RepairClass {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct GapRecord {
     /// sha256 content hash of `diag_code` + `antlr_rule_path` +
-    /// the **token-KIND shape** (spec §2[C]/§2.1, `PLSQL-USR-001`):
+    /// the **token-KIND shape** (spec §2[C]/§2.1):
     /// `sha256(diag_code, antlr_rule_path, token_kind_shape)`. The
     /// shape is the real ANTLR lexer's `TokenKind` sequence over the
     /// canonical grammar skeleton implied by `antlr_rule_path` — it
@@ -214,7 +214,7 @@ fn rule_path_skeleton(rule_path: Option<&str>) -> Option<String> {
 }
 
 /// Derive the spec §2.1 `span_shape` — a **token-KIND sequence,
-/// never text** (`PLSQL-USR-001`).
+/// never text**.
 ///
 /// **Spec-conformance (the P1 stopgap correction).** P1's original
 /// `span_shape` folded a span *width bucket* (`W512`, …) and a line

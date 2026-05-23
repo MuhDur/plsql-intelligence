@@ -2,19 +2,19 @@
 
 //! `plan-lint` — structural integrity checker for `plan.md`.
 //!
-//! Implements seven checks required by `PLSQL-PLAN-001`:
+//! Implements seven checks required by:
 //!
 //! 1. heading-number monotonicity (`##` and `###` numbering, with explicit
 //!    inserts like `10A` allowed)
 //! 2. ToC anchor validity (every `## Table of Contents` link resolves to a
 //!    real heading slug)
-//! 3. duplicate bead IDs (each `PLSQL-…-NNN` appears in at most one bead-seed
-//!    table row)
-//! 4. missing bead dependencies (every bead referenced in a `Depends` column
+//! 3. duplicate task IDs (each `PLSQL-…-NNN` appears in at most one
+//!    task-seed table row)
+//! 4. missing task dependencies (every task referenced in a `Depends` column
 //!    is itself defined)
 //! 5. stale section references (`§N` / `§N.M` references resolve to existing
 //!    sections)
-//! 6. component coverage matrix (every component named in §5 has a bead seed
+//! 6. component coverage matrix (every component named in §5 has a task seed
 //!    and at least one acceptance-criteria mention)
 //! 7. banned release-wedge language scanner (Phase 1/2/3, MVP, alpha/beta
 //!    release, "first wave", `Qn YYYY`, etc.), with a whitelist for the
@@ -34,6 +34,144 @@ use serde::Serialize;
 
 const SCHEMA_ID: &str = "plan-lint.report";
 const SCHEMA_VERSION: u32 = 1;
+
+/// Stable contract version for the `--capabilities` payload. Bump only
+/// on a breaking change to the JSON shape; the pinned regression test
+/// fails if the shape drifts without this being bumped.
+const CAPABILITIES_CONTRACT_VERSION: u32 = 1;
+
+/// Sorted list of every valid flag name (used by the typo-suggestion
+/// helper and surfaced in error messages on an unknown argument).
+const VALID_FLAGS: &[&str] = &[
+    "-V",
+    "-h",
+    "--capabilities",
+    "--doctor",
+    "--help",
+    "--plan",
+    "--robot-docs",
+    "--robot-json",
+    "--version",
+];
+
+/// Levenshtein-1 (or close-enough) "did you mean?" hint. Returns the
+/// closest known flag if its edit-distance ≤ 2 from `unknown`, else
+/// `None`. Cheap, allocation-light, and good enough for short flags.
+fn suggest_flag(unknown: &str, known: &[&'static str]) -> Option<&'static str> {
+    let mut best: Option<(usize, &'static str)> = None;
+    for cand in known {
+        let d = edit_distance(unknown, cand);
+        if d <= 2 && best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, *cand));
+        }
+    }
+    best.map(|(_, s)| s)
+}
+
+/// Iterative two-row Damerau-Levenshtein-ish edit distance.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (n, m) = (a.len(), b.len());
+    if n == 0 {
+        return m;
+    }
+    if m == 0 {
+        return n;
+    }
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut curr: Vec<usize> = vec![0; m + 1];
+    for i in 1..=n {
+        curr[0] = i;
+        for j in 1..=m {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1)
+                .min(curr[j - 1] + 1)
+                .min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[m]
+}
+
+fn capabilities_json() -> serde_json::Value {
+    serde_json::json!({
+        "binary": "plan-lint",
+        "contract_version": CAPABILITIES_CONTRACT_VERSION,
+        "version": env!("CARGO_PKG_VERSION"),
+        "mode": "validate plan.md structural integrity (heading monotonicity, ToC anchors, bead seeds, banned wedge language)",
+        "flags": {
+            "--plan": "path to plan.md (default: ./plan.md)",
+            "--robot-json": format!("emit a stable-schema JSON report on stdout ({SCHEMA_ID} v{SCHEMA_VERSION})"),
+            "--doctor": "print a per-rule summary alongside individual findings",
+            "--capabilities": "print this machine-readable agent contract as JSON and exit",
+            "--robot-docs": "print a paste-ready agent handbook and exit",
+            "--version / -V": "print `plan-lint <version>` and exit",
+            "-h / --help": "print usage and exit"
+        },
+        "exit_codes": {
+            "0": "clean (no errors; warnings still printed)",
+            "1": "one or more error-severity findings",
+            "2": "invocation error (bad args, unreadable plan, etc.)"
+        },
+        "stdout_contract": "stdout carries data (the JSON report under --robot-json, or the human findings) — all diagnostics go to stderr",
+        "report_schema": { "id": SCHEMA_ID, "version": SCHEMA_VERSION }
+    })
+}
+
+fn robot_docs_text() -> String {
+    format!(
+        r#"plan-lint agent handbook
+==========================
+
+WHAT IT DOES
+  Validates plan.md structural integrity: heading-number monotonicity,
+  ToC anchor resolution, bead-seed uniqueness, missing-dependency
+  detection, stale §section references, component coverage, and a
+  banned release-wedge-language scanner.
+
+CANONICAL INVOCATION
+  plan-lint                       # check ./plan.md, human findings
+  plan-lint --doctor              # add per-rule summary table
+  plan-lint --plan docs/plan.md   # check a different file
+  plan-lint --robot-json | jq .   # stable-schema JSON report
+
+ROBOT-JSON ENVELOPE
+  {{
+    "schema_id":      "{schema_id}",
+    "schema_version": {schema_version},
+    "plan_path":      "...",
+    "findings":       [ ... ],
+    "rule_results":   {{ ... }}
+  }}
+
+FLAGS SUMMARY
+  --plan <path>     plan.md path (default: ./plan.md)
+  --robot-json      stable JSON report on stdout
+  --doctor          add a rule-by-rule summary
+  --capabilities    machine-readable agent contract (JSON)
+  --robot-docs      this handbook
+  --version / -V    print plan-lint <version>
+  -h / --help       usage summary
+
+EXIT CODES
+  0  clean (no errors; warnings still printed)
+  1  one or more error-severity findings
+  2  invocation error (bad args, unreadable plan, etc.)
+
+DISCOVERY
+  plan-lint --capabilities    versioned agent contract
+  plan-lint --help            human usage summary
+
+NOTE
+  plan-lint is intentionally a tiny, single-purpose tool; it has no
+  `--robot-triage` mega-command (the contract surface is small enough
+  that `--capabilities` is already a one-call bootstrap).
+"#,
+        schema_id = SCHEMA_ID,
+        schema_version = SCHEMA_VERSION,
+    )
+}
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -98,10 +236,30 @@ fn main() -> ExitCode {
         Ok(a) => a,
         Err(msg) => {
             eprintln!("error: {msg}");
-            print_usage();
+            // Error-path diagnostic: keep on stderr.
+            let _ = print_usage_to(&mut std::io::stderr().lock());
             return ExitCode::from(2);
         }
     };
+
+    if args.version {
+        println!("plan-lint {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+
+    if args.capabilities {
+        let doc = capabilities_json();
+        // `--capabilities` is an inherently machine-readable surface; we
+        // emit pretty JSON so humans can skim it. A `| jq -c .` will
+        // compactify if the agent prefers single-line.
+        println!("{}", serde_json::to_string_pretty(&doc).unwrap());
+        return ExitCode::SUCCESS;
+    }
+
+    if args.robot_docs {
+        print!("{}", robot_docs_text());
+        return ExitCode::SUCCESS;
+    }
 
     let text = match fs::read_to_string(&args.plan) {
         Ok(t) => t,
@@ -155,65 +313,98 @@ fn main() -> ExitCode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Args {
     plan: PathBuf,
     robot_json: bool,
     doctor: bool,
+    capabilities: bool,
+    robot_docs: bool,
+    version: bool,
 }
 
 fn parse_args(mut args: Vec<String>) -> Result<Args, String> {
-    let mut plan = PathBuf::from("plan.md");
-    let mut robot_json = false;
-    let mut doctor = false;
+    let mut out = Args {
+        plan: PathBuf::from("plan.md"),
+        ..Args::default()
+    };
 
     let mut iter = args.drain(..);
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--plan" => {
-                plan = iter
+                out.plan = iter
                     .next()
                     .map(PathBuf::from)
                     .ok_or_else(|| "--plan requires a path".to_string())?;
             }
-            "--robot-json" => robot_json = true,
-            "--doctor" => doctor = true,
+            "--robot-json" => out.robot_json = true,
+            "--doctor" => out.doctor = true,
+            "--capabilities" => out.capabilities = true,
+            "--robot-docs" => out.robot_docs = true,
+            "-V" | "--version" => out.version = true,
             "-h" | "--help" => {
-                print_usage();
+                // POSIX: user-requested help is data, not a
+                // diagnostic — it goes to stdout so `--help | less`
+                // and `--help > file` work the way agents and humans
+                // both expect.
+                let _ = print_usage_to(&mut std::io::stdout().lock());
                 std::process::exit(0);
             }
-            other => return Err(format!("unknown argument {other:?}")),
+            other => {
+                let msg = match suggest_flag(other, VALID_FLAGS) {
+                    Some(hint) => format!(
+                        "unknown argument {other:?} (did you mean `{hint}`?)\nvalid flags: {}",
+                        VALID_FLAGS.join(", ")
+                    ),
+                    None => format!(
+                        "unknown argument {other:?}\nvalid flags: {}",
+                        VALID_FLAGS.join(", ")
+                    ),
+                };
+                return Err(msg);
+            }
         }
     }
 
-    Ok(Args {
-        plan,
-        robot_json,
-        doctor,
-    })
+    Ok(out)
 }
 
-fn print_usage() {
-    eprintln!("usage: plan-lint [--plan <path>] [--robot-json] [--doctor]");
-    eprintln!();
-    eprintln!("Validates structural integrity of plan.md (PLSQL-PLAN-001).");
-    eprintln!();
-    eprintln!("Flags:");
-    eprintln!("  --plan <path>   Path to plan.md (default: ./plan.md)");
-    eprintln!("  --robot-json    Emit a stable-schema JSON report to stdout");
-    eprintln!("                  (schema_id={SCHEMA_ID}, schema_version={SCHEMA_VERSION})");
-    eprintln!("  --doctor        Print a per-rule summary alongside individual findings");
-    eprintln!();
-    eprintln!("Examples:");
-    eprintln!("  plan-lint                       # check ./plan.md, human output");
-    eprintln!("  plan-lint --doctor              # add a rule-by-rule summary table");
-    eprintln!("  plan-lint --plan docs/plan.md   # check a different file");
-    eprintln!("  plan-lint --robot-json | jq .   # consume the JSON report");
-    eprintln!();
-    eprintln!("Exit codes:");
-    eprintln!("  0  clean (no errors; warnings still printed)");
-    eprintln!("  1  one or more error-severity findings");
-    eprintln!("  2  invocation error (bad args, unreadable plan, etc.)");
+fn print_usage_to<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
+    writeln!(w, "usage: plan-lint [--plan <path>] [--robot-json] [--doctor]")?;
+    writeln!(w)?;
+    writeln!(w, "Validates structural integrity of plan.md.")?;
+    writeln!(w)?;
+    writeln!(w, "Flags:")?;
+    writeln!(w, "  --plan <path>     Path to plan.md (default: ./plan.md)")?;
+    writeln!(w, "  --robot-json      Emit a stable-schema JSON report to stdout")?;
+    writeln!(
+        w,
+        "                    (schema_id={SCHEMA_ID}, schema_version={SCHEMA_VERSION})"
+    )?;
+    writeln!(
+        w,
+        "  --doctor          Print a per-rule summary alongside individual findings"
+    )?;
+    writeln!(
+        w,
+        "  --capabilities    Print the machine-readable agent contract as JSON and exit"
+    )?;
+    writeln!(w, "  --robot-docs      Print a paste-ready agent handbook and exit")?;
+    writeln!(w, "  -V, --version     Print plan-lint <version> and exit")?;
+    writeln!(w)?;
+    writeln!(w, "Examples:")?;
+    writeln!(w, "  plan-lint                       # check ./plan.md, human output")?;
+    writeln!(w, "  plan-lint --doctor              # add a rule-by-rule summary table")?;
+    writeln!(w, "  plan-lint --plan docs/plan.md   # check a different file")?;
+    writeln!(w, "  plan-lint --robot-json | jq .   # consume the JSON report")?;
+    writeln!(w, "  plan-lint --capabilities | jq . # versioned machine-readable contract")?;
+    writeln!(w)?;
+    writeln!(w, "Exit codes:")?;
+    writeln!(w, "  0  clean (no errors; warnings still printed)")?;
+    writeln!(w, "  1  one or more error-severity findings")?;
+    writeln!(w, "  2  invocation error (bad args, unreadable plan, etc.)")?;
+    Ok(())
 }
 
 // ----------------------------------------------------------------------------
@@ -1076,5 +1267,94 @@ mod tests {
         // Only the real ToC entry should be picked up.
         assert_eq!(doc.toc_entries.len(), 1);
         assert_eq!(doc.toc_entries[0].2, "1-identity");
+    }
+
+    // ----------------------------------------------------------------
+    // Agent-ergonomics surface (capabilities / robot-docs / typo DYM).
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn capabilities_contract_is_pinned() {
+        let c = capabilities_json();
+        assert_eq!(c["binary"], "plan-lint");
+        assert_eq!(c["contract_version"], CAPABILITIES_CONTRACT_VERSION);
+        assert_eq!(c["version"], env!("CARGO_PKG_VERSION"));
+        for key in ["flags", "exit_codes", "stdout_contract", "report_schema"] {
+            assert!(c.get(key).is_some(), "capabilities missing key `{key}`");
+        }
+        let flags = c["flags"].as_object().unwrap();
+        for required in [
+            "--plan",
+            "--robot-json",
+            "--doctor",
+            "--capabilities",
+            "--robot-docs",
+            "--version / -V",
+        ] {
+            assert!(flags.contains_key(required), "missing flag `{required}`");
+        }
+        assert_eq!(c["report_schema"]["id"], SCHEMA_ID);
+    }
+
+    #[test]
+    fn capabilities_round_trips_as_single_line_json() {
+        let s = serde_json::to_string(&capabilities_json()).unwrap();
+        assert!(!s.contains('\n'));
+        let round: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(round["binary"], "plan-lint");
+    }
+
+    #[test]
+    fn robot_docs_mentions_capabilities_and_schema() {
+        let docs = robot_docs_text();
+        assert!(docs.contains("--capabilities"));
+        assert!(docs.contains(SCHEMA_ID));
+        assert!(docs.contains("EXIT CODES"));
+    }
+
+    #[test]
+    fn version_flag_parses_long_and_short() {
+        for arg in ["--version", "-V"] {
+            let parsed = parse_args(vec![arg.to_string()])
+                .unwrap_or_else(|e| panic!("{arg} should parse, got: {e}"));
+            assert!(parsed.version, "{arg} should set version flag");
+        }
+    }
+
+    #[test]
+    fn capabilities_and_robot_docs_flags_parse() {
+        let p = parse_args(vec!["--capabilities".into()]).unwrap();
+        assert!(p.capabilities);
+        let p = parse_args(vec!["--robot-docs".into()]).unwrap();
+        assert!(p.robot_docs);
+    }
+
+    #[test]
+    fn unknown_flag_suggests_near_miss() {
+        let err = parse_args(vec!["--robotjson".into()]).unwrap_err();
+        assert!(err.contains("--robot-json"), "expected DYM hint; got: {err}");
+        assert!(err.contains("did you mean"), "expected DYM phrase; got: {err}");
+    }
+
+    #[test]
+    fn unknown_flag_lists_valid_flags() {
+        let err = parse_args(vec!["--totally-bogus-flag-xyz".into()]).unwrap_err();
+        // Far-from-anything: no hint, but the valid-flag list is shown.
+        assert!(err.contains("valid flags"));
+        for f in VALID_FLAGS {
+            assert!(err.contains(f), "valid flag {f} missing from error: {err}");
+        }
+    }
+
+    #[test]
+    fn suggest_flag_finds_obvious_typos() {
+        // 1-char drop: missing hyphen.
+        assert_eq!(suggest_flag("--robotjson", VALID_FLAGS), Some("--robot-json"));
+        // 2-char transpose / swap inside the suffix.
+        assert_eq!(suggest_flag("--versoin", VALID_FLAGS), Some("--version"));
+        // 1-char delta — `--robot-json` → `--robot-jso` (drop trailing n).
+        assert_eq!(suggest_flag("--robot-jso", VALID_FLAGS), Some("--robot-json"));
+        // Far-from-anything: no suggestion.
+        assert_eq!(suggest_flag("--xyz-totally-unknown", VALID_FLAGS), None);
     }
 }

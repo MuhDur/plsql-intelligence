@@ -1,4 +1,4 @@
-//! Catalog-fact feed into symbol resolution (PLSQL-SYM-010).
+//! Catalog-fact feed into symbol resolution.
 //!
 //! The source-only resolvers ([`crate::resolve_anchor`],
 //! [`crate::resolve_reference`], [`crate::resolve_overload`]) only

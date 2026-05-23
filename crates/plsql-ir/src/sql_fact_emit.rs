@@ -1,5 +1,4 @@
-//! Emit SQL table/column-use facts with precision markers
-//! (PLSQL-SQLSEM-004).
+//! Emit SQL table/column-use facts with precision markers.
 //!
 //! Walks a populated [`SqlStatementModel`] (tables + columns
 //! filled by SQLSEM-002 / SQLSEM-003) and emits normalized

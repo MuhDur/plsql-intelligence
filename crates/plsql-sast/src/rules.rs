@@ -1,6 +1,6 @@
 //! Concrete SAST rules. Each `Rule` impl is a pure function of
-//! its [`ScanContext`](crate::ScanContext); the harness
-//! (`PLSQL-SAST-002`) gates and drives them.
+//! its [`ScanContext`](crate::ScanContext); the harness gates and
+//! drives them.
 
 use plsql_ir::{FactKind, FactPayload, StringShape};
 
@@ -130,8 +130,7 @@ impl Rule for Sec001ExecuteImmediateInjection {
     }
 }
 
-/// **SEC006 — `GRANT … TO PUBLIC`** (PLSQL-SAST-008's sibling;
-/// PLSQL-SAST-008 bead id maps to this rule).
+/// **SEC006 — `GRANT … TO PUBLIC`**.
 ///
 /// Granting any privilege to the `PUBLIC` role exposes the object
 /// to every database account and is a textbook privilege-sprawl /

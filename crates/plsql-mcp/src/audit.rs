@@ -1,4 +1,4 @@
-//! Audit baseline for the live-DB tool surface (`PLSQL-MCP-LIVE-003`).
+//! Audit baseline for the live-DB tool surface.
 //!
 //! Per plan §13A.3, every live-DB tool call must:
 //!
@@ -12,9 +12,9 @@
 //! - Doctor subcommand verifies the audit posture and reports it.
 //!
 //! This module exposes the helpers concrete live-DB tools call before
-//! issuing SQL. It is transport- and connection-library-agnostic, so the
-//! per-tool beads (`PLSQL-MCP-LIVE-004..`) can plug it into whichever
-//! connection abstraction they choose.
+//! issuing SQL. It is transport- and connection-library-agnostic, so
+//! per-tool code can plug it into whichever connection abstraction it
+//! chooses.
 
 use serde::{Deserialize, Serialize};
 
@@ -55,9 +55,12 @@ impl AuditClient {
 /// the operator opts in.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AuditSink {
-    /// Owner-qualified audit table name (e.g. `"OPS_AUDIT.MCP_CALLS"`); the
-    /// `AuditPlan` builder verifies the value is non-empty + matches a
-    /// simple `OWNER.NAME` or `NAME` shape.
+    /// Owner-qualified audit table name (e.g. `"OPS_AUDIT.MCP_CALLS"`).
+    /// [`AuditPlan::with_audit_table`] is the only sanctioned way to set
+    /// this field: it rejects anything that is not a strict `OWNER.NAME`
+    /// or `NAME` identifier, so a value reaching `audit_insert_sql`
+    /// cannot carry a statement terminator, extra columns, a `@DBLINK`
+    /// suffix, or an embedded subquery.
     pub table_name: Option<String>,
 }
 
@@ -98,10 +101,23 @@ impl AuditPlan {
     }
 
     /// Configure an audit table sink.
+    ///
+    /// The audit-row INSERT splices the table name verbatim into SQL —
+    /// identifier positions cannot be bind-parameterised in Oracle — so
+    /// the name is validated here against a strict `OWNER.NAME` / `NAME`
+    /// shape before it can ever reach [`AuditPlan::audit_insert_sql`].
+    /// Returns `None` when `table_name` is not a valid identifier, so
+    /// a config value carrying a statement terminator,
+    /// extra columns, a `@DBLINK` suffix, an embedded subquery, or a
+    /// comment cannot escape the intended INSERT shape.
     #[must_use]
-    pub fn with_audit_table(mut self, table_name: impl Into<String>) -> Self {
-        self.sink.table_name = Some(table_name.into());
-        self
+    pub fn with_audit_table(mut self, table_name: impl Into<String>) -> Option<Self> {
+        let name = table_name.into();
+        if !is_valid_audit_table_name(name.trim()) {
+            return None;
+        }
+        self.sink.table_name = Some(name);
+        Some(self)
     }
 
     /// PL/SQL anonymous block to run before any tool SQL — sets module +
@@ -149,9 +165,19 @@ impl AuditPlan {
     }
 
     /// SQL that appends one audit row to the configured audit table.
-    /// Returns `None` when no sink is configured. The bead skeleton uses a
-    /// simple positional insert; the table schema is documented in
-    /// `docs/integrations/live-db/audit-table.md` (PLSQL-MCP-LIVE-003 follow-up).
+    /// Returns `None` when no sink is configured.
+    ///
+    /// The statement is a positional `INSERT` with five columns:
+    /// `tool_name`, `agent_program`, `agent_model`, `session_id`,
+    /// `recorded_at`. The first four are positional binds (`:1`..`:4`);
+    /// the fifth (`recorded_at`) is set to `SYSTIMESTAMP` by the
+    /// statement itself. The audit table (or a view with that
+    /// projection) must define those five columns in that order; a
+    /// `NUMBER` primary key and any house-keeping columns are the
+    /// integrator's choice. `with_audit_table` validates that the
+    /// supplied table name is a plain `OWNER.NAME` / `NAME` identifier
+    /// before this method ever produces a statement, so identifier
+    /// injection is impossible.
     #[must_use]
     pub fn audit_insert_sql(&self) -> Option<String> {
         let table = self.sink.table_name.as_deref()?.trim();
@@ -163,6 +189,51 @@ impl AuditPlan {
              values (:1, :2, :3, :4, systimestamp)"
         ))
     }
+}
+
+/// Validate an audit table name as a strict `OWNER.NAME` or bare
+/// `NAME` identifier.
+///
+/// Each segment must be an unquoted Oracle simple SQL name: a letter
+/// followed by letters, digits, `_`, `$`, or `#`, capped at 128 bytes.
+/// At most one `.` separator is allowed and both halves must be
+/// non-empty. Anything else — whitespace, statement terminators,
+/// `@DBLINK` suffixes, commas, parentheses, a leading/trailing/double
+/// dot — is rejected, so the name cannot escape the `insert into
+/// {table} …` shape it is interpolated into.
+#[must_use]
+fn is_valid_audit_table_name(name: &str) -> bool {
+    let mut parts = name.split('.');
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    match parts.next() {
+        // `OWNER.NAME` — exactly one dot, both halves valid, no third part.
+        Some(second) => {
+            parts.next().is_none()
+                && is_simple_sql_name(first)
+                && is_simple_sql_name(second)
+        }
+        // Bare `NAME` — no dot at all.
+        None => is_simple_sql_name(first),
+    }
+}
+
+/// Bare-bones `DBMS_ASSERT.SIMPLE_SQL_NAME` check for one identifier
+/// segment: a letter followed by letters, digits, `_`, `$`, or `#`,
+/// 1..=128 bytes. Mirrors `patch.rs::is_simple_sql_name`.
+#[must_use]
+fn is_simple_sql_name(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() || bytes.len() > 128 {
+        return false;
+    }
+    if !bytes[0].is_ascii_alphabetic() {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'#')
 }
 
 #[cfg(test)]
@@ -219,7 +290,8 @@ mod tests {
     #[test]
     fn audit_insert_sql_uses_configured_table() {
         let plan = AuditPlan::for_tool(fixture_client(), "describe_table")
-            .with_audit_table("OPS_AUDIT.MCP_CALLS");
+            .with_audit_table("OPS_AUDIT.MCP_CALLS")
+            .expect("valid audit table name");
         let sql = plan.audit_insert_sql().expect("sql");
         assert!(sql.contains("insert into OPS_AUDIT.MCP_CALLS"));
         assert!(sql.contains(":1") && sql.contains(":4"));
@@ -234,5 +306,51 @@ mod tests {
         assert!(!sink.is_configured());
         sink.table_name = Some(String::from("OPS_AUDIT.MCP_CALLS"));
         assert!(sink.is_configured());
+    }
+
+    #[test]
+    fn with_audit_table_accepts_valid_identifiers() {
+        // oracle-c1e2: a strict OWNER.NAME / NAME shape is accepted.
+        for name in ["MCP_CALLS", "OPS_AUDIT.MCP_CALLS", "PKG$WITH#SIGILS"] {
+            let plan = AuditPlan::for_tool(fixture_client(), "describe_table")
+                .with_audit_table(name);
+            assert!(
+                plan.is_some(),
+                "valid table name {name:?} should be accepted"
+            );
+            let plan = plan.unwrap();
+            assert!(plan.audit_insert_sql().is_some());
+        }
+    }
+
+    #[test]
+    fn with_audit_table_rejects_identifier_injection() {
+        // oracle-c1e2: anything that is not a strict OWNER.NAME / NAME
+        // identifier must be rejected — no statement terminators, no
+        // extra columns, no DBLINK suffix, no embedded subquery, no
+        // comment, no whitespace, no double-dot.
+        let attacks = [
+            "MCP_CALLS (x) VALUES (1); DROP TABLE T --",
+            "MCP_CALLS@SOMELINK",
+            "MCP_CALLS, OTHER",
+            "OPS_AUDIT..MCP_CALLS",
+            ".MCP_CALLS",
+            "MCP_CALLS.",
+            "MCP CALLS",
+            "1BAD",
+            "OPS-AUDIT.MCP_CALLS",
+            "MCP_CALLS;",
+            "(SELECT 1 FROM DUAL)",
+            "",
+            "   ",
+        ];
+        for attack in attacks {
+            let plan = AuditPlan::for_tool(fixture_client(), "describe_table")
+                .with_audit_table(attack);
+            assert!(
+                plan.is_none(),
+                "malicious table name {attack:?} must be rejected"
+            );
+        }
     }
 }

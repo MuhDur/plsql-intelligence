@@ -1,6 +1,6 @@
 //! Property test (spec §8): for arbitrary diagnostic inputs,
 //! capture never panics and every GapRecord round-trips through its
-//! versioned envelope (`PLSQL-USR-001`).
+//! versioned envelope.
 
 use plsql_accretion::{GapRecordEnvelope, capture_gaps_with_commit};
 use plsql_core::{Diagnostic, Position, Severity, Span, UnknownReason};

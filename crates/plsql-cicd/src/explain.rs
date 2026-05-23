@@ -1,4 +1,4 @@
-//! `explain-lifecycle` — customer-facing CI/CD report (PLSQL-CICD-013).
+//! `explain-lifecycle` — customer-facing CI/CD report.
 //!
 //! Translates an `InvalidationPrediction` into a structured Markdown +
 //! JSON report a release reviewer can attach to a change ticket. Each

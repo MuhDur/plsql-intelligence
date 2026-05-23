@@ -1,4 +1,4 @@
-//! Finding suppression (PLSQL-SAST-029).
+//! Finding suppression.
 //!
 //! Two suppression channels, applied *after* the scan so a
 //! suppressed finding is never lost — it moves to a dedicated

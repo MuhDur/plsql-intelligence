@@ -1,4 +1,4 @@
-//! Dependency-graph foundation tools (PLSQL-MCP-005):
+//! Dependency-graph foundation tools:
 //! `find_callers`, `find_callees`, `get_dependencies`.
 //!
 //! All three are pure read queries against the `DepGraph` an

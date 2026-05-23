@@ -8,10 +8,10 @@
 //! re-walking ASTs, so name resolution, overload selection, and Oracle
 //! catalog cross-checking happen in one place.
 //!
-//! `PLSQL-IR-001` introduces the top-level container types:
-//! [`SemanticModel`], [`FileModel`], and [`SchemaModel`]. `PLSQL-IR-002`
+//! introduces the top-level container types:
+//! [`SemanticModel`], [`FileModel`], and [`SchemaModel`].
 //! adds the [`Declaration`] enum and its variant payloads in the
-//! [`decl`] module. Statement lowering arrives in `PLSQL-IR-004`.
+//! [`decl`] module. Statement lowering arrives in.
 
 pub mod calls;
 pub mod canonical;
@@ -135,7 +135,7 @@ numeric_id!(
 /// orchestration (`plsql-engine`) embeds this inside `AnalysisRun`, and
 /// every product surface consumes it from there.
 ///
-/// Spec: plan.md §9.2.1 (PLSQL-IR-001).
+/// Spec: plan.md §9.2.1.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SemanticModel {
     pub files: Vec<FileModel>,
@@ -200,7 +200,7 @@ impl FileModel {
 /// the owning schema, public synonyms live in the synthetic `PUBLIC`
 /// schema in [`SemanticModel::schemas`]. The exact semantics of an
 /// `ObjectId` (catalog-only vs source-only vs both) is recorded in
-/// [`PLSQL-CAT-001`](catalog) and [`PLSQL-IR-002`](self).
+/// [](catalog) and [](self).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchemaModel {
     pub name: SchemaName,

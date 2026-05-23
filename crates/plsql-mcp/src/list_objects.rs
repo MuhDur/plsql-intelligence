@@ -1,4 +1,4 @@
-//! `list_objects` tool (`PLSQL-MCP-LIVE-005`).
+//! `list_objects` tool.
 //!
 //! Issues a paged `ALL_OBJECTS` (falling back to `USER_OBJECTS` if the
 //! caller is scoped to the connected schema) query with optional

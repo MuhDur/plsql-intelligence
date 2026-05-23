@@ -49,7 +49,7 @@ pub use tokens::{Token, TokenKind, TokenTape, Trivia, TriviaTable};
 /// Configuration knobs passed to every parse invocation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ParseOptions {
-    /// Which Oracle version to target (affects feature-gating in later beads).
+    /// Which Oracle version to target (affects feature-gating in later passes).
     pub oracle_version: OracleTargetVersion,
     /// Whether the backend should attempt error recovery on syntax errors.
     pub recovery: RecoveryMode,

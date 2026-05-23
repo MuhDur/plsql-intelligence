@@ -1,4 +1,4 @@
-//! `--baseline` mode for incremental adoption (`PLSQL-SAST-025`).
+//! `--baseline` mode for incremental adoption.
 //!
 //! A team turning SAST on against a large existing codebase cannot
 //! fix every pre-existing finding at once. The baseline workflow

@@ -1,6 +1,6 @@
-//! IR for PL/SQL expressions and name references (PLSQL-IR-005).
+//! IR for PL/SQL expressions and name references.
 //!
-//! Sibling of `stmt` (PLSQL-IR-004): where statements carry raw
+//! Sibling of `stmt`: where statements carry raw
 //! `rhs_text` / `cond_text` slices, the expression IR shipped
 //! here lets downstream passes (lineage, bindgen, SAST) reason
 //! about expression structure without re-tokenising.
@@ -9,7 +9,7 @@
 //! shape recognised here is one we've found in the lab corpus
 //! and the synthetic L1 / L2 fixtures. Anything outside this set
 //! lowers to [`Expr::Raw`] with the original text, mirroring the
-//! `Statement::Unrecognized` posture from PLSQL-IR-004.
+//! `Statement::Unrecognized` posture from.
 //!
 //! ## /oracle evidence
 //!
@@ -20,8 +20,8 @@
 //!   the operator precedence table for binary ops come from the
 //!   PL/SQL Language Reference chapter on expressions.
 //! * `LOW-LEVEL-CATALOGS.md` Data Dictionary View Families —
-//!   `ALL_IDENTIFIERS` is the PL/Scope-side view a future bead
-//!   will cross-check our reference resolution against.
+//!   `ALL_IDENTIFIERS` is the PL/Scope-side view that later
+//!   passes cross-check our reference resolution against.
 
 use serde::{Deserialize, Serialize};
 

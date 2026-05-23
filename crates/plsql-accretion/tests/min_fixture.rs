@@ -1,5 +1,5 @@
 //! P2 determinism + oracle-correctness suite (spec §8 unit/property
-//! rows, §1 I-DETERMINISM, `PLSQL-USR-001`).
+//! rows, §1 I-DETERMINISM).
 
 use plsql_accretion::{
     DEFAULT_MAX_BYTES, GapRecord, build_min_fixture, capture_gaps_with_commit, minimize_estate_gaps,

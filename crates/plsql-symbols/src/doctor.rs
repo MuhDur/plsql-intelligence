@@ -1,4 +1,4 @@
-//! Doctor surface for symbol resolution (`PLSQL-SYM-007`).
+//! Doctor surface for symbol resolution.
 //!
 //! Aggregates a stream of [`ResolutionReport`]s into a
 //! [`SymbolResolutionDoctorReport`] so an operator can ask: "is name

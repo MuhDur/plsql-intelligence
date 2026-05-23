@@ -1,10 +1,10 @@
-//! Function / procedure wrapper emission (PLSQL-BG-004).
+//! Function / procedure wrapper emission.
 //!
 //! Consumes a [`BindingPlan`] and produces the Rust source for the
 //! generated wrappers. The output is a single `String` per plan
 //! holding one Rust function per `RoutineBinding`; the caller is
-//! responsible for placing it into the right file (the CLI bead
-//! `PLSQL-BG-012` will own the file layout).
+//! responsible for placing it into the right file (the CLI driver
+//! owns the file layout).
 //!
 //! This module is intentionally string-templated — no `syn`
 //! / `quote!` dependency — because the wrapper shape is tightly

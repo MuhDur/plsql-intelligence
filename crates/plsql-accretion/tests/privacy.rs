@@ -303,7 +303,7 @@ fn negative_case_privacy_unprovable_persists_nothing() {
 /// by *other* test binaries (notably `usr-loop`'s integration
 /// tests) that cargo runs in parallel with this one; snapshotting
 /// it produced a rare read-during-write false failure
-/// (PLSQL-USR-001 I-DETERMINISM). `build_min_fixture` never persists
+/// (I-DETERMINISM). `build_min_fixture` never persists
 /// anywhere — persistence is an explicit `persist_min_fixture` call
 /// the loop makes only on success — so the no-persist assertion does
 /// not need the real repo dir at all: an isolated empty dir proves

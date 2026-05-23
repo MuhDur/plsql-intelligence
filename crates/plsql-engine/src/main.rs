@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! `plsql-engine` umbrella CLI (PLSQL-ENG-004).
+//! `plsql-engine` umbrella CLI.
 //!
 //! `analyze` runs the canonical pipeline over a project tree and
 //! emits a reusable, versioned `AnalysisRun` artifact (shared
@@ -37,9 +37,8 @@ use thiserror::Error;
 #[derive(Debug, Parser)]
 #[command(name = "plsql-engine")]
 #[command(about = "Run the canonical analysis pipeline and emit a reusable AnalysisRun artifact")]
-#[command(arg_required_else_help = true)]
 #[command(
-    after_help = "DISCOVERY:\n  plsql-engine capabilities   machine-readable agent contract (JSON)\n  plsql-engine robot-docs     agent handbook — start here if you are an AI"
+    after_help = "DISCOVERY:\n  plsql-engine capabilities   machine-readable agent contract (JSON)\n  plsql-engine robot-docs     agent handbook — start here if you are an AI\n  plsql-engine --robot-triage one-shot bootstrap (capabilities + health + quick_ref)"
 )]
 struct Cli {
     #[arg(
@@ -48,8 +47,14 @@ struct Cli {
         help = "Emit versioned machine-readable output using the shared robot-JSON envelope"
     )]
     robot_json: bool,
+    /// One-shot agent bootstrap. Emits {capabilities, health, quick_ref}
+    /// in a single JSON mega-object on stdout and exits — short-circuits
+    /// any subcommand. Exit 0 normally; reserved exit 2 if a future
+    /// blocker is wired. Mirrors `plsql-mcp --robot-triage`.
+    #[arg(long, global = true)]
+    robot_triage: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -92,8 +97,7 @@ struct DoctorArgs {
     #[arg(long)]
     full: bool,
     /// Emit the memory/footprint profile: full vs compact
-    /// serialized bytes, savings, and per-section breakdown
-    /// (PLSQL-PERF-002).
+    /// serialized bytes, savings, and per-section breakdown.
     #[arg(long)]
     memory: bool,
 }
@@ -115,6 +119,18 @@ enum CliError {
     WriteOutput { path: String, reason: String },
     #[error("failed to serialize robot JSON")]
     SerializeRobotJson,
+    /// The PROJECT_ROOT argument points at a path that does not exist on
+    /// disk. Surfaced as exit 2 (invocation failure) per the capabilities
+    /// exit-code dictionary — never as a "Clean" empty-result envelope.
+    /// Closes the Axiom 14 (never-silent-fail) hole an agent that mistypes
+    /// a project path would otherwise fall through.
+    #[error("plsql-engine: project root does not exist: {path}")]
+    ProjectRootMissing { path: String },
+    /// The PROJECT_ROOT exists but is not a directory (e.g. a regular file
+    /// or a broken symlink). Same exit code as `ProjectRootMissing` so the
+    /// agent contract is uniform.
+    #[error("plsql-engine: project root is not a directory: {path}")]
+    ProjectRootNotDirectory { path: String },
 }
 
 impl CliError {
@@ -124,9 +140,29 @@ impl CliError {
             Self::ReadArtifact { .. }
             | Self::ParseArtifact { .. }
             | Self::IncompatibleSchema { .. }
-            | Self::WriteOutput { .. } => 2,
+            | Self::WriteOutput { .. }
+            | Self::ProjectRootMissing { .. }
+            | Self::ProjectRootNotDirectory { .. } => 2,
         }
     }
+}
+
+/// Validate that the supplied project root is a path we can actually
+/// analyze: it must exist and be a directory. The check is factored out
+/// so it can be unit-tested without spawning the binary — and so the
+/// same logic gates every future entry point that takes a project root.
+fn validate_project_root(path: &std::path::Path) -> Result<(), CliError> {
+    if !path.exists() {
+        return Err(CliError::ProjectRootMissing {
+            path: path.display().to_string(),
+        });
+    }
+    if !path.is_dir() {
+        return Err(CliError::ProjectRootNotDirectory {
+            path: path.display().to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Stable contract version for the `capabilities` payload. Bump only on a
@@ -144,7 +180,8 @@ fn capabilities_json() -> serde_json::Value {
         "contract_version": CAPABILITIES_CONTRACT_VERSION,
         "version": env!("CARGO_PKG_VERSION"),
         "global_flags": {
-            "--robot-json": "emit versioned machine-readable output using the shared robot-JSON envelope"
+            "--robot-json": "emit versioned machine-readable output using the shared robot-JSON envelope",
+            "--robot-triage": "one-shot bootstrap: emit {capabilities, health, quick_ref} on stdout and exit"
         },
         "commands": {
             "analyze": "analyze a project tree and emit the reusable AnalysisRun artifact (robot-JSON) to stdout or --out",
@@ -175,7 +212,28 @@ fn main() -> std::process::ExitCode {
 
 fn run() -> Result<(), CliError> {
     let cli = Cli::parse();
-    match cli.command {
+
+    // --robot-triage short-circuits any subcommand: emit the mega
+    // bootstrap object (capabilities + health + quick_ref) and exit.
+    if cli.robot_triage {
+        return run_robot_triage(cli.robot_json);
+    }
+
+    let Some(command) = cli.command else {
+        // Bare invocation without --robot-triage: behave like clap's
+        // arg_required_else_help and print usage to stderr (exit 2).
+        // We keep stdout pure for `--robot-json` pipes.
+        use clap::CommandFactory;
+        let _ = Cli::command().write_long_help(&mut std::io::stderr());
+        let _ = writeln!(std::io::stderr());
+        let _ = writeln!(
+            std::io::stderr(),
+            "no subcommand given — try `plsql-engine analyze <project>`, `plsql-engine doctor`, or `plsql-engine --robot-triage`."
+        );
+        std::process::exit(2);
+    };
+
+    match command {
         Command::Analyze(args) => run_analyze(args, cli.robot_json),
         Command::Doctor(args) => run_doctor(args, cli.robot_json),
         Command::Capabilities => {
@@ -187,6 +245,67 @@ fn run() -> Result<(), CliError> {
             Ok(())
         }
     }
+}
+
+/// `--robot-triage` mega-bootstrap. Combine `capabilities` + a light
+/// health summary + a quick-ref of canonical invocations into a single
+/// JSON object on stdout. Mirrors `plsql-mcp --robot-triage` so agents
+/// can use the same bootstrap recipe for every CLI. Always exits 0 in
+/// the current build (no blockers wired); the exit-2 path is reserved
+/// for future blocker conditions.
+fn run_robot_triage(robot_json: bool) -> Result<(), CliError> {
+    let health = serde_json::json!({
+        "binary": "plsql-engine",
+        "version": env!("CARGO_PKG_VERSION"),
+        "schema": {
+            "analysis_run": {
+                "id": ANALYSIS_RUN_SCHEMA.id,
+                "version": format!(
+                    "{}.{}.{}",
+                    ANALYSIS_RUN_SCHEMA.version.major,
+                    ANALYSIS_RUN_SCHEMA.version.minor,
+                    ANALYSIS_RUN_SCHEMA.version.patch,
+                ),
+            }
+        },
+        "blockers": Vec::<&str>::new(),
+        "status": "ok",
+    });
+    let quick_ref = serde_json::json!([
+        {
+            "description": "bootstrap (capabilities + health + quick_ref in one call)",
+            "invocation": "plsql-engine --robot-triage"
+        },
+        {
+            "description": "full versioned agent contract",
+            "invocation": "plsql-engine capabilities"
+        },
+        {
+            "description": "analyze a project tree, write artifact to file",
+            "invocation": "plsql-engine analyze /path/to/project --out run.json"
+        },
+        {
+            "description": "inspect an artifact (compact health summary)",
+            "invocation": "plsql-engine doctor --run run.json"
+        },
+        {
+            "description": "machine-readable health check (full report)",
+            "invocation": "plsql-engine --robot-json doctor --run run.json --full"
+        }
+    ]);
+    let mega = serde_json::json!({
+        "capabilities": capabilities_json(),
+        "health": health,
+        "quick_ref": quick_ref,
+    });
+    let rendered = if robot_json {
+        serde_json::to_string(&mega)
+    } else {
+        serde_json::to_string_pretty(&mega)
+    };
+    let s = rendered.map_err(|_| CliError::SerializeRobotJson)?;
+    println!("{s}");
+    Ok(())
 }
 
 fn run_capabilities(robot_json: bool) {
@@ -254,6 +373,13 @@ DISCOVERY
 }
 
 fn run_analyze(args: AnalyzeArgs, robot_json: bool) -> Result<(), CliError> {
+    // Reject nonexistent / non-directory project roots up front so a
+    // mistyped path can never silently produce a "Clean" empty-result
+    // envelope (Axiom 14). The default `AnalysisRequest::default()`
+    // empty-root no-op path is intentionally exempt — it is only
+    // reachable through the library API, never through this CLI.
+    validate_project_root(&args.project_root)?;
+
     let req = AnalysisRequest {
         project_root: args.project_root,
         ..AnalysisRequest::default()
@@ -487,6 +613,59 @@ mod tests {
         assert_eq!(round["binary"], "plsql-engine");
     }
 
+    /// `plsql-engine analyze /nonexistent` must NOT pretend a clean run —
+    /// it must surface a typed error with exit code 2 (invocation failure)
+    /// so an agent that mistypes a path cannot silently consume a fake
+    /// "Clean" envelope. Regression for the Axiom 14 silent-success hole.
+    #[test]
+    fn validate_project_root_rejects_nonexistent_path_with_exit_two() {
+        let bogus = std::path::Path::new("/nonexistent/plsql-engine/analyze/path");
+        let err = validate_project_root(bogus)
+            .expect_err("validation must reject a path that does not exist on disk");
+        assert!(
+            matches!(err, CliError::ProjectRootMissing { .. }),
+            "expected ProjectRootMissing, got {err:?}"
+        );
+        assert_eq!(err.exit_code(), 2, "nonexistent path is an invocation failure");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("does not exist"),
+            "error message must name the missing-path failure mode: {msg}"
+        );
+        assert!(
+            msg.contains(&bogus.display().to_string()),
+            "error message must echo the offending path: {msg}"
+        );
+    }
+
+    /// A path that exists but is a regular file (or other non-directory)
+    /// is also an invocation failure — we cannot discover .pks/.pkb/.sql
+    /// files under a non-directory.
+    #[test]
+    fn validate_project_root_rejects_non_directory_with_exit_two() {
+        let tmp = std::env::temp_dir().join(format!(
+            "plsql-engine-validate-{}.tmp",
+            std::process::id()
+        ));
+        std::fs::write(&tmp, b"i am a file, not a directory").unwrap();
+        let err = validate_project_root(&tmp)
+            .expect_err("validation must reject a non-directory path");
+        let _ = std::fs::remove_file(&tmp);
+        assert!(
+            matches!(err, CliError::ProjectRootNotDirectory { .. }),
+            "expected ProjectRootNotDirectory, got {err:?}"
+        );
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    /// A real directory must validate — the success path stays open for
+    /// every legitimate project root.
+    #[test]
+    fn validate_project_root_accepts_existing_directory() {
+        let dir = std::env::temp_dir();
+        validate_project_root(&dir).expect("temp dir must validate");
+    }
+
     #[test]
     fn robot_docs_is_non_empty_and_mentions_capabilities() {
         // Capture stdout by calling the builder directly rather than spawning.
@@ -502,5 +681,43 @@ mod tests {
         let handbook = "plsql-engine capabilities    full machine-readable contract (JSON)";
         assert!(handbook.contains("capabilities"));
         assert!(!handbook.is_empty());
+    }
+
+    /// `--robot-triage` is a global flag that must parse without a
+    /// subcommand. Regression for the bug where `arg_required_else_help`
+    /// rejected the bare flag.
+    #[test]
+    fn clap_accepts_robot_triage_without_subcommand() {
+        use clap::Parser;
+        let cli =
+            Cli::try_parse_from(["plsql-engine", "--robot-triage"]).expect("--robot-triage must parse");
+        assert!(cli.robot_triage);
+        assert!(cli.command.is_none());
+    }
+
+    /// Capabilities must include the new `--robot-triage` global flag so
+    /// an agent can discover it from the contract document.
+    #[test]
+    fn capabilities_advertises_robot_triage() {
+        let c = capabilities_json();
+        assert!(
+            c["global_flags"]["--robot-triage"].is_string(),
+            "capabilities must advertise --robot-triage"
+        );
+    }
+
+    /// Clap v4 ships typo suggestions by default. Pin the behavior so
+    /// a future dep bump that disables it does not silently regress
+    /// agent UX (Axiom 7 — intent inference).
+    #[test]
+    fn clap_typo_suggests_robot_json() {
+        use clap::Parser;
+        let err = Cli::try_parse_from(["plsql-engine", "--robotjson", "doctor", "--run", "-"])
+            .unwrap_err();
+        let s = err.to_string();
+        assert!(
+            s.contains("--robot-json") || s.contains("similar"),
+            "clap should suggest --robot-json for --robotjson typo; got: {s}"
+        );
     }
 }

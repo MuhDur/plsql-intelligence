@@ -1,6 +1,6 @@
-//! Projection + column read/write extraction (PLSQL-SQLSEM-003).
+//! Projection + column read/write extraction.
 //!
-//! Builds on the table/alias resolution from PLSQL-SQLSEM-002
+//! Builds on the table/alias resolution from
 //! (`sql_resolve`). Given a `SqlStatementModel` whose `tables` +
 //! `alias_scope` are populated, this pass fills `projection`,
 //! `reads`, and `writes` by walking the SELECT list, the
@@ -15,7 +15,7 @@
 //!   against that table.
 //! * bare `col` with multiple tables in scope → `Unresolved`
 //!   (ambiguous without catalog column lists; the catalog
-//!   cross-check bead disambiguates later).
+//!   cross-check pass disambiguates later).
 //! * `*` / `alias.*` → `StarExpansion`.
 //!
 //! ## /oracle evidence
@@ -26,7 +26,7 @@
 //! * `LOW-LEVEL-CATALOGS.md` Data Dictionary View Families —
 //!   `ALL_TAB_COLUMNS` is the authority that turns an
 //!   `Unresolved` bare column into a `Resolved` one once the
-//!   catalog is available (deferred bead).
+//!   catalog is available (deferred to a later pass).
 
 use crate::sql_sem::{
     ColumnResolution, ColumnUse, ProjectionItem, SqlSemanticModel, SqlSemanticVerb,

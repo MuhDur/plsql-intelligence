@@ -1,4 +1,4 @@
-//! Overload disambiguation for emitted wrappers (PLSQL-BG-007).
+//! Overload disambiguation for emitted wrappers.
 //!
 //! PL/SQL packages let two subprograms share a name as long as
 //! their parameter signatures differ ("overloading"). Rust does

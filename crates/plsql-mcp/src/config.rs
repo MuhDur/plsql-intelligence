@@ -1,7 +1,7 @@
 //! Runtime configuration for `plsql-mcp`.
 //!
-//! Bead `PLSQL-MCP-001` adds the data shape only; loaders that read
-//! `~/.plsql-mcp/connections.toml` arrive with `PLSQL-MCP-002`.
+//! Bead adds the data shape only; loaders that read
+//! `~/.plsql-mcp/connections.toml` arrive with.
 
 use std::path::PathBuf;
 

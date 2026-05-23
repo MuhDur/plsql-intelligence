@@ -1,4 +1,4 @@
-//! Normalized fact schema (PLSQL-FACT-001).
+//! Normalized fact schema.
 //!
 //! Every analysis pass emits its results as a stream of
 //! [`Fact`] records sharing one canonical shape. A fact is:

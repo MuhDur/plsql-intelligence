@@ -1,7 +1,7 @@
-//! Local-daemon query protocol (PLSQL-STORE-DAEMON-001).
+//! Local-daemon query protocol.
 //!
 //! This module is the **protocol definition only** — the wire
-//! contract a future `plsqld` (PLSQL-STORE-DAEMON-002) serves and
+//! contract a future `plsqld` serves and
 //! that CLIs/MCP use to query a warm cache instead of re-running
 //! analysis. No socket, no server loop, no client runtime lives
 //! here: just the versioned message types, their semantics, the
@@ -46,10 +46,18 @@ pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion {
     patch: 0,
 };
 
+/// A `major.minor.patch` triple identifying a daemon
+/// wire-protocol revision (see [`PROTOCOL_VERSION`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersion {
+    /// Major version. Bumped on any breaking message-shape
+    /// change; a mismatch makes two peers incompatible.
     pub major: u16,
+    /// Minor version. Bumped on additive, backward-compatible
+    /// evolution; a server accepts any client minor `<=` its own.
     pub minor: u16,
+    /// Patch version. Reserved for non-wire-affecting fixes;
+    /// never consulted by the compatibility check.
     pub patch: u16,
 }
 
@@ -72,13 +80,21 @@ pub enum DaemonRequest {
     Ping,
     /// Fetch a cached artifact (e.g. a serialized `AnalysisRun`)
     /// by its content digest. Absent ⇒ `found: None`.
-    GetArtifact { digest_hex: String },
+    GetArtifact {
+        /// Lower-case hex content digest of the wanted artifact.
+        digest_hex: String,
+    },
     /// Query persisted facts, optionally filtered by `FactKind`
     /// name (snake_case, e.g. `dynamic_sql_evidence`) and capped
     /// at `limit` rows (`0` ⇒ server default).
     QueryFacts {
+        /// Optional `FactKind` name filter (snake_case). `None`
+        /// ⇒ no kind filter; all kinds are eligible.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<String>,
+        /// Maximum rows to return; `0` ⇒ the server's default
+        /// cap. The response's `truncated` flag reports whether
+        /// more rows existed than were returned.
         #[serde(default)]
         limit: u32,
     },
@@ -92,23 +108,39 @@ pub enum DaemonRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "result")]
 pub enum DaemonResponse {
+    /// Reply to [`DaemonRequest::Ping`] — the daemon is alive.
     Pong,
+    /// Reply to [`DaemonRequest::GetArtifact`].
     Artifact {
-        /// `None` ⇒ the digest is not cached (not an error).
+        /// The cached artifact, or `None` ⇒ the digest is not
+        /// cached (a normal answer, not an error — R13).
         found: Option<ArtifactPayload>,
     },
+    /// Reply to [`DaemonRequest::QueryFacts`].
     Facts {
+        /// The matching fact rows, in the daemon's iteration
+        /// order, at most `limit` of them.
         rows: Vec<FactRow>,
-        /// `true` ⇒ more rows existed than `limit` returned.
+        /// `true` ⇒ more rows matched than `limit` returned;
+        /// the result is a prefix, not the full set.
         truncated: bool,
     },
+    /// Reply to [`DaemonRequest::Stats`] — cache health counters.
     Stats(CacheStats),
+    /// A typed protocol/availability failure. Carries a
+    /// [`DaemonErrorCode`] so clients can branch without string
+    /// matching.
     Error(DaemonError),
 }
 
+/// One cached artifact, returned inside
+/// [`DaemonResponse::Artifact`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactPayload {
+    /// Lower-case hex content digest the artifact is keyed by;
+    /// echoes the [`DaemonRequest::GetArtifact`] `digest_hex`.
     pub digest_hex: String,
+    /// MIME-style media type of `body`, e.g. `application/json`.
     pub media_type: String,
     /// Raw artifact bytes, base64-free: transported as a UTF-8
     /// string because cached artifacts are JSON (the engine's
@@ -117,20 +149,34 @@ pub struct ArtifactPayload {
     pub body: String,
 }
 
+/// One persisted fact, returned inside [`DaemonResponse::Facts`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FactRow {
+    /// Stable unique identifier of the fact within the store.
     pub fact_id: String,
+    /// `FactKind` name (snake_case), e.g. `dynamic_sql_evidence`;
+    /// the same value a [`DaemonRequest::QueryFacts`] `kind`
+    /// filter matches against.
     pub kind: String,
+    /// The fact's payload as a JSON string, kind-specific in
+    /// shape and opaque to the protocol layer.
     pub payload_json: String,
 }
 
+/// Cache health counters, returned inside
+/// [`DaemonResponse::Stats`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheStats {
+    /// Number of distinct blobs (artifacts) currently cached.
     pub blob_count: u64,
+    /// Total on-disk size of all cached blobs, in bytes.
     pub total_bytes: u64,
+    /// Names of the registered cache strategies, e.g.
+    /// `analysis_run`.
     pub strategies: Vec<String>,
 }
 
+/// Machine-readable failure class carried by [`DaemonError`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DaemonErrorCode {
@@ -143,17 +189,28 @@ pub enum DaemonErrorCode {
     Unavailable,
 }
 
+/// A typed protocol/availability failure, carried by
+/// [`DaemonResponse::Error`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Error)]
 #[error("daemon error [{code:?}]: {message}")]
 pub struct DaemonError {
+    /// Machine-readable failure class; lets a client branch
+    /// without parsing `message`.
     pub code: DaemonErrorCode,
+    /// Human-readable detail for logs and diagnostics. Not
+    /// stable — do not match on its text.
     pub message: String,
 }
 
 /// Versioned wire envelope. One per newline-delimited line.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonEnvelope<T> {
+    /// Wire-protocol revision the sender speaks; the receiver
+    /// applies [`ProtocolVersion::accepts`] before trusting
+    /// `payload`.
     pub protocol_version: ProtocolVersion,
+    /// The framed message — a [`DaemonRequest`] or
+    /// [`DaemonResponse`] depending on direction.
     pub payload: T,
 }
 
@@ -167,13 +224,20 @@ impl<T> DaemonEnvelope<T> {
     }
 }
 
-/// Codec error for the line framing.
+/// Codec error for the line framing ([`encode`] / [`decode_line`]).
 #[derive(Debug, Error)]
 pub enum CodecError {
+    /// `serde_json` failed to serialize the envelope; the
+    /// payload string is the underlying error.
     #[error("serialize failed: {0}")]
     Serialize(String),
+    /// A framing violation: the JSON for a single frame contained
+    /// an interior `\n` / `\r` (only a trailing terminator is
+    /// allowed).
     #[error("the framed line must not contain a newline")]
     EmbeddedNewline,
+    /// `serde_json` failed to deserialize the line into an
+    /// envelope; the payload string is the underlying error.
     #[error("deserialize failed: {0}")]
     Deserialize(String),
 }

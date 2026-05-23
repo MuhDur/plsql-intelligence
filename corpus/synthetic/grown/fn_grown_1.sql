@@ -1,0 +1,6 @@
+CREATE OR REPLACE FUNCTION fn_grown_1(p_x NUMBER) RETURN NUMBER
+IS
+BEGIN
+    RETURN p_x * 2;
+END fn_grown_1;
+/

@@ -1,6 +1,6 @@
-//! `predict <changeset>` implementation (`PLSQL-CICD-002`).
+//! `predict <changeset>` implementation.
 //!
-//! Combines a `ChangeSet` (from `PLSQL-CICD-001`) with Oracle-specific
+//! Combines a `ChangeSet` (from) with Oracle-specific
 //! invalidation rules to emit an `InvalidationPrediction`. The rule
 //! engine is intentionally text-table — every rule names the
 //! `ChangedObjectKind` it triggers on, the kind of invalidation it
@@ -55,7 +55,7 @@ pub fn predict(changeset: &ChangeSet, mode: PredictMode) -> InvalidationPredicti
 }
 
 /// Build the `CompletenessReport` profile that `predict` attaches per
-/// run mode (PLSQL-CICD-011). Each mode declares its starting evidence
+/// run mode. Each mode declares its starting evidence
 /// surface so downstream gates know which `UnknownReason`s are
 /// expected vs. surprising.
 fn completeness_profile_for_mode(mode: PredictMode) -> plsql_core::CompletenessReport {

@@ -1,5 +1,4 @@
-//! Parse-corpus test harness (`PLSQL-PARSE-012`) + corpus dashboard
-//! (`PLSQL-PARSE-019`).
+//! Parse-corpus test harness + corpus dashboard.
 //!
 //! Walks the vendored corpora under `corpus/public/` and exercises the
 //! `plsql_parser_antlr::lower::lower_source` pre-parser against every

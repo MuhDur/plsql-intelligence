@@ -1,4 +1,4 @@
-//! **PLSQL-USR-001 §2[C]/§2.1 signature-conformance gate
+//! ** §2[C]/§2.1 signature-conformance gate
 //! (mandatory, anti-gaming).**
 //!
 //! Spec §2[C]: `signature = (diag_code, antlr_rule_path,
