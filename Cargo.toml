@@ -33,6 +33,8 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0 OR MIT"
+repository = "https://github.com/MuhDur/plsql-intelligence"
+homepage = "https://github.com/MuhDur/plsql-intelligence"
 rust-version = "1.85"
 
 [workspace.dependencies]

@@ -11,9 +11,8 @@ self-healing coverage flywheel.
 
 <div align="center">
 
-<!-- Replace OWNER with your GitHub org/user before publishing; see PUBLISHING.md -->
-[![CI](https://github.com/OWNER/plsql-intelligence/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/plsql-intelligence/actions/workflows/ci.yml)
-[![USR Loop](https://github.com/OWNER/plsql-intelligence/actions/workflows/usr.yml/badge.svg)](https://github.com/OWNER/plsql-intelligence/actions/workflows/usr.yml)
+[![CI](https://github.com/MuhDur/plsql-intelligence/actions/workflows/ci.yml/badge.svg)](https://github.com/MuhDur/plsql-intelligence/actions/workflows/ci.yml)
+[![USR Loop](https://github.com/MuhDur/plsql-intelligence/actions/workflows/usr.yml/badge.svg)](https://github.com/MuhDur/plsql-intelligence/actions/workflows/usr.yml)
 [![License: Apache-2.0 OR MIT](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](#license)
 [![unsafe: forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](#design-commitments)
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](rust-toolchain.toml)
@@ -24,7 +23,7 @@ self-healing coverage flywheel.
 
 ```sh
 # Build the whole workspace and run every test
-git clone https://github.com/OWNER/plsql-intelligence
+git clone https://github.com/MuhDur/plsql-intelligence
 cd plsql-intelligence
 cargo build --workspace && cargo test --workspace
 ```
@@ -285,7 +284,7 @@ see `rust-toolchain.toml`).
 ### From source (recommended)
 
 ```sh
-git clone https://github.com/OWNER/plsql-intelligence
+git clone https://github.com/MuhDur/plsql-intelligence
 cd plsql-intelligence
 cargo build --workspace --release
 ```

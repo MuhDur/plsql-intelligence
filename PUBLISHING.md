@@ -23,35 +23,26 @@ at the initial commit and carries none of the above either:
 git log --all --oneline | wc -l   # expect a small, clean initial history
 ```
 
-## Before the first push
+## Forking
 
-1. **Replace the badge owner.** `README.md` uses `OWNER` as a placeholder
-   in the CI and USR Loop badge URLs. Replace `OWNER` with your GitHub
-   org or username:
-
-   ```sh
-   sed -i 's#github.com/OWNER/plsql-intelligence#github.com/<you>/plsql-intelligence#g' README.md
-   ```
-
-2. **Run the full gate locally:**
-
-   ```sh
-   cargo build --workspace
-   cargo test  --workspace
-   cargo clippy --workspace --all-targets -- -D warnings
-   ```
-
-3. **Confirm the working tree is clean** — no stray absolute paths,
-   private hostnames, or internal project identifiers, and `git status`
-   shows only intended files.
-
-## Pushing
+The README badge URLs and the workspace `Cargo.toml` `repository` /
+`homepage` fields point at `github.com/MuhDur/plsql-intelligence`. If
+you fork, replace `MuhDur` with your handle:
 
 ```sh
-# create an empty repo named plsql-intelligence on GitHub first, then:
-git remote add origin git@github.com:<you>/plsql-intelligence.git
-git push -u origin main
+sed -i 's#github.com/MuhDur/plsql-intelligence#github.com/<you>/plsql-intelligence#g' README.md Cargo.toml
 ```
+
+## Local gate before pushing changes
+
+```sh
+cargo build --workspace
+cargo test  --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Confirm `git status` shows only intended files — no stray absolute
+paths, private hostnames, or internal project identifiers.
 
 `.github/workflows/ci.yml` and `.github/workflows/usr.yml` run on the
 first push. The USR Loop nightly acceptance proof honestly SKIPs on CI
