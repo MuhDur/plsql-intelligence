@@ -971,6 +971,7 @@ dependencies = [
  "oraclemcp-guard",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "zeroize",
 ]
