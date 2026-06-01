@@ -1051,6 +1051,7 @@ name = "plsql-mcp"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "oraclemcp-core",
  "plsql-catalog",
  "plsql-cicd",
  "plsql-core",
