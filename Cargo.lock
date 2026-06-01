@@ -751,6 +751,98 @@ dependencies = [
 ]
 
 [[package]]
+name = "oraclemcp-audit"
+version = "0.1.0"
+dependencies = [
+ "oraclemcp-error",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "oraclemcp-auth"
+version = "0.1.0"
+dependencies = [
+ "oraclemcp-audit",
+ "oraclemcp-error",
+ "oraclemcp-guard",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "oraclemcp-config"
+version = "0.1.0"
+dependencies = [
+ "oraclemcp-error",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "oraclemcp-core"
+version = "0.1.0"
+dependencies = [
+ "oraclemcp-audit",
+ "oraclemcp-auth",
+ "oraclemcp-config",
+ "oraclemcp-db",
+ "oraclemcp-error",
+ "oraclemcp-guard",
+ "oraclemcp-telemetry",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "oraclemcp-db"
+version = "0.1.0"
+dependencies = [
+ "oraclemcp-error",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "oraclemcp-error"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "oraclemcp-guard"
+version = "0.1.0"
+dependencies = [
+ "oraclemcp-audit",
+ "oraclemcp-error",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "oraclemcp-telemetry"
+version = "0.1.0"
+dependencies = [
+ "oraclemcp-error",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "owo-colors"
 version = "4.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -22,6 +22,17 @@ members = [
     "crates/plsql-mcp",
     "crates/plsql-support",
     "crates/plsql-accretion",
+    # oraclemcp-* core crates (plan §14): engine-free MCP spine, extracted in
+    # place from plsql-mcp/plsql-catalog. The CI dependency-lint enforces that
+    # none of these import a plsql-* engine crate (one-way boundary, §0).
+    "crates/oraclemcp-error",
+    "crates/oraclemcp-config",
+    "crates/oraclemcp-audit",
+    "crates/oraclemcp-telemetry",
+    "crates/oraclemcp-db",
+    "crates/oraclemcp-guard",
+    "crates/oraclemcp-auth",
+    "crates/oraclemcp-core",
     "tools/corpus-bench",
     "tools/corpus-grow",
     "tools/corpus-license-check",

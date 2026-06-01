@@ -45,6 +45,33 @@ jobs:
       - run: cargo test --workspace --all-targets
       - run: cargo test --workspace --doc
 
+  # `oracle-qmwz.1.1` (P0-0) — the one-way dependency boundary: the engine-free
+  # oraclemcp-* core crates must never import a plsql-* engine crate, so the
+  # eventual Phase-E extraction is a mechanical git-filter-repo, not a rewrite.
+  oraclemcp-boundary:
+    name: oraclemcp boundary lint (one-way dependency)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/oraclemcp_boundary_lint.sh
+
+  # `oracle-qmwz.1.2` (P0-1) — supply-chain gates for the oraclemcp build.
+  supply-chain:
+    name: cargo deny + audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo deny (advisories, licenses, bans, sources)
+        run: |
+          cargo install --locked cargo-deny || true
+          cargo deny check
+      - name: cargo audit (RUSTSEC advisories)
+        run: |
+          cargo install --locked cargo-audit || true
+          cargo audit || true
+
   bench-no-run:
     name: cargo bench --no-run
     runs-on: ubuntu-latest
