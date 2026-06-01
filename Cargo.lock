@@ -1002,8 +1002,10 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
+ "toml 0.8.23",
  "tracing",
 ]
 
