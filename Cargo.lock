@@ -845,6 +845,7 @@ version = "0.1.0"
 dependencies = [
  "oracle",
  "oraclemcp-error",
+ "oraclemcp-guard",
  "r2d2",
  "serde",
  "serde_json",
