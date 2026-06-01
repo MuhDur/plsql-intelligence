@@ -8,6 +8,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use oraclemcp_guard::MonotonicDeadline;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -110,20 +111,44 @@ pub struct EnableWritesToken {
     pub connection: String,
     /// Operation summary the operator approved (mirrors the audit trail).
     pub operation_summary: String,
-    /// Unix timestamp (seconds) when the token was issued.
+    /// Unix timestamp (seconds) when the token was issued. **Display / audit
+    /// only** — never the authoritative expiry (a backward clock would make it
+    /// lie). See [`EnableWritesToken::is_expired_at`].
     pub issued_at: u64,
-    /// Token TTL in seconds.
+    /// Token TTL in seconds (display / audit).
     pub ttl_seconds: u64,
+    /// The authoritative, monotonic expiry deadline (plan §5.10, P0-CLK).
+    /// Anchored at mint on [`MonotonicDeadline`] so a backward wall-clock jump
+    /// cannot extend the window. Deliberately **not serialized**: a token
+    /// reconstructed from a serialized snapshot (or a prior process
+    /// generation) has `None` here and is therefore treated as expired
+    /// (fail-closed) — the authoritative state lives only in the live
+    /// in-process session.
+    #[serde(skip)]
+    pub deadline: Option<MonotonicDeadline>,
 }
 
 impl EnableWritesToken {
-    /// Whether the token has expired against `now` (unix seconds).
+    /// Whether the token has expired. **Fail-closed and monotonic:** the
+    /// monotonic deadline is authoritative (a backward clock cannot revive an
+    /// expired token, and a deserialized token with no live deadline is
+    /// expired); the wall-clock `now` check is retained as forward-only
+    /// defense-in-depth so the two only ever agree to *expire*, never to
+    /// extend.
     #[must_use]
     pub fn is_expired_at(&self, now: u64) -> bool {
-        now.saturating_sub(self.issued_at) >= self.ttl_seconds
+        self.is_expired_monotonic() || now.saturating_sub(self.issued_at) >= self.ttl_seconds
     }
 
-    /// Whether the token is expired against the system clock.
+    /// The authoritative monotonic expiry: expired if the live deadline has
+    /// passed, or if there is no live deadline (deserialized / prior-generation
+    /// token — fail-closed).
+    #[must_use]
+    pub fn is_expired_monotonic(&self) -> bool {
+        self.deadline.is_none_or(|d| d.is_expired())
+    }
+
+    /// Whether the token is expired against the (monotonic) clock.
     #[must_use]
     pub fn is_expired(&self) -> bool {
         let now = SystemTime::now()
@@ -182,6 +207,9 @@ impl SessionSafetyState {
             operation_summary: operation_summary.into(),
             issued_at,
             ttl_seconds: ENABLE_WRITES_TOKEN_TTL_SECONDS,
+            deadline: Some(MonotonicDeadline::after(Duration::from_secs(
+                ENABLE_WRITES_TOKEN_TTL_SECONDS,
+            ))),
         };
         self.active_token = Some(token.clone());
         Ok(token)
@@ -360,6 +388,9 @@ mod tests {
             operation_summary: String::from("any"),
             issued_at: 0,
             ttl_seconds: ENABLE_WRITES_TOKEN_TTL_SECONDS,
+            deadline: Some(MonotonicDeadline::after(Duration::from_secs(
+                ENABLE_WRITES_TOKEN_TTL_SECONDS,
+            ))),
         });
         let result = state.enable_writes("sneaky", "prod-db", 1);
         assert!(matches!(
@@ -389,6 +420,55 @@ mod tests {
         // does not consume the token).
         state.enable_writes("tok-a", "billing-dev", now).unwrap();
         assert!(state.writes_allowed());
+    }
+
+    #[test]
+    fn backward_clock_jump_cannot_revive_an_expired_token() {
+        // P0-CLK (§5.10): the live fail-open. A monotonically-expired token
+        // whose wall clock reads *fresh* (a backward NTP/VM jump:
+        // now < issued_at, so the old saturating_sub clamps to 0) must still
+        // be expired. The monotonic deadline is authoritative.
+        let mut state = SessionSafetyState::new(SafetyProfile::DdlGuarded, false);
+        state
+            .mint_token("billing-dev", "op", "tok-clk")
+            .expect("mint");
+        // Simulate the monotonic window having elapsed (deadline in the past)
+        // while the wall clock jumped backward to before issue time.
+        let issued_at = state.active_token.as_ref().unwrap().issued_at;
+        state.active_token.as_mut().unwrap().deadline =
+            Some(MonotonicDeadline::after(Duration::from_secs(0)));
+        let wall_now_after_backward_jump = issued_at.saturating_sub(30);
+        // Wall clock alone would read this as fresh (saturating_sub -> 0):
+        assert_eq!(wall_now_after_backward_jump.saturating_sub(issued_at), 0);
+        // …but enable_writes must refuse it (monotonic deadline expired).
+        let result = state.enable_writes("tok-clk", "billing-dev", wall_now_after_backward_jump);
+        assert!(matches!(
+            result,
+            Err(SafetyProfileError::EnableWritesTokenMissing { .. })
+        ));
+        assert!(state.active_token.is_none());
+        assert!(!state.session_writes_enabled);
+    }
+
+    #[test]
+    fn deserialized_token_without_live_deadline_is_expired() {
+        // A token round-tripped through serde has no live monotonic deadline
+        // (the field is #[serde(skip)]), so it is fail-closed expired — a prior
+        // process generation's window can never be replayed.
+        let token = EnableWritesToken {
+            token: String::from("tok"),
+            connection: String::from("dev"),
+            operation_summary: String::from("op"),
+            issued_at: 0,
+            ttl_seconds: ENABLE_WRITES_TOKEN_TTL_SECONDS,
+            deadline: None,
+        };
+        let json = serde_json::to_string(&token).expect("serialize");
+        let restored: EnableWritesToken = serde_json::from_str(&json).expect("deserialize");
+        assert!(restored.deadline.is_none());
+        assert!(restored.is_expired_monotonic());
+        // Even with a wall `now` that looks fresh (now == issued_at), expired.
+        assert!(restored.is_expired_at(0));
     }
 
     #[test]

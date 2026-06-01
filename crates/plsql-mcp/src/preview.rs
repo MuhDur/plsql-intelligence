@@ -15,6 +15,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use oraclemcp_guard::MonotonicDeadline;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -48,15 +49,32 @@ pub struct PreviewedDdl {
     /// AND tied to this hash — any byte-level difference at execute time
     /// rejects the call.
     pub ddl_sha256: String,
+    /// **Display / audit only** — never the authoritative expiry.
     pub issued_at: u64,
+    /// Token TTL in seconds (display / audit).
     pub ttl_seconds: u64,
+    /// The authoritative, monotonic expiry deadline (plan §5.10, P0-CLK).
+    /// Not serialized: a preview reconstructed from a serialized snapshot or a
+    /// prior process generation has `None` here and is fail-closed expired.
+    #[serde(skip)]
+    pub deadline: Option<MonotonicDeadline>,
 }
 
 impl PreviewedDdl {
-    /// Whether the token has expired against `now` (unix seconds).
+    /// Whether the token has expired. Fail-closed and monotonic: the monotonic
+    /// deadline is authoritative (a backward clock cannot revive it; a token
+    /// with no live deadline is expired); the wall-clock `now` is forward-only
+    /// defense-in-depth (plan §5.10, P0-CLK).
     #[must_use]
     pub fn is_expired_at(&self, now: u64) -> bool {
-        now.saturating_sub(self.issued_at) >= self.ttl_seconds
+        self.is_expired_monotonic() || now.saturating_sub(self.issued_at) >= self.ttl_seconds
+    }
+
+    /// The authoritative monotonic expiry: expired if the live deadline has
+    /// passed, or if there is no live deadline (deserialized / prior generation).
+    #[must_use]
+    pub fn is_expired_monotonic(&self) -> bool {
+        self.deadline.is_none_or(|d| d.is_expired())
     }
 }
 
@@ -108,6 +126,9 @@ impl PreviewRegistry {
             ddl_sha256,
             issued_at,
             ttl_seconds: ENABLE_WRITES_TOKEN_TTL_SECONDS,
+            deadline: Some(MonotonicDeadline::after(Duration::from_secs(
+                ENABLE_WRITES_TOKEN_TTL_SECONDS,
+            ))),
         };
         // Re-issuing for the same connection invalidates the prior entry.
         self.pending.insert(connection, preview.clone());
@@ -361,5 +382,48 @@ mod tests {
         let _ = other;
         let dropped = registry.purge_expired(now);
         assert!(dropped >= 1);
+    }
+
+    #[test]
+    fn backward_clock_jump_cannot_revive_an_expired_preview() {
+        // P0-CLK (§5.10): a monotonically-expired preview whose wall clock
+        // reads fresh (backward jump: now < issued_at) must still be rejected.
+        let mut registry = PreviewRegistry::new();
+        let preview = registry
+            .preview_sql("dev", "op", "ALTER FOO ADD BAR NUMBER;", "tok")
+            .unwrap();
+        let issued_at = preview.issued_at;
+        // Force the monotonic window elapsed.
+        registry.pending.get_mut("dev").unwrap().deadline =
+            Some(MonotonicDeadline::after(Duration::from_secs(0)));
+        // A backward-jumped wall clock alone would read this as fresh…
+        let wall_now = issued_at.saturating_sub(30);
+        assert_eq!(wall_now.saturating_sub(issued_at), 0);
+        // …but the monotonic deadline forces rejection.
+        assert!(matches!(
+            registry.read_patch_preview("tok", wall_now),
+            Err(PreviewError::TokenExpired { .. })
+        ));
+        assert!(matches!(
+            registry.verify_byte_for_byte("tok", "dev", "ALTER FOO ADD BAR NUMBER;", wall_now),
+            Err(PreviewError::TokenExpired { .. })
+        ));
+    }
+
+    #[test]
+    fn deserialized_preview_without_live_deadline_is_expired() {
+        let mut registry = PreviewRegistry::new();
+        registry
+            .preview_sql("dev", "op", "ALTER FOO ADD BAR NUMBER;", "tok")
+            .unwrap();
+        // Round-trip the registry through serde — the #[serde(skip)] deadline
+        // is dropped, so the restored preview is fail-closed expired.
+        let json = serde_json::to_string(&registry).expect("serialize");
+        let restored: PreviewRegistry = serde_json::from_str(&json).expect("deserialize");
+        // Even at a wall `now` that looks fresh, the restored token is expired.
+        assert!(matches!(
+            restored.read_patch_preview("tok", 0),
+            Err(PreviewError::TokenExpired { .. })
+        ));
     }
 }

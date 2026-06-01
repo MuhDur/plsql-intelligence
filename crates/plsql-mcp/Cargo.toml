@@ -28,6 +28,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 oraclemcp-core = { path = "../oraclemcp-core" }
+oraclemcp-guard = { path = "../oraclemcp-guard" }
 plsql-catalog = { path = "../plsql-catalog" }
 plsql-cicd = { path = "../plsql-cicd" }
 plsql-core = { path = "../plsql-core" }
