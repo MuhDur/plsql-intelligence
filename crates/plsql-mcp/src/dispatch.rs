@@ -46,9 +46,10 @@ use serde_json::Value;
 
 use crate::{
     AnalyzeProjectRequest, CompileCheckRequest, CompletenessReportRequest, DocLookupRequest,
-    DynamicSqlEvidenceRequest, GetSymbolRequest, ParseFileRequest, run_analyze_project,
-    run_compile_check, run_completeness_report, run_doc_lookup, run_dynamic_sql_evidence,
-    run_get_symbol, run_inspect_profile, run_parse_file,
+    DynamicSqlEvidenceRequest, GetSymbolRequest, ParseFileRequest, PlsqlAnalyzeRequest,
+    run_analyze_project, run_compile_check, run_completeness_report, run_doc_lookup,
+    run_dynamic_sql_evidence, run_get_symbol, run_inspect_profile, run_parse_file,
+    run_plsql_analyze,
 };
 
 /// Why a dispatched tool could not run to completion in the pure
@@ -126,6 +127,7 @@ pub fn dispatch_table() -> &'static [&'static str] {
         "compile_check",
         "inspect_profile",
         "analyze_project",
+        "plsql_analyze",
         "dynamic_sql_evidence",
         "completeness_report",
         "doc_lookup",
@@ -206,6 +208,16 @@ pub fn dispatch_tool(name: &str, arguments: &Value) -> Result<DispatchOutcome, D
         "analyze_project" => {
             let req: AnalyzeProjectRequest = parse_args(name, arguments)?;
             match run_analyze_project(req) {
+                Ok(resp) => Ok(ran(&resp)),
+                Err(e) => Err(DispatchError::InvalidArguments {
+                    tool: name.to_string(),
+                    detail: e.to_string(),
+                }),
+            }
+        }
+        "plsql_analyze" => {
+            let req: PlsqlAnalyzeRequest = parse_args(name, arguments)?;
+            match run_plsql_analyze(req) {
                 Ok(resp) => Ok(ran(&resp)),
                 Err(e) => Err(DispatchError::InvalidArguments {
                     tool: name.to_string(),

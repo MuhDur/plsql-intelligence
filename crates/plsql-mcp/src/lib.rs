@@ -60,6 +60,7 @@ pub mod list_objects;
 pub mod mcp_protocol;
 pub mod parse_tools;
 pub mod patch;
+pub mod plsql_analyze;
 pub mod preview;
 pub mod query;
 pub mod safety;
@@ -71,6 +72,10 @@ pub mod trust;
 pub use analyze_project::{
     AnalyzeProjectError, AnalyzeProjectRequest, AnalyzeProjectResponse,
     register_analyze_project_tool, run_analyze_project,
+};
+pub use plsql_analyze::{
+    CallRef, ComplexityInfo, LintFinding, PlsqlAnalyzeError, PlsqlAnalyzeRequest,
+    PlsqlAnalyzeResponse, RoutineInfo, register_plsql_analyze_tool, run_plsql_analyze,
 };
 pub use change_tools::{
     ChangeToolError, register_change_tools, run_classify_change, run_compare_oracle_deps,
@@ -238,6 +243,7 @@ pub fn default_tool_registry() -> ToolRegistry {
     // Static-analysis tools (no project, no DB) — always safe to call.
     register_parse_tools(&mut r);
     register_analyze_project_tool(&mut r);
+    register_plsql_analyze_tool(&mut r);
     register_graph_tools(&mut r);
     register_foundation_tools(&mut r);
     register_change_tools(&mut r);
