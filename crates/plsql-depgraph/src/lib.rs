@@ -920,9 +920,16 @@ impl DepGraph {
     pub fn detect_cycles(&self) -> Result<CycleDetectResult, GraphQueryError> {
         let mut state = TarjanState::default();
 
+        // Adjacency index built once (hoisted out of the per-node walk):
+        // re-sorting the whole edge vector at every visited node was
+        // O(N^2 log N). Each node maps to its out-neighbours in the same
+        // ascending-edge-id order the recursive walk used, so component
+        // ordering is byte-for-byte preserved.
+        let adjacency = self.build_adjacency_index();
+
         for node_id in sorted_nodes(&self.nodes).into_iter().map(|node| node.id) {
             if !state.indices.contains_key(&node_id) {
-                self.strong_connect(node_id, &mut state)?;
+                self.strong_connect(node_id, &adjacency, &mut state)?;
             }
         }
 
@@ -934,6 +941,22 @@ impl DepGraph {
 
         cycles.sort_by_key(|cycle| cycle.nodes.first().map(|node| node.id).unwrap_or_default());
         Ok(CycleDetectResult { cycles })
+    }
+
+    /// Build the out-edge adjacency index used by the iterative
+    /// Tarjan walk. Neighbours are listed in ascending `EdgeId` order
+    /// — identical to the `sorted_edges(&self.edges).filter(from ==)`
+    /// the recursive implementation evaluated at every level — so the
+    /// SCCs produced are unchanged.
+    fn build_adjacency_index(&self) -> HashMap<NodeId, Vec<(NodeId, EdgeId)>> {
+        let mut adjacency: HashMap<NodeId, Vec<(NodeId, EdgeId)>> = HashMap::new();
+        for edge in sorted_edges(&self.edges) {
+            adjacency
+                .entry(edge.from)
+                .or_default()
+                .push((edge.to, edge.id));
+        }
+        adjacency
     }
 
     #[instrument(level = "trace", skip(self))]
@@ -1025,87 +1048,140 @@ impl DepGraph {
         })
     }
 
+    /// Tarjan strong-connect rewritten with an **explicit work stack**
+    /// so deep dependency chains can no longer overflow the native call
+    /// stack (the recursive form aborted with SIGABRT on a
+    /// tens-of-thousands-node linear chain — both a real Oracle
+    /// view-on-view / package-call estate and a trivially hostile
+    /// artifact). Memory is now bounded by the heap, degrading honestly
+    /// instead of crashing. The neighbour visit order matches the old
+    /// `sorted_edges(...).filter(from ==)` walk exactly, so the
+    /// strongly-connected components produced are unchanged.
     fn strong_connect(
         &self,
-        node_id: NodeId,
+        root: NodeId,
+        adjacency: &HashMap<NodeId, Vec<(NodeId, EdgeId)>>,
         state: &mut TarjanState,
     ) -> Result<(), GraphQueryError> {
-        state.indices.insert(node_id, state.index);
-        state.lowlinks.insert(node_id, state.index);
-        state.index += 1;
-        state.stack.push(node_id);
-        state.on_stack.insert(node_id);
-
-        for edge in sorted_edges(&self.edges)
-            .into_iter()
-            .filter(|edge| edge.from == node_id)
-        {
-            let neighbor = edge.to;
-            if !state.indices.contains_key(&neighbor) {
-                self.strong_connect(neighbor, state)?;
-
-                let neighbor_lowlink = state.lowlinks.get(&neighbor).copied().ok_or(
-                    GraphQueryError::MissingEdgeEndpoint {
-                        edge_id: edge.id,
-                        missing_node_id: neighbor,
-                    },
-                )?;
-                let current_lowlink = state.lowlinks.get(&node_id).copied().ok_or(
-                    GraphQueryError::MissingEdgeEndpoint {
-                        edge_id: edge.id,
-                        missing_node_id: node_id,
-                    },
-                )?;
-                if neighbor_lowlink < current_lowlink {
-                    state.lowlinks.insert(node_id, neighbor_lowlink);
-                }
-            } else if state.on_stack.contains(&neighbor) {
-                let neighbor_index = state.indices.get(&neighbor).copied().ok_or(
-                    GraphQueryError::MissingEdgeEndpoint {
-                        edge_id: edge.id,
-                        missing_node_id: neighbor,
-                    },
-                )?;
-                let current_lowlink = state.lowlinks.get(&node_id).copied().ok_or(
-                    GraphQueryError::MissingEdgeEndpoint {
-                        edge_id: edge.id,
-                        missing_node_id: node_id,
-                    },
-                )?;
-                if neighbor_index < current_lowlink {
-                    state.lowlinks.insert(node_id, neighbor_index);
-                }
-            }
+        // Each frame is a suspended `strong_connect(node)` call: the
+        // node being processed plus the index of the next out-neighbour
+        // to inspect when the frame resumes.
+        struct Frame {
+            node_id: NodeId,
+            neighbor_cursor: usize,
         }
 
-        let node_index =
-            state
-                .indices
-                .get(&node_id)
-                .copied()
-                .ok_or(GraphQueryError::NodeNotFound {
-                    selector: format!("node-id={}", node_id.get()),
-                })?;
-        let node_lowlink =
-            state
-                .lowlinks
-                .get(&node_id)
-                .copied()
-                .ok_or(GraphQueryError::NodeNotFound {
-                    selector: format!("node-id={}", node_id.get()),
-                })?;
+        const EMPTY: &[(NodeId, EdgeId)] = &[];
 
-        if node_lowlink == node_index {
-            let mut component = Vec::new();
-            while let Some(current) = state.stack.pop() {
-                state.on_stack.remove(&current);
-                component.push(current);
-                if current == node_id {
+        let mut work: Vec<Frame> = Vec::new();
+
+        // Inline the "enter a node" bookkeeping the recursive form did
+        // at function entry.
+        state.indices.insert(root, state.index);
+        state.lowlinks.insert(root, state.index);
+        state.index += 1;
+        state.stack.push(root);
+        state.on_stack.insert(root);
+        work.push(Frame {
+            node_id: root,
+            neighbor_cursor: 0,
+        });
+
+        while let Some(frame) = work.last_mut() {
+            let node_id = frame.node_id;
+            let neighbors = adjacency.get(&node_id).map_or(EMPTY, Vec::as_slice);
+
+            // Resume scanning this node's out-neighbours where we left
+            // off. A `descend` flag lets us push a child frame and
+            // `continue` the outer loop (mirroring native recursion)
+            // without re-borrowing `frame` after `work` is mutated.
+            let mut descend: Option<NodeId> = None;
+            while frame.neighbor_cursor < neighbors.len() {
+                let (neighbor, edge_id) = neighbors[frame.neighbor_cursor];
+                frame.neighbor_cursor += 1;
+
+                if !state.indices.contains_key(&neighbor) {
+                    // Unvisited: enter the child, then suspend so we can
+                    // fold its lowlink back in when it returns.
+                    state.indices.insert(neighbor, state.index);
+                    state.lowlinks.insert(neighbor, state.index);
+                    state.index += 1;
+                    state.stack.push(neighbor);
+                    state.on_stack.insert(neighbor);
+                    descend = Some(neighbor);
                     break;
+                } else if state.on_stack.contains(&neighbor) {
+                    let neighbor_index = state.indices.get(&neighbor).copied().ok_or(
+                        GraphQueryError::MissingEdgeEndpoint {
+                            edge_id,
+                            missing_node_id: neighbor,
+                        },
+                    )?;
+                    let current_lowlink = state.lowlinks.get(&node_id).copied().ok_or(
+                        GraphQueryError::MissingEdgeEndpoint {
+                            edge_id,
+                            missing_node_id: node_id,
+                        },
+                    )?;
+                    if neighbor_index < current_lowlink {
+                        state.lowlinks.insert(node_id, neighbor_index);
+                    }
                 }
             }
-            component.sort_unstable();
-            state.components.push(component);
+
+            if let Some(child) = descend {
+                work.push(Frame {
+                    node_id: child,
+                    neighbor_cursor: 0,
+                });
+                continue;
+            }
+
+            // All out-neighbours processed: this is the post-recursion
+            // tail. Emit an SCC if this node is a root, then pop the
+            // frame and fold our lowlink into the parent's.
+            let node_index =
+                state
+                    .indices
+                    .get(&node_id)
+                    .copied()
+                    .ok_or(GraphQueryError::NodeNotFound {
+                        selector: format!("node-id={}", node_id.get()),
+                    })?;
+            let node_lowlink =
+                state
+                    .lowlinks
+                    .get(&node_id)
+                    .copied()
+                    .ok_or(GraphQueryError::NodeNotFound {
+                        selector: format!("node-id={}", node_id.get()),
+                    })?;
+
+            if node_lowlink == node_index {
+                let mut component = Vec::new();
+                while let Some(current) = state.stack.pop() {
+                    state.on_stack.remove(&current);
+                    component.push(current);
+                    if current == node_id {
+                        break;
+                    }
+                }
+                component.sort_unstable();
+                state.components.push(component);
+            }
+
+            work.pop();
+            if let Some(parent) = work.last() {
+                let parent_id = parent.node_id;
+                let parent_lowlink = state.lowlinks.get(&parent_id).copied().ok_or(
+                    GraphQueryError::NodeNotFound {
+                        selector: format!("node-id={}", parent_id.get()),
+                    },
+                )?;
+                if node_lowlink < parent_lowlink {
+                    state.lowlinks.insert(parent_id, node_lowlink);
+                }
+            }
         }
 
         Ok(())
@@ -2365,6 +2441,102 @@ mod tests {
                 }],
             }
         );
+    }
+
+    /// Build a single linear dependency chain `n1 -> n2 -> ... -> nN`
+    /// (no back-edges, so zero cycles). With the recursive Tarjan this
+    /// drove `len` native frames deep before any SCC popped; at tens of
+    /// thousands of nodes the ~8 MiB main-thread stack was exhausted and
+    /// the process aborted with SIGABRT.
+    fn build_linear_chain(len: u64) -> DepGraph {
+        let mut graph = DepGraph::new();
+        for i in 1..=len {
+            graph.insert_node(Node::new(
+                NodeId::new(i),
+                LogicalObjectId::new(format!("chain.node_{i}")),
+                ObjectRevisionId::new(format!("sha256:{i}")),
+                QualifiedName::new(None, ObjectName::from(SymbolId::new(i))),
+                NodeIdentityKind::Table,
+            ));
+        }
+        for i in 1..len {
+            graph.insert_edge(
+                Edge::new(
+                    EdgeId::new(i),
+                    NodeId::new(i),
+                    NodeId::new(i + 1),
+                    EdgeKind::Reads,
+                    Confidence::new(ConfidenceLevel::High, None),
+                ),
+                Provenance::new(
+                    FileId::new(1),
+                    Span::new(
+                        FileId::new(1),
+                        Position::new(1, 1, 0),
+                        Position::new(1, 2, 1),
+                    ),
+                    ResolutionStrategy::CatalogLookup,
+                ),
+                None,
+            );
+        }
+        graph
+    }
+
+    #[test]
+    fn detect_cycles_handles_deep_linear_chain_without_stack_overflow() {
+        // Regression for oracle-lokg.3: the recursive Tarjan aborted the
+        // process (SIGABRT) on a deep linear chain. The iterative
+        // explicit-stack rewrite must terminate cleanly with the correct
+        // (empty) cycle set instead.
+        let graph = build_linear_chain(60_000);
+        let report = graph
+            .detect_cycles()
+            .expect("deep linear chain must not crash cycle detection");
+        assert!(
+            report.cycles.is_empty(),
+            "a pure linear chain has no strongly-connected component larger than one node"
+        );
+    }
+
+    #[test]
+    fn detect_cycles_finds_cycle_at_tail_of_deep_chain() {
+        // Same deep chain, but close the last two nodes into a 2-cycle.
+        // Proves the iterative walk still detects an SCC buried tens of
+        // thousands of frames deep — i.e. it computes the same answer as
+        // the recursive form, not merely "doesn't crash".
+        let mut graph = build_linear_chain(40_000);
+        graph.insert_edge(
+            Edge::new(
+                EdgeId::new(40_000),
+                NodeId::new(40_000),
+                NodeId::new(39_999),
+                EdgeKind::Reads,
+                Confidence::new(ConfidenceLevel::High, None),
+            ),
+            Provenance::new(
+                FileId::new(1),
+                Span::new(
+                    FileId::new(1),
+                    Position::new(1, 1, 0),
+                    Position::new(1, 2, 1),
+                ),
+                ResolutionStrategy::CatalogLookup,
+            ),
+            None,
+        );
+        let report = graph
+            .detect_cycles()
+            .expect("deep chain with tail cycle must not crash cycle detection");
+        assert_eq!(report.cycles.len(), 1, "exactly one 2-node cycle expected");
+        let cycle = &report.cycles[0];
+        let mut cycle_ids = cycle
+            .nodes
+            .iter()
+            .map(|node| node.id.get())
+            .collect::<Vec<_>>();
+        cycle_ids.sort_unstable();
+        assert_eq!(cycle_ids, vec![39_999, 40_000]);
     }
 
     #[test]
