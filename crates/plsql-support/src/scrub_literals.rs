@@ -211,8 +211,22 @@ pub fn scrub_literals(source: &str, thresholds: ScrubThresholds) -> (String, Scr
             continue;
         }
 
-        out.push(bytes[i] as char);
-        i += 1;
+        // Pass through one UTF-8 scalar value (NOT one byte). A
+        // bare `bytes[i] as char` is a Latin-1 reinterpretation that
+        // (a) mangles a multi-byte char into mojibake and, worse,
+        // (b) advances `i` by one byte into the *middle* of a
+        // multi-byte sequence — the next `&source[i..]` slice (the
+        // date/q/string scanners) then panics with a non-char-boundary
+        // error, aborting the whole redaction/MinFixture build. All
+        // scanner matches above are against ASCII bytes, which can
+        // never appear inside a multi-byte UTF-8 sequence, so `i`
+        // always lands on a char boundary here. (oracle-qm3q.14)
+        let ch = source[i..]
+            .chars()
+            .next()
+            .expect("i is on a UTF-8 char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
     }
 
     (out, stats)
@@ -485,6 +499,41 @@ mod tests {
         let src = "x := 1; /* 漢字 こんにちは and then no terminator";
         let (out, _) = scrub_literals(src, ScrubThresholds::default_thresholds());
         assert!(out.contains("漢字"));
+    }
+
+    #[test]
+    fn non_ascii_bytes_outside_string_do_not_panic_and_are_preserved() {
+        // Regression for oracle-qm3q.14: the byte-as-char fallback
+        // advanced `i` one byte into a multi-byte UTF-8 char; the
+        // next `&source[i..]` slice (date/q/string scanners) then
+        // panicked at a non-char boundary, aborting the bundle build.
+        // Each input puts a non-ASCII char in a token-separator or
+        // unquoted-identifier position (outside any string/comment).
+        for src in [
+            "x\u{00A0}:= 1;",     // NBSP between tokens
+            "café := 1;",         // accented leading identifier
+            "v_é := 5",           // accented char inside identifier
+            "é",                  // trailing accent only
+            "a — b",              // em-dash separator
+        ] {
+            let (out, _) = scrub_literals(src, ScrubThresholds::default_thresholds());
+            // No panic reached here; non-literal text must be copied
+            // byte-identical (no Latin-1 mojibake).
+            assert!(
+                out.contains('é') || !src.contains('é'),
+                "accented char must survive verbatim for {src:?}: {out}"
+            );
+            assert_eq!(
+                out.contains('\u{00A0}'),
+                src.contains('\u{00A0}'),
+                "NBSP must survive verbatim for {src:?}: {out}"
+            );
+            assert_eq!(
+                out.contains('—'),
+                src.contains('—'),
+                "em-dash must survive verbatim for {src:?}: {out}"
+            );
+        }
     }
 
     #[test]

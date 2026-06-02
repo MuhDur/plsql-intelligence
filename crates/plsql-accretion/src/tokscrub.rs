@@ -175,6 +175,43 @@ fn synthesise(class: Class, original: &str) -> String {
     }
 }
 
+/// `true` iff `text` is a synthetic alias this module's
+/// [`synthesise`] could have emitted — the SINGLE strict shape both
+/// privacy layers (`fixture.rs::privacy_residue_clean` at build time
+/// and `gate.rs::residue_check` / G8 at re-scan time) must agree on.
+///
+/// Exactly the synthesis vocabulary, nothing looser:
+/// * `id_<hex12>`  — `Class::Ident` / `Class::QuotedIdent` body
+///   (the surrounding `"…"` is stripped first).
+/// * `sx_<hex8>`   — `Class::Str` body (the surrounding `'…'` is
+///   stripped first).
+/// * `7` / `7.0`   — the only two numerals [`synthesise`] emits for a
+///   `Class::Num` (integer / float subtype).
+///
+/// Everything else fails closed. There is deliberately **no** broad
+/// "any all-digit token" or "id_/sx_ + any alphanumeric of any
+/// length" clause: an arbitrary numeral (a 16-digit card, a salary,
+/// an SSN) or a short/spoofed `id_abc` is, by definition, an
+/// un-scrubbed original and must be rejected as residue.
+///
+/// Both layers import this one function so the two privacy gates can
+/// never drift again (oracle-qm3q.25).
+#[must_use]
+pub fn is_synthetic_alias(text: &str) -> bool {
+    // Strip the synthetic's own delimiters: a string synthetic keeps
+    // its `'…'`, a quoted-id synthetic its `"…"`.
+    let body = text.trim_matches('\'').trim_matches('"');
+    if let Some(hex) = body.strip_prefix("id_") {
+        return hex.len() == 12 && hex.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    if let Some(hex) = body.strip_prefix("sx_") {
+        return hex.len() == 8 && hex.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    // The two — and only two — numerals `synthesise(Class::Num, _)`
+    // can emit.
+    body == "7" || body == "7.0"
+}
+
 /// Tokenise `src` with the real ANTLR backend and re-synthesise it
 /// token-by-token into a grammar-position-preserving, privacy-safe
 /// buffer.
@@ -440,5 +477,35 @@ mod tests {
     fn empty_or_trivia_only_yields_none() {
         assert_eq!(structure_preserving_scrub(""), None);
         assert_eq!(structure_preserving_scrub("   \n  "), None);
+    }
+
+    #[test]
+    fn is_synthetic_alias_is_the_strict_synthesis_vocabulary() {
+        // Accepts EXACTLY what `synthesise` can emit.
+        assert!(is_synthetic_alias("id_0123456789ab")); // hex12
+        assert!(is_synthetic_alias("sx_0123abcd")); // hex8
+        assert!(is_synthetic_alias("'sx_0123abcd'")); // string delims stripped
+        assert!(is_synthetic_alias("\"id_0123456789ab\"")); // qid delims stripped
+        assert!(is_synthetic_alias("7"));
+        assert!(is_synthetic_alias("7.0"));
+        // Cross-check against the actual synthesiser output.
+        assert!(is_synthetic_alias(&synthesise(Class::Ident, "customers_pii")));
+        assert!(is_synthetic_alias(&synthesise(Class::QuotedIdent, "My Col")));
+        assert!(is_synthetic_alias(&synthesise(Class::Str, "ZZSECRET")));
+        assert!(is_synthetic_alias(&synthesise(Class::Num, "4111111111111111")));
+        assert!(is_synthetic_alias(&synthesise(Class::Num, "98765.43")));
+
+        // Rejects un-scrubbed originals and spoofed/loose shapes.
+        assert!(!is_synthetic_alias("123")); // arbitrary numeral
+        assert!(!is_synthetic_alias("4111111111111111")); // 16-digit card
+        assert!(!is_synthetic_alias("98765.43")); // decimal salary
+        assert!(!is_synthetic_alias("555-12-3456")); // SSN shape
+        assert!(!is_synthetic_alias("sx_42a")); // wrong length / non-hex
+        assert!(!is_synthetic_alias("id_abc")); // wrong length
+        assert!(!is_synthetic_alias("id_zzzzzzzzzzzz")); // non-hex
+        assert!(!is_synthetic_alias("id_0123456789abff")); // too long
+        assert!(!is_synthetic_alias("customer_ssn"));
+        assert!(!is_synthetic_alias("ACME"));
+        assert!(!is_synthetic_alias(""));
     }
 }

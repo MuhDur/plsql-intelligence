@@ -596,7 +596,15 @@ pub fn residue_check(candidate_text: &str, fixtures_dir: &Path) -> Result<String
             if let Some(verdicts) = crate::tokscrub::token_verdicts(&src) {
                 for v in verdicts {
                     if let crate::tokscrub::TokVerdict::EstateClass(body) = v {
-                        if !is_synthetic_alias(&body) {
+                        // The SINGLE shared strict classifier — same
+                        // synthesis vocabulary (id_<hex12> / sx_<hex8>
+                        // / `7` / `7.0`) the build-time
+                        // `fixture.rs::privacy_residue_clean` enforces,
+                        // so this independent G8 re-scan can never
+                        // drift looser and pass a fixture with an
+                        // un-scrubbed numeric secret or a spoofed
+                        // short id_/sx_ alias (oracle-qm3q.25).
+                        if !crate::tokscrub::is_synthetic_alias(&body) {
                             return Err(GateError::PrivacyResidue(format!(
                                 "I-PRIVACY LEAK in fixture {}: non-synthetic estate-class token {:?} survived (not an id_/sx_/numeral alias)",
                                 f.display(),
@@ -612,21 +620,6 @@ pub fn residue_check(candidate_text: &str, fixtures_dir: &Path) -> Result<String
     Ok(format!(
         "0 surviving original bytes: candidate clean + {fixtures_scanned} MinFixture(s) residue-proven (wordlist-free ANTLR-lexer token scan + estate-marker grep)"
     ))
-}
-
-/// A token is a legitimate synthetic alias iff it is an
-/// `id_<n>` / `sx_<n>` identifier alias or a numeral the scrubber
-/// emits. (Mirrors `fixture.rs`'s synthesis vocabulary; kept local
-/// so G8 needs no estate.)
-fn is_synthetic_alias(body: &str) -> bool {
-    let b = body.trim_matches('"').trim_matches('\'');
-    if let Some(rest) = b.strip_prefix("id_").or_else(|| b.strip_prefix("sx_")) {
-        return !rest.is_empty() && rest.bytes().all(|c| c.is_ascii_alphanumeric());
-    }
-    // Numerals / quoted synthetic strings the scrubber emits.
-    !b.is_empty()
-        && b.bytes()
-            .all(|c| c.is_ascii_digit() || c == b'.' || c == b'-')
 }
 
 /// **G6 helper** — measure the three monotonic §0 metrics for
@@ -1028,6 +1021,35 @@ mod tests {
         assert!(matches!(e, GateError::PrivacyResidue(_)), "{e:?}");
     }
 
+    /// **G8 privacy backstop regression (oracle-qm3q.25).** A planted
+    /// fixture carrying a bare 16-digit numeric secret (a card number)
+    /// MUST be caught by the independent token-residue re-scan and
+    /// abort the run. Before the strict-shape unification, the loose
+    /// gate classifier accepted any all-digit token as a "synthetic
+    /// numeral" and silently PASSED such a fixture.
+    #[test]
+    fn g8_rejects_fixture_with_bare_numeric_secret() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "plsql-g8-residue-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("mk fixtures_dir");
+        let fixture = dir.join("planted.sql");
+        // A NumericLiteral that classifies as Class::Num but is NOT
+        // the synthesiser's `7`/`7.0` — an un-scrubbed original.
+        std::fs::write(&fixture, "SELECT 4111111111111111 FROM dual;\n")
+            .expect("write planted fixture");
+
+        let res = residue_check("# usr-gate: clean candidate\n", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let e = res.expect_err("G8 must abort on a bare 16-digit numeric secret");
+        assert!(matches!(e, GateError::PrivacyResidue(_)), "{e:?}");
+    }
+
     #[test]
     fn pins_check_returns_typed_error_without_directives() {
         let e = pins_check(Path::new("."), "no pins directives here\n").unwrap_err();
@@ -1146,9 +1168,25 @@ mod tests {
 
     #[test]
     fn synthetic_alias_classifier() {
-        assert!(is_synthetic_alias("id_1"));
-        assert!(is_synthetic_alias("sx_42a"));
-        assert!(is_synthetic_alias("123"));
+        // G8 now shares the strict classifier with the build-time
+        // residue proof (oracle-qm3q.25): only the exact synthesis
+        // vocabulary passes; the previous loose all-digit / any-length
+        // id_/sx_ clauses (which would have let a 16-digit card or a
+        // spoofed `sx_42a`/`id_abc` survive G8) fail closed.
+        use crate::tokscrub::is_synthetic_alias;
+        // Accepts.
+        assert!(is_synthetic_alias("id_0123456789ab"));
+        assert!(is_synthetic_alias("sx_0123abcd"));
+        assert!(is_synthetic_alias("7"));
+        assert!(is_synthetic_alias("7.0"));
+        // Rejects (the divergence the bead documents).
+        assert!(!is_synthetic_alias("123"));
+        assert!(!is_synthetic_alias("sx_42a"));
+        assert!(!is_synthetic_alias("id_abc"));
+        assert!(!is_synthetic_alias("id_zzzzzzzzzzzz"));
+        assert!(!is_synthetic_alias("4111111111111111"));
+        assert!(!is_synthetic_alias("98765.43"));
+        assert!(!is_synthetic_alias("555-12-3456"));
         assert!(!is_synthetic_alias("customer_ssn"));
         assert!(!is_synthetic_alias("ACME"));
     }

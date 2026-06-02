@@ -148,8 +148,17 @@ fn strip_comments(src: &str) -> String {
                     i += 1;
                     break;
                 }
-                out.push(b[i] as char);
-                i += 1;
+                // UTF-8-preserving copy of the string body. A bare
+                // `b[i] as char` is a Latin-1 reinterpretation that
+                // mangles a multi-byte body char into mojibake; `i`
+                // is on a char boundary here (we only break on the
+                // ASCII `'` byte). (oracle-qm3q.14)
+                let c = src[i..]
+                    .chars()
+                    .next()
+                    .expect("i is on a UTF-8 char boundary");
+                out.push(c);
+                i += c.len_utf8();
             }
             continue;
         }
@@ -169,8 +178,17 @@ fn strip_comments(src: &str) -> String {
             out.push(' ');
             continue;
         }
-        out.push(b[i] as char);
-        i += 1;
+        // UTF-8-preserving copy of general source (between strings
+        // and comments). A bare `b[i] as char` would mangle a
+        // non-ASCII unquoted/NLS identifier byte into mojibake and
+        // advance `i` mid-sequence. Every branch above keys off ASCII
+        // bytes, so `i` is on a char boundary here. (oracle-qm3q.14)
+        let c = src[i..]
+            .chars()
+            .next()
+            .expect("i is on a UTF-8 char boundary");
+        out.push(c);
+        i += c.len_utf8();
     }
     out
 }
@@ -497,7 +515,7 @@ fn verify_scrub_manifest(minimised: &str, manifest: &RedactionDeltaManifest) -> 
 #[must_use]
 #[instrument(level = "trace", skip(original, redacted))]
 fn privacy_residue_clean(original: &str, redacted: &str) -> bool {
-    use crate::tokscrub::{TokVerdict, token_verdicts};
+    use crate::tokscrub::{TokVerdict, is_synthetic_alias, token_verdicts};
 
     let _ = original; // the proof is positive over `redacted`'s tokens
 
@@ -513,52 +531,22 @@ fn privacy_residue_clean(original: &str, redacted: &str) -> bool {
             // verbatim (that is what preserves the parse position).
             continue;
         };
-        // An estate-class token MUST be a synthetic alias. The
-        // synthetic for a string keeps its `'…'` delimiters and for
-        // a quoted-id its `"…"`; strip those before the shape check.
-        //
-        // Numeric synthetics are EXACTLY the two fixed numerals
-        // `tokscrub::synthesise` emits for a `NumericLiteral` — `7`
-        // (integer subtype) and `7.0` (float subtype). There is no
-        // broad "any all-digits token" clause: an arbitrary all-digit
-        // numeral (a 16-digit card number, an SSN, an account id, a
-        // salary) is, by definition, an UN-scrubbed original numeral
-        // and must fail closed. If a future synthetic numeral shape
-        // is added to `synthesise`, enumerate it explicitly here.
-        let body = text.trim_matches('\'').trim_matches('"');
-        let is_synth = is_synthetic_alias(body) || body == "7" || body == "7.0";
-        if !is_synth {
+        // An estate-class token MUST be a synthetic alias. The strict
+        // synthesis vocabulary (id_<hex12> / sx_<hex8> / `7` / `7.0`,
+        // delimiters stripped) is enforced by the SINGLE shared
+        // `tokscrub::is_synthetic_alias` so this build-time layer and
+        // the independent G8 re-scan in `gate.rs` can never drift
+        // (oracle-qm3q.25). There is deliberately no broad
+        // "any all-digits token" clause: an arbitrary numeral
+        // (a 16-digit card, an SSN, a salary) is an un-scrubbed
+        // original and fails closed.
+        if !is_synthetic_alias(text) {
             // A surviving identifier / literal that is NOT a
             // synthetic alias is an original-byte leak. Fail closed.
             return false;
         }
     }
     true
-}
-
-/// `true` iff `w` is a synthetic alias emitted by the structure-
-/// preserving token scrub:
-///
-/// * `id_<hex12>` — an identifier / quoted-identifier body
-///   (`tokscrub::synthesise` `Class::Ident` / `Class::QuotedIdent`).
-/// * `sx_<hex8>`  — a string-literal body
-///   (`tokscrub::synthesise` `Class::Str`).
-///
-/// Both bodies are a one-way `sha256(salt ‖ class ‖ original)`
-/// truncation: the hex carries no original byte. Numeric synthetics
-/// are the two fixed literals `7` / `7.0` and are matched
-/// explicitly by the caller — there is deliberately no broad
-/// all-digits clause (an arbitrary all-digit numeral is an
-/// un-scrubbed original ⇒ fails the residue proof).
-#[must_use]
-fn is_synthetic_alias(w: &str) -> bool {
-    if let Some(hex) = w.strip_prefix("id_") {
-        return hex.len() == 12 && hex.bytes().all(|b| b.is_ascii_hexdigit());
-    }
-    if let Some(hex) = w.strip_prefix("sx_") {
-        return hex.len() == 8 && hex.bytes().all(|b| b.is_ascii_hexdigit());
-    }
-    false
 }
 
 /// Persist a privacy-proven [`MinFixture`] under the repo's `.usr/`
@@ -1000,7 +988,27 @@ mod tests {
     }
 
     #[test]
+    fn strip_comments_preserves_non_ascii_bytes() {
+        // Regression for oracle-qm3q.14: the byte-as-char copies at
+        // the string-body and general-source sites were a Latin-1
+        // reinterpretation that mangled `v_café`/`'naïve'` into
+        // mojibake (`v_cafÃ©`/`'naÃ¯ve'`). The decommented buffer
+        // must reproduce the source byte-for-byte where no comment
+        // was removed.
+        let s = "v_café := 'naïve';";
+        let out = strip_comments(s);
+        assert_eq!(out, s, "non-ASCII identifier/string body mangled: {out}");
+        // em-dash separator between tokens (general fallback path).
+        let s2 = "a — b";
+        assert_eq!(strip_comments(s2), s2);
+    }
+
+    #[test]
     fn synthetic_alias_shape_recognised() {
+        // The strict synthesis vocabulary now lives in `tokscrub` as
+        // the single shared classifier both privacy layers import
+        // (oracle-qm3q.25).
+        use crate::tokscrub::is_synthetic_alias;
         // Identifier / quoted-id body: id_<hex12>.
         assert!(is_synthetic_alias("id_0123456789ab"));
         assert!(!is_synthetic_alias("id_xyz"));

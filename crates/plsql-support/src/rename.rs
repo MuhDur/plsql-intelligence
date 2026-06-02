@@ -221,9 +221,20 @@ pub fn rename_with_reserved(source: &str, salt: &str, reserved: &[&str]) -> (Str
                     i += 1;
                     break;
                 }
-                // multi-byte safe slice — push the single byte char.
-                out.push(bytes[i] as char);
-                i += 1;
+                // Content-preserving UTF-8 copy. A bare `bytes[i] as
+                // char` is a Latin-1 reinterpretation that mangles a
+                // multi-byte string-body char into mojibake (`café`
+                // → `cafÃ©`), defeating the bundle's purpose as a
+                // faithful reproduction of the customer's source.
+                // `i` is on a char boundary here (we only break the
+                // loop on the ASCII `'` byte), so a full scalar copy
+                // is safe. (oracle-qm3q.14)
+                let c = source[i..]
+                    .chars()
+                    .next()
+                    .expect("i is on a UTF-8 char boundary");
+                out.push(c);
+                i += c.len_utf8();
             }
             continue;
         }
@@ -262,9 +273,18 @@ pub fn rename_with_reserved(source: &str, salt: &str, reserved: &[&str]) -> (Str
             continue;
         }
 
-        // Fallback: pass through one byte.
-        out.push(bytes[i] as char);
-        i += 1;
+        // Fallback: pass through one UTF-8 scalar value, not one
+        // byte. A bare `bytes[i] as char` would mangle a non-ASCII
+        // separator (em-dash, NBSP, accented unquoted identifier)
+        // into mojibake and advance `i` mid-sequence; every scanner
+        // match above is against ASCII bytes, so `i` is on a char
+        // boundary here. (oracle-qm3q.14)
+        let c = source[i..]
+            .chars()
+            .next()
+            .expect("i is on a UTF-8 char boundary");
+        out.push(c);
+        i += c.len_utf8();
     }
 
     (
@@ -454,6 +474,30 @@ mod tests {
         // Empty reserved set ⇒ even `SELECT` gets renamed.
         let (out, _) = rename_with_reserved("select x", "salt", &[]);
         assert!(!out.starts_with("select"));
+    }
+
+    #[test]
+    fn non_ascii_string_body_passes_through_unchanged() {
+        // Regression for oracle-qm3q.14: the string-body byte-as-char
+        // copy was a Latin-1 reinterpretation that mangled `café`
+        // into `cafÃ©`, corrupting the redacted bundle's source.
+        let (out, _) = rename_identifiers("x := 'café';", "salt");
+        assert!(out.contains("'café'"), "accented string body mangled: {out}");
+        // q-quote and longer multi-byte bodies likewise survive.
+        let (out2, _) = rename_identifiers("y := 'naïve façade — déjà vu';", "salt");
+        assert!(
+            out2.contains("'naïve façade — déjà vu'"),
+            "multi-byte string body mangled: {out2}"
+        );
+    }
+
+    #[test]
+    fn non_ascii_separator_between_tokens_preserved() {
+        // Regression for oracle-qm3q.14: the general fallback (`:266`)
+        // pushed one byte per non-ident char, mangling a multi-byte
+        // separator. The em-dash must survive verbatim.
+        let (out, _) = rename_identifiers("a — b", "salt");
+        assert!(out.contains('—'), "em-dash separator mangled: {out}");
     }
 
     #[test]
