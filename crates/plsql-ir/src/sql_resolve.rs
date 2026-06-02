@@ -39,7 +39,16 @@ use crate::sql_sem::{SqlSemanticVerb, SqlStatementModel, TableUsageKind, TableUs
 /// `alias_scope` + `verb`).
 #[must_use]
 pub fn resolve_sql(raw: &str) -> SqlStatementModel {
-    let upper = raw.trim_start().to_ascii_uppercase();
+    // `upper` is derived from the *trimmed* text, so the byte offsets the
+    // tokenizer computes against `upper` only line up with a buffer that is
+    // also trimmed. Slicing the untrimmed `raw` with those offsets shifts
+    // every table/alias by the leading-whitespace length (e.g.
+    // "    SELECT id FROM Employees emp" -> table "ROM EMPLO", alias "ees").
+    // Bind the trimmed slice once and thread it everywhere `raw` was used.
+    // (ASCII whitespace is single-byte, so `trimmed`/`upper` share offsets.)
+    // (oracle-ajm2.18)
+    let trimmed = raw.trim_start();
+    let upper = trimmed.to_ascii_uppercase();
     let verb = classify_verb(&upper);
     let mut model = SqlStatementModel {
         verb,
@@ -48,33 +57,33 @@ pub fn resolve_sql(raw: &str) -> SqlStatementModel {
 
     match verb {
         SqlSemanticVerb::Select => {
-            collect_from_and_joins(&upper, raw, &mut model, TableUsageKind::Read);
+            collect_from_and_joins(&upper, trimmed, &mut model, TableUsageKind::Read);
         }
         SqlSemanticVerb::Insert => {
-            for (s, t, a) in tables_after_keyword(&upper, raw, "INTO") {
+            for (s, t, a) in tables_after_keyword(&upper, trimmed, "INTO") {
                 add(&mut model, s, t, a, TableUsageKind::Write);
             }
             // INSERT … SELECT — the sub-select FROM is a read.
-            collect_from_and_joins(&upper, raw, &mut model, TableUsageKind::Read);
+            collect_from_and_joins(&upper, trimmed, &mut model, TableUsageKind::Read);
         }
         SqlSemanticVerb::Update => {
-            for (s, t, a) in tables_after_keyword(&upper, raw, "UPDATE") {
+            for (s, t, a) in tables_after_keyword(&upper, trimmed, "UPDATE") {
                 add(&mut model, s, t, a, TableUsageKind::Write);
             }
-            collect_from_and_joins(&upper, raw, &mut model, TableUsageKind::Read);
+            collect_from_and_joins(&upper, trimmed, &mut model, TableUsageKind::Read);
         }
         SqlSemanticVerb::Delete => {
-            for (s, t, a) in tables_after_keyword(&upper, raw, "FROM") {
+            for (s, t, a) in tables_after_keyword(&upper, trimmed, "FROM") {
                 add(&mut model, s, t, a, TableUsageKind::Write);
             }
         }
         SqlSemanticVerb::MergeUpdate
         | SqlSemanticVerb::MergeInsert
         | SqlSemanticVerb::MergeDelete => {
-            for (s, t, a) in tables_after_keyword(&upper, raw, "INTO") {
+            for (s, t, a) in tables_after_keyword(&upper, trimmed, "INTO") {
                 add(&mut model, s, t, a, TableUsageKind::ReadWrite);
             }
-            for (s, t, a) in tables_after_keyword(&upper, raw, "USING") {
+            for (s, t, a) in tables_after_keyword(&upper, trimmed, "USING") {
                 add(&mut model, s, t, a, TableUsageKind::Read);
             }
         }
@@ -296,6 +305,18 @@ mod tests {
         assert_eq!(m.tables[0].alias, "e");
         assert_eq!(m.tables[0].usage, TableUsageKind::Read);
         assert_eq!(m.alias_scope.resolve("e"), Some(("", "EMPLOYEES")));
+    }
+
+    #[test]
+    fn leading_whitespace_does_not_shift_table_and_alias_offsets() {
+        // oracle-ajm2.18: `upper` was derived from the trimmed text but the
+        // tokenizer sliced the *untrimmed* `raw`, so leading whitespace shifted
+        // every offset (table -> "ROM EMPLO", alias -> "ees"). Threading the
+        // trimmed slice keeps offsets aligned with the buffer they index.
+        let m = resolve_sql("    SELECT id FROM Employees emp");
+        assert_eq!(m.tables.len(), 1, "{:?}", m.tables);
+        assert_eq!(m.tables[0].table, "EMPLOYEES");
+        assert_eq!(m.tables[0].alias, "emp");
     }
 
     #[test]

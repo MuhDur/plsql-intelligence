@@ -724,12 +724,21 @@ fn classify_statement(raw: &str, file_id: FileId, start: usize, end: usize) -> A
 }
 
 fn extract_first_quoted(s: &str) -> Option<String> {
-    let mut it = s.char_indices();
-    for (_, c) in it.by_ref() {
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
         if c == '\'' {
             let mut buf = String::new();
-            for (_, nc) in it.by_ref() {
+            while let Some(nc) = it.next() {
                 if nc == '\'' {
+                    // Oracle doubled-`''` escape: `''` is a single literal `'`,
+                    // not the end of the literal. Without this the captured SQL
+                    // text is truncated at the first inner escaped quote (e.g.
+                    // EXECUTE IMMEDIATE 'SELECT ''x'' FROM dual'). (oracle-ajm2.20)
+                    if it.peek() == Some(&'\'') {
+                        it.next();
+                        buf.push('\'');
+                        continue;
+                    }
                     return Some(buf);
                 }
                 buf.push(nc);
@@ -797,11 +806,17 @@ pub fn lower_expression_text(expr: &str, file_id: FileId, base_offset: usize) ->
         };
     }
     // Top-level binary (lowest precedence first).
+    //
+    // `=` shares the relational tier with the comparison operators so a
+    // separate, higher `&["="]` tier cannot match the `=` byte inside `<=`,
+    // `>=`, or `!=` before the 2-char form is tried. Multi-char ops stay
+    // ahead of single-char ones within the tier, so `a <= b` matches `<=`
+    // rather than mis-splitting on the embedded `=` into `op:"="`/`lhs:"a <"`.
+    // (oracle-ajm2.10)
     let tiers: &[&[&str]] = &[
         &[" OR "],
         &[" AND "],
-        &["="],
-        &["<>", "!=", "<=", ">=", "<", ">"],
+        &["<>", "!=", "<=", ">=", "=", "<", ">"],
         &["||"],
         &["+", "-"],
         &["*", "/"],
@@ -1185,17 +1200,28 @@ fn advance_to_decl_end(bytes: &[u8], start: usize) -> usize {
             continue;
         }
 
-        // Track BEGIN/END nesting for proper statement boundary detection
-        if matches_keyword_ignore_case(bytes, i, b"BEGIN") {
-            depth += 1;
-            i += 5;
-            continue;
-        }
-        if matches_keyword_ignore_case(bytes, i, b"END") {
-            if depth > 0 {
-                depth -= 1;
+        // Track block nesting symmetrically: `BEGIN`/`IF`/`LOOP`/`CASE`
+        // open a block and `END`/`END IF`/`END LOOP`/`END CASE` close one.
+        // Counting only BEGIN/END while a bare `END` matched the `END` of an
+        // `END IF`/`END LOOP`/`END CASE` was asymmetric (the opener was never
+        // counted but its terminator decremented the depth), so a routine body
+        // containing any IF/LOOP/CASE block had its declaration span truncated
+        // at the first inner `END IF;`/`END LOOP;`/`END CASE;` — dropping every
+        // later statement (calls, DML writes, EXECUTE IMMEDIATE sinks) from the
+        // dependency graph and taint analysis.
+        if let Some(step) = crate::recover::block_structure_step(bytes, i) {
+            match step {
+                crate::recover::BlockStep::Open { consumed } => {
+                    depth += 1;
+                    i += consumed;
+                }
+                crate::recover::BlockStep::Close { consumed } => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                    i += consumed;
+                }
             }
-            i += 3;
             continue;
         }
 
@@ -1664,6 +1690,68 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
     }
 
     #[test]
+    fn inner_end_if_does_not_truncate_decl_span() {
+        // oracle-ajm2.2: `advance_to_decl_end` counted only BEGIN/END while a
+        // bare `END` matched the `END` of an inner `END IF;`. The IF opener was
+        // never counted but its terminator decremented the depth (1 -> 0), so
+        // the declaration span was truncated at the first `END IF;` (offset 51)
+        // and the trailing `INSERT INTO audit VALUES(1);` lay entirely outside
+        // the span — silently dropped from DML-edge/taint analysis.
+        let src =
+            "CREATE PROCEDURE a IS BEGIN IF x THEN NULL; END IF; INSERT INTO audit VALUES(1); END;";
+        let ast = lower_source(src, fid());
+        let proc_span = ast
+            .root
+            .declarations
+            .iter()
+            .find_map(|d| match d {
+                AstDecl::Procedure { name, span } if name == "a" => Some(*span),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("procedure a missing from {:?}", ast.root.declarations));
+        assert_eq!(
+            proc_span.end.offset,
+            src.len() as u32,
+            "procedure span must run to the real trailing END; (full source), not the \
+             inner END IF; — got {} of {}",
+            proc_span.end.offset,
+            src.len()
+        );
+        // Exactly one declaration: the post-`END IF;` text was not mis-promoted
+        // into a spurious second decl.
+        assert_eq!(ast.root.declarations.len(), 1, "{:?}", ast.root.declarations);
+    }
+
+    #[test]
+    fn inner_end_loop_and_end_case_do_not_truncate_decl_span() {
+        // oracle-ajm2.2 (LOOP/CASE arms): mirror the END IF case for the other
+        // two compound terminators so the symmetric opener-counting is exercised
+        // for all of IF/LOOP/CASE.
+        let loop_src =
+            "CREATE PROCEDURE b IS BEGIN LOOP NULL; END LOOP; INSERT INTO audit VALUES(1); END;";
+        let case_src = "CREATE PROCEDURE c IS BEGIN CASE WHEN x THEN NULL; END CASE; \
+             INSERT INTO audit VALUES(1); END;";
+        for src in [loop_src, case_src] {
+            let ast = lower_source(src, fid());
+            let span = ast
+                .root
+                .declarations
+                .iter()
+                .find_map(|d| match d {
+                    AstDecl::Procedure { span, .. } => Some(*span),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("procedure missing from {:?}", ast.root.declarations));
+            assert_eq!(
+                span.end.offset,
+                src.len() as u32,
+                "span must run to the trailing END; not the inner END LOOP/CASE; src={src:?}"
+            );
+            assert_eq!(ast.root.declarations.len(), 1, "{:?}", ast.root.declarations);
+        }
+    }
+
+    #[test]
     fn semicolon_inside_string_does_not_split_statement_body() {
         // oracle-qm3q.12: the `;` inside 'a ; b' must not split the call into
         // extra statements. Before the fix this produced 3 statements with a
@@ -1761,6 +1849,21 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
             } => {
                 assert_eq!(sql_text, "UPDATE t SET a = :1");
                 assert!(*has_using);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse005_execute_immediate_honors_doubled_quote_escape() {
+        // oracle-ajm2.20: `extract_first_quoted` returned at the first lone `'`,
+        // truncating the captured literal at an inner doubled-`''` escape
+        // (`'SELECT ''x'' FROM dual'` -> "SELECT "). Honouring `''` captures
+        // the full SQL with escapes un-doubled to single quotes.
+        let s = stmts("EXECUTE IMMEDIATE 'SELECT ''x'' FROM dual';");
+        match &s[0] {
+            AstStatement::ExecuteImmediate { sql_text, .. } => {
+                assert_eq!(sql_text, "SELECT 'x' FROM dual");
             }
             other => panic!("{other:?}"),
         }
@@ -1946,6 +2049,38 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
         match ex("(a OR b) AND c") {
             AstExpr::Binary { op, .. } => assert_eq!(op, "AND"),
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse006_relational_two_char_ops_not_mis_split_on_embedded_equals() {
+        // oracle-ajm2.10: the `&["="]` tier matched the `=` byte inside
+        // `<=`/`>=`/`!=` before the relational tier, yielding op:"=" with a
+        // corrupted LHS slice (`a <`). Merging `=` into the relational tier
+        // (2-char ops first) makes the whole 2-char op match.
+        for (src, expected_op, lhs) in
+            [("a <= b", "<=", "a"), ("a >= b", ">=", "a"), ("a != b", "!=", "a")]
+        {
+            match ex(src) {
+                AstExpr::Binary {
+                    op,
+                    lhs_text,
+                    rhs_text,
+                    ..
+                } => {
+                    assert_eq!(op, expected_op, "op for {src:?}");
+                    assert_eq!(lhs_text, lhs, "lhs_text for {src:?}");
+                    assert_eq!(rhs_text, "b", "rhs_text for {src:?}");
+                }
+                other => panic!("{src:?} -> {other:?}"),
+            }
+        }
+        // The previously-correct operators must still split correctly.
+        for (src, expected_op) in [("a = b", "="), ("a < b", "<"), ("a <> b", "<>")] {
+            match ex(src) {
+                AstExpr::Binary { op, .. } => assert_eq!(op, expected_op, "op for {src:?}"),
+                other => panic!("{src:?} -> {other:?}"),
+            }
         }
     }
 

@@ -58,17 +58,24 @@ pub fn recover_to_statement_boundary(
             continue;
         }
 
-        // Track BEGIN/END nesting
-        if matches_kw_at(bytes, i, b"BEGIN") {
-            depth += 1;
-            i += 5;
-            continue;
-        }
-        if matches_kw_at(bytes, i, b"END") {
-            if depth > 0 {
-                depth -= 1;
+        // Track block nesting symmetrically: `BEGIN`/`IF`/`LOOP`/`CASE`
+        // open a block and `END`/`END IF`/`END LOOP`/`END CASE` close one.
+        // (Counting only BEGIN/END while a bare `END` matched the `END` of
+        // an `END IF` truncated the recovered region at the first inner
+        // `END IF;`.)
+        if let Some(step) = block_structure_step(bytes, i) {
+            match step {
+                BlockStep::Open { consumed } => {
+                    depth += 1;
+                    i += consumed;
+                }
+                BlockStep::Close { consumed } => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                    i += consumed;
+                }
             }
-            i += 3;
             continue;
         }
 
@@ -109,6 +116,83 @@ pub fn recover_to_statement_boundary(
         recovered_at: len,
         diagnostic: Some(diag),
     }
+}
+
+/// The block-structure token recognised at a byte position by
+/// [`block_structure_step`].
+pub(crate) enum BlockStep {
+    /// A block opener (`BEGIN`/`IF`/`LOOP`/`CASE`); depth must be
+    /// incremented and the scan advanced by `consumed` bytes.
+    Open { consumed: usize },
+    /// A block terminator (bare `END`, or `END IF`/`END LOOP`/`END CASE`);
+    /// depth must be decremented and the scan advanced by `consumed` bytes.
+    Close { consumed: usize },
+}
+
+/// Recognise a PL/SQL block opener or terminator at byte `pos`, returning
+/// how the surrounding scanner should adjust its `BEGIN…END` depth and how
+/// many bytes to advance.
+///
+/// This is the single source of truth for block-depth bookkeeping shared by
+/// the three text scanners ([`recover_to_statement_boundary`],
+/// `lower::advance_to_decl_end`, and the already-correct
+/// `lower::lower_statement_body` mirrors this logic). Counting **only**
+/// `BEGIN`/`END` while letting a bare `END` match the `END` of an `END IF`/
+/// `END LOOP`/`END CASE` was asymmetric: the opener (`IF`/`LOOP`/`CASE`) was
+/// never counted but its terminator decremented the depth, so a routine body
+/// containing any `IF`/`LOOP`/`CASE` block had its declaration span truncated
+/// at the first inner `END IF;`/`END LOOP;`/`END CASE;`, silently dropping
+/// every later statement (procedure calls, DML writes, `EXECUTE IMMEDIATE`
+/// sinks) from the dependency graph and taint analysis. Treating `IF`/`LOOP`/
+/// `CASE` as openers and matching `END <kw>` as a single terminator restores
+/// symmetry.
+pub(crate) fn block_structure_step(bytes: &[u8], pos: usize) -> Option<BlockStep> {
+    // `END <kw>` / bare `END` must be tested before the openers so the
+    // bare-`END` arm does not consume the `END` of an `END IF` and leave the
+    // `IF` to be miscounted as a fresh opener.
+    if let Some(consumed) = end_block_len(bytes, pos) {
+        return Some(BlockStep::Close { consumed });
+    }
+    if matches_kw_at(bytes, pos, b"BEGIN") {
+        return Some(BlockStep::Open { consumed: 5 });
+    }
+    // `IF`/`LOOP`/`CASE` each open a block closed by `END IF`/`END LOOP`/
+    // `END CASE`. They must be counted so their terminators do not push the
+    // depth negative (and prematurely close the enclosing `BEGIN`).
+    if matches_kw_at(bytes, pos, b"IF") {
+        return Some(BlockStep::Open { consumed: 2 });
+    }
+    if matches_kw_at(bytes, pos, b"LOOP") {
+        return Some(BlockStep::Open { consumed: 4 });
+    }
+    if matches_kw_at(bytes, pos, b"CASE") {
+        return Some(BlockStep::Open { consumed: 4 });
+    }
+    None
+}
+
+/// If a block terminator starts at byte `pos`, return its length in bytes
+/// (covering `END`, any whitespace, and the optional `IF`/`LOOP`/`CASE`
+/// sub-keyword). Returns `None` when there is no `END` at `pos`.
+///
+/// Mirrors `lower::end_keyword_len` but operates on the raw byte slice so it
+/// can be shared by the byte-walking scanners in this module.
+fn end_block_len(bytes: &[u8], pos: usize) -> Option<usize> {
+    if !matches_kw_at(bytes, pos, b"END") {
+        return None;
+    }
+    // Skip `END` and any run of ASCII whitespace.
+    let mut j = pos + 3;
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    for sub in [b"IF".as_slice(), b"LOOP".as_slice(), b"CASE".as_slice()] {
+        if matches_kw_at(bytes, j, sub) {
+            return Some(j + sub.len() - pos);
+        }
+    }
+    // Bare `END` (terminates a BEGIN…END block).
+    Some(3)
 }
 
 /// Case-insensitive keyword match at a byte position (word-boundary check).
@@ -365,6 +449,34 @@ mod tests {
             "BEGIN_OF_DAY is an identifier, not a block opener; the ; at depth 0 \
              must terminate recovery"
         );
+    }
+
+    #[test]
+    fn recover_respects_inner_end_if_loop_case_depth() {
+        // oracle-ajm2.2: counting only BEGIN/END while a bare `END` matched the
+        // `END` of an inner `END IF` made recovery terminate one statement early.
+        // `BEGIN` -> depth 1, `IF` -> depth 2, `END IF` -> depth 1 (NOT 0), so
+        // the `;` after `END IF` stays inside the block and recovery lands after
+        // the real trailing `END;`.
+        //                  0         1         2         3         4
+        //                  0123456789012345678901234567890123456789012345
+        let if_src = b"bad BEGIN IF x THEN NULL; END IF; tail; END; rest";
+        let r = recover_to_statement_boundary(if_src, 0, fid());
+        assert_eq!(
+            r.recovered_at, 44,
+            "the ; after `END IF` and the ; after `tail` are inside the BEGIN block; \
+             only the ; after the real trailing END; (offset 44) terminates recovery"
+        );
+
+        // LOOP variant: same structure with END LOOP.
+        let loop_src = b"bad BEGIN LOOP NULL; END LOOP; tail; END; rest";
+        let rl = recover_to_statement_boundary(loop_src, 0, fid());
+        assert_eq!(rl.recovered_at, 41);
+
+        // CASE variant: same structure with END CASE.
+        let case_src = b"bad BEGIN CASE WHEN x THEN NULL; END CASE; tail; END; rest";
+        let rc = recover_to_statement_boundary(case_src, 0, fid());
+        assert_eq!(rc.recovered_at, 53);
     }
 
     #[test]

@@ -210,7 +210,12 @@ fn recognise_datetime_literal(text: &str) -> Option<Expr> {
         return None;
     }
     let trimmed = after.trim_start();
-    if !trimmed.starts_with('\'') || !trimmed.ends_with('\'') {
+    // Mirror `recognise_string_literal`'s `len < 2` guard. For a lone `'`,
+    // `starts_with('\'')` AND `ends_with('\'')` both inspect the same single
+    // byte and are true, so without this guard `&trimmed[1..0]` panics with
+    // "begin > end (1 > 0)". Both quotes are single-byte ASCII so the byte
+    // length comparison is correct. (oracle-ajm2.3)
+    if trimmed.len() < 2 || !trimmed.starts_with('\'') || !trimmed.ends_with('\'') {
         return None;
     }
     let body = &trimmed[1..trimmed.len() - 1];
@@ -284,11 +289,16 @@ fn recognise_top_level_binary(text: &str) -> Option<Expr> {
     // Operators in *decreasing* match width so multi-char ops
     // (`<=`, `>=`, `<>`, `||`) win over single-char ones at the
     // same position.
+    // `=` shares the relational tier with the comparison operators so a
+    // separate, higher `&["="]` tier cannot match the `=` byte inside `<=`,
+    // `>=`, or `!=` before the 2-char form is tried. Multi-char ops stay
+    // ahead of single-char ones within the tier (the scan tries each op
+    // left-to-right at the same byte), so `a <= b` reaches the `<` byte and
+    // matches `<=` rather than splitting on the embedded `=`. (oracle-ajm2.10)
     let precedence: &[&[&str]] = &[
         &["OR"],
         &["AND"],
-        &["="],
-        &["<>", "!=", "<=", ">=", "<", ">"],
+        &["<>", "!=", "<=", ">=", "=", "<", ">"],
         &["||"],
         &["+", "-"],
         &["*", "/"],
@@ -653,6 +663,84 @@ mod tests {
         } else {
             panic!();
         }
+    }
+
+    #[test]
+    fn relational_two_char_ops_not_mis_split_on_embedded_equals() {
+        // oracle-ajm2.10: a higher-precedence `&["="]` tier matched the `=`
+        // byte inside `<=`/`>=`/`!=` before the relational tier was reached,
+        // corrupting the LHS into a Raw node (`a <`) and op into `=`. Merging
+        // `=` into the relational tier (2-char ops first) fixes the split.
+        for (src, expected_op) in [("a <= b", "<="), ("a >= b", ">="), ("a != b", "!=")] {
+            match lower_expression(src) {
+                Expr::Binary { op, lhs, rhs } => {
+                    assert_eq!(op, expected_op, "op for {src:?}");
+                    assert!(
+                        matches!(*lhs, Expr::Name(_)),
+                        "lhs of {src:?} must lower to a Name, not Raw: {lhs:?}"
+                    );
+                    assert!(
+                        matches!(*rhs, Expr::Name(_)),
+                        "rhs of {src:?} must lower to a Name: {rhs:?}"
+                    );
+                }
+                other => panic!("{src:?} should lower to Binary, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unaffected_comparison_ops_still_split_correctly() {
+        // The relational-tier merge must not regress the operators that
+        // already worked: `=`, `<`, `>`, `<>`.
+        for (src, expected_op) in [("a = b", "="), ("a < b", "<"), ("a > b", ">"), ("a <> b", "<>")]
+        {
+            match lower_expression(src) {
+                Expr::Binary { op, lhs, rhs } => {
+                    assert_eq!(op, expected_op, "op for {src:?}");
+                    assert!(matches!(*lhs, Expr::Name(_)), "lhs of {src:?}: {lhs:?}");
+                    assert!(matches!(*rhs, Expr::Name(_)), "rhs of {src:?}: {rhs:?}");
+                }
+                other => panic!("{src:?} should lower to Binary, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn call_on_lhs_of_le_is_preserved_for_calls_edge() {
+        // oracle-ajm2.10: with the mis-split, `compute_total(x)` on the LHS of
+        // `<=` became a Raw node, dropped by collect_calls — a Calls-edge false
+        // negative. After the fix the LHS lowers to a Call the extractor sees.
+        match lower_expression("compute_total(x) <= 10") {
+            Expr::Binary { op, lhs, .. } => {
+                assert_eq!(op, "<=");
+                assert!(
+                    matches!(*lhs, Expr::Call { .. }),
+                    "LHS must lower to a Call so the Calls-edge is emitted: {lhs:?}"
+                );
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn datetime_lone_quote_does_not_panic() {
+        // oracle-ajm2.3: `DATE'` (and the TIMESTAMP/INTERVAL/whitespace
+        // variants) used to slice `&trimmed[1..0]` and panic. With the
+        // `len < 2` guard the recognizer declines and lowering falls through
+        // to a non-panicking Expr (Raw for these unrecognised shapes).
+        for src in ["DATE'", "TIMESTAMP '", "INTERVAL '", "DATE   '"] {
+            let e = lower_expression(src);
+            assert!(
+                !matches!(e, Expr::DateTimeLit { .. }),
+                "{src:?} is not a well-formed datetime literal: {e:?}"
+            );
+        }
+        // A well-formed literal still parses.
+        assert!(matches!(
+            lower_expression("DATE'2020-01-01'"),
+            Expr::DateTimeLit { .. }
+        ));
     }
 
     #[test]

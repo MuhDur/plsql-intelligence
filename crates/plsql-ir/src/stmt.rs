@@ -638,14 +638,23 @@ fn classify_loop(text: &str) -> Statement {
 }
 
 fn extract_quoted(text: &str) -> Option<String> {
-    let mut iter = text.char_indices();
-    while let Some((_, c)) = iter.next() {
+    let mut iter = text.chars().peekable();
+    while let Some(c) = iter.next() {
         if c == '\'' {
-            let start = iter.clone();
-            let _ = start;
             let mut buf = String::new();
-            for (_, nc) in iter.by_ref() {
+            while let Some(nc) = iter.next() {
                 if nc == '\'' {
+                    // Oracle doubled-`''` escape: a `'` immediately followed by
+                    // another `'` is a single literal `'`, not the end of the
+                    // literal. Mirror `string_literal_end`'s handling so the
+                    // captured SQL text is not truncated at the first inner
+                    // escaped quote (e.g. EXECUTE IMMEDIATE 'SELECT ''x''…').
+                    // (oracle-ajm2.20)
+                    if iter.peek() == Some(&'\'') {
+                        iter.next();
+                        buf.push('\'');
+                        continue;
+                    }
                     return Some(buf);
                 }
                 buf.push(nc);
@@ -801,6 +810,22 @@ mod tests {
             } => {
                 assert_eq!(sql_literal, "UPDATE t SET a = :1");
                 assert!(*has_bind_variables);
+            }
+            other => panic!("expected ExecuteImmediate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_immediate_honors_doubled_quote_escape() {
+        // oracle-ajm2.20: `extract_quoted` returned at the first lone `'`,
+        // truncating the captured literal at an inner doubled-`''` escape
+        // (`'SELECT ''x'' FROM dual'` -> "SELECT "). Mirroring
+        // `string_literal_end`'s `''` handling captures the full SQL with the
+        // escapes un-doubled to single quotes.
+        let r = lower_statement_body("EXECUTE IMMEDIATE 'SELECT ''x'' FROM dual';");
+        match &r[0] {
+            Statement::ExecuteImmediate { sql_literal, .. } => {
+                assert_eq!(sql_literal, "SELECT 'x' FROM dual");
             }
             other => panic!("expected ExecuteImmediate, got {other:?}"),
         }
