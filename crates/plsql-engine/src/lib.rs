@@ -742,9 +742,16 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
     // configured AND enabled. Any cache failure degrades to an
     // uncached run (cache is an optimisation, never correctness).
     // The key folds every source file's bytes (so a content
-    // change misses) and a serialisation of the analysis profile
-    // (so a profile change invalidates — a stale fragment is
-    // never served across profiles, by key construction).
+    // change misses) and a serialisation of BOTH the analysis
+    // profile AND the redaction policy (so a profile or a
+    // redaction-posture change invalidates — a stale fragment is
+    // never served across profiles or across redaction policies,
+    // by key construction). Folding the redaction policy is
+    // forward-correctness hardening: no shipped consumer yet reads
+    // run.artifacts.redaction_policy to gate disclosure, but were
+    // one wired up, a fragment cached under a permissive policy
+    // must never be served to a request that asked for a stricter
+    // one (which would under-redact).
     const CACHE_STRATEGY: &str = "semantic_fragment";
     let cache_ctx: Option<(plsql_store::Store, String, String)> = (|| {
         if !req.cache.enabled {
@@ -760,7 +767,12 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
             hasher_input.push(0);
         }
         let content_hash = plsql_store::hash_hex(&hasher_input);
-        let profile_bytes = serde_json::to_vec(&req.analysis_profile).ok()?;
+        // Fold the analysis profile AND the redaction policy into the
+        // same key component so a change to either invalidates the
+        // cached fragment (a permissively-redacted artifact must never
+        // satisfy a stricter-redaction request).
+        let profile_bytes =
+            serde_json::to_vec(&(&req.analysis_profile, &req.redaction_policy)).ok()?;
         let profile_hash = plsql_store::hash_hex(&profile_bytes);
         let store =
             plsql_store::Store::open(&dir.join("cache.db"), plsql_store::StoreConfig::default())
@@ -1398,6 +1410,73 @@ mod tests {
             Some(false),
             "a changed analysis profile must invalidate the cached fragment"
         );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn eng003b_redaction_policy_change_invalidates_cache() {
+        // oracle-hrzg.7: the cache key must fold the redaction policy
+        // so a fragment cached under a permissive (non-redacting)
+        // policy is never served to a request asking for a stricter
+        // posture. Before the fix the key folded only the analysis
+        // profile, so flipping `redact_freeform_text` was a cache hit
+        // and stamped the request's strict policy verbatim onto a body
+        // computed under the permissive one.
+        use crate::config::CacheConfig;
+        use plsql_output::RedactionPolicy;
+        let base = std::env::temp_dir().join(format!(
+            "plsql-eng003b-redact-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let proj = base.join("proj");
+        let cache = base.join("cache");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(
+            proj.join("a.sql"),
+            "CREATE PROCEDURE pr IS BEGIN NULL; END;\n/\n",
+        )
+        .unwrap();
+
+        let mk = |policy: RedactionPolicy| AnalysisRequest {
+            project_root: proj.clone(),
+            cache: CacheConfig {
+                enabled: true,
+                directory: Some(cache.clone()),
+                ..CacheConfig::default()
+            },
+            redaction_policy: policy,
+            ..AnalysisRequest::default()
+        };
+
+        // First run under the permissive default policy -> miss, stored.
+        let permissive = RedactionPolicy::default();
+        assert!(!permissive.redact_freeform_text);
+        let miss = analyze_project(mk(permissive.clone())).expect("miss ok");
+        assert_eq!(miss.cache_outcome, Some(false), "first run is a miss");
+
+        // Same content + profile + policy -> hit.
+        let hit = analyze_project(mk(permissive)).expect("hit ok");
+        assert_eq!(hit.cache_outcome, Some(true), "identical request is a hit");
+
+        // Only the redaction posture changes (stricter): must MISS so
+        // the permissively-cached fragment cannot under-redact.
+        let strict = RedactionPolicy {
+            redact_freeform_text: true,
+            ..RedactionPolicy::default()
+        };
+        let after_policy_change = analyze_project(mk(strict.clone())).expect("ok");
+        assert_eq!(
+            after_policy_change.cache_outcome,
+            Some(false),
+            "a stricter redaction policy must invalidate the cached fragment"
+        );
+        // The freshly computed run carries the requested strict policy.
+        assert_eq!(after_policy_change.artifacts.redaction_policy, strict);
 
         std::fs::remove_dir_all(&base).ok();
     }
