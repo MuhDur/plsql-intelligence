@@ -1263,10 +1263,36 @@ fn advance_to_decl_end(bytes: &[u8], start: usize) -> usize {
 /// `END` returns the depth to 0 so the routine's own trailing `;` terminates
 /// the span, and a following `CREATE` survives as a distinct declaration.
 ///
+/// The declarative section may itself declare **nested** subprograms
+/// (`PROCEDURE inner IS … BEGIN … END;` / `FUNCTION inner … IS … BEGIN … END;`).
+/// A naive "first `BEGIN`" scan returns the *nested* routine's `BEGIN` (oracle-
+/// hrzg.1): the depth-0 body scan then opens at that nested `BEGIN`, the nested
+/// `END;` returns the depth to 0, and the routine span is truncated at the
+/// nested `END;` — silently dropping the enclosing routine's real body (its
+/// INSERT/UPDATE/DELETE/MERGE Writes, procedure Calls, and EXECUTE IMMEDIATE
+/// sinks) from the dependency graph, lineage, and intra-procedural taint
+/// analysis (a fail-open SAST false-negative; contradicting R13). So when a
+/// nested `PROCEDURE`/`FUNCTION` header is seen at the declarative level its
+/// whole `IS|AS … BEGIN … END;` unit (or `… ;` forward declaration) is skipped
+/// as a balanced block via [`skip_nested_subprogram`] before scanning resumes,
+/// and only the first `BEGIN` that is **not** inside any nested subprogram is
+/// returned.
+///
 /// Returns `None` when no top-level `BEGIN` is found before EOF (a malformed or
 /// body-less routine on the degraded recovery path); the caller then falls back
 /// to a depth-0 scan from `create_start`.
 fn find_body_begin(bytes: &[u8], start: usize) -> Option<usize> {
+    find_body_begin_depth(bytes, start, 0)
+}
+
+/// Maximum nested-subprogram recursion depth for `find_body_begin`. Real Oracle
+/// PL/SQL nests subprograms only a few levels; this bound guards against
+/// pathological or adversarial input (a `PROCEDURE` keyword flood with no
+/// closing `END`) recursing without limit. On overflow the scan degrades to the
+/// historic first-`BEGIN` behaviour for the remainder — never a panic.
+const MAX_NESTED_SUBPROGRAM_DEPTH: usize = 64;
+
+fn find_body_begin_depth(bytes: &[u8], start: usize, depth: usize) -> Option<usize> {
     let len = bytes.len();
     let mut i = start;
     while i < len {
@@ -1277,12 +1303,89 @@ fn find_body_begin(bytes: &[u8], start: usize) -> Option<usize> {
             i = next;
             continue;
         }
+        // A nested subprogram declared in the IS|AS section: skip its entire
+        // `… BEGIN … END;` (or `… ;` forward declaration) so its `BEGIN` is not
+        // mistaken for the enclosing routine's own body `BEGIN`.
+        if depth < MAX_NESTED_SUBPROGRAM_DEPTH
+            && (matches_keyword_ignore_case(bytes, i, b"PROCEDURE")
+                || matches_keyword_ignore_case(bytes, i, b"FUNCTION"))
+        {
+            i = skip_nested_subprogram(bytes, i, depth + 1);
+            continue;
+        }
         if matches_keyword_ignore_case(bytes, i, b"BEGIN") {
             return Some(i);
         }
         i += 1;
     }
     None
+}
+
+/// Skip a nested subprogram declaration that begins at the `PROCEDURE`/
+/// `FUNCTION` keyword at byte `pos`, returning the byte index immediately past
+/// it (past its terminating `;`).
+///
+/// Two shapes are handled:
+///   * a **forward declaration** — `PROCEDURE name(params);` /
+///     `FUNCTION name(params) RETURN t;` — has no `IS|AS` body and is terminated
+///     by the first `;` at parenthesis-depth 0; and
+///   * a **definition** — `… IS|AS <decl-section> BEGIN <body> END[ name];` —
+///     whose own (possibly further-nested) `BEGIN` is located by recursing into
+///     [`find_body_begin_depth`] and whose matching `END;` is found by the
+///     shared balanced-block scan [`advance_to_decl_end_with_depth`].
+///
+/// `depth` is the nested-subprogram recursion depth, propagated to bound the
+/// mutual recursion (`find_body_begin_depth` ↔ `skip_nested_subprogram`).
+fn skip_nested_subprogram(bytes: &[u8], pos: usize, depth: usize) -> usize {
+    let len = bytes.len();
+    // Step over the PROCEDURE/FUNCTION keyword itself so its trailing bytes are
+    // not re-examined.
+    let mut i = if matches_keyword_ignore_case(bytes, pos, b"PROCEDURE") {
+        pos + 9
+    } else {
+        pos + 8
+    };
+    let mut paren = 0usize;
+    while i < len {
+        if let Some(next) = crate::recover::skip_opaque_span(bytes, i, pos) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'(' => {
+                paren += 1;
+                i += 1;
+                continue;
+            }
+            b')' => {
+                paren = paren.saturating_sub(1);
+                i += 1;
+                continue;
+            }
+            // A `;` at paren-depth 0 reached before any `IS|AS` is a forward
+            // declaration — the whole subprogram is just `PROCEDURE name(…);`.
+            b';' if paren == 0 => return i + 1,
+            _ => {}
+        }
+        if paren == 0
+            && (matches_keyword_ignore_case(bytes, i, b"IS")
+                || matches_keyword_ignore_case(bytes, i, b"AS"))
+        {
+            // Definition: advance past IS|AS and locate this subprogram's own
+            // body BEGIN (recursing so any further nested subprograms in *its*
+            // declarative section are likewise skipped), then run the shared
+            // balanced-block scan to its matching `END;`.
+            let after_kw = i + 2;
+            return match find_body_begin_depth(bytes, after_kw, depth) {
+                Some(begin) => advance_to_decl_end_with_depth(bytes, begin, 0),
+                // No BEGIN before EOF (malformed / body-less) — terminate at the
+                // first `;` at depth 0 so the outer scan still makes progress.
+                None => advance_to_decl_end_with_depth(bytes, after_kw, 0),
+            };
+        }
+        i += 1;
+    }
+    len
 }
 
 /// Advance past the end of the current statement, seeding the initial
@@ -2108,6 +2211,195 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
             src.len()
         );
         assert_eq!(ast.root.declarations.len(), 1, "{:?}", ast.root.declarations);
+    }
+
+    /// Find the single matching decl span for a given name, asserting the
+    /// declaration kind via the supplied projection.
+    fn only_span(ast: &Ast, project: impl Fn(&AstDecl) -> Option<Span>) -> Span {
+        let spans: Vec<Span> = ast.root.declarations.iter().filter_map(&project).collect();
+        assert_eq!(
+            spans.len(),
+            1,
+            "expected exactly one matching decl: {:?}",
+            ast.root.declarations
+        );
+        spans[0]
+    }
+
+    #[test]
+    fn procedure_with_nested_subprogram_span_reaches_own_end() {
+        // oracle-hrzg.1: a standalone CREATE PROCEDURE that declares a nested
+        // subprogram in its IS section. The naive "first BEGIN" scan landed on
+        // the *nested* routine's BEGIN, so the depth-0 body scan returned at the
+        // nested END; (offset 57) — truncating the span before the enclosing
+        // body's `inner` Call and `INSERT INTO audit` Write (offset 71). The
+        // nesting-aware scan skips the whole nested subprogram and anchors on the
+        // enclosing routine's own BEGIN, so the span runs to the trailing END;.
+        let src = "CREATE PROCEDURE p IS PROCEDURE inner IS BEGIN NULL; END; BEGIN inner; INSERT INTO audit VALUES(1); END;";
+        let ast = lower_source(src, fid());
+        let span = only_span(&ast, |d| match d {
+            AstDecl::Procedure { name, span } if name == "p" => Some(*span),
+            _ => None,
+        });
+        assert_eq!(
+            span.end.offset,
+            src.len() as u32,
+            "procedure span must run to the trailing END; (full source), not the nested \
+             routine's END; — got {} of {}",
+            span.end.offset,
+            src.len()
+        );
+        // The engine-fallback slice (source[0..span.end]) must contain the
+        // enclosing body so the Calls/Writes edges are emitted.
+        let slice = &src[..span.end.offset as usize];
+        assert!(
+            slice.contains("INSERT INTO audit"),
+            "enclosing body's INSERT must be inside the span slice: {slice:?}"
+        );
+        assert!(
+            slice.contains("inner;"),
+            "enclosing body's inner call must be inside the span slice: {slice:?}"
+        );
+        assert_eq!(ast.root.declarations.len(), 1, "{:?}", ast.root.declarations);
+    }
+
+    #[test]
+    fn function_with_nested_subprogram_span_reaches_own_end() {
+        // oracle-hrzg.1 (FUNCTION arm): a nested FUNCTION in the IS section must
+        // not truncate the enclosing function's span at the nested END;.
+        let src = "CREATE FUNCTION f RETURN NUMBER IS FUNCTION g RETURN NUMBER IS BEGIN RETURN 1; END; BEGIN INSERT INTO audit VALUES(1); RETURN g; END;";
+        let ast = lower_source(src, fid());
+        let span = only_span(&ast, |d| match d {
+            AstDecl::Function { name, span } if name == "f" => Some(*span),
+            _ => None,
+        });
+        assert_eq!(
+            span.end.offset,
+            src.len() as u32,
+            "function span must run to the trailing END; (full source), not the nested \
+             function's END; — got {} of {}",
+            span.end.offset,
+            src.len()
+        );
+        let slice = &src[..span.end.offset as usize];
+        assert!(
+            slice.contains("INSERT INTO audit"),
+            "enclosing body's INSERT must be inside the span slice: {slice:?}"
+        );
+        assert_eq!(ast.root.declarations.len(), 1, "{:?}", ast.root.declarations);
+    }
+
+    #[test]
+    fn trigger_declare_section_nested_subprogram_span_reaches_own_end() {
+        // oracle-hrzg.1 (TRIGGER arm): a DECLARE-section nested subprogram in a
+        // trigger body must not truncate the trigger span at the nested END;.
+        let src = "CREATE TRIGGER t BEFORE INSERT ON tbl FOR EACH ROW DECLARE PROCEDURE log_it IS BEGIN NULL; END; BEGIN INSERT INTO audit VALUES(1); END;";
+        let ast = lower_source(src, fid());
+        let span = only_span(&ast, |d| match d {
+            AstDecl::Trigger { name, span } if name == "t" => Some(*span),
+            _ => None,
+        });
+        assert_eq!(
+            span.end.offset,
+            src.len() as u32,
+            "trigger span must run to the trailing END; (full source), not the nested \
+             subprogram's END; — got {} of {}",
+            span.end.offset,
+            src.len()
+        );
+        let slice = &src[..span.end.offset as usize];
+        assert!(
+            slice.contains("INSERT INTO audit"),
+            "enclosing body's INSERT must be inside the span slice: {slice:?}"
+        );
+        assert_eq!(ast.root.declarations.len(), 1, "{:?}", ast.root.declarations);
+    }
+
+    #[test]
+    fn multi_level_nested_subprograms_do_not_truncate_decl_span() {
+        // oracle-hrzg.1 (deep nesting): two levels of nested subprograms in the
+        // IS section. The deepest nested END; must not truncate the enclosing
+        // routine's span — the nesting-aware scan must skip *both* levels and
+        // land on the outermost routine's own BEGIN.
+        let src = "CREATE PROCEDURE p IS PROCEDURE mid IS PROCEDURE deep IS BEGIN NULL; END; BEGIN NULL; END; BEGIN INSERT INTO audit VALUES(1); END;";
+        let ast = lower_source(src, fid());
+        let span = only_span(&ast, |d| match d {
+            AstDecl::Procedure { name, span } if name == "p" => Some(*span),
+            _ => None,
+        });
+        assert_eq!(
+            span.end.offset,
+            src.len() as u32,
+            "deeply nested subprograms must not truncate the outer routine span — \
+             got {} of {}",
+            span.end.offset,
+            src.len()
+        );
+        let slice = &src[..span.end.offset as usize];
+        assert!(
+            slice.contains("INSERT INTO audit"),
+            "enclosing body's INSERT must be inside the span slice: {slice:?}"
+        );
+        assert_eq!(ast.root.declarations.len(), 1, "{:?}", ast.root.declarations);
+    }
+
+    #[test]
+    fn forward_declared_nested_subprogram_does_not_truncate_decl_span() {
+        // oracle-hrzg.1 (forward declaration): a nested subprogram declared
+        // forward (`PROCEDURE inner;`, no IS|AS body) is terminated by the first
+        // `;`; the skip must consume only that `;` and resume so the enclosing
+        // routine's own BEGIN is still found.
+        let src = "CREATE PROCEDURE p IS PROCEDURE inner; BEGIN inner; INSERT INTO audit VALUES(1); END;";
+        let ast = lower_source(src, fid());
+        let span = only_span(&ast, |d| match d {
+            AstDecl::Procedure { name, span } if name == "p" => Some(*span),
+            _ => None,
+        });
+        assert_eq!(
+            span.end.offset,
+            src.len() as u32,
+            "a forward-declared nested subprogram must not truncate the span — \
+             got {} of {}",
+            span.end.offset,
+            src.len()
+        );
+        let slice = &src[..span.end.offset as usize];
+        assert!(
+            slice.contains("INSERT INTO audit"),
+            "enclosing body's INSERT must be inside the span slice: {slice:?}"
+        );
+        assert_eq!(ast.root.declarations.len(), 1, "{:?}", ast.root.declarations);
+    }
+
+    #[test]
+    fn nested_subprogram_does_not_swallow_following_decl() {
+        // oracle-hrzg.1 (guard): the nesting-aware skip must not over-run past
+        // the enclosing routine's own END; into a following CREATE — the second
+        // declaration must survive as its own decl.
+        let src = "CREATE PROCEDURE p IS PROCEDURE inner IS BEGIN NULL; END; BEGIN NULL; END;\nCREATE PROCEDURE q IS BEGIN NULL; END;\n";
+        let ast = lower_source(src, fid());
+        assert_eq!(
+            ast.root.declarations.len(),
+            2,
+            "both procedures must survive: {:?}",
+            ast.root.declarations
+        );
+        assert!(
+            ast.root
+                .declarations
+                .iter()
+                .any(|d| matches!(d, AstDecl::Procedure { name, .. } if name == "p")),
+            "procedure p missing: {:?}",
+            ast.root.declarations
+        );
+        assert!(
+            ast.root
+                .declarations
+                .iter()
+                .any(|d| matches!(d, AstDecl::Procedure { name, .. } if name == "q")),
+            "following procedure q must survive as its own decl: {:?}",
+            ast.root.declarations
+        );
     }
 
     #[test]
