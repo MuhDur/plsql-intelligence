@@ -76,17 +76,35 @@ pub const SKIPPED_SAMPLE_LIMIT: usize = 50;
 /// Build a [`BindingsCoverageReport`] from a [`BindingPlan`].
 #[must_use]
 pub fn coverage_report(plan: &BindingPlan) -> BindingsCoverageReport {
-    let mut by_routine: BTreeMap<&str, RoutineState> = BTreeMap::new();
-    for routine in &plan.routines {
-        by_routine.insert(routine.name.as_str(), RoutineState::default());
+    // Per-routine state is keyed by BINDING INDEX, not by name: PL/SQL
+    // packages legally carry overloaded subprograms sharing one name (lib.rs
+    // documents `name` as "as it appears in the package"), so a name-keyed map
+    // would collapse N overloads into one shared state and miscount the
+    // clean/skip/emit split. A routine-targeted diagnostic names a routine, so
+    // it fans out to EVERY binding sharing that name (the report cannot tell
+    // which overload the diagnostic meant); each index is then tallied exactly
+    // once so `emitted + skipped == routines_total` always holds.
+    let mut states: Vec<RoutineState> = vec![RoutineState::default(); plan.routines.len()];
+    let mut indices_by_name: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (idx, routine) in plan.routines.iter().enumerate() {
+        indices_by_name
+            .entry(routine.name.as_str())
+            .or_default()
+            .push(idx);
     }
     let mut plan_level_diagnostics = Vec::new();
 
     for diagnostic in &plan.diagnostics {
         match diagnostic.routine.as_deref() {
             Some(name) => {
-                let state = by_routine.entry(name).or_default();
-                state.record(diagnostic);
+                if let Some(indices) = indices_by_name.get(name) {
+                    for &idx in indices {
+                        states[idx].record(diagnostic);
+                    }
+                }
+                // A diagnostic naming a routine absent from the plan targets
+                // no binding; it is intentionally dropped from the per-routine
+                // tally (it still shows up in the by-code histogram below).
             }
             None => plan_level_diagnostics.push(diagnostic),
         }
@@ -97,11 +115,8 @@ pub fn coverage_report(plan: &BindingPlan) -> BindingsCoverageReport {
     let mut skipped = 0usize;
     let mut skipped_routines: Vec<String> = Vec::new();
 
-    for routine in &plan.routines {
-        let state = by_routine
-            .get(routine.name.as_str())
-            .copied()
-            .unwrap_or_default();
+    for (idx, routine) in plan.routines.iter().enumerate() {
+        let state = states[idx];
         if state.has_skip {
             skipped += 1;
             skipped_routines.push(routine.name.clone());
@@ -112,6 +127,7 @@ pub fn coverage_report(plan: &BindingPlan) -> BindingsCoverageReport {
         }
     }
     skipped_routines.sort();
+    skipped_routines.dedup();
     let skipped_routines_sample = skipped_routines
         .into_iter()
         .take(SKIPPED_SAMPLE_LIMIT)
@@ -412,5 +428,56 @@ mod tests {
         let r = coverage_report(&plan);
         assert_eq!(r.emit_percent, 70);
         assert_eq!(r.posture, BindingsPosture::Caution);
+    }
+
+    // --- oracle-rwjl.16: per-routine state must be keyed by binding INDEX, not
+    // by name, so overloaded PL/SQL packages (legal duplicate routine names)
+    // are reported per-binding. The concrete observable defect of the old
+    // name-keyed map was a duplicate name in `skipped_routines_sample`; the
+    // emitted/skipped tally still sums to routines_total either way. ---
+
+    #[test]
+    fn overloaded_skipped_routine_is_not_duplicated_in_sample() {
+        // [hire, hire, list] with a Skip targeting "hire". The two same-named
+        // bindings both count as skipped (a name-keyed diagnostic cannot pick
+        // one overload), but the sample must list "hire" only ONCE — the old
+        // name-keyed read-back pushed "hire" for each binding, yielding the
+        // duplicate ["hire", "hire"].
+        let plan = BindingPlan {
+            package_id: "x.pkg".into(),
+            package_name: "PKG".into(),
+            routines: vec![routine("hire"), routine("hire"), routine("list")],
+            diagnostics: vec![diag(Some("hire"), BindingDiagnosticCode::RefCursor)],
+        };
+        let r = coverage_report(&plan);
+        // The invariant always holds: emitted + skipped == total.
+        assert_eq!(r.emitted_clean + r.emitted_with_caveats + r.skipped, 3);
+        // Sample carries no duplicate name.
+        assert_eq!(
+            r.skipped_routines_sample,
+            vec!["hire"],
+            "overloaded skipped routine must appear once: {:?}",
+            r.skipped_routines_sample
+        );
+        // The unrelated `list` binding stays clean.
+        assert!(r.emitted_clean >= 1);
+    }
+
+    #[test]
+    fn overload_does_not_bleed_state_onto_distinctly_named_routine() {
+        // Two overloads named `hire` plus a `list`; only `list` carries a
+        // Skip. The `hire` bindings must NOT inherit `list`'s state (a name
+        // collision on the per-name map could only mis-key same-named entries,
+        // but this guards the index keying explicitly).
+        let plan = BindingPlan {
+            package_id: "x.pkg".into(),
+            package_name: "PKG".into(),
+            routines: vec![routine("hire"), routine("hire"), routine("list")],
+            diagnostics: vec![diag(Some("list"), BindingDiagnosticCode::RefCursor)],
+        };
+        let r = coverage_report(&plan);
+        assert_eq!(r.skipped, 1);
+        assert_eq!(r.emitted_clean, 2, "both `hire` overloads must be clean");
+        assert_eq!(r.skipped_routines_sample, vec!["list"]);
     }
 }

@@ -58,8 +58,16 @@ pub fn emit_wrappers(plan: &BindingPlan) -> String {
         plan.package_name,
         plan.routines.len()
     );
-    for routine in &plan.routines {
-        emit_routine(&mut out, &plan.package_id, routine);
+    // Overloaded PL/SQL packages legally carry two+ subprograms sharing a
+    // name; Rust requires a unique `pub fn` per module. Disambiguate once,
+    // up front, so the emitted module never writes two identical `pub fn`s
+    // (rustc E0428). `disambiguate_overloads` returns a parallel Vec of Rust
+    // identifiers in input order; singletons keep their verbatim name. The
+    // composed `BEGIN {package_id}.{r.name}(…)` block still targets the real
+    // overloaded PL/SQL name (`r.name`), so the server-side call is unchanged.
+    let rust_names = crate::overload::disambiguate_overloads(&plan.routines);
+    for (idx, routine) in plan.routines.iter().enumerate() {
+        emit_routine(&mut out, &plan.package_id, routine, &rust_names[idx], idx);
         out.push('\n');
     }
     for diag in &plan.diagnostics {
@@ -138,14 +146,220 @@ fn unsupported_type(r: &RoutineBinding) -> Option<String> {
     None
 }
 
-fn emit_routine(out: &mut String, package_id: &str, r: &RoutineBinding) {
+/// `Some(reason)` when `s` cannot be emitted verbatim as a Rust identifier:
+/// empty, a leading ASCII digit, any character outside `[A-Za-z0-9_]`, or a
+/// reserved Rust keyword. The reason is a static, human-readable phrase folded
+/// into the emitted `BINDING_INVALID_IDENTIFIER` diagnostic. ASCII-only on
+/// purpose — the emitted `pub fn`/parameter positions and the SQL-block literal
+/// must round-trip through rustc, and a non-ASCII or metacharacter name would
+/// either break the build or smuggle tokens into a generated string literal.
+fn rust_ident_problem(s: &str) -> Option<&'static str> {
+    if s.is_empty() {
+        return Some("identifier is empty");
+    }
+    let mut chars = s.chars();
+    let first = chars.next().expect("non-empty checked above");
+    if first.is_ascii_digit() {
+        return Some("identifier starts with a digit");
+    }
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return Some("identifier starts with a character outside [A-Za-z_]");
+    }
+    for c in s.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '_') {
+            return Some("identifier contains a character outside [A-Za-z0-9_]");
+        }
+    }
+    if is_rust_keyword(s) {
+        return Some("identifier is a reserved Rust keyword");
+    }
+    None
+}
+
+/// Reserved Rust keywords (strict + reserved-for-future, 2015/2018 editions)
+/// that cannot appear as a bare `pub fn` name or parameter binding without a
+/// raw-identifier escape. Emitting one verbatim is a hard compile error, so a
+/// plan carrying such a name fails closed.
+fn is_rust_keyword(s: &str) -> bool {
+    matches!(
+        s,
+        "as" | "break"
+            | "const"
+            | "continue"
+            | "crate"
+            | "dyn"
+            | "else"
+            | "enum"
+            | "extern"
+            | "false"
+            | "fn"
+            | "for"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "pub"
+            | "ref"
+            | "return"
+            | "self"
+            | "Self"
+            | "static"
+            | "struct"
+            | "super"
+            | "trait"
+            | "true"
+            | "type"
+            | "unsafe"
+            | "use"
+            | "where"
+            | "while"
+            | "async"
+            | "await"
+            | "abstract"
+            | "become"
+            | "box"
+            | "do"
+            | "final"
+            | "macro"
+            | "override"
+            | "priv"
+            | "typeof"
+            | "unsized"
+            | "virtual"
+            | "yield"
+            | "try"
+    )
+}
+
+/// `Some(reason)` when `package_id` is not a dot-qualified sequence of
+/// Oracle-safe identifier segments (`[A-Za-z][A-Za-z0-9_$#]*`). `package_id` is
+/// only ever interpolated into PL/SQL — the static `{block:?}` (Debug-escaped)
+/// and the dynamic `format!("BEGIN {package_id}…")` string literal — never into
+/// a Rust identifier position, so `$`/`#` (legal in Oracle names) are permitted,
+/// but quotes/braces/dots-runs that would break the generated string literal or
+/// the call target are rejected.
+fn package_id_problem(package_id: &str) -> Option<&'static str> {
+    if package_id.is_empty() {
+        return Some("package_id is empty");
+    }
+    for segment in package_id.split('.') {
+        if segment.is_empty() {
+            return Some("package_id has an empty dot-qualified segment");
+        }
+        let mut chars = segment.chars();
+        let first = chars.next().expect("non-empty checked above");
+        if !first.is_ascii_alphabetic() {
+            return Some("package_id segment does not start with an ASCII letter");
+        }
+        for c in segment.chars() {
+            if !(c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '#') {
+                return Some("package_id segment contains an unsafe character");
+            }
+        }
+    }
+    None
+}
+
+/// First reason `r` (or `package_id`) cannot be emitted, or `None` if every
+/// raw-interpolated identifier is safe. Covers the routine name, every
+/// parameter name, and the package_id — all of which land in raw positions in
+/// the generated wrapper (the `pub fn` signature, the `match &name` scrutinee,
+/// the dynamic `format!` block, and the SQL-block literal).
+fn invalid_identifier_reason(package_id: &str, r: &RoutineBinding) -> Option<String> {
+    if let Some(reason) = package_id_problem(package_id) {
+        return Some(reason.to_string());
+    }
+    if let Some(reason) = rust_ident_problem(&r.name) {
+        return Some(format!("routine name `{}`: {reason}", r.name));
+    }
+    for p in &r.parameters {
+        if let Some(reason) = rust_ident_problem(&p.name) {
+            return Some(format!("parameter name `{}`: {reason}", p.name));
+        }
+    }
+    None
+}
+
+/// Derive a deterministic, collision-free, legal Rust identifier for the stub
+/// `pub fn` of a routine that failed the identifier gate. Every non-`[A-Za-z0-9_]`
+/// character of the proposed Rust name is folded to `_`; the routine index is
+/// appended so two distinct invalid routines never collapse to the same stub
+/// (preserving the "no duplicate `pub fn`" guarantee even on hostile input).
+fn safe_stub_ident(rust_name: &str, idx: usize) -> String {
+    let mut base = String::with_capacity(rust_name.len() + 1);
+    for c in rust_name.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            base.push(c);
+        } else {
+            base.push('_');
+        }
+    }
+    // Ensure a valid leading character (non-empty, not a digit) and steer
+    // clear of accidentally minting a Rust keyword.
+    if base.is_empty()
+        || base.chars().next().is_some_and(|c| c.is_ascii_digit())
+        || is_rust_keyword(&base)
+    {
+        base.insert_str(0, "binding_invalid_");
+    }
+    format!("{base}_{idx}")
+}
+
+fn emit_routine(out: &mut String, package_id: &str, r: &RoutineBinding, rust_name: &str, idx: usize) {
     if r.autonomous_transaction {
         let _ = writeln!(
             out,
             "/// **PRAGMA AUTONOMOUS_TRANSACTION** — this procedure commits/rolls back its own transaction independently of the caller. The wrapper does not surface a transactional handle; callers must reason about isolation themselves."
         );
     }
-    let _ = write!(out, "pub fn {}(executor: &mut impl OracleExecutor", r.name);
+
+    // Fail-closed identifier gate. The CLI deserializes an UNTRUSTED
+    // `BindingPlan` over plain serde (main.rs), so a hostile or upstream-buggy
+    // plan can carry a routine/parameter name or a package_id that is not a
+    // legal Rust identifier (e.g. `f", DROP TABLE t; --`, `p_a => :99`) or
+    // would break the emitted Rust when interpolated raw into the `pub fn`
+    // signature, the `match &name` scrutinee, the dynamic `format!` block, or
+    // the `BEGIN {package_id}.{name}(…)` literal. Every other attacker-shaped
+    // plan fails closed with a typed BINDING_* body (compilable Rust, exit 0);
+    // this one must too rather than silently emitting uncompilable Rust. The
+    // guard runs BEFORE path selection so it protects both the static layout
+    // and the defaulted-parameter dynamic path. The emitted stub `pub fn`
+    // identifier is derived deterministically (and made unique via the routine
+    // index) so the error body always type-checks.
+    if let Some(problem) = invalid_identifier_reason(package_id, r) {
+        let stub = safe_stub_ident(rust_name, idx);
+        let _ = writeln!(
+            out,
+            "pub fn {stub}(executor: &mut impl OracleExecutor) -> Result<(), ExecutionError> {{"
+        );
+        let _ = writeln!(
+            out,
+            "    let _ = executor;\n    \
+             // bindgen: {problem}; the BindingPlan carries an identifier that is not a legal \
+             Rust identifier (or a package_id with an unsafe segment), so no wrapper can be \
+             emitted for it.\n    \
+             Err(ExecutionError {{ code: \"BINDING_INVALID_IDENTIFIER\".to_string(), \
+             message: {msg:?}.to_string() }})",
+            problem = problem,
+            msg = format!(
+                "routine `{}` in package `{}`: {problem}; supply a BindingPlan with legal \
+                 Rust-identifier routine/parameter names and an Oracle-safe package_id",
+                r.name, package_id
+            ),
+        );
+        let _ = writeln!(out, "}}");
+        return;
+    }
+
+    let _ = write!(
+        out,
+        "pub fn {rust_name}(executor: &mut impl OracleExecutor"
+    );
     for p in &r.parameters {
         if matches!(p.mode, ParameterMode::In | ParameterMode::InOut) {
             let _ = write!(out, ", {}: {}", p.name, rust_type_sig(p));
@@ -1223,6 +1437,262 @@ mod tests {
             src.contains("BINDING_OMIT_INOUT"),
             "omitting an IN OUT must be a typed error: {src}"
         );
+    }
+
+    // --- oracle-rwjl.5: overloaded PL/SQL packages (legal duplicate routine
+    // names) must NOT emit two identical `pub fn`s (rustc E0428). emit_wrappers
+    // now wires `disambiguate_overloads`; the server-side call still targets
+    // the real overloaded PL/SQL name. ---
+
+    fn overload(name: &str, param_name: &str) -> RoutineBinding {
+        RoutineBinding {
+            name: name.into(),
+            kind: RoutineKind::Procedure,
+            parameters: vec![param(param_name, "i64", ParameterMode::In, false)],
+            return_type: None,
+            autonomous_transaction: false,
+        }
+    }
+
+    #[test]
+    fn overloaded_routines_emit_distinct_pub_fn_names() {
+        // Before the fix both routines emitted `pub fn hire(...)` — the
+        // operator's `cargo build` then failed with E0428. They must now get
+        // distinct, disambiguated identifiers.
+        let plan = plan(vec![
+            overload("hire", "p_emp_id"),
+            overload("hire", "p_emp_name"),
+        ]);
+        let src = emit_wrappers(&plan);
+        assert!(
+            src.contains("pub fn hire_p_emp_id("),
+            "first overload must be suffixed: {src}"
+        );
+        assert!(
+            src.contains("pub fn hire_p_emp_name("),
+            "second overload must be suffixed: {src}"
+        );
+        // No bare `pub fn hire(` remains — that would be the duplicate.
+        assert!(
+            !src.contains("pub fn hire("),
+            "the colliding bare name must NOT be emitted: {src}"
+        );
+        // Exactly two `pub fn`s, both unique.
+        let fn_names: Vec<&str> = src
+            .match_indices("pub fn ")
+            .map(|(i, _)| {
+                let rest = &src[i + "pub fn ".len()..];
+                &rest[..rest.find('(').unwrap()]
+            })
+            .collect();
+        assert_eq!(fn_names.len(), 2, "{fn_names:?}");
+        let unique: std::collections::BTreeSet<_> = fn_names.iter().collect();
+        assert_eq!(unique.len(), 2, "duplicate pub fn names emitted: {fn_names:?}");
+    }
+
+    #[test]
+    fn overloaded_call_still_targets_the_real_plsql_name() {
+        // The disambiguated Rust name must NOT leak into the composed PL/SQL
+        // block — the server still resolves the overload by its real name.
+        let plan = plan(vec![
+            overload("hire", "p_emp_id"),
+            overload("hire", "p_emp_name"),
+        ]);
+        let src = emit_wrappers(&plan);
+        assert!(
+            src.contains("BEGIN hr.demo_pkg.hire(:1); END;"),
+            "the PL/SQL call must target the real overloaded name `hire`: {src}"
+        );
+        assert!(
+            !src.contains("hr.demo_pkg.hire_p_emp_id"),
+            "the disambiguated Rust name must not leak into the PL/SQL block: {src}"
+        );
+    }
+
+    // --- oracle-rwjl.7 / oracle-rwjl.13: an untrusted BindingPlan whose
+    // routine name, parameter name, or package_id is not a legal identifier
+    // must fail closed with a typed BINDING_INVALID_IDENTIFIER body (exit 0,
+    // compilable Rust) instead of emitting uncompilable Rust. The guard covers
+    // BOTH the static layout and the defaulted-parameter dynamic path. ---
+
+    fn assert_invalid_identifier_body(src: &str) {
+        assert!(
+            src.contains("BINDING_INVALID_IDENTIFIER"),
+            "must emit a typed invalid-identifier error body: {src}"
+        );
+        // The stub signature must be well-formed Rust: a legal `pub fn`
+        // identifier and no raw injected metacharacter in an identifier
+        // position.
+        assert!(
+            !src.contains("pub fn f\","),
+            "the raw invalid name must NOT reach the pub fn position: {src}"
+        );
+        assert!(
+            !src.contains("unimplemented!"),
+            "must not panic-body: {src}"
+        );
+    }
+
+    #[test]
+    fn routine_name_with_quote_fails_closed_static_path() {
+        // The headline repro: a routine name carrying a quote + SQL fragment.
+        // No defaulted param → static path.
+        let r = RoutineBinding {
+            name: "f\", DROP TABLE t; --".into(),
+            kind: RoutineKind::Procedure,
+            parameters: vec![param("p_id", "i64", ParameterMode::In, false)],
+            return_type: None,
+            autonomous_transaction: false,
+        };
+        let src = emit_wrappers(&plan(vec![r]));
+        assert_invalid_identifier_body(&src);
+        // No PL/SQL block is composed for a rejected routine.
+        assert!(
+            !src.contains("executor.call_routine("),
+            "rejected routine must not compose a server call: {src}"
+        );
+    }
+
+    #[test]
+    fn routine_name_with_quote_fails_closed_dynamic_path() {
+        // Same hostile name but WITH a defaulted param → would route to the
+        // dynamic `format!` block (emit.rs:392) where the name is interpolated
+        // raw into a string literal. Must still fail closed before that.
+        let r = RoutineBinding {
+            name: "inj\"); evil(\"x".into(),
+            kind: RoutineKind::Procedure,
+            parameters: vec![defaulted_param("p_id", "i64", ParameterMode::In, false)],
+            return_type: None,
+            autonomous_transaction: false,
+        };
+        let src = emit_wrappers(&plan(vec![r]));
+        assert_invalid_identifier_body(&src);
+        assert!(
+            !src.contains("let __block = format!("),
+            "rejected routine must not reach the dynamic block: {src}"
+        );
+    }
+
+    #[test]
+    fn parameter_name_with_metacharacters_fails_closed() {
+        // A hostile parameter name (`p_a => :99 -- broken`) must be rejected;
+        // it would otherwise break the `pub fn` signature and the dynamic
+        // `match &name` / named-notation literals.
+        let r = RoutineBinding {
+            name: "ok_proc".into(),
+            kind: RoutineKind::Procedure,
+            parameters: vec![param("p_a => :99 -- broken", "i64", ParameterMode::In, false)],
+            return_type: None,
+            autonomous_transaction: false,
+        };
+        let src = emit_wrappers(&plan(vec![r]));
+        assert_invalid_identifier_body(&src);
+    }
+
+    #[test]
+    fn package_id_with_unsafe_segment_fails_closed() {
+        // package_id is interpolated raw into the PL/SQL block literal; a
+        // quote/brace there breaks the generated Rust string literal.
+        let mut p = plan(vec![RoutineBinding {
+            name: "ok_proc".into(),
+            kind: RoutineKind::Procedure,
+            parameters: vec![param("p_a", "i64", ParameterMode::In, false)],
+            return_type: None,
+            autonomous_transaction: false,
+        }]);
+        p.package_id = "hr.\"; DROP TABLE t; --".into();
+        let src = emit_wrappers(&p);
+        assert_invalid_identifier_body(&src);
+    }
+
+    #[test]
+    fn rust_keyword_routine_name_fails_closed() {
+        // A routine literally named `match` would emit `pub fn match(...)`.
+        let r = RoutineBinding {
+            name: "match".into(),
+            kind: RoutineKind::Procedure,
+            parameters: vec![param("p_a", "i64", ParameterMode::In, false)],
+            return_type: None,
+            autonomous_transaction: false,
+        };
+        let src = emit_wrappers(&plan(vec![r]));
+        assert_invalid_identifier_body(&src);
+    }
+
+    #[test]
+    fn two_distinct_invalid_routines_get_unique_stub_names() {
+        // Two rejected routines must not collapse to one stub `pub fn`
+        // (which would itself be an E0428 duplicate).
+        let mk = |n: &str| RoutineBinding {
+            name: n.into(),
+            kind: RoutineKind::Procedure,
+            parameters: vec![param("p_a", "i64", ParameterMode::In, false)],
+            return_type: None,
+            autonomous_transaction: false,
+        };
+        let src = emit_wrappers(&plan(vec![mk("bad name 1"), mk("bad name 2")]));
+        let fn_names: Vec<&str> = src
+            .match_indices("pub fn ")
+            .map(|(i, _)| {
+                let rest = &src[i + "pub fn ".len()..];
+                &rest[..rest.find('(').unwrap()]
+            })
+            .collect();
+        assert_eq!(fn_names.len(), 2, "{fn_names:?}");
+        let unique: std::collections::BTreeSet<_> = fn_names.iter().collect();
+        assert_eq!(
+            unique.len(),
+            2,
+            "two invalid routines must get distinct stub idents: {fn_names:?}"
+        );
+    }
+
+    #[test]
+    fn valid_oracle_identifiers_still_emit_normally() {
+        // Regression guard: legal names (incl. underscores/digits) must NOT be
+        // misclassified as invalid.
+        let r = RoutineBinding {
+            name: "find_by_id_2".into(),
+            kind: RoutineKind::Function,
+            parameters: vec![param("p_emp_id", "i64", ParameterMode::In, false)],
+            return_type: Some(RustTypeRef {
+                path: "i64".into(),
+                nullable: false,
+            }),
+            autonomous_transaction: false,
+        };
+        let src = emit_wrappers(&plan(vec![r]));
+        assert!(
+            !src.contains("BINDING_INVALID_IDENTIFIER"),
+            "legal identifiers must not trip the gate: {src}"
+        );
+        assert!(src.contains("pub fn find_by_id_2("), "{src}");
+    }
+
+    // Direct unit coverage of the identifier-classification helpers.
+    #[test]
+    fn rust_ident_problem_flags_the_expected_cases() {
+        assert!(rust_ident_problem("ok_name").is_none());
+        assert!(rust_ident_problem("_leading_underscore").is_none());
+        assert!(rust_ident_problem("").is_some());
+        assert!(rust_ident_problem("2leading").is_some());
+        assert!(rust_ident_problem("has space").is_some());
+        assert!(rust_ident_problem("has\"quote").is_some());
+        assert!(rust_ident_problem("p_a => :1").is_some());
+        assert!(rust_ident_problem("dollar$sign").is_some());
+        assert!(rust_ident_problem("match").is_some());
+        assert!(rust_ident_problem("type").is_some());
+    }
+
+    #[test]
+    fn package_id_problem_allows_oracle_segments_rejects_unsafe() {
+        assert!(package_id_problem("hr.emp_pkg").is_none());
+        assert!(package_id_problem("schema$1.pkg#name").is_none());
+        assert!(package_id_problem("").is_some());
+        assert!(package_id_problem("hr.").is_some());
+        assert!(package_id_problem(".pkg").is_some());
+        assert!(package_id_problem("hr.\"injected").is_some());
+        assert!(package_id_problem("hr.{brace}").is_some());
     }
 
     // A hand-mirrored copy of exactly what `emit_routine_body_dynamic`
