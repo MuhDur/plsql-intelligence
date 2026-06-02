@@ -179,15 +179,19 @@ fn lower_package(
     }
 
     let name = extract_identifier(source, pos);
-    // A package BODY opens an `AS|IS … END[ name];` envelope the byte scanner
-    // does not count; seed depth 1 so the span runs to the body's own trailing
-    // `END;` rather than truncating at the first nested routine's `END;`
-    // (oracle-clgt.7). A package SPEC has no such envelope: depth 0.
-    let end = if is_body {
-        advance_to_decl_end_with_depth(bytes, create_start, 1)
-    } else {
-        advance_to_decl_end(bytes, create_start)
-    };
+    // BOTH a package BODY and a package SPEC open an `AS|IS … END[ name];`
+    // envelope the byte scanner never counts (it only opens on
+    // `BEGIN`/`IF`/`LOOP`/`CASE`). For the BODY this matters because of nested
+    // routines' `END;` (oracle-clgt.7); for the SPEC it matters because a member
+    // declaration's own `;` (a constant with a default, or a `PROCEDURE p;`
+    // forward declaration) is the first `;` the scanner reaches — with depth 0 it
+    // returned there, truncating the spec span at the first member instead of at
+    // the trailing `END name;` (oracle-73t1.10). Seeding depth 1 for both means
+    // the scan only returns on a `;` once the body/spec's own trailing
+    // `END[ name];` has decremented the depth back to 0. (TYPE specs differ — an
+    // OBJECT/VARRAY/TABLE spec closes with `);`, not `END`, so lower_type keeps
+    // depth 0 for the SPEC case.)
+    let end = advance_to_decl_end_with_depth(bytes, create_start, 1);
     let span = make_span(file_id, create_start as u32, end as u32);
 
     if is_body {
@@ -290,7 +294,11 @@ fn lower_type(
     // A type BODY opens an `AS|IS … END[ name];` envelope the byte scanner
     // does not count; seed depth 1 so the span runs to the body's own trailing
     // `END;` rather than truncating at the first member routine's `END;`
-    // (oracle-clgt.7). A type SPEC has no such envelope: depth 0.
+    // (oracle-clgt.7). A type SPEC, unlike a *package* spec (oracle-73t1.10),
+    // has **no** `END[ name];` envelope — `AS OBJECT (…)` / `AS VARRAY(…) OF …`
+    // / `AS TABLE OF …` close with `);`, so depth 0 is correct here. Seeding
+    // depth 1 would over-run the spec past its own `;` into any following
+    // declaration (the type spec would swallow the next CREATE).
     let end = if is_body {
         advance_to_decl_end_with_depth(bytes, create_start, 1)
     } else {
@@ -1218,19 +1226,22 @@ fn advance_to_decl_end(bytes: &[u8], start: usize) -> usize {
 /// Advance past the end of the current statement, seeding the initial
 /// `BEGIN…END` nesting depth.
 ///
-/// PACKAGE/TYPE **bodies** open their own `AS|IS … END[ name];` envelope that
-/// the byte scanner's [`block_structure_step`](crate::recover::block_structure_step)
-/// never counts (it only opens on `BEGIN`/`IF`/`LOOP`/`CASE`). With a depth
-/// seed of `0`, a body containing two or more nested routines returned on the
-/// first nested routine's `END;` — silently truncating the declaration span
-/// and orphaning every later routine's source range (including its DML /
+/// PACKAGE/TYPE **bodies** — and a PACKAGE **spec** — open their own
+/// `AS|IS … END[ name];` envelope that the byte scanner's
+/// [`block_structure_step`](crate::recover::block_structure_step) never counts
+/// (it only opens on `BEGIN`/`IF`/`LOOP`/`CASE`). With a depth seed of `0`, a
+/// body containing two or more nested routines returned on the first nested
+/// routine's `END;`, and a package spec returned on its first member
+/// declaration's `;` — silently truncating the declaration span and orphaning
+/// every later routine/member's source range (including any DML /
 /// `EXECUTE IMMEDIATE` sinks) from span-based IR consumers (oracle-clgt.7,
-/// contradicting R13 "no uncertainty is silently dropped"). Seeding depth `1`
-/// for body cases means the scan only returns on a `;` once the body's own
-/// trailing `END[ name];` has decremented the depth back to `0`. SPEC cases
-/// keep depth `0` (no `BEGIN…END` envelope). The SQL*Plus `/` terminator
+/// oracle-73t1.10; contradicting R13 "no uncertainty is silently dropped").
+/// Seeding depth `1` for those cases means the scan only returns on a `;` once
+/// the decl's own trailing `END[ name];` has decremented the depth back to `0`.
+/// A TYPE **spec** keeps depth `0` because it has no `END` envelope — an
+/// OBJECT/VARRAY/TABLE spec closes with `);`. The SQL*Plus `/` terminator
 /// branch already requires `depth == 0` and so is only satisfied after the
-/// body `END`, leaving it unaffected.
+/// trailing `END`, leaving it unaffected.
 fn advance_to_decl_end_with_depth(bytes: &[u8], start: usize, initial_depth: usize) -> usize {
     let len = bytes.len();
     let mut i = start;
@@ -1830,6 +1841,89 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
     }
 
     #[test]
+    fn package_spec_runs_to_trailing_end_name() {
+        // oracle-73t1.10: a PACKAGE SPEC opens an `AS … END pkg;` envelope the
+        // byte scanner never counts (it only opens on BEGIN/IF/LOOP/CASE). With
+        // depth seed 0 the scan returned on the first member declaration's `;`
+        // (here the CASE-valued constant default at offset 83), truncating the
+        // PackageSpec span so the following `PROCEDURE do_work;` member and the
+        // trailing `END p;` lay outside it. The CASE expression must balance
+        // itself (CASE opener +1, its bare `END` -1) so seeding depth 1 leaves
+        // the constant's `;` at depth 1 (skipped) and only the spec's own
+        // `END p;` decrements back to 0, ending the span at the full source.
+        let src = "CREATE PACKAGE p AS\n  g_max CONSTANT NUMBER := CASE WHEN x = 1 THEN 10 ELSE 20 END;\n  PROCEDURE do_work;\nEND p;\n";
+        let ast = lower_source(src, fid());
+        let spec_span = ast
+            .root
+            .declarations
+            .iter()
+            .find_map(|d| match d {
+                AstDecl::PackageSpec { name, span } if name == "p" => Some(*span),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("package spec p missing from {:?}", ast.root.declarations));
+        // The span must end immediately after the spec's own trailing `END p;`
+        // (the `;` at index 110, so end-offset 111) — well past the first
+        // member's `;` at offset 83 where depth-0 scanning truncated it. (It
+        // stops at the `;`, not the following `\n`, so it is one byte short of
+        // src.len() == 112.)
+        let end_name_terminator = src.rfind("END p;").map(|i| (i + "END p;".len()) as u32);
+        assert_eq!(end_name_terminator, Some(111), "fixture sanity");
+        assert_eq!(
+            spec_span.end.offset,
+            111,
+            "package spec span must run to the trailing END p; (offset 111), not the \
+             first member's `;` (offset 83) — got {}",
+            spec_span.end.offset
+        );
+        // Exactly one declaration: the following PROCEDURE member was not
+        // mis-promoted into a spurious top-level decl.
+        assert_eq!(ast.root.declarations.len(), 1, "{:?}", ast.root.declarations);
+    }
+
+    #[test]
+    fn object_type_spec_does_not_swallow_following_decl() {
+        // oracle-73t1.10 (guard): a TYPE spec has NO `END[ name];` envelope —
+        // `AS OBJECT (…)` closes with `);`. It must therefore keep depth 0; if
+        // it were seeded to depth 1 (as the package-spec fix does) the scan
+        // would never decrement back to 0 and would over-run past the type
+        // spec's own `;`, swallowing the following CREATE PROCEDURE into the
+        // type-spec span and orphaning the procedure.
+        let src = "CREATE TYPE t AS OBJECT (x NUMBER);\nCREATE PROCEDURE p IS BEGIN NULL; END;\n";
+        let ast = lower_source(src, fid());
+        assert_eq!(
+            ast.root.declarations.len(),
+            2,
+            "object type spec must not swallow the following decl: {:?}",
+            ast.root.declarations
+        );
+        let ts_span = ast
+            .root
+            .declarations
+            .iter()
+            .find_map(|d| match d {
+                AstDecl::TypeSpec { name, span } if name == "t" => Some(*span),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("type spec t missing from {:?}", ast.root.declarations));
+        // The type spec ends at its own `);` (offset 35), not at the
+        // procedure's trailing END;.
+        assert_eq!(
+            ts_span.end.offset, 35,
+            "object type spec span must end at its own `);`, got {}",
+            ts_span.end.offset
+        );
+        assert!(
+            ast.root
+                .declarations
+                .iter()
+                .any(|d| matches!(d, AstDecl::Procedure { name, .. } if name == "p")),
+            "following procedure p must survive as its own decl: {:?}",
+            ast.root.declarations
+        );
+    }
+
+    #[test]
     fn type_body_with_two_members_does_not_truncate_decl_span() {
         // oracle-clgt.7 (TYPE BODY arm): a TYPE BODY's `AS … END;` envelope is
         // likewise uncounted; with depth seed 0 the span truncated at the first
@@ -2375,3 +2469,4 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
         assert!(t.span().start.offset >= 50);
     }
 }
+
