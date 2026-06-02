@@ -621,9 +621,18 @@ impl std::fmt::Display for ClassifyError {
 /// * `--- a/<p>` paired with `+++ b/<p>` → Body change on `<p>`
 /// * Different `<p>` on either side → Dropped(old) + Created(new)
 ///
-/// Hunk lines (`@@ …@@`), context lines, additions, and deletions
-/// are intentionally ignored — body-level semantic diffing requires
-/// a parser (Layer 1) and is tracked separately. Non-PL/SQL files
+/// Hunk lines (`@@ …@@`) toggle hunk state: once a `@@` line is
+/// seen, every following line is treated as hunk content (context,
+/// addition, deletion) until the next file pair begins (`diff --git`,
+/// or a fresh `--- `/`+++ ` header pair). This matters because PL/SQL
+/// source is comment-saturated: a removed `-- comment` line shows up
+/// in the hunk body as `--- comment`, and an added one as `+++ …`.
+/// Without hunk tracking those would be mis-read as file headers and
+/// either abort the whole changeset (`MalformedDiff`) or skew the
+/// deletion count. Inside a hunk we classify strictly on the single
+/// leading marker (`-` = deletion, `+` = addition) regardless of the
+/// remaining characters. Body-level semantic diffing still requires a
+/// parser (Layer 1) and is tracked separately. Non-PL/SQL files
 /// (anything outside `.sql/.pls/.plsql/.pks/.pkb`) are skipped.
 ///
 /// File paths feed through `path_to_object_id` so the report uses
@@ -702,15 +711,56 @@ pub fn parse_unified_diff(diff: &str) -> Result<SemanticChangeSet, ClassifyError
             }
         };
 
-    for (idx, line) in diff.lines().enumerate() {
+    // Track whether we are inside a hunk body (after a `@@ … @@`
+    // line). PL/SQL source is comment-saturated, so a removed `--
+    // comment` line surfaces as `--- comment` and an added one as
+    // `+++ …`; inside a hunk those are content, NOT file headers, and
+    // must be classified purely on their single leading `-`/`+`
+    // marker. Outside a hunk, `--- `/`+++ ` are file headers. We need
+    // lookahead to disambiguate the (header-less `diff -u`) case where
+    // a fresh file pair begins without a `diff --git` line, so collect
+    // the lines once and index into them.
+    let lines: Vec<&str> = diff.lines().collect();
+    let mut in_hunk = false;
+    for (idx, &line) in lines.iter().enumerate() {
         let lineno = idx + 1;
-        if let Some(rest) = line.strip_prefix("--- ") {
+        // A new file pair resets hunk state. `diff --git` is the
+        // canonical separator; without it (raw `diff -u`), a `--- `
+        // line immediately followed by a `+++ ` line also starts a
+        // fresh pair even while we were nominally inside a hunk.
+        if line.starts_with("diff --git ") {
+            in_hunk = false;
+            continue;
+        }
+
+        // For a header-less `diff -u` stream a fresh file pair begins,
+        // even while we are nominally still inside the previous hunk,
+        // with the canonical 3-line shape `--- X` / `+++ Y` / `@@ …`.
+        // Require that full shape so an in-hunk deleted `-- a` / added
+        // `++ b` run (which surfaces as `--- a` / `+++ b` followed by
+        // more hunk content, NOT a `@@` header) is never mistaken for
+        // a new file pair.
+        let starts_fresh_pair_in_hunk = lines
+            .get(idx + 1)
+            .is_some_and(|n| n.starts_with("+++ "))
+            && lines.get(idx + 2).is_some_and(|n| n.starts_with("@@"));
+        // `--- ` is a file header when we are outside any hunk, or —
+        // for header-less diffs — when it opens the canonical fresh
+        // pair shape above. Inside a hunk a `--- comment` line is
+        // otherwise a deleted comment, not a header.
+        let minus_is_header =
+            line.starts_with("--- ") && (!in_hunk || starts_fresh_pair_in_hunk);
+
+        if minus_is_header {
+            let rest = &line["--- ".len()..];
             flush(&current_pair, additions, deletions, &mut changeset);
             current_pair = None;
             additions = 0;
             deletions = 0;
+            in_hunk = false;
             pending_minus = Some(rest.trim().to_string());
-        } else if let Some(rest) = line.strip_prefix("+++ ") {
+        } else if !in_hunk && line.starts_with("+++ ") {
+            let rest = &line["+++ ".len()..];
             let minus = pending_minus
                 .take()
                 .ok_or_else(|| ClassifyError::MalformedDiff {
@@ -718,10 +768,28 @@ pub fn parse_unified_diff(diff: &str) -> Result<SemanticChangeSet, ClassifyError
                     detail: "+++ header without preceding --- header".to_string(),
                 })?;
             current_pair = Some((minus, rest.trim().to_string()));
-        } else if line.starts_with('+') && !line.starts_with("+++") {
-            additions += 1;
-        } else if line.starts_with('-') && !line.starts_with("---") {
-            deletions += 1;
+        } else if line.starts_with("@@") {
+            // Entering (or continuing) a hunk body. A pending `--- `
+            // header without a matching `+++ ` is malformed even if a
+            // hunk follows.
+            if pending_minus.is_some() {
+                return Err(ClassifyError::MalformedDiff {
+                    line: lineno,
+                    detail: "--- header followed by @@ hunk without matching +++".to_string(),
+                });
+            }
+            in_hunk = true;
+        } else if in_hunk {
+            // Classify strictly on the single leading marker: any line
+            // beginning with `-` is a deletion (even `--- comment`),
+            // any line beginning with `+` is an addition (even
+            // `+++ comment`). Context (` `) and no-newline (`\`)
+            // markers are ignored.
+            if line.starts_with('-') {
+                deletions += 1;
+            } else if line.starts_with('+') {
+                additions += 1;
+            }
         }
     }
 
@@ -3744,6 +3812,115 @@ mod impact_tests {
         let diff = "+++ b/pkg/x.pkb\n@@\n+abc\n";
         let err = parse_unified_diff(diff).unwrap_err();
         assert!(matches!(err, ClassifyError::MalformedDiff { .. }), "{err}");
+    }
+
+    // oracle-hrzg.4 regression: a unified diff that removes a leading
+    // SQL `-- comment` line surfaces in the hunk body as `--- comment`.
+    // Before hunk-state tracking the parser mis-read that as a `--- `
+    // file header, flushing the (only) pair and then erroring with
+    // `MalformedDiff{trailing --- header without matching +++}` —
+    // discarding the entire valid single-file changeset. It must now
+    // yield exactly one Body record for the changed object.
+    #[test]
+    fn parse_unified_diff_deleted_comment_last_hunk_line_is_not_header() {
+        // Verbatim shape of a real `git diff` that removes the leading
+        // `-- old comment line` from a procedure source file.
+        let diff = "diff --git a/proc.sql b/proc.sql\nindex 09c7876..5b737da 100644\n--- a/proc.sql\n+++ b/proc.sql\n@@ -1,4 +1,3 @@\n--- old comment line\n create or replace procedure hr.p is\n begin\n   null;\n end;\n";
+        let cs = parse_unified_diff(diff).expect("deleted -- comment must not abort the diff");
+        assert_eq!(cs.changes.len(), 1, "{:?}", cs.changes);
+        match &cs.changes[0] {
+            ChangeRecord::Body(bc) => {
+                assert_eq!(bc.object_id, "proc");
+                // The removed `-- old comment line` is the single
+                // deletion; there are no additions.
+                assert_eq!(bc.hash_before.as_deref(), Some("diff:-1"));
+                assert_eq!(bc.hash_after.as_deref(), Some("diff:+0"));
+            }
+            other => panic!("expected Body, got {other:?}"),
+        }
+    }
+
+    // oracle-hrzg.4 regression: editing a `-- comment` mid-hunk must
+    // tally the deletion (old `--- comment` line) and the addition (new
+    // `+++ comment` line) on the correct sides rather than dropping the
+    // deletion because the body line starts with `---`.
+    #[test]
+    fn parse_unified_diff_edited_comment_midhunk_counts_correctly() {
+        let diff = "--- a/pkg/c.pkb\n+++ b/pkg/c.pkb\n@@ -1,4 +1,4 @@\n create or replace package body c is\n--- old note\n+-- new note\n begin null; end;\n";
+        let cs = parse_unified_diff(diff).expect("edited -- comment must parse");
+        assert_eq!(cs.changes.len(), 1, "{:?}", cs.changes);
+        match &cs.changes[0] {
+            ChangeRecord::Body(bc) => {
+                assert_eq!(bc.object_id, "pkg.c");
+                assert_eq!(bc.hash_before.as_deref(), Some("diff:-1"));
+                assert_eq!(bc.hash_after.as_deref(), Some("diff:+1"));
+            }
+            other => panic!("expected Body, got {other:?}"),
+        }
+    }
+
+    // oracle-hrzg.4 regression: a deleted line whose content itself
+    // starts with `-- ` and an added line whose content starts with
+    // `++ ` (so the hunk-body markers read `--- …` / `+++ …`) must be
+    // counted as one deletion + one addition, never as a file-header
+    // pair — guarded by requiring the canonical `--- /+++ /@@` triple
+    // for header detection inside a hunk.
+    #[test]
+    fn parse_unified_diff_dashdash_plusplus_content_in_hunk_not_header() {
+        let diff = "--- a/pkg/d.pkb\n+++ b/pkg/d.pkb\n@@ -1,3 +1,3 @@\n begin\n--- a\n+++ b\n null;\n";
+        let cs = parse_unified_diff(diff).expect("-- / ++ content must parse");
+        assert_eq!(cs.changes.len(), 1, "{:?}", cs.changes);
+        match &cs.changes[0] {
+            ChangeRecord::Body(bc) => {
+                assert_eq!(bc.object_id, "pkg.d");
+                assert_eq!(bc.hash_before.as_deref(), Some("diff:-1"));
+                assert_eq!(bc.hash_after.as_deref(), Some("diff:+1"));
+            }
+            other => panic!("expected Body, got {other:?}"),
+        }
+    }
+
+    // oracle-hrzg.4 regression: the multi-file failure mode from the
+    // finding — a removed `-- comment` in the FIRST file of a two-file
+    // diff must not skew that file's deletion count, and the second
+    // file must still be detected. Without hunk tracking the first
+    // file's `--- comment` deletion was silently dropped (`diff:-0`).
+    #[test]
+    fn parse_unified_diff_deleted_comment_in_multi_file_keeps_counts() {
+        let diff = "diff --git a/proc.sql b/proc.sql\n--- a/proc.sql\n+++ b/proc.sql\n@@ -1,2 +1,1 @@\n--- old comment line\n create or replace procedure hr.p is begin null; end;\ndiff --git a/next.sql b/next.sql\n--- a/next.sql\n+++ b/next.sql\n@@ -1,2 +1,2 @@\n-old\n+new\n context\n";
+        let cs = parse_unified_diff(diff).expect("multi-file diff must parse");
+        assert_eq!(cs.changes.len(), 2, "{:?}", cs.changes);
+        match &cs.changes[0] {
+            ChangeRecord::Body(bc) => {
+                assert_eq!(bc.object_id, "proc");
+                assert_eq!(bc.hash_before.as_deref(), Some("diff:-1"), "deletion must be tallied");
+                assert_eq!(bc.hash_after.as_deref(), Some("diff:+0"));
+            }
+            other => panic!("expected Body for proc, got {other:?}"),
+        }
+        match &cs.changes[1] {
+            ChangeRecord::Body(bc) => {
+                assert_eq!(bc.object_id, "next");
+                assert_eq!(bc.hash_before.as_deref(), Some("diff:-1"));
+                assert_eq!(bc.hash_after.as_deref(), Some("diff:+1"));
+            }
+            other => panic!("expected Body for next, got {other:?}"),
+        }
+    }
+
+    // oracle-hrzg.4 regression: a header-less `diff -u` stream (no
+    // `diff --git` separator) with two concatenated file pairs must
+    // still split into two records — the second file's `--- `/`+++ `
+    // header pair is recognised mid-stream via the canonical
+    // `--- /+++ /@@` lookahead even though we were inside the first
+    // file's hunk.
+    #[test]
+    fn parse_unified_diff_headerless_multi_file_splits() {
+        let diff = "--- a/pkg/a.pkb\n+++ b/pkg/a.pkb\n@@ -1,2 +1,2 @@\n-x\n+y\n--- a/pkg/b.pkb\n+++ b/pkg/b.pkb\n@@ -1,2 +1,2 @@\n-m\n+n\n";
+        let cs = parse_unified_diff(diff).expect("header-less multi-file diff must parse");
+        assert_eq!(cs.changes.len(), 2, "{:?}", cs.changes);
+        assert!(matches!(&cs.changes[0], ChangeRecord::Body(b) if b.object_id == "pkg.a"));
+        assert!(matches!(&cs.changes[1], ChangeRecord::Body(b) if b.object_id == "pkg.b"));
     }
 
     #[test]
