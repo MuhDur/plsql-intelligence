@@ -2694,6 +2694,14 @@ pub fn detect_orphans(
     let mut outbound: std::collections::HashSet<plsql_depgraph::NodeId> =
         std::collections::HashSet::new();
     for edge in &graph.edges {
+        if edge.from == edge.to {
+            // Self-loop (recursive self-call) is not an external reference;
+            // it must count toward neither inbound nor outbound so a purely
+            // recursive, otherwise-unreferenced object is still tiered as
+            // HighConfidenceUnused. Mirrors the `edge.from != edge.to`
+            // convention used in recompile_order.
+            continue;
+        }
         inbound.insert(edge.to);
         outbound.insert(edge.from);
     }
@@ -5052,5 +5060,81 @@ mod impact_tests {
         assert!(json.contains("plsql.lineage.classify_rename"));
         let back: RobotJsonEnvelope<RenameClassification> = serde_json::from_str(&json).unwrap();
         assert_eq!(back.payload.candidates.len(), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // detect_orphans — self-loop guard (oracle-qm3q.18)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn detect_orphans_self_loop_is_not_an_inbound_reference() {
+        use plsql_output::OrphanConfidenceTier;
+
+        // A genuinely unused recursive object: its ONLY edge is its own
+        // self-call. Before the fix, the self-loop was counted as both an
+        // inbound and an outbound reference, so the node was silently
+        // excluded from the orphan report (false negative) and miscounted
+        // in `objects_with_references`.
+        let mut g = DepGraph::new();
+        g.insert_node(typed_node(
+            1,
+            "billing.recursive_proc",
+            NodeIdentityKind::StandaloneProcedure,
+        ));
+        g.insert_edge(
+            typed_edge(1, 1, 1, EdgeKind::Calls, ConfidenceLevel::High),
+            provenance(),
+            None,
+        );
+
+        let report = detect_orphans(&g, false);
+
+        // The self-call is not an external reference, so the node has zero
+        // inbound references and must surface as a removal candidate.
+        assert_eq!(report.objects_with_references, 0);
+        assert_eq!(report.objects_examined, 1);
+        assert_eq!(report.candidates.len(), 1);
+        let c = &report.candidates[0];
+        assert_eq!(c.object_id, "billing.recursive_proc");
+        // Self-loop is excluded from `outbound` too, so a purely recursive
+        // node is tiered HighConfidenceUnused (no incoming, no *external*
+        // outgoing), not LikelyUnused.
+        assert_eq!(c.confidence, OrphanConfidenceTier::HighConfidenceUnused);
+    }
+
+    #[test]
+    fn detect_orphans_distinct_inbound_edge_still_counts_as_referenced() {
+        // Guard the other direction: a real inbound edge from a *distinct*
+        // node must still mark the target as referenced (no over-broad
+        // self-loop suppression). caller -> callee plus a callee self-call.
+        let mut g = DepGraph::new();
+        g.insert_node(typed_node(
+            1,
+            "billing.callee",
+            NodeIdentityKind::StandaloneProcedure,
+        ));
+        g.insert_node(typed_node(
+            2,
+            "billing.caller",
+            NodeIdentityKind::StandaloneProcedure,
+        ));
+        g.insert_edge(
+            typed_edge(1, 2, 1, EdgeKind::Calls, ConfidenceLevel::High),
+            provenance(),
+            None,
+        );
+        g.insert_edge(
+            typed_edge(2, 1, 1, EdgeKind::Calls, ConfidenceLevel::High),
+            provenance(),
+            None,
+        );
+
+        let report = detect_orphans(&g, false);
+
+        // callee has a genuine inbound edge from caller, so it is referenced.
+        assert_eq!(report.objects_with_references, 1);
+        // Only the caller (zero inbound) is an orphan candidate.
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(report.candidates[0].object_id, "billing.caller");
     }
 }
