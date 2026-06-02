@@ -402,14 +402,17 @@ fn truncate(value: String, limit: Option<usize>) -> (String, bool) {
 
 #[must_use]
 fn is_read_only_sql(sql: &str) -> bool {
-    let mut remainder = sql.trim_start();
-    while remainder.starts_with("/*") {
-        if let Some(end) = remainder.find("*/") {
-            remainder = remainder[end + 2..].trim_start();
-        } else {
-            return false;
-        }
-    }
+    // Oracle treats both `/* … */` block comments and `-- … \n` line
+    // comments as whitespace-equivalent token separators, including before
+    // the leading keyword. `strip_sql_comments` neutralises *both* forms to a
+    // single space (and is string-literal aware, so a comment-introducer
+    // living inside a quoted literal is left intact), so the leading-token
+    // scan must run over the stripped copy — otherwise a legitimate
+    // `-- note\nSELECT …` parses its leading token as `--` and is wrongly
+    // refused. The same stripped copy feeds the trailing-statement check so a
+    // commented-out tail (`SELECT 1 FROM dual; -- x`) is recognised as empty.
+    let stripped = strip_sql_comments(sql);
+    let remainder = stripped.trim_start();
     let token = remainder
         .split(|c: char| c.is_whitespace() || c == '(')
         .next()
@@ -558,13 +561,57 @@ const fn utf8_char_len(b: u8) -> usize {
     }
 }
 
-/// Returns `true` when `sql` contains a `;` followed by any
-/// non-whitespace, non-comment content. The driver typically rejects
+/// Returns `true` when `sql` contains a statement-terminating `;` followed by
+/// any non-whitespace, non-comment content. The driver typically rejects
 /// multi-statement strings with ORA-00911 anyway, but the predicate
 /// itself should reflect intent so a future driver migration doesn't
 /// silently relax the policy.
+///
+/// The `;` search is string-literal aware: a semicolon living *inside* a
+/// single-quoted literal (`'x; y'`, with `''` recognised as an embedded
+/// escaped quote) or a double-quoted identifier (`"a;b"`) is not a statement
+/// terminator and is skipped, mirroring the `in_squote`/`in_dquote` state
+/// machine in `strip_sql_comments`. Without this a legitimate single-statement
+/// read-only `SELECT note FROM logs WHERE note = 'x; y'` would be wrongly
+/// refused because the literal's `;` looked like a statement boundary.
+///
+/// Genuine multi-statement strings (`SELECT 1 FROM dual; DELETE FROM logs`)
+/// still return `true` and stay rejected, so the fail-closed guarantee holds.
 fn has_trailing_non_empty_statement(sql: &str) -> bool {
-    let Some(idx) = sql.find(';') else {
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    let mut in_squote = false;
+    let mut in_dquote = false;
+    let mut terminator: Option<usize> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_squote {
+            if b == b'\'' {
+                in_squote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_dquote {
+            if b == b'"' {
+                in_dquote = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' => in_squote = true,
+            b'"' => in_dquote = true,
+            b';' => {
+                terminator = Some(i);
+                break;
+            }
+            _ => {}
+        }
+        // Advance by whole code points so multi-byte UTF-8 is never split.
+        i += utf8_char_len(b).max(1);
+    }
+    let Some(idx) = terminator else {
         return false;
     };
     let mut tail = &sql[idx + 1..];
@@ -827,6 +874,38 @@ mod tests {
         assert!(is_read_only_sql("SELECT 1 FROM DUAL;   "));
         assert!(is_read_only_sql("SELECT 1 FROM DUAL; -- trailing comment"));
         assert!(is_read_only_sql("SELECT 1 FROM DUAL; /* trailing */"));
+    }
+
+    #[test]
+    fn read_only_predicate_multi_statement_and_leading_comment_guards_are_literal_aware() {
+        // oracle-lokg.4: the multi-statement (`;`) and leading-comment guards
+        // must be string-literal / line-comment aware like their siblings
+        // (`strip_sql_comments`, `has_for_update_lock`), so a single-statement
+        // read-only SELECT is not spuriously refused by run_query.
+        //
+        // A `;` *inside* a single-quoted literal is not a statement boundary:
+        // these are single, read-only SELECTs and must be accepted.
+        assert!(is_read_only_sql("SELECT 'a;b' FROM dual"));
+        assert!(is_read_only_sql(
+            "SELECT note FROM logs WHERE note = 'x; y'"
+        ));
+        // Doubled-quote escape keeps the literal balanced; the `;` stays quoted.
+        assert!(is_read_only_sql("SELECT 'it''s; ok' FROM dual"));
+        // A `;` inside a double-quoted identifier is likewise not a terminator.
+        assert!(is_read_only_sql("SELECT 1 AS \"a;b\" FROM dual"));
+        // A leading `--` line comment must be stripped like a leading `/* */`,
+        // so the real leading keyword (SELECT) is what gets classified.
+        assert!(is_read_only_sql("-- note\nSELECT 1 FROM dual"));
+        assert!(is_read_only_sql("  -- a\n  -- b\n  SELECT 1 FROM dual"));
+        // Mixed leading comment forms still resolve to the SELECT token.
+        assert!(is_read_only_sql("/* x */ -- y\nSELECT 1 FROM dual"));
+
+        // Fail-closed guarantee preserved: genuine multi-statement strings
+        // (the `;` is a real terminator outside any literal) stay rejected.
+        assert!(!is_read_only_sql("SELECT 'a;b' FROM dual; DELETE FROM logs"));
+        assert!(!is_read_only_sql("SELECT 'a' FROM dual; DROP TABLE x"));
+        // A leading line comment that hides a write statement is still rejected.
+        assert!(!is_read_only_sql("-- note\nDELETE FROM logs"));
     }
 
     #[test]
