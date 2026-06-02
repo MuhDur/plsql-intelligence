@@ -200,9 +200,21 @@ fn extract_execute_immediate(
     let mut current_lit = String::new();
     let mut current_expr = String::new();
     let mut current_expr_open = false;
-    for c in body.chars() {
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
         if c == '\'' {
             if in_string {
+                // Oracle escapes an embedded single quote by doubling
+                // it (`''`). A doubled quote is one literal `'`, not a
+                // string close/reopen — peek ahead and fold it into the
+                // current literal so the fragment stays intact and we
+                // don't mint the inner text as a spurious candidate
+                // object.
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                    current_lit.push('\'');
+                    continue;
+                }
                 fragments.push(current_lit.clone());
                 current_lit.clear();
                 in_string = false;
@@ -249,12 +261,37 @@ fn run_is_dbms_assert(run: &str) -> bool {
     run.to_ascii_uppercase().contains("DBMS_ASSERT.")
 }
 
+/// Blank out embedded single-quoted SQL string literals inside a
+/// dynamic-SQL fragment, replacing each `'...'` run (and its content)
+/// with spaces. The walker has already coalesced Oracle's doubled-`''`
+/// escape into single `'` characters, so a `'` here opens or closes a
+/// real embedded string value — that value is data, never an object
+/// name, so it must not be mined as a candidate identifier (e.g. the
+/// `done` in `SET note = 'done'`).
+fn strip_embedded_string_literals(frag: &str) -> String {
+    let mut out = String::with_capacity(frag.len());
+    let mut in_literal = false;
+    for c in frag.chars() {
+        if c == '\'' {
+            in_literal = !in_literal;
+            out.push(' ');
+        } else if in_literal {
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Extract `[schema.]identifier` names from the literal fragments
 /// — anything that matches the Oracle identifier shape after
 /// stripping the surrounding SQL keywords.
 fn candidate_objects_from_fragments(frags: &[String]) -> Vec<CandidateObject> {
     let mut out: Vec<CandidateObject> = Vec::new();
     for frag in frags {
+        let frag = strip_embedded_string_literals(frag);
+        let frag = frag.as_str();
         for word in frag.split(|c: char| {
             !(c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '#' || c == '.')
         }) {
@@ -482,6 +519,37 @@ mod tests {
         // Keywords filtered out.
         assert!(!names.iter().any(|n| n.eq_ignore_ascii_case("SELECT")));
         assert!(!names.iter().any(|n| n.eq_ignore_ascii_case("FROM")));
+    }
+
+    #[test]
+    fn doubled_quote_literal_stays_one_fragment() {
+        // Oracle escapes an embedded `'` by doubling it. The walker
+        // must fold `''` into one literal quote rather than splitting
+        // the statement at each quote — otherwise the inner text gets
+        // wrongly minted as a candidate object and the single literal
+        // is reported as several fragments.
+        let ev = recognise_dynamic_sql(
+            "EXECUTE IMMEDIATE 'UPDATE t SET note = ''done'' WHERE id = 5';",
+            "pkg.proc:88",
+        )
+        .unwrap();
+        // One literal statement, doubled quotes coalesced to a single
+        // embedded quote.
+        assert_eq!(
+            ev.fragments,
+            vec!["UPDATE t SET note = 'done' WHERE id = 5"]
+        );
+        // Even number of quote toggles => still a constant statement.
+        assert_eq!(ev.opacity_reason, OpacityReason::LiteralOnly);
+        assert!(ev.expr_interpolations.is_empty());
+        // The escaped literal content must NOT surface as an object.
+        assert!(
+            !ev.candidate_objects
+                .iter()
+                .any(|c| c.object.eq_ignore_ascii_case("done")),
+            "escaped literal content leaked as candidate object: {:?}",
+            ev.candidate_objects
+        );
     }
 
     #[test]
