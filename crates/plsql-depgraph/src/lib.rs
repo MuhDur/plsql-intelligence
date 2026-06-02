@@ -936,7 +936,7 @@ impl DepGraph {
         let mut cycles = state
             .components
             .into_iter()
-            .filter_map(|component| self.component_cycle_summary(component).transpose())
+            .filter_map(|component| self.component_cycle_summary(component, &adjacency).transpose())
             .collect::<Result<Vec<_>, _>>()?;
 
         cycles.sort_by_key(|cycle| cycle.nodes.first().map(|node| node.id).unwrap_or_default());
@@ -1190,7 +1190,25 @@ impl DepGraph {
     fn component_cycle_summary(
         &self,
         component: Vec<NodeId>,
+        adjacency: &HashMap<NodeId, Vec<(NodeId, EdgeId)>>,
     ) -> Result<Option<CycleSummary>, GraphQueryError> {
+        // Cheap cycle test FIRST, before any O(E) edge scan: a multi-node SCC is
+        // always a cycle; a single-node SCC is a cycle only if it has a self-edge.
+        // Using the prebuilt adjacency index keeps the common case — a size-1
+        // component with no self-loop, i.e. every node of an acyclic chain — O(1)
+        // instead of re-sorting the whole edge vector per component (which was
+        // O(V·E log E) on deep graphs and crashed only because the old recursive
+        // Tarjan stack-overflowed before reaching this tail).
+        let is_cycle = component.len() > 1
+            || component.first().is_some_and(|n| {
+                adjacency
+                    .get(n)
+                    .is_some_and(|outs| outs.iter().any(|(to, _)| to == n))
+            });
+        if !is_cycle {
+            return Ok(None);
+        }
+
         let component_nodes = component
             .iter()
             .copied()
@@ -1208,14 +1226,6 @@ impl DepGraph {
             .filter(|edge| component_set.contains(&edge.from) && component_set.contains(&edge.to))
             .map(|edge| self.edge_summary(edge))
             .collect::<Result<Vec<_>, _>>()?;
-
-        let is_cycle = component_nodes.len() > 1
-            || component_edges
-                .iter()
-                .any(|edge| edge.from.id == edge.to.id);
-        if !is_cycle {
-            return Ok(None);
-        }
 
         Ok(Some(CycleSummary {
             nodes: component_nodes,
