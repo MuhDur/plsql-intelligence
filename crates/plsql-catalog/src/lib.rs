@@ -5384,9 +5384,9 @@ mod tests {
     use plsql_core::{AnalysisProfile, ColumnName, MemberName, ObjectName, SchemaName, SymbolId};
     use tempfile::tempdir;
 
-    #[cfg(not(feature = "oracle-driver"))]
     use std::collections::HashSet;
 
+    #[cfg(not(feature = "oracle-driver"))]
     use crate::RustOracleConnection;
     use crate::{
         AccessibleByTarget, CATALOG_SNAPSHOT_SCHEMA_ID, CATALOG_SNAPSHOT_SCHEMA_VERSION,
