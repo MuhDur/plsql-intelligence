@@ -77,7 +77,11 @@ impl<'a> FlowQuery<'a> {
                 }
             }
         }
-        let is_tainted = !kinds.is_empty() && cleansed.is_empty();
+        // `kinds` holds only live (uncleansed) taint — a bound sanitiser already
+        // dropped what it consumed — so a non-empty `kinds` is the alarm. We do
+        // NOT additionally require `cleansed.is_empty()`: a cleanser recorded for
+        // one operand must not suppress a live kind from a concatenated sibling.
+        let is_tainted = !kinds.is_empty();
         TaintAnswer {
             is_tainted,
             kinds,
@@ -164,11 +168,17 @@ mod tests {
     }
 
     #[test]
-    fn has_taint_kind_ignores_cleansing() {
+    fn sanitized_value_carries_no_live_taint_kind() {
+        // A value wholly sanitised by DBMS_ASSERT carries no live taint kind —
+        // the sanitiser consumed it — so it is neither flagged nor reported as a
+        // live UserInput source. (`cleansed_by` still records that DBMS_ASSERT
+        // fired; see `cleansed_name_not_flagged`.) This replaces the former
+        // "tainted-but-cleansed" representation that let a sibling cleanse mask a
+        // concatenated tainted operand.
         let e = env("v_s := DBMS_ASSERT.SIMPLE_SQL_NAME(p_user);", &["p_user"]);
         let q = FlowQuery::new(&e);
-        // Kind still present even though cleansed.
-        assert!(q.has_taint_kind("v_s", TaintKind::UserInput));
+        assert!(!q.has_taint_kind("v_s", TaintKind::UserInput));
+        assert!(!q.taint_of("v_s").is_tainted);
     }
 
     #[test]

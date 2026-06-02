@@ -40,10 +40,15 @@ pub struct ValueFlow {
     pub string_shape: Option<StringShape>,
 }
 
-/// Taint state — `kinds` lists every source that flows into the
-/// value; `cleansed_by` lists every sanitiser the value passed
-/// through. SAST emits a finding iff at least one taint remains
-/// without a matching cleanser.
+/// Taint state. `kinds` lists the *live* (uncleansed) taint sources that
+/// flow into the value — a bound sanitiser (e.g. a `DBMS_ASSERT.*` call)
+/// removes the kinds it cleanses, so a sanitized value carries no live kind.
+/// `cleansed_by` records which sanitisers fired anywhere in the value's
+/// derivation (kept for reporting, not for the alarm). SAST emits a finding
+/// iff `kinds` is non-empty. Tracking *live* kinds (rather than all-seen
+/// kinds gated on an empty `cleansed_by`) binds cleansing to the sanitized
+/// sub-expression, so taint concatenated alongside a sanitized operand still
+/// alarms (e.g. `DBMS_ASSERT.ENQUOTE_LITERAL('x') || p_user`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Taint {
     pub kinds: Vec<TaintKind>,
@@ -155,14 +160,14 @@ pub enum StringShape {
 }
 
 impl Taint {
-    /// True iff there is any taint kind not matched by a
-    /// cleanser. Cleansers don't match by kind — they apply
-    /// universally — so a single recorded cleanser drops the
-    /// alarm to false. Callers wanting per-kind cleansing can
-    /// post-filter.
+    /// True iff the value carries any *live* (uncleansed) taint kind.
+    /// `kinds` already excludes anything a bound sanitiser consumed (see the
+    /// struct doc), so the alarm is a simple non-emptiness check — no longer
+    /// gated on `cleansed_by`, which a sibling cleanse used to satisfy and
+    /// thereby mask a concatenated tainted operand (the SEC001 fail-open).
     #[must_use]
     pub fn flags_alarm(&self) -> bool {
-        !self.kinds.is_empty() && self.cleansed_by.is_empty()
+        !self.kinds.is_empty()
     }
 }
 
@@ -205,11 +210,25 @@ mod tests {
 
     #[test]
     fn taint_does_not_flag_when_cleansed() {
+        // A value sanitised by a bound cleanser carries NO live kind: the
+        // cleanser drained the kinds it consumed. `cleansed_by` is retained only
+        // for reporting and does not by itself suppress the alarm.
+        let t = Taint {
+            kinds: vec![],
+            cleansed_by: vec![TaintCleanser::DbmsAssert],
+        };
+        assert!(!t.flags_alarm());
+    }
+
+    #[test]
+    fn taint_flags_when_live_kind_present_despite_a_recorded_cleanser() {
+        // Regression for the SEC001 fail-open: a cleanser recorded somewhere in
+        // the derivation must NOT mask a live (uncleansed) kind from a sibling.
         let t = Taint {
             kinds: vec![TaintKind::UserInput],
             cleansed_by: vec![TaintCleanser::DbmsAssert],
         };
-        assert!(!t.flags_alarm());
+        assert!(t.flags_alarm());
     }
 
     #[test]

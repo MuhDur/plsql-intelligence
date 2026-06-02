@@ -170,13 +170,45 @@ fn collect_expr_flow(expr: &Expr, sources: &TaintSources, flow: &mut ValueFlow) 
         }
         Expr::Call { callee, args } => {
             let path = callee.parts.join(".").to_ascii_uppercase();
-            if path.starts_with("DBMS_ASSERT.")
-                && !flow.taint.cleansed_by.contains(&TaintCleanser::DbmsAssert)
-            {
-                flow.taint.cleansed_by.push(TaintCleanser::DbmsAssert);
-            }
-            for a in args {
-                collect_expr_flow(a, sources, flow);
+            if path.starts_with("DBMS_ASSERT.") {
+                // A `DBMS_ASSERT.*` call SANITIZES its argument: the value it
+                // returns is safe to interpolate. The cleansing therefore binds to
+                // the call's *argument subtree*, NOT to the enclosing expression.
+                // Compute the args in an ISOLATED sub-flow and drop their taint
+                // (kinds + cleansers) — it is consumed by the sanitizer — so the
+                // call contributes nothing injectable to the parent. Only taint
+                // that flows AROUND the call (e.g. a concatenated sibling) reaches
+                // the parent and can still alarm.
+                //
+                // The old code pushed `DbmsAssert` onto the *shared* parent flow
+                // and recursed the args into it, so a cleanse on one operand zeroed
+                // the alarm for an unrelated sibling — e.g.
+                // `DBMS_ASSERT.ENQUOTE_LITERAL('x') || p_user` came out
+                // {UserInput, cleansed:DbmsAssert} → flags_alarm=false (fail-open).
+                let mut sanitized = ValueFlow::default();
+                for a in args {
+                    collect_expr_flow(a, sources, &mut sanitized);
+                }
+                // The sanitizer CONSUMES its argument's live taint: record the
+                // cleanser (for reporting) and DROP the kinds — they are no longer
+                // injectable. `kinds` holds only *live* (uncleansed) taint, so the
+                // dropped kinds simply never enter the enclosing `flow`. Only taint
+                // that flows AROUND the call (a concatenated sibling) reaches it.
+                if !sanitized.taint.kinds.is_empty()
+                    && !flow.taint.cleansed_by.contains(&TaintCleanser::DbmsAssert)
+                {
+                    flow.taint.cleansed_by.push(TaintCleanser::DbmsAssert);
+                }
+                // Carry forward only non-taint shape info; the result is clean.
+                if flow.string_shape.is_none() {
+                    flow.string_shape = sanitized.string_shape;
+                }
+            } else {
+                // A non-sanitizing call is transparent to taint: its arguments'
+                // taint flows through to the enclosing expression.
+                for a in args {
+                    collect_expr_flow(a, sources, flow);
+                }
             }
         }
         Expr::Binary { lhs, rhs, .. } => {
@@ -217,14 +249,43 @@ mod tests {
     }
 
     #[test]
-    fn dbms_assert_call_cleanses_taint() {
+    fn dbms_assert_call_cleanses_its_argument() {
+        // DBMS_ASSERT.* sanitizes its argument: the result is a clean value with no
+        // alarm. The arg's taint is consumed by the sanitizer, so the result no
+        // longer carries the UserInput kind (we dropped the old "tainted-but-
+        // cleansed" representation, which let an unrelated cleanser mask a
+        // concatenated sibling — see the fail-open regression below).
         let s = lower_statement_body("v_safe := DBMS_ASSERT.SIMPLE_SQL_NAME(p_user_table);");
         let env = analyze_flow(&s, &src(&["p_user_table"]));
         let f = env.get("v_safe").unwrap();
-        assert!(f.taint.kinds.contains(&TaintKind::UserInput));
-        assert!(f.taint.cleansed_by.contains(&TaintCleanser::DbmsAssert));
-        // Cleanser present → no alarm.
-        assert!(!f.taint.flags_alarm());
+        assert!(!f.taint.flags_alarm(), "sanitized value must not alarm");
+        assert!(
+            !f.taint.kinds.contains(&TaintKind::UserInput),
+            "the sanitizer consumes the argument's taint"
+        );
+    }
+
+    #[test]
+    fn dbms_assert_does_not_cleanse_a_concatenated_sibling() {
+        // SEC001 fail-open regression: a DBMS_ASSERT cleanse on ONE operand must
+        // NOT zero the injection alarm for tainted input concatenated ALONGSIDE it.
+        // `DBMS_ASSERT.ENQUOTE_LITERAL('x') || p_user` interpolates raw p_user.
+        let s =
+            lower_statement_body("v_sql := DBMS_ASSERT.ENQUOTE_LITERAL('x') || p_user;");
+        let env = analyze_flow(&s, &src(&["p_user"]));
+        let f = env.get("v_sql").unwrap();
+        assert!(
+            f.taint.kinds.contains(&TaintKind::UserInput),
+            "the uncleansed sibling p_user must remain tainted"
+        );
+        assert!(
+            f.taint.cleansed_by.is_empty(),
+            "the sibling assert's cleanser must not leak onto the whole expression"
+        );
+        assert!(
+            f.taint.flags_alarm(),
+            "raw user input concatenated with a sanitized literal must still alarm"
+        );
     }
 
     #[test]
