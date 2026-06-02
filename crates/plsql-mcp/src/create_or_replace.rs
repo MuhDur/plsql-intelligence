@@ -161,41 +161,35 @@ pub fn run_create_or_replace<F: FnOnce() -> String>(
 /// label. Public so tests and the audit module can share the same
 /// classifier.
 pub fn classify_kind(ddl: &str) -> Result<String, CreateOrReplaceError> {
-    let trimmed = ddl.trim_start();
-    let upper = trimmed.to_ascii_uppercase();
+    // Tokenize the leading header on whitespace RUNS so arbitrary spacing
+    // (multiple spaces, tabs, newlines) between keywords cannot change the
+    // classification. Oracle collapses any whitespace run to a single separator;
+    // matching on a literal single space let `CREATE OR REPLACE PACKAGE<TAB>BODY
+    // OWNER.PKG` fail the `PACKAGE BODY` prefix, fall through to `PACKAGE`, and
+    // drop the BODY suffix — which then (via parse_target_schema) lost the OWNER
+    // and bypassed the cross-schema write-confirmation guard.
+    let upper = ddl.trim_start().to_ascii_uppercase();
+    let tokens: Vec<&str> = upper.split_whitespace().collect();
 
-    let after_create_or_replace = upper
-        .strip_prefix("CREATE OR REPLACE ")
-        .or_else(|| upper.strip_prefix("CREATE OR REPLACE\t"))
-        .or_else(|| upper.strip_prefix("CREATE OR REPLACE\n"));
-
-    let Some(rest) = after_create_or_replace else {
-        let leading = upper
-            .split_whitespace()
-            .take(3)
-            .collect::<Vec<_>>()
-            .join(" ");
+    if tokens.len() < 3 || tokens[0] != "CREATE" || tokens[1] != "OR" || tokens[2] != "REPLACE" {
+        let leading = tokens.iter().take(3).copied().collect::<Vec<_>>().join(" ");
         return Err(CreateOrReplaceError::NotCreateOrReplace { leading });
-    };
+    }
 
-    let rest = rest.trim_start();
-    // Look for the longest supported kind prefix.
-    for kind in SUPPORTED_KINDS {
-        // A match requires that the next character after the kind
-        // is whitespace or end-of-string — otherwise `PACKAGE` would
-        // match `PACKAGES` (no such object, but the principle holds).
-        if let Some(after) = rest.strip_prefix(kind)
-            && (after.is_empty() || after.starts_with(|c: char| c.is_whitespace()))
-        {
-            return Ok((*kind).to_string());
+    // The kind is the 1-2 tokens after `CREATE OR REPLACE`. Try the two-word form
+    // first (PACKAGE BODY / TYPE BODY) so the suffix is never truncated, then the
+    // single-word form. Robust regardless of SUPPORTED_KINDS ordering.
+    let kind_tokens = &tokens[3..];
+    for take in [2usize, 1] {
+        if kind_tokens.len() >= take {
+            let candidate = kind_tokens[..take].join(" ");
+            if SUPPORTED_KINDS.contains(&candidate.as_str()) {
+                return Ok(candidate);
+            }
         }
     }
 
-    let kind = rest
-        .split_whitespace()
-        .take(2)
-        .collect::<Vec<_>>()
-        .join(" ");
+    let kind = kind_tokens.iter().take(2).copied().collect::<Vec<_>>().join(" ");
     Err(CreateOrReplaceError::UnsupportedKind { kind })
 }
 
@@ -216,24 +210,20 @@ pub fn classify_kind(ddl: &str) -> Result<String, CreateOrReplaceError> {
 pub fn parse_target_schema(ddl: &str) -> Result<Option<String>, CreateOrReplaceError> {
     let kind = classify_kind(ddl)?;
 
-    let trimmed = ddl.trim_start();
-    let upper = trimmed.to_ascii_uppercase();
-    // `classify_kind` already proved the prefix; strip it the same way.
-    let rest = upper
-        .strip_prefix("CREATE OR REPLACE ")
-        .or_else(|| upper.strip_prefix("CREATE OR REPLACE\t"))
-        .or_else(|| upper.strip_prefix("CREATE OR REPLACE\n"))
-        .unwrap_or(&upper)
-        .trim_start();
-    // Strip the (already-validated) kind keyword.
-    let after_kind = rest.strip_prefix(kind.as_str()).unwrap_or(rest).trim_start();
+    // Re-tokenize on whitespace runs exactly as classify_kind did, so spacing
+    // cannot shift which token is the object name. `CREATE OR REPLACE` occupies
+    // tokens[0..3]; the (already-validated) kind occupies the next 1-2 tokens;
+    // the object name is the token that immediately follows.
+    let upper = ddl.trim_start().to_ascii_uppercase();
+    let tokens: Vec<&str> = upper.split_whitespace().collect();
+    let name_idx = 3 + kind.split_whitespace().count();
 
-    // The object name is the next token. It ends at the first
-    // whitespace or `(` (e.g. a parameter list for PROCEDURE/FUNCTION).
-    let name_token = after_kind
-        .split(|c: char| c.is_whitespace() || c == '(')
-        .next()
-        .unwrap_or("");
+    let Some(name_raw) = tokens.get(name_idx) else {
+        return Ok(None);
+    };
+    // The object name ends at the first `(` — a PROCEDURE/FUNCTION parameter list
+    // may abut the name with no separating whitespace (e.g. `FOO(p IN NUMBER)`).
+    let name_token = name_raw.split('(').next().unwrap_or("");
     if name_token.is_empty() {
         return Ok(None);
     }
@@ -383,6 +373,32 @@ mod tests {
         let kind =
             classify_kind("CREATE OR REPLACE TYPE BODY billing.invoice_t AS\nBEGIN\nEND;").unwrap();
         assert_eq!(kind, "TYPE BODY");
+    }
+
+    #[test]
+    fn two_word_kind_survives_arbitrary_whitespace() {
+        // Regression: extra/non-space whitespace between the two kind words must
+        // NOT truncate `PACKAGE BODY` / `TYPE BODY` to `PACKAGE` / `TYPE`. Before
+        // the whitespace-run tokenization, a tab or double space dropped the BODY
+        // suffix and (via parse_target_schema) the owner — a cross-schema bypass.
+        for sep in ["  ", "\t", "\n", " \t ", "\u{0c}"] {
+            let ddl = format!("CREATE OR REPLACE PACKAGE{sep}BODY billing.invoice_pkg AS BEGIN NULL; END;");
+            assert_eq!(
+                classify_kind(&ddl).unwrap(),
+                "PACKAGE BODY",
+                "PACKAGE{sep:?}BODY must classify as PACKAGE BODY"
+            );
+            // …and the owner must still be extracted (the bypass is the schema loss).
+            assert_eq!(
+                parse_target_schema(&ddl).unwrap(),
+                Some("BILLING".to_string()),
+                "owner must survive PACKAGE{sep:?}BODY spacing (no cross-schema bypass)"
+            );
+        }
+        // Likewise extra spacing before the schema-qualified name must not drop it.
+        let ddl = "CREATE OR REPLACE TYPE BODY   acct.balance_t AS BEGIN NULL; END;";
+        assert_eq!(classify_kind(ddl).unwrap(), "TYPE BODY");
+        assert_eq!(parse_target_schema(ddl).unwrap(), Some("ACCT".to_string()));
     }
 
     #[test]
