@@ -63,8 +63,18 @@ use crate::RoutineBinding;
 /// per-routine assigned Rust identifier in the same order as the
 /// input slice; callers (the emitter) use the indices to drive
 /// `RoutineBinding.name` substitution.
+///
+/// `package_id` is consulted only to detect routines the emitter will
+/// fail closed on (an unsafe `package_id` rejects every routine; an
+/// invalid routine/parameter name rejects just that routine). Such a
+/// routine's `pub fn` is a deterministic *stub* identifier, and that
+/// stub must be reserved against the SAME global uniqueness set as the
+/// real wrappers — otherwise a folded stub (`"a b"` → `a_b_0`) could
+/// silently equal a legal sibling singleton's verbatim name (`a_b_0`)
+/// and the emitter would write two identical `pub fn`s into one module
+/// (rustc E0428). See [`crate::emit::invalid_identifier_reason`].
 #[must_use]
-pub fn disambiguate_overloads(routines: &[RoutineBinding]) -> Vec<String> {
+pub fn disambiguate_overloads(package_id: &str, routines: &[RoutineBinding]) -> Vec<String> {
     // Bucket indices by lowercase PL/SQL name.
     let mut buckets: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (idx, r) in routines.iter().enumerate() {
@@ -146,6 +156,28 @@ pub fn disambiguate_overloads(routines: &[RoutineBinding]) -> Vec<String> {
             out[*idx] = claim(base, &mut taken);
         }
     }
+
+    // Pass C — fail-closed STUB names. A routine the emitter will reject (an
+    // unsafe `package_id`, or an invalid routine/parameter name) never emits a
+    // real wrapper; it emits a stub `pub fn` whose identifier is derived by
+    // folding its proposed Rust name (`crate::emit::safe_stub_ident`). That
+    // folded name must be reserved against this SAME global `taken` set so it
+    // cannot duplicate a legal sibling's name — e.g. the invalid routine `"a b"`
+    // folds to `a_b_0`, which is also the verbatim name of a legal singleton
+    // routine `a_b_0`; without claiming here the emitter would write two
+    // identical `pub fn a_b_0`s into one module (rustc E0428). Legal singletons
+    // and overload assignments are seeded into `taken` above (Passes A/B), so a
+    // colliding stub deterministically yields and escalates with a `_<n>`
+    // ordinal, never the legal name. The stub base is folded from the name this
+    // routine was *otherwise* assigned (`out[idx]`), so the chosen stub matches
+    // what the emitter would derive on its own.
+    for (idx, r) in routines.iter().enumerate() {
+        if crate::emit::invalid_identifier_reason(package_id, r).is_some() {
+            let base = crate::emit::safe_stub_ident(&out[idx], idx);
+            out[idx] = claim(base, &mut taken);
+        }
+    }
+
     out
 }
 
@@ -244,6 +276,11 @@ mod tests {
     use super::*;
     use crate::{ParameterBinding, ParameterMode, RoutineKind, RustTypeRef};
 
+    // A legal Oracle package_id for the overload-disambiguation tests; the
+    // routines here all carry legal identifiers, so the fail-closed stub pass
+    // (Pass C) never fires and the assigned names match the historic behaviour.
+    const PKG: &str = "hr.demo_pkg";
+
     fn rb(name: &str, params: Vec<&str>) -> RoutineBinding {
         RoutineBinding {
             name: name.into(),
@@ -268,14 +305,14 @@ mod tests {
     #[test]
     fn singletons_are_left_alone() {
         let routines = vec![rb("foo", vec!["p_id"]), rb("bar", vec!["p_name"])];
-        let names = disambiguate_overloads(&routines);
+        let names = disambiguate_overloads(PKG, &routines);
         assert_eq!(names, vec!["foo", "bar"]);
     }
 
     #[test]
     fn two_overloads_get_param_name_suffixes() {
         let routines = vec![rb("hire", vec!["p_emp_id"]), rb("hire", vec!["p_emp_name"])];
-        let names = disambiguate_overloads(&routines);
+        let names = disambiguate_overloads(PKG, &routines);
         // Common prefix length is 0 (first param name differs).
         assert_eq!(names, vec!["hire_p_emp_id", "hire_p_emp_name"]);
     }
@@ -286,7 +323,7 @@ mod tests {
             rb("update_emp", vec!["p_emp_id", "p_dept_id"]),
             rb("update_emp", vec!["p_emp_id", "p_salary"]),
         ];
-        let names = disambiguate_overloads(&routines);
+        let names = disambiguate_overloads(PKG, &routines);
         // p_emp_id is shared at index 0 → dropped. Suffix is the
         // tail name only.
         assert_eq!(names, vec!["update_emp_p_dept_id", "update_emp_p_salary"]);
@@ -299,7 +336,7 @@ mod tests {
             rb("compute", vec!["p_in_2"]),
             rb("compute", vec!["p_in_3"]),
         ];
-        let names = disambiguate_overloads(&routines);
+        let names = disambiguate_overloads(PKG, &routines);
         let unique: std::collections::BTreeSet<_> = names.iter().collect();
         assert_eq!(unique.len(), 3, "{names:?}");
     }
@@ -307,7 +344,7 @@ mod tests {
     #[test]
     fn zero_param_collision_falls_back_to_ordinal() {
         let routines = vec![rb("touch", vec![]), rb("touch", vec![])];
-        let names = disambiguate_overloads(&routines);
+        let names = disambiguate_overloads(PKG, &routines);
         assert_eq!(names, vec!["touch_1", "touch_2"]);
     }
 
@@ -323,7 +360,7 @@ mod tests {
             rb("proc", vec!["p_val"]),
             rb("proc", vec!["p_other"]),
         ];
-        let names = disambiguate_overloads(&routines);
+        let names = disambiguate_overloads(PKG, &routines);
         let unique: std::collections::BTreeSet<_> = names.iter().collect();
         assert_eq!(
             unique.len(),
@@ -353,8 +390,8 @@ mod tests {
             rb("proc", vec!["p_val"]),
             rb("proc", vec!["p_val"]),
         ];
-        let na = disambiguate_overloads(&a);
-        let nb = disambiguate_overloads(&b);
+        let na = disambiguate_overloads(PKG, &a);
+        let nb = disambiguate_overloads(PKG, &b);
         assert_eq!(na, vec!["proc_p_val_1", "proc_p_val_2", "proc_p_other"]);
         // In b the unique sibling is first; the colliding pair occupies the
         // 2nd/3rd group slots (i=1,2 within the group) → suffixes _2/_3.
@@ -379,7 +416,7 @@ mod tests {
             rb("proc", vec!["x"]),
             rb("proc", vec!["x_2"]),
         ];
-        let names = disambiguate_overloads(&routines);
+        let names = disambiguate_overloads(PKG, &routines);
         let unique: std::collections::BTreeSet<_> = names.iter().collect();
         assert_eq!(
             unique.len(),
@@ -402,7 +439,7 @@ mod tests {
             rb("get_x", vec!["a"]),
             rb("get_x", vec!["b"]),
         ];
-        let names = disambiguate_overloads(&routines);
+        let names = disambiguate_overloads(PKG, &routines);
         let unique: std::collections::BTreeSet<_> = names.iter().collect();
         assert_eq!(
             unique.len(),
@@ -429,7 +466,7 @@ mod tests {
             rb("touch", vec![]),
             rb("touch_1", vec!["p_id"]),
         ];
-        let names = disambiguate_overloads(&routines);
+        let names = disambiguate_overloads(PKG, &routines);
         let unique: std::collections::BTreeSet<_> = names.iter().collect();
         assert_eq!(
             unique.len(),
@@ -452,7 +489,7 @@ mod tests {
     #[test]
     fn case_insensitive_grouping_collapses_capitalisation() {
         let routines = vec![rb("HIRE", vec!["p_emp_id"]), rb("hire", vec!["p_emp_name"])];
-        let names = disambiguate_overloads(&routines);
+        let names = disambiguate_overloads(PKG, &routines);
         // Both end up grouped under "hire" → both get suffixes.
         assert!(names[0].starts_with("hire_") && names[1].starts_with("hire_"));
         assert_ne!(names[0], names[1]);
@@ -464,8 +501,8 @@ mod tests {
         // same name-set (positions match the input order).
         let a = vec![rb("hire", vec!["p_a"]), rb("hire", vec!["p_b"])];
         let b = vec![rb("hire", vec!["p_b"]), rb("hire", vec!["p_a"])];
-        let na = disambiguate_overloads(&a);
-        let nb = disambiguate_overloads(&b);
+        let na = disambiguate_overloads(PKG, &a);
+        let nb = disambiguate_overloads(PKG, &b);
         assert_eq!(na[0], "hire_p_a");
         assert_eq!(na[1], "hire_p_b");
         assert_eq!(nb[0], "hire_p_b");

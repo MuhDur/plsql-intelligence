@@ -65,9 +65,9 @@ pub fn emit_wrappers(plan: &BindingPlan) -> String {
     // identifiers in input order; singletons keep their verbatim name. The
     // composed `BEGIN {package_id}.{r.name}(…)` block still targets the real
     // overloaded PL/SQL name (`r.name`), so the server-side call is unchanged.
-    let rust_names = crate::overload::disambiguate_overloads(&plan.routines);
+    let rust_names = crate::overload::disambiguate_overloads(&plan.package_id, &plan.routines);
     for (idx, routine) in plan.routines.iter().enumerate() {
-        emit_routine(&mut out, &plan.package_id, routine, &rust_names[idx], idx);
+        emit_routine(&mut out, &plan.package_id, routine, &rust_names[idx]);
         out.push('\n');
     }
     for diag in &plan.diagnostics {
@@ -270,7 +270,12 @@ fn package_id_problem(package_id: &str) -> Option<&'static str> {
 /// parameter name, and the package_id — all of which land in raw positions in
 /// the generated wrapper (the `pub fn` signature, the `match &name` scrutinee,
 /// the dynamic `format!` block, and the SQL-block literal).
-fn invalid_identifier_reason(package_id: &str, r: &RoutineBinding) -> Option<String> {
+///
+/// `pub(crate)` so [`crate::overload::disambiguate_overloads`] can detect the
+/// same fail-closed routines the emitter does and reserve their stub `pub fn`
+/// names against the single global uniqueness set, rather than each module
+/// deciding independently and risking a duplicate `pub fn` (rustc E0428).
+pub(crate) fn invalid_identifier_reason(package_id: &str, r: &RoutineBinding) -> Option<String> {
     if let Some(reason) = package_id_problem(package_id) {
         return Some(reason.to_string());
     }
@@ -290,7 +295,13 @@ fn invalid_identifier_reason(package_id: &str, r: &RoutineBinding) -> Option<Str
 /// character of the proposed Rust name is folded to `_`; the routine index is
 /// appended so two distinct invalid routines never collapse to the same stub
 /// (preserving the "no duplicate `pub fn`" guarantee even on hostile input).
-fn safe_stub_ident(rust_name: &str, idx: usize) -> String {
+///
+/// `pub(crate)` so [`crate::overload::disambiguate_overloads`] mints the stub
+/// base from the SAME logic the emitter trusts, then runs it through the global
+/// `claim` probe — closing the gap where a folded stub (`"a b"` → `a_b_0`) could
+/// silently equal a legal sibling singleton's verbatim name (`a_b_0`) and emit
+/// two identical `pub fn`s into one module (rustc E0428).
+pub(crate) fn safe_stub_ident(rust_name: &str, idx: usize) -> String {
     let mut base = String::with_capacity(rust_name.len() + 1);
     for c in rust_name.chars() {
         if c.is_ascii_alphanumeric() || c == '_' {
@@ -310,7 +321,7 @@ fn safe_stub_ident(rust_name: &str, idx: usize) -> String {
     format!("{base}_{idx}")
 }
 
-fn emit_routine(out: &mut String, package_id: &str, r: &RoutineBinding, rust_name: &str, idx: usize) {
+fn emit_routine(out: &mut String, package_id: &str, r: &RoutineBinding, rust_name: &str) {
     if r.autonomous_transaction {
         let _ = writeln!(
             out,
@@ -328,14 +339,16 @@ fn emit_routine(out: &mut String, package_id: &str, r: &RoutineBinding, rust_nam
     // plan fails closed with a typed BINDING_* body (compilable Rust, exit 0);
     // this one must too rather than silently emitting uncompilable Rust. The
     // guard runs BEFORE path selection so it protects both the static layout
-    // and the defaulted-parameter dynamic path. The emitted stub `pub fn`
-    // identifier is derived deterministically (and made unique via the routine
-    // index) so the error body always type-checks.
+    // and the defaulted-parameter dynamic path. The stub `pub fn` identifier is
+    // `rust_name`: `disambiguate_overloads` already folded this routine's
+    // proposed name via `safe_stub_ident` AND reserved it against the package's
+    // single global uniqueness set, so the stub always type-checks AND can never
+    // duplicate a legal sibling's `pub fn` (rustc E0428) — even when the folded
+    // stub happens to equal a real singleton's verbatim name.
     if let Some(problem) = invalid_identifier_reason(package_id, r) {
-        let stub = safe_stub_ident(rust_name, idx);
         let _ = writeln!(
             out,
-            "pub fn {stub}(executor: &mut impl OracleExecutor) -> Result<(), ExecutionError> {{"
+            "pub fn {rust_name}(executor: &mut impl OracleExecutor) -> Result<(), ExecutionError> {{"
         );
         let _ = writeln!(
             out,
@@ -1644,6 +1657,56 @@ mod tests {
             unique.len(),
             2,
             "two invalid routines must get distinct stub idents: {fn_names:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_stub_does_not_collide_with_a_legal_sibling_singleton() {
+        // oracle-clgt.6: an INVALID routine name whose fold+index stub happens
+        // to equal a LEGAL sibling singleton's verbatim Rust name must not
+        // produce two identical `pub fn`s (rustc E0428). `"a b"` (space →
+        // invalid) folds to the stub `a_b_0`; the sibling `a_b_0` is a legal
+        // singleton emitted verbatim. Before the fix `safe_stub_ident` ran in
+        // `emit_routine` without consulting the global uniqueness set, so both
+        // became `pub fn a_b_0`. Now `disambiguate_overloads` reserves the stub
+        // against the same `taken` set, so the stub yields and escalates.
+        let mk = |n: &str| RoutineBinding {
+            name: n.into(),
+            kind: RoutineKind::Procedure,
+            parameters: vec![param("p_a", "i64", ParameterMode::In, false)],
+            return_type: None,
+            autonomous_transaction: false,
+        };
+        let src = emit_wrappers(&plan(vec![mk("a b"), mk("a_b_0")]));
+        let fn_names: Vec<&str> = src
+            .match_indices("pub fn ")
+            .map(|(i, _)| {
+                let rest = &src[i + "pub fn ".len()..];
+                &rest[..rest.find('(').unwrap()]
+            })
+            .collect();
+        assert_eq!(fn_names.len(), 2, "{fn_names:?}");
+        let unique: std::collections::BTreeSet<_> = fn_names.iter().collect();
+        assert_eq!(
+            unique.len(),
+            2,
+            "the invalid routine's stub must not duplicate the legal sibling `a_b_0`: {fn_names:?}"
+        );
+        // The legal sibling keeps its verbatim name; the colliding stub
+        // escalates with a deterministic `_<n>` ordinal.
+        assert!(
+            fn_names.contains(&"a_b_0"),
+            "the legal singleton must keep its verbatim name: {fn_names:?}"
+        );
+        assert!(
+            src.contains("pub fn a_b_0_2("),
+            "the invalid routine's stub must escalate off the legal name: {src}"
+        );
+        // The legal sibling still emits a real wrapper; the invalid one fails
+        // closed with the typed body.
+        assert!(
+            src.contains("BINDING_INVALID_IDENTIFIER"),
+            "the invalid routine must still fail closed: {src}"
         );
     }
 
