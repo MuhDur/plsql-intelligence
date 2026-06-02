@@ -73,12 +73,35 @@ pub fn score_dynamic_sql_edge(evidence: &DynamicSqlEvidence) -> Confidence {
 }
 
 fn medium_or_low(evidence: &DynamicSqlEvidence) -> Confidence {
-    if !evidence.dbms_assert_calls.is_empty() {
+    // Medium ("object set is bounded by the asserted names") is
+    // only honest when *every* interpolated run was routed through
+    // a DBMS_ASSERT sanitiser. A flat non-empty `dbms_assert_calls`
+    // count is not sufficient: a single asserted identifier next to
+    // an unsanitised interpolation still permits injection, so
+    // stamping Medium there would falsely claim the object set is
+    // bounded (oracle-qm3q.21). Compare per-interpolation coverage.
+    let total = evidence.expr_interpolations.len();
+    let sanitised = evidence
+        .expr_interpolations
+        .iter()
+        .filter(|e| e.sanitised)
+        .count();
+
+    if total > 0 && sanitised == total {
         Confidence {
             level: ConfidenceLevel::Medium,
             explanation: Some(format!(
-                "interpolated dynamic SQL, {} identifier(s) routed through DBMS_ASSERT — object set is bounded by the asserted names",
-                evidence.dbms_assert_calls.len()
+                "interpolated dynamic SQL, all {total} interpolation(s) routed through DBMS_ASSERT — object set is bounded by the asserted names"
+            )),
+        }
+    } else if sanitised > 0 {
+        // Partial sanitisation: some interpolations are bounded but
+        // at least one flows in unsanitised. Stay Low and say so —
+        // never claim the object set is bounded.
+        Confidence {
+            level: ConfidenceLevel::Low,
+            explanation: Some(format!(
+                "interpolated dynamic SQL with partial DBMS_ASSERT sanitisation ({sanitised} of {total}) — at least one interpolation is unsanitised, so substituted object names are unknown"
             )),
         }
     } else {
@@ -160,5 +183,66 @@ mod tests {
         let c = score_dynamic_sql_edge(&ev);
         assert_eq!(c.level, ConfidenceLevel::Medium);
         assert!(c.explanation.unwrap().contains("DBMS_ASSERT"));
+    }
+
+    /// Regression for oracle-qm3q.21: a partially-sanitised
+    /// EXECUTE IMMEDIATE — one identifier wrapped in DBMS_ASSERT,
+    /// another raw value concatenated unsanitised — must NOT be
+    /// stamped Medium / "object set is bounded". Before the fix
+    /// `medium_or_low` awarded Medium on a bare non-empty
+    /// `dbms_assert_calls` list, masking the live injection path.
+    #[test]
+    fn partial_dbms_assert_coverage_is_low_not_medium() {
+        let ev = recognise_dynamic_sql(
+            "EXECUTE IMMEDIATE 'SELECT * FROM ' || DBMS_ASSERT.SIMPLE_SQL_NAME(p_tab) || ' WHERE c=''' || p_raw || '''';",
+            "p:8",
+        )
+        .unwrap();
+        // Sanity: the recogniser saw the assert call AND a second
+        // (unsanitised) interpolation feeding p_raw.
+        assert_eq!(ev.dbms_assert_calls.len(), 1);
+        assert!(
+            ev.expr_interpolations.len() >= 2,
+            "expected at least two interpolations, got {:?}",
+            ev.expr_interpolations
+        );
+        assert!(
+            ev.expr_interpolations.iter().any(|e| e.sanitised),
+            "the DBMS_ASSERT run should be marked sanitised"
+        );
+        assert!(
+            ev.expr_interpolations.iter().any(|e| !e.sanitised),
+            "the bare p_raw run should be marked unsanitised"
+        );
+
+        let c = score_dynamic_sql_edge(&ev);
+        assert_eq!(
+            c.level,
+            ConfidenceLevel::Low,
+            "partial sanitisation must stay Low, not Medium"
+        );
+        let explanation = c.explanation.unwrap();
+        assert!(
+            !explanation.contains("bounded"),
+            "explanation must not claim the object set is bounded under partial sanitisation: {explanation}"
+        );
+        assert!(
+            explanation.contains("partial"),
+            "explanation should name the partial sanitisation: {explanation}"
+        );
+    }
+
+    /// Full coverage (every interpolation asserted) stays Medium and
+    /// reports honest "bounded" language.
+    #[test]
+    fn full_dbms_assert_coverage_is_medium() {
+        let ev = recognise_dynamic_sql(
+            "EXECUTE IMMEDIATE 'DROP TABLE ' || DBMS_ASSERT.SIMPLE_SQL_NAME(p_tab);",
+            "p:9",
+        )
+        .unwrap();
+        let c = score_dynamic_sql_edge(&ev);
+        assert_eq!(c.level, ConfidenceLevel::Medium);
+        assert!(c.explanation.unwrap().contains("bounded"));
     }
 }

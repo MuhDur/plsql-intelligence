@@ -35,7 +35,8 @@ pub use doctor::{
     doctor_report,
 };
 pub use dynamic_sql::{
-    CandidateObject, DbmsAssertCall, DynamicSqlEvidence, OpacityReason, recognise_dynamic_sql,
+    CandidateObject, DbmsAssertCall, DynamicSqlEvidence, ExprInterpolation, OpacityReason,
+    recognise_dynamic_sql,
 };
 pub use dynamic_sql_confidence::{dynamic_sql_confidence_level, score_dynamic_sql_edge};
 pub use dynamic_sql_shape::{EnrichedDynamicSql, enrich_dynamic_sql};

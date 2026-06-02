@@ -42,6 +42,18 @@ pub struct DynamicSqlEvidence {
     /// presence of any of these lets the SAST layer downgrade
     /// an "unbounded injection" verdict to "sanitised dynamic".
     pub dbms_assert_calls: Vec<DbmsAssertCall>,
+    /// Per-interpolation sanitisation status. One entry per
+    /// `<expr>` placeholder the recogniser collapsed out of the
+    /// concatenation, in left-to-right order. `true` means the
+    /// non-literal run that produced that placeholder routed
+    /// through a `DBMS_ASSERT` call (bounded); `false` means it
+    /// is an unsanitised interpolation. A flat
+    /// [`dbms_assert_calls`] count is *not* enough to conclude
+    /// the object set is bounded — a single asserted identifier
+    /// alongside an unsanitised one still permits injection — so
+    /// the confidence scorer compares per-interpolation coverage
+    /// here rather than trusting a bare non-empty assert list.
+    pub expr_interpolations: Vec<ExprInterpolation>,
     /// Candidate object names the recogniser inferred from the
     /// fragments (everything that pattern-matches
     /// `[schema.]identifier`).
@@ -62,6 +74,18 @@ pub struct DbmsAssertCall {
     /// confirming the operator passed the same input that
     /// becomes part of the dynamic statement.
     pub argument: String,
+}
+
+/// One non-literal run (`<expr>` placeholder) extracted from a
+/// dynamic-SQL concatenation, tagged with whether the run was
+/// routed through a `DBMS_ASSERT` sanitiser.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExprInterpolation {
+    /// `true` iff the source text of this interpolation contains
+    /// a `DBMS_ASSERT.<fn>(...)` call — i.e. the substituted
+    /// identifier is bounded by the asserted name. `false` for a
+    /// bare expression that flows unsanitised into the statement.
+    pub sanitised: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,34 +120,37 @@ pub enum OpacityReason {
 pub fn recognise_dynamic_sql(call_text: &str, site: &str) -> Option<DynamicSqlEvidence> {
     let upper = call_text.to_ascii_uppercase();
     let trimmed = upper.trim_start();
-    let (fragments, candidate_objects, uses_binds) = if trimmed.starts_with("EXECUTE IMMEDIATE") {
-        extract_execute_immediate(call_text)
-    } else if trimmed.contains("DBMS_SQL.") {
-        return Some(DynamicSqlEvidence {
-            site: site.into(),
-            fragments: vec![],
-            uses_binds: false,
-            dbms_assert_calls: detect_dbms_assert_calls(call_text),
-            candidate_objects: vec![],
-            opacity_reason: OpacityReason::DbmsSqlChain,
-        });
-    } else if trimmed.starts_with("OPEN ")
-        && trimmed.contains("FOR ")
-        && !trimmed.contains("FOR SELECT")
-        && !trimmed.contains("FOR INSERT")
-        && !trimmed.contains("FOR UPDATE")
-    {
-        return Some(DynamicSqlEvidence {
-            site: site.into(),
-            fragments: vec![],
-            uses_binds: trimmed.contains("USING "),
-            dbms_assert_calls: detect_dbms_assert_calls(call_text),
-            candidate_objects: vec![],
-            opacity_reason: OpacityReason::RefCursorBind,
-        });
-    } else {
-        return None;
-    };
+    let (fragments, candidate_objects, uses_binds, expr_interpolations) =
+        if trimmed.starts_with("EXECUTE IMMEDIATE") {
+            extract_execute_immediate(call_text)
+        } else if trimmed.contains("DBMS_SQL.") {
+            return Some(DynamicSqlEvidence {
+                site: site.into(),
+                fragments: vec![],
+                uses_binds: false,
+                dbms_assert_calls: detect_dbms_assert_calls(call_text),
+                expr_interpolations: vec![],
+                candidate_objects: vec![],
+                opacity_reason: OpacityReason::DbmsSqlChain,
+            });
+        } else if trimmed.starts_with("OPEN ")
+            && trimmed.contains("FOR ")
+            && !trimmed.contains("FOR SELECT")
+            && !trimmed.contains("FOR INSERT")
+            && !trimmed.contains("FOR UPDATE")
+        {
+            return Some(DynamicSqlEvidence {
+                site: site.into(),
+                fragments: vec![],
+                uses_binds: trimmed.contains("USING "),
+                dbms_assert_calls: detect_dbms_assert_calls(call_text),
+                expr_interpolations: vec![],
+                candidate_objects: vec![],
+                opacity_reason: OpacityReason::RefCursorBind,
+            });
+        } else {
+            return None;
+        };
     let opacity_reason = if fragments.iter().any(|f| f.contains("<expr>")) {
         OpacityReason::ContainsExpression
     } else {
@@ -134,6 +161,7 @@ pub fn recognise_dynamic_sql(call_text: &str, site: &str) -> Option<DynamicSqlEv
         fragments,
         uses_binds,
         dbms_assert_calls: detect_dbms_assert_calls(call_text),
+        expr_interpolations,
         candidate_objects,
         opacity_reason,
     })
@@ -144,10 +172,12 @@ pub fn recognise_dynamic_sql(call_text: &str, site: &str) -> Option<DynamicSqlEv
 /// any of those fragments mention. `<expr>` is the placeholder
 /// for any non-literal piece so the fragment shape stays
 /// comparable across runs.
-fn extract_execute_immediate(text: &str) -> (Vec<String>, Vec<CandidateObject>, bool) {
+fn extract_execute_immediate(
+    text: &str,
+) -> (Vec<String>, Vec<CandidateObject>, bool, Vec<ExprInterpolation>) {
     let upper = text.to_ascii_uppercase();
     let Some(after_kw) = upper.find("EXECUTE IMMEDIATE") else {
-        return (vec![], vec![], false);
+        return (vec![], vec![], false, vec![]);
     };
     let rest = &text[after_kw + "EXECUTE IMMEDIATE".len()..];
     let using_pos = rest.to_ascii_uppercase().find(" USING ");
@@ -160,10 +190,15 @@ fn extract_execute_immediate(text: &str) -> (Vec<String>, Vec<CandidateObject>, 
 
     // Walk by character; collect runs inside `'...'` as literal
     // fragments, runs outside as `<expr>` placeholders (collapsed
-    // around `||`).
+    // around `||`). For each `<expr>` we also capture the verbatim
+    // source of the non-literal run so we can tag whether that
+    // specific interpolation was routed through a DBMS_ASSERT
+    // sanitiser (per-interpolation coverage, not a flat count).
     let mut fragments: Vec<String> = Vec::new();
+    let mut expr_interpolations: Vec<ExprInterpolation> = Vec::new();
     let mut in_string = false;
     let mut current_lit = String::new();
+    let mut current_expr = String::new();
     let mut current_expr_open = false;
     for c in body.chars() {
         if c == '\'' {
@@ -174,6 +209,10 @@ fn extract_execute_immediate(text: &str) -> (Vec<String>, Vec<CandidateObject>, 
             } else {
                 if current_expr_open {
                     fragments.push("<expr>".into());
+                    expr_interpolations.push(ExprInterpolation {
+                        sanitised: run_is_dbms_assert(&current_expr),
+                    });
+                    current_expr.clear();
                     current_expr_open = false;
                 }
                 in_string = true;
@@ -182,17 +221,32 @@ fn extract_execute_immediate(text: &str) -> (Vec<String>, Vec<CandidateObject>, 
         }
         if in_string {
             current_lit.push(c);
-        } else if !c.is_whitespace() {
-            current_expr_open = true;
+        } else {
+            current_expr.push(c);
+            if !c.is_whitespace() {
+                current_expr_open = true;
+            }
         }
     }
     if current_expr_open {
         fragments.push("<expr>".into());
+        expr_interpolations.push(ExprInterpolation {
+            sanitised: run_is_dbms_assert(&current_expr),
+        });
     }
 
     let candidate_objects = candidate_objects_from_fragments(&fragments);
     let uses_binds = using_pos.is_some();
-    (fragments, candidate_objects, uses_binds)
+    (fragments, candidate_objects, uses_binds, expr_interpolations)
+}
+
+/// True iff a single non-literal concatenation run routed its
+/// value through a `DBMS_ASSERT.<fn>(...)` sanitiser. Purely
+/// textual — the run is one `||`-delimited expression chunk, so a
+/// `DBMS_ASSERT.` prefix means the substituted identifier is
+/// bounded by the asserted name.
+fn run_is_dbms_assert(run: &str) -> bool {
+    run.to_ascii_uppercase().contains("DBMS_ASSERT.")
 }
 
 /// Extract `[schema.]identifier` names from the literal fragments
@@ -371,6 +425,43 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].function, "SIMPLE_SQL_NAME");
         assert_eq!(f[0].argument, "p_tab");
+    }
+
+    #[test]
+    fn expr_interpolations_tag_per_run_sanitisation() {
+        // One asserted identifier + one raw interpolation: the
+        // recogniser must tag each `<expr>` run independently so the
+        // confidence scorer can detect partial coverage.
+        let ev = recognise_dynamic_sql(
+            "EXECUTE IMMEDIATE 'SELECT * FROM ' || DBMS_ASSERT.SIMPLE_SQL_NAME(p_tab) || ' WHERE c=''' || p_raw || '''';",
+            "pkg.proc:55",
+        )
+        .unwrap();
+        assert!(
+            ev.expr_interpolations.iter().any(|e| e.sanitised),
+            "DBMS_ASSERT run should be sanitised: {:?}",
+            ev.expr_interpolations
+        );
+        assert!(
+            ev.expr_interpolations.iter().any(|e| !e.sanitised),
+            "bare p_raw run should be unsanitised: {:?}",
+            ev.expr_interpolations
+        );
+    }
+
+    #[test]
+    fn expr_interpolations_all_sanitised_when_fully_asserted() {
+        let ev = recognise_dynamic_sql(
+            "EXECUTE IMMEDIATE 'GRANT ' || DBMS_ASSERT.SIMPLE_SQL_NAME(p) || ' TO ' || DBMS_ASSERT.ENQUOTE_NAME(g);",
+            "pkg.proc:56",
+        )
+        .unwrap();
+        assert!(!ev.expr_interpolations.is_empty());
+        assert!(
+            ev.expr_interpolations.iter().all(|e| e.sanitised),
+            "every interpolation should be sanitised: {:?}",
+            ev.expr_interpolations
+        );
     }
 
     #[test]
