@@ -73,8 +73,21 @@ pub fn resolve_sql(raw: &str) -> SqlStatementModel {
             collect_from_and_joins(&upper, trimmed, &mut model, TableUsageKind::Read);
         }
         SqlSemanticVerb::Delete => {
-            for (s, t, a) in tables_after_keyword(&upper, trimmed, "FROM") {
+            // Only the FIRST `FROM` table is the DELETE target (a Write); any
+            // further `FROM`/`JOIN` tables come from a WHERE sub-SELECT and are
+            // Reads. The old code tagged every `FROM` triple Write, so
+            // `DELETE FROM t WHERE id IN (SELECT id FROM staging)` recorded
+            // STAGING as a Write with reversed data-flow direction.
+            // (oracle-rwjl.6)
+            let mut from_tables = tables_after_keyword(&upper, trimmed, "FROM").into_iter();
+            if let Some((s, t, a)) = from_tables.next() {
                 add(&mut model, s, t, a, TableUsageKind::Write);
+            }
+            for (s, t, a) in from_tables {
+                add(&mut model, s, t, a, TableUsageKind::Read);
+            }
+            for (s, t, a) in tables_after_keyword(&upper, trimmed, "JOIN") {
+                add(&mut model, s, t, a, TableUsageKind::Read);
             }
         }
         SqlSemanticVerb::MergeUpdate
@@ -376,6 +389,36 @@ mod tests {
         assert_eq!(m.verb, SqlSemanticVerb::Delete);
         assert_eq!(m.tables[0].table, "STALE");
         assert_eq!(m.tables[0].usage, TableUsageKind::Write);
+    }
+
+    // oracle-rwjl.6: a DELETE whose WHERE reads a staging table via a
+    // subquery must tag the target Write and the subquery table Read — never
+    // Write. The old DELETE arm tagged every `FROM` triple Write.
+    #[test]
+    fn delete_with_where_subquery_target_write_subquery_read() {
+        let m = resolve_sql("DELETE FROM t WHERE id IN (SELECT id FROM staging)");
+        assert_eq!(m.verb, SqlSemanticVerb::Delete);
+        assert!(
+            m.tables
+                .iter()
+                .any(|t| t.table == "T" && t.usage == TableUsageKind::Write),
+            "DELETE target T must be Write: {:?}",
+            m.tables
+        );
+        assert!(
+            m.tables
+                .iter()
+                .any(|t| t.table == "STAGING" && t.usage == TableUsageKind::Read),
+            "WHERE sub-SELECT table STAGING must be Read: {:?}",
+            m.tables
+        );
+        assert!(
+            !m.tables
+                .iter()
+                .any(|t| t.table == "STAGING" && t.usage == TableUsageKind::Write),
+            "STAGING must NEVER be Write: {:?}",
+            m.tables
+        );
     }
 
     #[test]

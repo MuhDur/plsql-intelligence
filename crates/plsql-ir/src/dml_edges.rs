@@ -176,8 +176,22 @@ fn accesses_from_sql(verb: SqlVerb, raw: &str, out: &mut Vec<TableAccess>) {
             }
         }
         SqlVerb::Delete => {
-            for t in tables_after(&upper, raw, "FROM") {
-                push(out, t, AccessKind::Write);
+            // Only the FIRST `FROM` table is the DELETE target (a Write). Any
+            // further `FROM` occurrences come from a WHERE sub-SELECT — e.g.
+            // `DELETE FROM t WHERE id IN (SELECT id FROM staging)` — and are
+            // READS, not writes. The old code pushed every `FROM` table as a
+            // Write, minting a spurious `Writes staging` edge with reversed
+            // data-flow direction. Subquery `JOIN` tables are reads too.
+            // (oracle-rwjl.6)
+            let mut from_tables = tables_after(&upper, raw, "FROM").into_iter();
+            if let Some(target) = from_tables.next() {
+                push(out, target, AccessKind::Write);
+            }
+            for t in from_tables {
+                push(out, t, AccessKind::Read);
+            }
+            for t in tables_after(&upper, raw, "JOIN") {
+                push(out, t, AccessKind::Read);
             }
         }
         SqlVerb::Merge => {
@@ -324,6 +338,31 @@ mod tests {
         assert!(
             a.iter()
                 .any(|x| x.table == "STALE_ROWS" && x.access == AccessKind::Write)
+        );
+    }
+
+    // oracle-rwjl.6: a DELETE whose WHERE reads a staging table via a
+    // subquery must tag the DELETE target as Write and the subquery table as
+    // Read — never Write. The old DELETE arm pushed every `FROM` table as a
+    // Write, minting a spurious `Writes STAGING` edge with reversed data-flow.
+    #[test]
+    fn delete_with_where_subquery_target_is_write_subquery_is_read() {
+        let s = lower_statement_body("DELETE FROM t WHERE id IN (SELECT id FROM staging);");
+        let a = extract_table_accesses(&s);
+        assert!(
+            a.iter()
+                .any(|x| x.table == "T" && x.access == AccessKind::Write),
+            "DELETE target T must be a Write: {a:?}"
+        );
+        assert!(
+            a.iter()
+                .any(|x| x.table == "STAGING" && x.access == AccessKind::Read),
+            "WHERE sub-SELECT table STAGING must be a Read: {a:?}"
+        );
+        assert!(
+            !a.iter()
+                .any(|x| x.table == "STAGING" && x.access == AccessKind::Write),
+            "STAGING must NEVER be classified as a Write: {a:?}"
         );
     }
 

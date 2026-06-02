@@ -450,46 +450,67 @@ fn strip_comments(s: &str) -> String {
     out
 }
 
+/// Whole-word prefix test: `trimmed` begins with `keyword` AND the char
+/// immediately after the keyword is a word boundary (not `[A-Za-z0-9_$#]`).
+///
+/// The keyword classifiers below all gated on a bare `starts_with`, so a
+/// local whose name merely *starts* with a verb — `null_count`,
+/// `return_val`, `update_stats`, `delete_flag`, `commit_seq`, … — was
+/// swallowed by the wrong arm (e.g. `null_count := 5;` → `Statement::Null`,
+/// `update_stats(p_id);` → `Statement::Sql{Update}`). The dropped statement
+/// then vanished from `flow_intra::walk` (assignments) or minted a phantom
+/// DML edge (calls), and any user-tainted value laundered through such a
+/// local was never recorded — a taint fail-open. Requiring a trailing word
+/// boundary makes the verb match only the real keyword. (oracle-rwjl.3)
+fn starts_with_keyword(trimmed: &str, keyword: &str) -> bool {
+    let Some(rest) = trimmed.strip_prefix(keyword) else {
+        return false;
+    };
+    match rest.chars().next() {
+        None => true,
+        Some(c) => !(c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '#'),
+    }
+}
+
+/// Byte offset of the first top-level `:=` in `text` — one that is NOT inside
+/// a string literal (single-quoted or q-quoted). A top-level `:=` makes the
+/// statement unambiguously an assignment, regardless of what verb its LHS
+/// local happens to start with, so `classify` checks this BEFORE the keyword
+/// classifiers. (oracle-rwjl.3)
+fn top_level_assign_pos(text: &str) -> Option<usize> {
+    let chars: Vec<char> = text.chars().collect();
+    // Map char index -> byte offset so the returned position indexes `text`.
+    let mut byte_off = 0usize;
+    let mut i = 0usize;
+    while i < chars.len() {
+        if let Some(end) = string_literal_end(&chars, i) {
+            // Skip the opaque literal span verbatim.
+            for &ch in &chars[i..end] {
+                byte_off += ch.len_utf8();
+            }
+            i = end;
+            continue;
+        }
+        if chars[i] == ':' && chars.get(i + 1) == Some(&'=') {
+            return Some(byte_off);
+        }
+        byte_off += chars[i].len_utf8();
+        i += 1;
+    }
+    None
+}
+
 fn classify(text: &str) -> Statement {
     let upper = text.to_ascii_uppercase();
     let trimmed = upper.trim();
-    if trimmed.starts_with("NULL") {
-        return Statement::Null;
-    }
-    if trimmed.starts_with("COMMIT")
-        || trimmed.starts_with("ROLLBACK")
-        || trimmed.starts_with("SAVEPOINT")
-    {
-        let verb = trimmed.split_whitespace().next().unwrap_or("").to_string();
-        return Statement::TransactionControl { verb };
-    }
-    if trimmed.starts_with("RAISE") {
-        let rest = text[5..].trim().trim_end_matches(';').trim();
-        let exception = if rest.is_empty() {
-            None
-        } else {
-            Some(rest.to_string())
-        };
-        return Statement::Raise { exception };
-    }
-    if trimmed.starts_with("RETURN") {
-        let rest = text[6..].trim().trim_end_matches(';').trim();
-        let value_text = if rest.is_empty() {
-            None
-        } else {
-            Some(rest.to_string())
-        };
-        return Statement::Return { value_text };
-    }
-    if trimmed.starts_with("EXIT") {
-        let rest = text[4..].trim().trim_end_matches(';').trim();
-        let when_text = rest
-            .strip_prefix("WHEN")
-            .or_else(|| rest.strip_prefix("when"))
-            .map(|s| s.trim().to_string());
-        return Statement::Exit { when_text };
-    }
-    if trimmed.starts_with("EXECUTE IMMEDIATE") {
+    // BODY-INTRODUCING constructs are classified FIRST: an IF / LOOP / FOR /
+    // WHILE / BEGIN / DECLARE statement legitimately contains a `:=` inside its
+    // BODY (`IF c THEN v := p; END IF;`), so the top-level `:=` test below must
+    // not run before them or it would swallow the whole construct. With the
+    // word-boundary `starts_with_keyword`, `if_count := 1` / `for_idx := 0`
+    // etc. do NOT match these — they fall through to the assignment test.
+    // (oracle-rwjl.3)
+    if starts_with_keyword(trimmed, "EXECUTE IMMEDIATE") {
         let after = &text[17..];
         let sql_literal = extract_quoted(after).unwrap_or_default();
         let has_bind_variables = after.to_ascii_uppercase().contains("USING ");
@@ -498,8 +519,71 @@ fn classify(text: &str) -> Statement {
             has_bind_variables,
         };
     }
+    if starts_with_keyword(trimmed, "IF") {
+        return classify_if(text);
+    }
+    if starts_with_keyword(trimmed, "LOOP")
+        || starts_with_keyword(trimmed, "FOR")
+        || starts_with_keyword(trimmed, "WHILE")
+    {
+        return classify_loop(text);
+    }
+    if starts_with_keyword(trimmed, "BEGIN") || starts_with_keyword(trimmed, "DECLARE") {
+        return Statement::NestedBlock {
+            body_text: text.to_string(),
+        };
+    }
+    // A top-level `:=` (outside any string literal) makes the statement
+    // unambiguously an assignment — emit it BEFORE the non-body verb
+    // classifiers so a verb-prefixed LHS local (`return_val := …`,
+    // `commit_count := …`) is never mis-swallowed. Slice the ORIGINAL `text`
+    // so case is preserved. (oracle-rwjl.3)
+    if let Some(pos) = top_level_assign_pos(text) {
+        let lhs = &text[..pos];
+        let rhs = &text[pos + 2..];
+        return Statement::Assignment {
+            target: lhs.trim().to_string(),
+            rhs_text: rhs.trim().trim_end_matches(';').trim().to_string(),
+        };
+    }
+    if starts_with_keyword(trimmed, "NULL") {
+        return Statement::Null;
+    }
+    if starts_with_keyword(trimmed, "COMMIT")
+        || starts_with_keyword(trimmed, "ROLLBACK")
+        || starts_with_keyword(trimmed, "SAVEPOINT")
+    {
+        let verb = trimmed.split_whitespace().next().unwrap_or("").to_string();
+        return Statement::TransactionControl { verb };
+    }
+    if starts_with_keyword(trimmed, "RAISE") {
+        let rest = text[5..].trim().trim_end_matches(';').trim();
+        let exception = if rest.is_empty() {
+            None
+        } else {
+            Some(rest.to_string())
+        };
+        return Statement::Raise { exception };
+    }
+    if starts_with_keyword(trimmed, "RETURN") {
+        let rest = text[6..].trim().trim_end_matches(';').trim();
+        let value_text = if rest.is_empty() {
+            None
+        } else {
+            Some(rest.to_string())
+        };
+        return Statement::Return { value_text };
+    }
+    if starts_with_keyword(trimmed, "EXIT") {
+        let rest = text[4..].trim().trim_end_matches(';').trim();
+        let when_text = rest
+            .strip_prefix("WHEN")
+            .or_else(|| rest.strip_prefix("when"))
+            .map(|s| s.trim().to_string());
+        return Statement::Exit { when_text };
+    }
     for verb in ["SELECT", "INSERT", "UPDATE", "DELETE", "MERGE"] {
-        if trimmed.starts_with(verb) {
+        if starts_with_keyword(trimmed, verb) {
             let kind = match verb {
                 "SELECT" => SqlVerb::Select,
                 "INSERT" => SqlVerb::Insert,
@@ -513,23 +597,6 @@ fn classify(text: &str) -> Statement {
                 raw_text: text.to_string(),
             };
         }
-    }
-    if trimmed.starts_with("IF ") {
-        return classify_if(text);
-    }
-    if trimmed.starts_with("LOOP") || trimmed.starts_with("FOR ") || trimmed.starts_with("WHILE ") {
-        return classify_loop(text);
-    }
-    if trimmed.starts_with("BEGIN") || trimmed.starts_with("DECLARE") {
-        return Statement::NestedBlock {
-            body_text: text.to_string(),
-        };
-    }
-    if let Some((lhs, rhs)) = text.split_once(":=") {
-        return Statement::Assignment {
-            target: lhs.trim().to_string(),
-            rhs_text: rhs.trim().trim_end_matches(';').trim().to_string(),
-        };
     }
     Statement::Unrecognized {
         raw_text: text.to_string(),
@@ -762,6 +829,62 @@ mod tests {
             }
             other => panic!("expected Assignment, got {other:?}"),
         }
+    }
+
+    // oracle-rwjl.3: an assignment whose LHS local merely STARTS with a verb
+    // keyword (`return_val`, `null_count`, `update_x`, `delete_flag`,
+    // `commit_count`, `exit_code`, `raise_amount`, `select_idx`, …) must be
+    // classified as `Statement::Assignment` — NOT swallowed by the keyword
+    // classifier. The bare `starts_with("RETURN")` etc. used to misclassify
+    // these, dropping the assignment from flow_intra::walk (a taint
+    // fail-open) and minting phantom DML edges.
+    #[test]
+    fn verb_prefixed_assignment_is_an_assignment_not_a_keyword() {
+        for (input, want_target, want_rhs) in [
+            ("return_val := p_user;", "return_val", "p_user"),
+            ("null_count := 5;", "null_count", "5"),
+            ("update_x := p_user;", "update_x", "p_user"),
+            ("delete_flag := 1;", "delete_flag", "1"),
+            ("commit_count := 1;", "commit_count", "1"),
+            ("exit_code := 0;", "exit_code", "0"),
+            ("raise_amount := 100;", "raise_amount", "100"),
+            ("select_idx := 7;", "select_idx", "7"),
+            ("merge_key := p_user;", "merge_key", "p_user"),
+            ("insert_seq := 3;", "insert_seq", "3"),
+            ("savepoint_id := 2;", "savepoint_id", "2"),
+            ("rollback_count := 9;", "rollback_count", "9"),
+        ] {
+            let r = lower_statement_body(input);
+            match &r[0] {
+                Statement::Assignment { target, rhs_text } => {
+                    assert_eq!(target, want_target, "target for {input:?}");
+                    assert_eq!(rhs_text, want_rhs, "rhs for {input:?}");
+                }
+                other => panic!("expected Assignment for {input:?}, got {other:?}"),
+            }
+        }
+    }
+
+    // oracle-rwjl.3: a real keyword statement (verb at a true word boundary)
+    // must still classify as the keyword, not regress to Unrecognized.
+    #[test]
+    fn real_keyword_statements_still_classify() {
+        assert_eq!(lower_statement_body("NULL;")[0], Statement::Null);
+        assert!(matches!(
+            lower_statement_body("RETURN 1;")[0],
+            Statement::Return { .. }
+        ));
+        assert!(matches!(
+            lower_statement_body("DELETE FROM t WHERE id = 1;")[0],
+            Statement::Sql {
+                verb: SqlVerb::Delete,
+                ..
+            }
+        ));
+        assert!(matches!(
+            lower_statement_body("COMMIT;")[0],
+            Statement::TransactionControl { .. }
+        ));
     }
 
     #[test]

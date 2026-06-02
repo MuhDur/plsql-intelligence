@@ -180,6 +180,47 @@ fn expr_flow(expr: &Expr, sources: &TaintSources, env: &FlowEnv) -> ValueFlow {
     flow
 }
 
+/// Is `path` (an already-upper-cased dotted call path) a *validating*
+/// `DBMS_ASSERT` entry point — i.e. one that actually rejects unsafe input
+/// and so cleanses the taint of its argument?
+///
+/// Two prior gaps, both fixed here (oracle-rwjl.4):
+///
+/// 1. **`DBMS_ASSERT.NOOP` is NOT a sanitizer.** Oracle documents NOOP as an
+///    identity pass-through that performs no validation and returns its
+///    argument unchanged. The old `path.starts_with("DBMS_ASSERT.")` guard
+///    matched it uniformly, so `EXECUTE IMMEDIATE DBMS_ASSERT.NOOP(p_user)`
+///    was reported clean — a SQL-injection fail-open in the flagship SEC001
+///    rule. NOOP (and any unrecognized DBMS_ASSERT entry point) must fall
+///    through to the transparent branch so its argument's taint reaches the
+///    sink and still alarms.
+/// 2. **A schema prefix made a real sanitizer transparent.** `starts_with`
+///    failed to match `SYS.DBMS_ASSERT.SIMPLE_SQL_NAME(...)`, so a genuinely
+///    cleansed value over-reported. We now tolerate an optional leading
+///    schema segment.
+///
+/// The allowlist mirrors the validating set enumerated in
+/// `plsql-symbols/src/dynamic_sql.rs` (which lists NOOP separately, only for
+/// textual detection — never as a validator).
+fn is_dbms_assert_sanitizer(path: &str) -> bool {
+    const VALIDATORS: &[&str] = &[
+        "SIMPLE_SQL_NAME",
+        "QUALIFIED_SQL_NAME",
+        "SCHEMA_NAME",
+        "ENQUOTE_NAME",
+        "SQL_OBJECT_NAME",
+        "ENQUOTE_LITERAL",
+    ];
+    let segs: Vec<&str> = path.split('.').collect();
+    // Match `[schema.]DBMS_ASSERT.<fn>`: the trailing two segments must be
+    // `DBMS_ASSERT` then a validating function. NOOP (or any unknown entry
+    // point) deliberately fails this test and falls through to transparent.
+    match segs.as_slice() {
+        [.., "DBMS_ASSERT", func] => VALIDATORS.contains(func),
+        _ => false,
+    }
+}
+
 fn collect_expr_flow(expr: &Expr, sources: &TaintSources, env: &FlowEnv, flow: &mut ValueFlow) {
     match expr {
         Expr::Name(n) => {
@@ -232,7 +273,7 @@ fn collect_expr_flow(expr: &Expr, sources: &TaintSources, env: &FlowEnv, flow: &
         }
         Expr::Call { callee, args } => {
             let path = callee.parts.join(".").to_ascii_uppercase();
-            if path.starts_with("DBMS_ASSERT.") {
+            if is_dbms_assert_sanitizer(&path) {
                 // A `DBMS_ASSERT.*` call SANITIZES its argument: the value it
                 // returns is safe to interpolate. The cleansing therefore binds to
                 // the call's *argument subtree*, NOT to the enclosing expression.
@@ -552,5 +593,80 @@ mod tests {
             "laundered taint concatenated into SQL must remain tainted"
         );
         assert!(sql.taint.flags_alarm());
+    }
+
+    // oracle-rwjl.3: a verb-prefixed local (`return_val`) used to be swallowed
+    // by classify() (→ Statement::Return), dropping the assignment from
+    // flow_intra::walk so taint laundered through it never reached the sink.
+    // Now it is a real Assignment, so v_sql inherits p_user's taint.
+    #[test]
+    fn verb_prefixed_local_laundering_propagates_taint() {
+        let s = lower_statement_body("return_val := p_user; v_sql := return_val;");
+        let env = analyze_flow(&s, &src(&["p_user"]));
+        let rv = env
+            .get("return_val")
+            .expect("the verb-prefixed local must be recorded as an assignment");
+        assert!(
+            rv.taint.kinds.contains(&TaintKind::UserInput),
+            "return_val must inherit p_user's taint"
+        );
+        let sql = env.get("v_sql").unwrap();
+        assert!(
+            sql.taint.kinds.contains(&TaintKind::UserInput),
+            "taint laundered through the verb-prefixed local must reach v_sql"
+        );
+        assert!(sql.taint.flags_alarm());
+    }
+
+    // oracle-rwjl.4: DBMS_ASSERT.NOOP is Oracle's documented identity
+    // pass-through — it performs NO validation, so it must NOT cleanse. Raw
+    // user input wrapped in NOOP and concatenated into dynamic SQL must still
+    // alarm (the old uniform `starts_with("DBMS_ASSERT.")` reported it clean —
+    // a SEC001 fail-open).
+    #[test]
+    fn dbms_assert_noop_is_not_a_sanitizer() {
+        let s = lower_statement_body("v_sql := 'SELECT * FROM ' || DBMS_ASSERT.NOOP(p_user);");
+        let env = analyze_flow(&s, &src(&["p_user"]));
+        let f = env.get("v_sql").unwrap();
+        assert!(
+            f.taint.kinds.contains(&TaintKind::UserInput),
+            "NOOP performs no validation; its argument's taint must survive"
+        );
+        assert!(
+            f.taint.flags_alarm(),
+            "user input wrapped in DBMS_ASSERT.NOOP must still alarm"
+        );
+    }
+
+    // oracle-rwjl.4 (direct, not just concatenated): a bare NOOP wrap is also
+    // transparent.
+    #[test]
+    fn dbms_assert_noop_direct_assignment_stays_tainted() {
+        let s = lower_statement_body("v_sql := DBMS_ASSERT.NOOP(p_user);");
+        let env = analyze_flow(&s, &src(&["p_user"]));
+        let f = env.get("v_sql").unwrap();
+        assert!(
+            f.taint.kinds.contains(&TaintKind::UserInput),
+            "NOOP does not consume taint"
+        );
+        assert!(f.taint.flags_alarm());
+    }
+
+    // oracle-rwjl.4: a REAL validating sanitizer with a SYS schema prefix must
+    // still be recognised as a cleanser (the old `starts_with` missed the
+    // prefix and over-reported a genuinely safe value).
+    #[test]
+    fn sys_prefixed_dbms_assert_sanitizer_cleanses() {
+        let s = lower_statement_body("v_safe := SYS.DBMS_ASSERT.SIMPLE_SQL_NAME(p_tab);");
+        let env = analyze_flow(&s, &src(&["p_tab"]));
+        let f = env.get("v_safe").unwrap();
+        assert!(
+            !f.taint.flags_alarm(),
+            "a schema-prefixed real sanitizer must still cleanse"
+        );
+        assert!(
+            !f.taint.kinds.contains(&TaintKind::UserInput),
+            "the sanitizer consumes the argument's taint"
+        );
     }
 }
