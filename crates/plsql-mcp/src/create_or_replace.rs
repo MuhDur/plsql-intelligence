@@ -215,57 +215,196 @@ pub fn classify_kind(ddl: &str) -> Result<String, CreateOrReplaceError> {
 pub fn parse_target_schema(ddl: &str) -> Result<Option<String>, CreateOrReplaceError> {
     let kind = classify_kind(ddl)?;
 
-    // Re-tokenize on whitespace runs exactly as classify_kind did, so spacing
-    // cannot shift which token is the object name. `CREATE OR REPLACE` occupies
-    // tokens[0..3]; the (already-validated) kind occupies the next 1-2 tokens;
-    // the object name is the token that immediately follows.
-    let upper = ddl.trim_start().to_ascii_uppercase();
-    let tokens: Vec<&str> = upper.split_whitespace().collect();
-    let name_idx = 3 + kind.split_whitespace().count();
+    // `CREATE OR REPLACE` occupies the first 3 whitespace-delimited tokens; the
+    // (already-validated) kind occupies the next 1-2. The object name is the
+    // token region that immediately follows. We must walk the ORIGINAL ddl
+    // (not an upper-cased copy) so a quoted owner's case survives, and scan it
+    // with full Oracle double-quoted-identifier awareness so embedded
+    // whitespace / dots inside a `"..."` span are not mistaken for a token or
+    // qualifier boundary.
+    let skip_tokens = 3 + kind.split_whitespace().count();
+    let Some(region_start) = nth_token_offset(ddl, skip_tokens) else {
+        // No object-name token at all — genuinely unqualified.
+        return Ok(None);
+    };
 
-    if tokens.get(name_idx).is_none() {
-        return Ok(None);
+    // oracle-j1ep.1: extract the object-name region honouring Oracle
+    // double-quoted identifiers. Inside a `"..."` span, whitespace and dots are
+    // literal name content and `""` is an escaped embedded quote; the name only
+    // ends at the first UNQUOTED whitespace or `(` (a PROCEDURE/FUNCTION param
+    // list may abut the name with no separating whitespace, e.g. `FOO(p ...)`).
+    // An unterminated quote is malformed — fail CLOSED.
+    //
+    // oracle-rwjl.8: the qualifier dot may be surrounded by whitespace
+    // (`OWNER . OBJECT`); Oracle treats that as the same name `OWNER.OBJECT`,
+    // so unquoted whitespace that merely hugs an unquoted dot does not end the
+    // region. We therefore split into segments on UNQUOTED dots first, allowing
+    // surrounding whitespace to be trimmed away per segment.
+    let segments = match scan_qualified_name(&ddl[region_start..]) {
+        Some(segments) => segments,
+        None => {
+            // Unterminated quote in the name region.
+            return Err(CreateOrReplaceError::MalformedQualifiedName {
+                name: ddl[region_start..].trim_start().to_string(),
+            });
+        }
+    };
+
+    match segments.as_slice() {
+        // Genuinely unqualified — targets the current/principal schema.
+        [object] if !object.is_empty() => Ok(None),
+        // Well-formed `OWNER.OBJECT`: two non-empty segments.
+        [owner, object] if !owner.is_empty() && !object.is_empty() => Ok(Some(owner.clone())),
+        // `OWNER.`, `.OBJECT`, `OWNER..OBJECT`, `A.B.C`, or empty: ambiguous /
+        // malformed. Fail CLOSED rather than route to the principal schema and
+        // skip the operator-typed cross-schema confirmation.
+        _ => Err(CreateOrReplaceError::MalformedQualifiedName {
+            name: segments.join("."),
+        }),
     }
-    // oracle-rwjl.8: the schema qualifier dot may be surrounded by whitespace
-    // (`OWNER . OBJECT`, `OWNER .OBJECT`, `OWNER. OBJECT`). Oracle treats those
-    // as the *same* qualified name `OWNER.OBJECT`, but a per-token scan that
-    // only looked at `tokens[name_idx]` saw the bare `OWNER` (no dot) and
-    // misclassified the write as same-schema, silently skipping the operator
-    // typed cross-schema confirmation. Reassemble the object-name region from
-    // `name_idx` onward and collapse whitespace immediately around the dot so
-    // every spaced form normalises to `OWNER.OBJECT` BEFORE the `(` cut.
-    let tail = tokens[name_idx..].join(" ");
-    let normalised = tail
-        .replace(" . ", ".")
-        .replace(" .", ".")
-        .replace(". ", ".");
-    // The object name region runs up to the first whitespace (the rest of the
-    // header — `AS`, `IS`, a parameter list with internal spaces, …). The name
-    // itself ends at the first `(`: a PROCEDURE/FUNCTION parameter list may abut
-    // the name with no separating whitespace (e.g. `FOO(p IN NUMBER)`).
-    let name_region = normalised.split_whitespace().next().unwrap_or("");
-    let name_token = name_region.split('(').next().unwrap_or("");
-    if name_token.is_empty() {
-        return Ok(None);
+}
+
+/// Byte offset of the `n`-th whitespace-delimited token (0-based) in `s`, or
+/// `None` if `s` has fewer than `n + 1` tokens. Used to locate the start of the
+/// object-name region in the ORIGINAL DDL after skipping the
+/// `CREATE OR REPLACE <kind>` head tokens, so the name's original case (which
+/// matters for quoted identifiers) is preserved.
+fn nth_token_offset(s: &str, n: usize) -> Option<usize> {
+    let mut token = 0usize;
+    let mut in_token = false;
+    for (idx, ch) in s.char_indices() {
+        if ch.is_whitespace() {
+            in_token = false;
+        } else {
+            if !in_token {
+                if token == n {
+                    return Some(idx);
+                }
+                token += 1;
+                in_token = true;
+            }
+        }
     }
-    // No dot at all — a genuinely unqualified name targeting the
-    // current/principal schema.
-    if !name_token.contains('.') {
-        return Ok(None);
+    None
+}
+
+/// Scan the object-name region at the start of `region` (the slice beginning at
+/// the object name) and split it into its dot-separated segments, honouring
+/// Oracle double-quoted-identifier syntax.
+///
+/// While inside a `"..."` span, whitespace and dots are literal name content
+/// and `""` is an escaped embedded quote. The name region ends at the first
+/// UNQUOTED whitespace or `(`. Each segment is normalised per Oracle dictionary
+/// rules: a quoted segment is unquoted (surrounding `"` stripped, `""` → `"`)
+/// with its case preserved; an unquoted segment is upper-cased.
+///
+/// Returns the list of normalised segments, or `None` when a double quote is
+/// left unterminated (a malformed name the caller must fail closed on).
+/// Whitespace that merely hugs an UNQUOTED qualifier dot is trimmed away so
+/// `OWNER . OBJECT` still yields `["OWNER", "OBJECT"]`.
+fn scan_qualified_name(region: &str) -> Option<Vec<String>> {
+    let mut segments: Vec<String> = Vec::new();
+    let mut current = String::new();
+    // Did the segment currently being built come (at least partly) from a
+    // quoted span? Quoted segments preserve case; unquoted ones are upper-cased.
+    let mut current_quoted = false;
+    let mut in_quote = false;
+
+    let mut chars = region.char_indices().peekable();
+    while let Some((_idx, ch)) = chars.next() {
+        if in_quote {
+            if ch == '"' {
+                // `""` inside a quote is an escaped quote: keep one `"`.
+                if matches!(chars.peek(), Some((_, '"'))) {
+                    current.push('"');
+                    chars.next();
+                } else {
+                    in_quote = false;
+                }
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                in_quote = true;
+                current_quoted = true;
+            }
+            // Unquoted dot: segment boundary. Push the finished segment, start
+            // the next one, and consume any whitespace run hugging the dot's
+            // right-hand side (`OWNER. OBJECT`) so it is not mistaken for the
+            // end of the name region.
+            '.' => {
+                segments.push(normalise_segment(&current, current_quoted));
+                current.clear();
+                current_quoted = false;
+                while matches!(chars.peek(), Some((_, c)) if c.is_whitespace()) {
+                    chars.next();
+                }
+            }
+            // Unquoted whitespace ends the name region UNLESS it merely hugs an
+            // unquoted dot. Peek past the run: if the next non-whitespace char
+            // is a dot, the whitespace is part of a spaced qualifier and is
+            // skipped (the dot itself is left for the `.` arm to handle on the
+            // next iteration); otherwise the name region is complete.
+            c if c.is_whitespace() => {
+                if skip_ws_before_dot(&mut chars) {
+                    continue;
+                }
+                break;
+            }
+            // Unquoted `(` abuts a parameter list — the name ends here.
+            '(' => break,
+            other => current.push(other),
+        }
     }
-    // A dot is present: the name is schema-qualified. A well-formed Oracle
-    // qualified name is exactly `OWNER.OBJECT` — two non-empty segments. Any
-    // other shape (`OWNER.`, `.OBJECT`, `OWNER..OBJECT`, `A.B.C`) is ambiguous
-    // / malformed; fail CLOSED rather than silently treating it as unqualified
-    // (which would route it to the principal schema and skip the operator
-    // typed cross-schema confirmation).
-    let segments: Vec<&str> = name_token.split('.').collect();
-    if segments.len() == 2 && !segments[0].is_empty() && !segments[1].is_empty() {
-        Ok(Some(segments[0].to_string()))
+
+    if in_quote {
+        // Unterminated quote — malformed.
+        return None;
+    }
+
+    // Flush the final segment. A trailing unquoted dot (`OWNER.`) leaves an
+    // empty final segment, which the caller treats as malformed.
+    segments.push(normalise_segment(&current, current_quoted));
+    Some(segments)
+}
+
+/// Normalise one identifier segment: a quoted segment keeps its exact case; an
+/// unquoted one is upper-cased and trimmed of the whitespace that may have
+/// hugged a spaced qualifier dot.
+fn normalise_segment(raw: &str, quoted: bool) -> String {
+    if quoted {
+        // The segment text was already accumulated without its surrounding
+        // quotes and with `""` collapsed to `"`; preserve case verbatim. A
+        // quoted segment is never trimmed (whitespace inside `"..."` is part of
+        // the identifier).
+        raw.to_string()
     } else {
-        Err(CreateOrReplaceError::MalformedQualifiedName {
-            name: name_token.to_string(),
-        })
+        raw.trim().to_ascii_uppercase()
+    }
+}
+
+/// Peek across a run of unquoted whitespace (the current char was whitespace
+/// and already consumed) and report whether the next non-whitespace char is an
+/// unquoted dot. When it is, the iterator is advanced to *just before* that dot
+/// (the whitespace run is consumed, the dot is left for the caller's `.` arm to
+/// turn into a segment boundary). Otherwise the iterator is left untouched so
+/// the caller can stop at the name boundary.
+fn skip_ws_before_dot(chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>) -> bool {
+    // Look ahead on a clone so a non-dot outcome leaves the real cursor put.
+    let mut lookahead = chars.clone();
+    while matches!(lookahead.peek(), Some((_, c)) if c.is_whitespace()) {
+        lookahead.next();
+    }
+    if matches!(lookahead.peek(), Some((_, '.'))) {
+        // Commit: consume only the whitespace run, leaving the dot in place.
+        *chars = lookahead;
+        true
+    } else {
+        false
     }
 }
 
@@ -551,6 +690,114 @@ mod tests {
                 ),
                 "malformed qualified name {malformed:?} must fail closed, got {:?}",
                 parse_target_schema(malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn parse_target_schema_resolves_quoted_owner_with_embedded_whitespace() {
+        // oracle-j1ep.1: a quoted owner whose identifier contains embedded
+        // whitespace (`"My Schema".PKG`) must NOT be misclassified as
+        // unqualified. The old split_whitespace pipeline tokenised the quoted
+        // owner into `"MY` / `SCHEMA".PKG`, saw `"MY` (no dot), and returned
+        // Ok(None) — routing the write to the principal schema and waving the
+        // cross-schema typed-confirmation gate through (a fail-open clone of
+        // the unquoted-spaced / tab forms already fixed for rwjl.8).
+        assert_eq!(
+            parse_target_schema(
+                "CREATE OR REPLACE PACKAGE BODY \"My Schema\".PKG AS BEGIN NULL; END;"
+            )
+            .unwrap(),
+            Some("My Schema".to_string()),
+            "quoted owner with embedded space must resolve (case preserved), not fail open"
+        );
+        // PROCEDURE form where the param list abuts the quoted-owner name.
+        assert_eq!(
+            parse_target_schema(
+                "CREATE OR REPLACE PROCEDURE \"My Schema\".DO_IT(p IN NUMBER) AS BEGIN NULL; END;"
+            )
+            .unwrap(),
+            Some("My Schema".to_string())
+        );
+        // Embedded dot inside the quoted owner is literal name content, not a
+        // qualifier — still a single owner segment, not a three-part name.
+        assert_eq!(
+            parse_target_schema(
+                "CREATE OR REPLACE VIEW \"A.B\".V AS SELECT 1 FROM dual;"
+            )
+            .unwrap(),
+            Some("A.B".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_target_schema_preserves_quoted_segment_case_and_unescapes() {
+        // A quoted identifier is case-sensitive in Oracle; the resolved owner
+        // must keep its exact case rather than the dictionary upper-case used
+        // for unquoted names.
+        assert_eq!(
+            parse_target_schema("CREATE OR REPLACE VIEW \"lower_owner\".V AS SELECT 1 FROM dual;")
+                .unwrap(),
+            Some("lower_owner".to_string())
+        );
+        // `""` inside a quoted identifier is one escaped embedded double quote.
+        assert_eq!(
+            parse_target_schema(
+                "CREATE OR REPLACE VIEW \"Weird\"\"Owner\".V AS SELECT 1 FROM dual;"
+            )
+            .unwrap(),
+            Some("Weird\"Owner".to_string())
+        );
+        // An unquoted owner stays upper-cased (dictionary normalisation).
+        assert_eq!(
+            parse_target_schema("CREATE OR REPLACE VIEW billing.v AS SELECT 1 FROM dual;")
+                .unwrap(),
+            Some("BILLING".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_target_schema_quoted_unqualified_is_none() {
+        // A quoted name with NO qualifier dot targets the current schema —
+        // Ok(None), not a malformed name.
+        assert_eq!(
+            parse_target_schema("CREATE OR REPLACE VIEW \"My View\" AS SELECT 1 FROM dual;")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_target_schema_fails_closed_on_unterminated_quote() {
+        // An unterminated double quote in the object-name region is malformed;
+        // it must fail CLOSED rather than swallow the rest of the header as a
+        // single (quoted) owner and route past the cross-schema gate.
+        assert!(
+            matches!(
+                parse_target_schema(
+                    "CREATE OR REPLACE VIEW \"My Schema.V AS SELECT 1 FROM dual;"
+                ),
+                Err(CreateOrReplaceError::MalformedQualifiedName { .. })
+            ),
+            "unterminated quote must fail closed, got {:?}",
+            parse_target_schema("CREATE OR REPLACE VIEW \"My Schema.V AS SELECT 1 FROM dual;")
+        );
+    }
+
+    #[test]
+    fn parse_target_schema_spaced_quoted_qualifier_dot() {
+        // The spaced-qualifier normalisation (rwjl.8) and quoted-identifier
+        // awareness (j1ep.1) must compose: a quoted owner followed by a spaced
+        // dot still resolves the owner.
+        for spaced in [
+            "CREATE OR REPLACE PACKAGE BODY \"My Schema\" . PKG AS BEGIN NULL; END;",
+            "CREATE OR REPLACE PACKAGE BODY \"My Schema\" .PKG AS BEGIN NULL; END;",
+            "CREATE OR REPLACE PACKAGE BODY \"My Schema\". PKG AS BEGIN NULL; END;",
+        ] {
+            assert_eq!(
+                parse_target_schema(spaced).unwrap(),
+                Some("My Schema".to_string()),
+                "spaced quoted qualifier {spaced:?} must resolve the owner"
             );
         }
     }
