@@ -265,6 +265,48 @@ fn package_id_problem(package_id: &str) -> Option<&'static str> {
     None
 }
 
+/// `Some(reason)` when a [`RustTypeRef::path`] cannot be emitted verbatim into a
+/// Rust *type position* (the `pub fn` parameter list and the `Result<…>` return
+/// type). A `RustTypeRef` is unconstrained `String` on the wire — the CLI
+/// deserializes an UNTRUSTED `BindingPlan` over plain serde — so a hostile or
+/// upstream-buggy plan can carry a path like `String" ; pub fn pwned(){}` (any
+/// non-allowlisted Oracle type already takes the type-path code path through the
+/// emitter, so the field is fully attacker-reachable). Interpolated raw into the
+/// signature it would either break the build (denial-of-build) or smuggle live
+/// tokens into a Rust type position.
+///
+/// A legitimate Rust type path the emitter ever produces is a dotted/`::`-pathed
+/// identifier sequence with optional balanced generic brackets and comma-space
+/// separators: `i64`, `Option<String>`, `Vec<u8>`, `chrono::Duration`,
+/// `crate::types::owner::Name`, `std::collections::HashMap<i64, String>`. So the
+/// gate is an allowlist of `[A-Za-z0-9_:<>, ]` plus a non-empty, balanced-angle-
+/// bracket requirement. That rejects every quote, newline, control char, and
+/// statement metacharacter (`;`, `(`, `)`, `{`, `}`, `=`, `"`, …) that could
+/// escape the type position, while admitting every shape `type_mapping` mints.
+fn type_path_problem(path: &str) -> Option<&'static str> {
+    if path.is_empty() {
+        return Some("rust_type path is empty");
+    }
+    let mut depth: i32 = 0;
+    for c in path.chars() {
+        match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | ':' | ',' | ' ' => {}
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth < 0 {
+                    return Some("rust_type path has an unbalanced `>`");
+                }
+            }
+            _ => return Some("rust_type path contains a character outside [A-Za-z0-9_:<>, ]"),
+        }
+    }
+    if depth != 0 {
+        return Some("rust_type path has an unbalanced `<`");
+    }
+    None
+}
+
 /// First reason `r` (or `package_id`) cannot be emitted, or `None` if every
 /// raw-interpolated identifier is safe. Covers the routine name, every
 /// parameter name, and the package_id — all of which land in raw positions in
@@ -286,6 +328,21 @@ pub(crate) fn invalid_identifier_reason(package_id: &str, r: &RoutineBinding) ->
         if let Some(reason) = rust_ident_problem(&p.name) {
             return Some(format!("parameter name `{}`: {reason}", p.name));
         }
+        // The parameter's rust_type.path lands raw in the `pub fn` signature
+        // (`{name}: {path}`) via `rust_type_sig`; gate it the same way as the
+        // names so a hostile path (`String" ; pub fn pwned(){}`) diverts to the
+        // fail-closed stub BEFORE any signature token is written, rather than
+        // either breaking the build or smuggling live Rust into a type position.
+        if let Some(reason) = type_path_problem(&p.rust_type.path) {
+            return Some(format!("parameter `{}` type path: {reason}", p.name));
+        }
+    }
+    // The return type path lands raw in the `Result<…, ExecutionError>` return
+    // position via `compute_return_type`/`rust_type_str`; gate it too.
+    if let Some(rt) = &r.return_type
+        && let Some(reason) = type_path_problem(&rt.path)
+    {
+        return Some(format!("return type path: {reason}"));
     }
     None
 }
@@ -353,12 +410,17 @@ fn emit_routine(out: &mut String, package_id: &str, r: &RoutineBinding, rust_nam
         let _ = writeln!(
             out,
             "    let _ = executor;\n    \
-             // bindgen: {problem}; the BindingPlan carries an identifier that is not a legal \
-             Rust identifier (or a package_id with an unsafe segment), so no wrapper can be \
+             // bindgen: {comment_problem}; the BindingPlan carries an identifier that is not a \
+             legal Rust identifier (or a package_id with an unsafe segment), so no wrapper can be \
              emitted for it.\n    \
              Err(ExecutionError {{ code: \"BINDING_INVALID_IDENTIFIER\".to_string(), \
              message: {msg:?}.to_string() }})",
-            problem = problem,
+            // `problem` embeds the raw (untrusted) routine/parameter name; a `\n`
+            // in it would terminate the single-line `//` comment and emit the
+            // remainder as live top-level Rust. comment_safe folds control chars
+            // to spaces so the whole diagnostic stays on one comment line. The
+            // `message: {msg:?}` literal below is already safe (Debug-escaped).
+            comment_problem = comment_safe(&problem),
             msg = format!(
                 "routine `{}` in package `{}`: {problem}; supply a BindingPlan with legal \
                  Rust-identifier routine/parameter names and an Oracle-safe package_id",
@@ -408,14 +470,26 @@ fn emit_routine(out: &mut String, package_id: &str, r: &RoutineBinding, rust_nam
     // Types we cannot scalar-marshal get a typed error body — never
     // a runtime `unimplemented!()` panic (the BG-004 audit defect).
     if let Some(why) = unsupported_type(r) {
+        // `why` embeds the raw (untrusted) parameter name + rust_type.path. The
+        // `invalid_identifier_reason` gate above already rejects a path with a
+        // quote/newline/metacharacter (diverting it to BINDING_INVALID_IDENTIFIER
+        // before we reach here), but route `why` through comment_safe for the
+        // `//` comment and Debug-format the whole message string (`{msg:?}`)
+        // anyway: defense-in-depth so a control char or quote can never escape
+        // either the single-line comment or the message string literal, matching
+        // the BINDING_INVALID_IDENTIFIER body's already-safe shape.
+        let msg = format!(
+            "{}: {why} is not scalar-marshallable; supply a manual wrapper or a \
+             .plsql-bindgen.toml type override",
+            r.name
+        );
         let _ = writeln!(
             out,
             "    let _ = executor;\n    \
-             // bindgen: {why} has no scalar bind marshalling.\n    \
+             // bindgen: {comment_why} has no scalar bind marshalling.\n    \
              Err(ExecutionError {{ code: \"BINDING_UNSUPPORTED_MARSHALLING\".to_string(), \
-             message: \"{}: {why} is not scalar-marshallable; supply a manual wrapper or a \
-             .plsql-bindgen.toml type override\".to_string() }})",
-            r.name
+             message: {msg:?}.to_string() }})",
+            comment_why = comment_safe(&why),
         );
         let _ = writeln!(out, "}}");
         return;
@@ -1864,6 +1938,278 @@ mod tests {
         assert!(package_id_problem(".pkg").is_some());
         assert!(package_id_problem("hr.\"injected").is_some());
         assert!(package_id_problem("hr.{brace}").is_some());
+    }
+
+    // === oracle-aqum.2 / oracle-aqum.3 (round 6): end the codegen-injection
+    // family. Every untrusted BindingPlan field that lands in a generated `//`
+    // comment must be routed through comment_safe, and every field that lands
+    // in a Rust code position (identifier OR type path) must pass a fail-closed
+    // validator before any token is written. The tests below drive real
+    // emit_wrappers with hostile fields and assert nothing escapes. ===
+
+    /// Assert that no line of `src` *starts* (after indentation) with a Rust
+    /// item keyword that a hostile field tried to smuggle to a top-level
+    /// position. Unlike `assert_all_lines_are_comments`, this tolerates the
+    /// legitimate generated `pub fn`/`let`/`Err(` lines a real wrapper emits —
+    /// it only fails on a line whose *leading* token is an attacker-supplied
+    /// injection marker that should only ever survive as inert comment text.
+    fn assert_no_injected_item_leaks(src: &str, markers: &[&str]) {
+        for line in src.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue; // inert comment text is fine
+            }
+            for marker in markers {
+                assert!(
+                    !trimmed.starts_with(marker),
+                    "an untrusted field smuggled `{marker}` to a line-leading \
+                     top-level position: {line:?}\nfull source:\n{src}"
+                );
+            }
+        }
+    }
+
+    /// Assert that wherever `marker` appears in `src` it is *neutralized*: the
+    /// line is either a `//` comment (the field was folded onto one comment line
+    /// by comment_safe) or the marker sits inside a `"…"` string literal (the
+    /// field was Debug-escaped into the typed-error `message`). It must never
+    /// appear as bare, line-leading Rust — that would be a live injected item.
+    fn assert_injected_text_only_in_comments(src: &str, marker: &str) {
+        for line in src.lines() {
+            let Some(pos) = line.find(marker) else {
+                continue;
+            };
+            let trimmed = line.trim_start();
+            let in_comment = trimmed.starts_with("//");
+            // The marker is inside a string literal iff a `"` opens before it on
+            // the same line (the Debug-escaped message keeps everything on one
+            // physical line, so an unescaped real `"` cannot precede it).
+            let in_string_literal = line[..pos].contains('"');
+            assert!(
+                in_comment || in_string_literal,
+                "`{marker}` escaped as live Rust (not a comment, not a string \
+                 literal): {line:?}\nfull source:\n{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn routine_name_with_newline_cannot_escape_invalid_identifier_comment() {
+        // oracle-aqum.2: a routine name carrying a newline + an injected
+        // top-level item drives the BINDING_INVALID_IDENTIFIER body, whose `//`
+        // comment interpolated `problem` (which embeds the raw routine name)
+        // RAW before the fix — the `\n` terminated the comment and emitted the
+        // tail as live top-level Rust. comment_safe now folds the newline to a
+        // space so the whole diagnostic stays on one comment line.
+        let r = RoutineBinding {
+            name: "ev\n    Ok(())\n}\npub fn injected_via_routine_name() -> i32 { 42 }\n//il"
+                .into(),
+            kind: RoutineKind::Procedure,
+            parameters: vec![param("p_a", "i64", ParameterMode::In, false)],
+            return_type: None,
+            autonomous_transaction: false,
+        };
+        let src = emit_wrappers(&plan(vec![r]));
+        assert!(
+            src.contains("BINDING_INVALID_IDENTIFIER"),
+            "hostile routine name must fail closed: {src}"
+        );
+        // The injected `pub fn` survives only as inert text inside the single
+        // `//` diagnostic line — never at a line-leading top-level position.
+        assert_no_injected_item_leaks(&src, &["pub fn injected_via_routine_name"]);
+        assert_injected_text_only_in_comments(&src, "pub fn injected_via_routine_name");
+    }
+
+    #[test]
+    fn parameter_name_with_newline_cannot_escape_invalid_identifier_comment() {
+        // oracle-aqum.2 (parameter variant): a parameter name carrying a
+        // newline + injected item must likewise stay inside the comment.
+        let r = RoutineBinding {
+            name: "ok_proc".into(),
+            kind: RoutineKind::Procedure,
+            parameters: vec![param(
+                "p_a\n}\npub fn injected_via_param_name() -> i32 { 7 }\n//",
+                "i64",
+                ParameterMode::In,
+                false,
+            )],
+            return_type: None,
+            autonomous_transaction: false,
+        };
+        let src = emit_wrappers(&plan(vec![r]));
+        assert!(
+            src.contains("BINDING_INVALID_IDENTIFIER"),
+            "hostile parameter name must fail closed: {src}"
+        );
+        assert_no_injected_item_leaks(&src, &["pub fn injected_via_param_name"]);
+        assert_injected_text_only_in_comments(&src, "pub fn injected_via_param_name");
+    }
+
+    #[test]
+    fn parameter_type_path_with_quote_fails_closed() {
+        // oracle-aqum.3: RustTypeRef.path is unconstrained on the wire. A path
+        // like `String" ; pub fn pwned(){}` was interpolated RAW into the `pub
+        // fn` signature (`p_x: String" ; pub fn pwned(){}`), producing
+        // uncompilable Rust with attacker tokens in a live position. The
+        // type-path gate now diverts it to the fail-closed stub BEFORE the
+        // signature is written.
+        let r = RoutineBinding {
+            name: "do_thing".into(),
+            kind: RoutineKind::Procedure,
+            parameters: vec![param(
+                "p_x",
+                "String\" ; pub fn pwned(){}",
+                ParameterMode::In,
+                false,
+            )],
+            return_type: None,
+            autonomous_transaction: false,
+        };
+        let src = emit_wrappers(&plan(vec![r]));
+        assert!(
+            src.contains("BINDING_INVALID_IDENTIFIER"),
+            "hostile type path must fail closed: {src}"
+        );
+        // The raw path never reaches the signature position.
+        assert!(
+            !src.contains("p_x: String\""),
+            "the raw type path leaked into the signature: {src}"
+        );
+        assert!(
+            !src.contains("pub fn pwned"),
+            "the type path smuggled a `pub fn` into a code position: {src}"
+        );
+        assert_no_injected_item_leaks(&src, &["pub fn pwned"]);
+    }
+
+    #[test]
+    fn return_type_path_with_injection_fails_closed() {
+        // oracle-aqum.3 (return-type variant): the return type path lands in the
+        // `Result<…, ExecutionError>` position via compute_return_type. A
+        // hostile path must divert to the fail-closed stub, not the signature.
+        let r = RoutineBinding {
+            name: "make_thing".into(),
+            kind: RoutineKind::Function,
+            parameters: vec![param("p_x", "i64", ParameterMode::In, false)],
+            return_type: Some(RustTypeRef {
+                path: "Bogus> { } pub fn pwned() -> i32 { 42 } fn _x() -> Result<(".into(),
+                nullable: false,
+            }),
+            autonomous_transaction: false,
+        };
+        let src = emit_wrappers(&plan(vec![r]));
+        assert!(
+            src.contains("BINDING_INVALID_IDENTIFIER"),
+            "hostile return type path must fail closed: {src}"
+        );
+        assert!(
+            !src.contains("pub fn pwned"),
+            "the return type path smuggled a `pub fn`: {src}"
+        );
+        // The malformed path never reaches the `Result<…>` position.
+        assert!(
+            !src.contains("Result<Bogus>"),
+            "the raw return type path leaked into the Result position: {src}"
+        );
+        assert_no_injected_item_leaks(&src, &["pub fn pwned"]);
+    }
+
+    #[test]
+    fn type_path_problem_allows_real_paths_rejects_injection() {
+        // Direct unit coverage of the type-path validator. Every shape
+        // `type_mapping` mints must pass; every metacharacter that could escape
+        // a Rust type position must be rejected.
+        assert!(type_path_problem("i64").is_none());
+        assert!(type_path_problem("String").is_none());
+        assert!(type_path_problem("Vec<u8>").is_none());
+        assert!(type_path_problem("Option<String>").is_none());
+        assert!(type_path_problem("chrono::Duration").is_none());
+        assert!(type_path_problem("crate::oracle_types::OracleDateTime").is_none());
+        assert!(type_path_problem("crate::types::owner::Name").is_none());
+        assert!(type_path_problem("std::collections::HashMap<i64, String>").is_none());
+        assert!(type_path_problem("rust_decimal::Decimal").is_none());
+        // Rejections.
+        assert!(type_path_problem("").is_some());
+        assert!(type_path_problem("String\" ; pub fn pwned(){}").is_some());
+        assert!(type_path_problem("i64;").is_some());
+        assert!(type_path_problem("i64\nfn x(){}").is_some());
+        assert!(type_path_problem("Vec<u8").is_some(), "unbalanced `<`");
+        assert!(type_path_problem("u8>").is_some(), "unbalanced `>`");
+        assert!(type_path_problem("Foo>Bar<Baz").is_some(), "interleaved brackets");
+        assert!(type_path_problem("(i64)").is_some());
+        assert!(type_path_problem("Foo=Bar").is_some());
+    }
+
+    #[test]
+    fn no_untrusted_field_can_escape_generated_comment_or_inject_rust() {
+        // oracle-aqum.2 + oracle-aqum.3 family-ender: one plan loaded with a
+        // hostile value in EVERY untrusted field that the emitter interpolates
+        // into a generated `//` comment OR a Rust code position — package_name,
+        // package_id, routine name, parameter name, parameter type path, return
+        // type path, and every BindingDiagnostic field. The emitted module must
+        // contain ZERO line-leading injected top-level items; every hostile
+        // value survives only as inert comment text or a Debug-escaped literal.
+        let injection = "\n}\npub fn PWNED() -> i32 { 42 }\n//";
+        let mut p = plan(vec![
+            // Hostile package_id + hostile routine name (invalid-identifier path).
+            RoutineBinding {
+                name: format!("r1{injection}"),
+                kind: RoutineKind::Procedure,
+                parameters: vec![param("p_a", "i64", ParameterMode::In, false)],
+                return_type: None,
+                autonomous_transaction: false,
+            },
+            // Legal names but hostile parameter type path (type-path gate).
+            RoutineBinding {
+                name: "r2".into(),
+                kind: RoutineKind::Procedure,
+                parameters: vec![param(
+                    "p_b",
+                    "String\"; pub fn PWNED() {}",
+                    ParameterMode::In,
+                    false,
+                )],
+                return_type: None,
+                autonomous_transaction: false,
+            },
+            // Legal names + a valid-but-unmarshallable type (UNSUPPORTED path).
+            RoutineBinding {
+                name: "r3".into(),
+                kind: RoutineKind::Function,
+                parameters: vec![param("p_c", "chrono::NaiveDate", ParameterMode::In, false)],
+                return_type: Some(RustTypeRef {
+                    path: "i64".into(),
+                    nullable: false,
+                }),
+                autonomous_transaction: false,
+            },
+        ]);
+        p.package_name = format!("pkgname{injection}");
+        // package_id stays Oracle-safe so r2/r3 reach their own gates; r1's
+        // hostile name already exercises the invalid-identifier comment.
+        p.package_id = "hr.demo_pkg".into();
+        p.diagnostics.push(BindingDiagnostic {
+            routine: Some(format!("diagrtn{injection}")),
+            code: format!("DIAGCODE{injection}"),
+            message: format!("diagmsg{injection}"),
+            suggested_workaround: Some(format!("diagwork{injection}")),
+            span: None,
+            severity: BindingSeverity::Warn,
+        });
+        let src = emit_wrappers(&p);
+        // The single injected item marker must NEVER appear at a line-leading
+        // top-level position, regardless of which field carried it. (`}` is not
+        // a usable discriminator here: legitimate function-closing braces are
+        // line-leading too — the injected `pub fn PWNED` is the real marker.)
+        assert_no_injected_item_leaks(&src, &["pub fn PWNED"]);
+        // And no field-borne `pub fn PWNED` survived as live Rust anywhere:
+        // every occurrence is inside an inert `//` comment or a Debug-escaped
+        // `"…"` message literal, never a bare top-level item.
+        assert_injected_text_only_in_comments(&src, "pub fn PWNED");
+        // The fail-closed routines still emit their typed bodies (nothing was
+        // silently dropped), and the legal r3 emits its UNSUPPORTED body.
+        assert!(src.contains("BINDING_INVALID_IDENTIFIER"), "{src}");
+        assert!(src.contains("BINDING_UNSUPPORTED_MARSHALLING"), "{src}");
     }
 
     // A hand-mirrored copy of exactly what `emit_routine_body_dynamic`
