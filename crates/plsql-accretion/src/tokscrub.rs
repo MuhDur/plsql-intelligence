@@ -180,13 +180,25 @@ fn synthesise(class: Class, original: &str) -> String {
 /// privacy layers (`fixture.rs::privacy_residue_clean` at build time
 /// and `gate.rs::residue_check` / G8 at re-scan time) must agree on.
 ///
-/// Exactly the synthesis vocabulary, nothing looser:
-/// * `id_<hex12>`  — `Class::Ident` / `Class::QuotedIdent` body
-///   (the surrounding `"…"` is stripped first).
-/// * `sx_<hex8>`   — `Class::Str` body (the surrounding `'…'` is
-///   stripped first).
-/// * `7` / `7.0`   — the only two numerals [`synthesise`] emits for a
-///   `Class::Num` (integer / float subtype).
+/// Exactly the synthesis vocabulary, nothing looser — and, crucially,
+/// **delimiter-aware**: each accepted body shape is tied to the exact
+/// delimiter [`synthesise`] emits it with, because the lexer carries
+/// the verbatim delimiters in a token's text (a `StringLiteral` is
+/// `'…'`, a `QuotedIdentifier` is `"…"`).
+/// * `'sx_<hex8>'`     — single-quote-delimited body, the ONLY shape
+///   `synthesise(Class::Str, _)` emits. A `'…'` body that is not
+///   `sx_<hex8>` (e.g. `'7'`, `'7.0'`, `'id_<hex12>'`) is an
+///   un-scrubbed original *string* and fails closed.
+/// * `"id_<hex12>"`    — double-quote-delimited body, the ONLY shape
+///   `synthesise(Class::QuotedIdent, _)` emits.
+/// * `id_<hex12>`      — undelimited `Class::Ident` body.
+/// * `7` / `7.0`       — undelimited, the only two numerals
+///   `synthesise(Class::Num, _)` emits (integer / float subtype).
+/// * `sx_<hex8>`       — undelimited; only to keep the bare-body unit
+///   tests honest. A bare `sx_` token cannot reach this path from the
+///   real lexer (`token_verdicts` always carries the `'…'` for a
+///   `StringLiteral`), so this branch is dead on the production path
+///   yet never widens the single-quoted acceptance set.
 ///
 /// Everything else fails closed. There is deliberately **no** broad
 /// "any all-digit token" or "id_/sx_ + any alphanumeric of any
@@ -198,18 +210,38 @@ fn synthesise(class: Class, original: &str) -> String {
 /// never drift again (oracle-qm3q.25).
 #[must_use]
 pub fn is_synthetic_alias(text: &str) -> bool {
-    // Strip the synthetic's own delimiters: a string synthetic keeps
-    // its `'…'`, a quoted-id synthetic its `"…"`.
-    let body = text.trim_matches('\'').trim_matches('"');
-    if let Some(hex) = body.strip_prefix("id_") {
-        return hex.len() == 12 && hex.bytes().all(|b| b.is_ascii_hexdigit());
+    let is_hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit());
+
+    // A single-quote-delimited token is a `StringLiteral`: the ONLY
+    // synthetic `synthesise(Class::Str, _)` can emit is `'sx_<hex8>'`.
+    // Nothing else (`'7'`, `'7.0'`, `'id_<hex12>'`, …) is a synthetic;
+    // those are un-scrubbed original string bodies and fail closed.
+    if let Some(body) = text
+        .strip_prefix('\'')
+        .and_then(|b| b.strip_suffix('\''))
+    {
+        return body.strip_prefix("sx_").is_some_and(|hex| is_hex(hex, 8));
     }
-    if let Some(hex) = body.strip_prefix("sx_") {
-        return hex.len() == 8 && hex.bytes().all(|b| b.is_ascii_hexdigit());
+
+    // A double-quote-delimited token is a `QuotedIdentifier`: the ONLY
+    // synthetic is `"id_<hex12>"`.
+    if let Some(body) = text.strip_prefix('"').and_then(|b| b.strip_suffix('"')) {
+        return body.strip_prefix("id_").is_some_and(|hex| is_hex(hex, 12));
+    }
+
+    // Undelimited tokens: a bare `Class::Ident` synthetic (`id_<hex12>`),
+    // a bare numeral synthetic (`7` / `7.0`), or — only so the bare-body
+    // unit tests stay honest — a bare `sx_<hex8>` (unreachable from the
+    // lexer, which always quotes a `StringLiteral`).
+    if let Some(hex) = text.strip_prefix("id_") {
+        return is_hex(hex, 12);
+    }
+    if let Some(hex) = text.strip_prefix("sx_") {
+        return is_hex(hex, 8);
     }
     // The two — and only two — numerals `synthesise(Class::Num, _)`
     // can emit.
-    body == "7" || body == "7.0"
+    text == "7" || text == "7.0"
 }
 
 /// Tokenise `src` with the real ANTLR backend and re-synthesise it
@@ -507,5 +539,78 @@ mod tests {
         assert!(!is_synthetic_alias("customer_ssn"));
         assert!(!is_synthetic_alias("ACME"));
         assert!(!is_synthetic_alias(""));
+    }
+
+    #[test]
+    fn single_quoted_body_validates_only_as_sx_hex8() {
+        // oracle-ajm2.23 — a single-quote-delimited token is a
+        // `StringLiteral`; `synthesise(Class::Str, _)` can ONLY emit
+        // `'sx_<hex8>'`. The pre-fix code stripped both quote kinds
+        // unconditionally, so `'7'`, `'7.0'`, `'id_<hex12>'`, and
+        // `'sx_<hex8>'`-as-string-content all wrongly validated as
+        // clean synthetics. They are un-scrubbed original string
+        // bodies and must fail closed.
+        assert!(
+            !is_synthetic_alias("'7'"),
+            "single-quoted '7' is an original string literal, not a Class::Num synthetic"
+        );
+        assert!(!is_synthetic_alias("'7.0'"));
+        assert!(
+            !is_synthetic_alias("'id_0123456789ab'"),
+            "single-quoted id_ is original string content, not a Class::QuotedIdent synthetic"
+        );
+        // The only single-quoted shape `synthesise(Class::Str, _)`
+        // emits still validates.
+        assert!(is_synthetic_alias("'sx_0123abcd'"));
+        // A double-quoted token is a QuotedIdentifier: only id_<hex12>.
+        assert!(is_synthetic_alias("\"id_0123456789ab\""));
+        assert!(
+            !is_synthetic_alias("\"sx_0123abcd\""),
+            "double-quoted sx_ is not a Class::QuotedIdent synthetic"
+        );
+        assert!(!is_synthetic_alias("\"7\""));
+    }
+
+    #[test]
+    fn residue_proof_rejects_low_entropy_string_literals_via_real_lexer() {
+        // oracle-ajm2.23 — drive the fix through the REAL ANTLR lexer
+        // exactly as `gate.rs::residue_check` / `fixture.rs` do: the
+        // verbatim StringLiteral token text carries the surrounding
+        // single quotes, so `'7'` reaches `is_synthetic_alias` as the
+        // body `"'7'"` and must be rejected as residue.
+        //
+        // We isolate the verdict for the SINGLE-QUOTED token in each
+        // snippet (the surrounding `x`/`status` identifiers and bare
+        // numerals are estate-class too, but they are not the shape
+        // under test). The `'…'` token is the only one whose verbatim
+        // text starts and ends with a single quote.
+        let quoted_verdict = |snippet: &str| -> bool {
+            token_verdicts(snippet)
+                .expect("tokenises")
+                .into_iter()
+                .find_map(|v| match v {
+                    TokVerdict::EstateClass(body)
+                        if body.starts_with('\'') && body.ends_with('\'') =>
+                    {
+                        Some(is_synthetic_alias(&body))
+                    }
+                    _ => None,
+                })
+                .expect("snippet contains a single-quoted string literal")
+        };
+        // Each low-entropy single-quoted body is now flagged as residue
+        // (NOT a synthetic alias), where the pre-fix conflation passed.
+        assert!(
+            !quoted_verdict("SELECT 1 FROM dual WHERE status = '7'"),
+            "single-quoted '7' must be flagged as un-scrubbed residue"
+        );
+        assert!(!quoted_verdict("SELECT 1 FROM dual WHERE x = '7.0'"));
+        assert!(!quoted_verdict("SELECT 1 FROM dual WHERE x = 'id_0123456789ab'"));
+        // A genuinely-scrubbed string literal ('sx_<hex8>') still
+        // validates as the synthetic `synthesise(Class::Str, _)` emits.
+        assert!(
+            quoted_verdict("SELECT 1 FROM dual WHERE x = 'sx_0123abcd'"),
+            "a real Class::Str synthetic must pass the residue proof"
+        );
     }
 }

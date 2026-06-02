@@ -384,11 +384,22 @@ pub fn roundtrip_check(corpus_dir: &Path, fixtures_dir: &Path) -> Result<String,
     use plsql_parser::{ParseOptions, parse_with_backend};
     use plsql_parser_antlr::Antlr4RustBackend;
 
-    let mut files = collect_sources(corpus_dir);
-    if fixtures_dir.is_dir() {
-        files.extend(collect_sources(fixtures_dir));
-    }
-    files.sort();
+    let corpus_files = collect_sources(corpus_dir);
+    let fixture_files = if fixtures_dir.is_dir() {
+        collect_sources(fixtures_dir)
+    } else {
+        Vec::new()
+    };
+    // Tag each input with its origin so the evidence line can report
+    // the VERIFIED corpus / fixture split (never the merely-FOUND
+    // count) — a vacuous-pass guard against the self-inconsistent
+    // "over 0 inputs (1 corpus + …)" line (oracle-ajm2.11).
+    let mut files: Vec<(bool, &Path)> = corpus_files
+        .iter()
+        .map(|f| (true, f.as_path()))
+        .chain(fixture_files.iter().map(|f| (false, f.as_path())))
+        .collect();
+    files.sort_by(|a, b| a.1.cmp(b.1));
     if files.is_empty() {
         // A round-trip stage with zero inputs cannot make a real
         // claim — fail-closed (never a vacuous pass).
@@ -400,10 +411,22 @@ pub fn roundtrip_check(corpus_dir: &Path, fixtures_dir: &Path) -> Result<String,
     }
     let backend = Antlr4RustBackend::new();
     let mut checked = 0usize;
-    for f in &files {
-        let Ok(src) = std::fs::read_to_string(f) else {
-            continue;
-        };
+    let mut corpus_verified = 0usize;
+    let mut fixtures_verified = 0usize;
+    for (is_corpus, f) in &files {
+        // An unreadable collected file is a FOUND input the stage
+        // cannot verify (non-UTF-8 legacy PL/SQL, or a TOCTOU
+        // delete/chmod between listing and read). We cannot prove a
+        // file rounds-trips losslessly if we cannot even read it, so
+        // this is a hard gate failure — never a silent skip that would
+        // shrink the verified denominator toward a vacuous "100%"
+        // (oracle-ajm2.11).
+        let src = std::fs::read_to_string(f).map_err(|e| {
+            GateError::Io(format!(
+                "round-trip input {} could not be read ({e}) — cannot prove lossless over a file that exists; fail-closed",
+                f.display()
+            ))
+        })?;
         let r = parse_with_backend(&src, FileId::new(0), &backend, &ParseOptions::default());
         let recon = r.cst.reconstruct();
         if recon != src {
@@ -415,15 +438,21 @@ pub fn roundtrip_check(corpus_dir: &Path, fixtures_dir: &Path) -> Result<String,
             )));
         }
         checked += 1;
+        if *is_corpus {
+            corpus_verified += 1;
+        } else {
+            fixtures_verified += 1;
+        }
+    }
+    // Defense-in-depth: even with the per-file fail-closed above, never
+    // emit a "100%" claim backed by zero verified inputs.
+    if checked == 0 {
+        return Err(GateError::Io(
+            "0 round-trip inputs verified — vacuous claim refused".into(),
+        ));
     }
     Ok(format!(
-        "lossless round-trip 100% over {checked} inputs ({} corpus + {} prior MinFixtures)",
-        collect_sources(corpus_dir).len(),
-        if fixtures_dir.is_dir() {
-            collect_sources(fixtures_dir).len()
-        } else {
-            0
-        }
+        "lossless round-trip 100% over {checked} inputs ({corpus_verified} corpus + {fixtures_verified} prior MinFixtures)"
     ))
 }
 
@@ -589,9 +618,18 @@ pub fn residue_check(candidate_text: &str, fixtures_dir: &Path) -> Result<String
     let mut fixtures_scanned = 0usize;
     if fixtures_dir.is_dir() {
         for f in collect_sources(fixtures_dir) {
-            let Ok(src) = std::fs::read_to_string(&f) else {
-                continue;
-            };
+            // An unreadable fixture is a FOUND artifact the privacy
+            // stage cannot scan; silently skipping it would let an
+            // un-proven (possibly estate-bearing) fixture slip through
+            // the I-PRIVACY backstop. Treat a read failure as a hard
+            // residue failure — fail-closed, never silently un-scanned
+            // (oracle-ajm2.11).
+            let src = std::fs::read_to_string(&f).map_err(|e| {
+                GateError::PrivacyResidue(format!(
+                    "I-PRIVACY: fixture {} could not be read ({e}) — cannot prove it carries no estate residue; fail-closed",
+                    f.display()
+                ))
+            })?;
             scan_one(&format!("fixture {}", f.display()), &src)?;
             if let Some(verdicts) = crate::tokscrub::token_verdicts(&src) {
                 for v in verdicts {
@@ -1019,6 +1057,87 @@ mod tests {
         let leak = "# usr-gate: x\nselect ESTATE_SECRET from t;\n";
         let e = residue_check(leak, Path::new("/no/such/fixtures/xyzzy")).unwrap_err();
         assert!(matches!(e, GateError::PrivacyResidue(_)), "{e:?}");
+    }
+
+    /// Allocate a fresh, unique temp dir (no fixed name ⇒ no cross-test
+    /// collision under a shared `TMPDIR`).
+    #[cfg(test)]
+    fn unique_tmpdir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "plsql-gate-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("mk tmpdir");
+        dir
+    }
+
+    /// **G2 fail-closed regression (oracle-ajm2.11).** A corpus whose
+    /// only collected source file is unreadable (non-UTF-8 legacy
+    /// PL/SQL, or a TOCTOU delete/chmod) MUST be a hard gate failure —
+    /// never the vacuous `lossless round-trip 100% over 0 inputs`
+    /// PASS the pre-fix `let Ok(src) = … else { continue; }` produced.
+    #[test]
+    fn roundtrip_fails_closed_on_unreadable_input() {
+        let corpus = unique_tmpdir("rt-unreadable");
+        // A `.sql` file with non-UTF-8 bytes — `read_to_string` fails.
+        std::fs::write(
+            corpus.join("legacy.sql"),
+            b"\xff\xfe\x00\x80 SELECT 1 FROM dual;",
+        )
+        .expect("write non-utf8 fixture");
+
+        let res = roundtrip_check(&corpus, Path::new("/no/such/fixtures/xyzzy"));
+        let _ = std::fs::remove_dir_all(&corpus);
+
+        let e = res.expect_err("an unreadable found input must NOT vacuous-pass");
+        assert!(
+            matches!(e, GateError::Io(ref m) if m.contains("could not be read")),
+            "expected a fail-closed Io read error, got {e:?}"
+        );
+    }
+
+    /// The evidence line must report the VERIFIED corpus / fixture
+    /// split, not the merely-FOUND count (the pre-fix self-inconsistent
+    /// `over 0 inputs (1 corpus + …)` line). A clean ASCII corpus
+    /// rounds-trips and the counts are consistent.
+    #[test]
+    fn roundtrip_reports_verified_counts() {
+        let corpus = unique_tmpdir("rt-verified");
+        std::fs::write(corpus.join("ok.sql"), "SELECT 1 FROM dual;\n").expect("write");
+        let report = roundtrip_check(&corpus, Path::new("/no/such/fixtures/xyzzy"))
+            .expect("clean ASCII corpus round-trips");
+        let _ = std::fs::remove_dir_all(&corpus);
+        assert!(
+            report.contains("over 1 inputs") && report.contains("1 corpus"),
+            "verified-count evidence must be self-consistent, got {report:?}"
+        );
+    }
+
+    /// **G8 fail-closed regression (oracle-ajm2.11).** An unreadable
+    /// fixture is a FOUND artifact the privacy stage cannot scan;
+    /// silently skipping it (the pre-fix `let Ok(src) = … else
+    /// { continue; }`) would let an un-proven fixture slip through the
+    /// I-PRIVACY backstop. It MUST be a typed `PrivacyResidue` failure.
+    #[test]
+    fn residue_check_fails_closed_on_unreadable_fixture() {
+        let fixtures = unique_tmpdir("residue-unreadable");
+        std::fs::write(
+            fixtures.join("legacy.sql"),
+            b"\xff\xfe\x00\x80 SELECT 1 FROM dual;",
+        )
+        .expect("write non-utf8 fixture");
+
+        let res = residue_check("# usr-gate: clean candidate\n", &fixtures);
+        let _ = std::fs::remove_dir_all(&fixtures);
+
+        let e = res.expect_err("an unreadable fixture must NOT be silently un-scanned");
+        assert!(
+            matches!(e, GateError::PrivacyResidue(ref m) if m.contains("could not be read")),
+            "expected a fail-closed PrivacyResidue read error, got {e:?}"
+        );
     }
 
     /// **G8 privacy backstop regression (oracle-qm3q.25).** A planted
