@@ -27,9 +27,9 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 use miette::Diagnostic;
 use plsql_engine::{
-    ANALYSIS_RUN_SCHEMA, AnalysisRequest, analysis_run_envelope, analyze_project,
-    engine_doctor_envelope, engine_doctor_report, engine_full_doctor_envelope,
-    engine_full_doctor_report,
+    ANALYSIS_RUN_SCHEMA, AnalysisRequest, SchemaCompatibility, analysis_run_envelope,
+    analyze_project, engine_doctor_envelope, engine_doctor_report, engine_full_doctor_envelope,
+    engine_full_doctor_report, schema_compatibility,
 };
 use plsql_output::RobotJsonEnvelope;
 use thiserror::Error;
@@ -413,6 +413,45 @@ fn run_analyze(args: AnalyzeArgs, robot_json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Schema-compatibility gate for a loaded `AnalysisRun` artifact
+/// (`plsql-engine doctor --run`). Routes the artifact's
+/// `(schema_id, schema_version)` through
+/// [`plsql_engine::schema_compatibility`] so the documented
+/// additive-minor forward-compat tolerance is actually *enforced*
+/// here rather than merely defined: a same-id artifact whose minor
+/// version is greater-or-equal to this build's is accepted
+/// (`Compatible` / `ForwardCompatible` — the consumer simply
+/// ignores any newer optional fields), and only a differing
+/// `schema_id` (wrong payload shape) or a differing major version
+/// (incompatible wire shape) is rejected fail-closed with
+/// [`CliError::IncompatibleSchema`].
+fn check_artifact_schema(
+    schema_id: &str,
+    schema_version: plsql_output::SchemaVersion,
+) -> Result<(), CliError> {
+    let id_matches = schema_id == ANALYSIS_RUN_SCHEMA.id;
+    let version_ok = matches!(
+        schema_compatibility(schema_version, ANALYSIS_RUN_SCHEMA.version),
+        SchemaCompatibility::Compatible | SchemaCompatibility::ForwardCompatible
+    );
+    if id_matches && version_ok {
+        return Ok(());
+    }
+    Err(CliError::IncompatibleSchema {
+        found: format!(
+            "{}@{}.{}.{}",
+            schema_id, schema_version.major, schema_version.minor, schema_version.patch
+        ),
+        expected: format!(
+            "{}@{}.{}.{}",
+            ANALYSIS_RUN_SCHEMA.id,
+            ANALYSIS_RUN_SCHEMA.version.major,
+            ANALYSIS_RUN_SCHEMA.version.minor,
+            ANALYSIS_RUN_SCHEMA.version.patch
+        ),
+    })
+}
+
 fn run_doctor(args: DoctorArgs, robot_json: bool) -> Result<(), CliError> {
     let raw = if args.run == "-" {
         use std::io::Read;
@@ -437,24 +476,7 @@ fn run_doctor(args: DoctorArgs, robot_json: bool) -> Result<(), CliError> {
             reason: e.to_string(),
         })?;
 
-    if !envelope.matches_schema(ANALYSIS_RUN_SCHEMA) {
-        return Err(CliError::IncompatibleSchema {
-            found: format!(
-                "{}@{}.{}.{}",
-                envelope.schema_id,
-                envelope.schema_version.major,
-                envelope.schema_version.minor,
-                envelope.schema_version.patch
-            ),
-            expected: format!(
-                "{}@{}.{}.{}",
-                ANALYSIS_RUN_SCHEMA.id,
-                ANALYSIS_RUN_SCHEMA.version.major,
-                ANALYSIS_RUN_SCHEMA.version.minor,
-                ANALYSIS_RUN_SCHEMA.version.patch
-            ),
-        });
-    }
+    check_artifact_schema(&envelope.schema_id, envelope.schema_version)?;
 
     if args.memory {
         let prof = plsql_engine::engine_memory_profile(&envelope.payload);
@@ -718,6 +740,76 @@ mod tests {
         assert!(
             s.contains("--robot-json") || s.contains("similar"),
             "clap should suggest --robot-json for --robotjson typo; got: {s}"
+        );
+    }
+
+    /// The `doctor --run` schema gate must route through
+    /// `schema_compatibility`, not strict `matches_schema` equality, so
+    /// the documented additive-minor forward-compat tolerance is actually
+    /// enforced at the only production site that reads a serialized
+    /// artifact. Before the fix the gate used exact `(id, version)`
+    /// equality and a same-major higher-minor artifact — which
+    /// `is_readable_by` reports as ForwardCompatible — was rejected,
+    /// making the entire compatibility tier dead in production
+    /// (oracle-ajm2.17).
+    #[test]
+    fn doctor_gate_accepts_forward_compatible_minor() {
+        use plsql_output::SchemaVersion;
+
+        let canonical = ANALYSIS_RUN_SCHEMA.version;
+
+        // Exact match is accepted.
+        check_artifact_schema(ANALYSIS_RUN_SCHEMA.id, canonical)
+            .expect("exact-version artifact must be readable");
+
+        // Same-major, higher-minor (newer optional fields) — the
+        // additive-minor tolerance. This is the case that was wrongly
+        // rejected before the fix.
+        let higher_minor = SchemaVersion::new(canonical.major, canonical.minor + 1, 0);
+        check_artifact_schema(ANALYSIS_RUN_SCHEMA.id, higher_minor).expect(
+            "a same-major higher-minor artifact is ForwardCompatible and must be accepted",
+        );
+
+        // Same-major, lower-or-equal minor — Compatible.
+        let lower_minor = SchemaVersion::new(canonical.major, 0, 0);
+        check_artifact_schema(ANALYSIS_RUN_SCHEMA.id, lower_minor)
+            .expect("a same-major lower-minor artifact is Compatible and must be accepted");
+
+        // Patch level never affects compatibility.
+        let bumped_patch =
+            SchemaVersion::new(canonical.major, canonical.minor, canonical.patch + 7);
+        check_artifact_schema(ANALYSIS_RUN_SCHEMA.id, bumped_patch)
+            .expect("patch bumps must never affect readability");
+    }
+
+    /// The gate must still fail closed: a differing major version (wire
+    /// shape changed) or a differing `schema_id` (wrong payload shape)
+    /// is rejected with `IncompatibleSchema` (exit 2). Routing through
+    /// `schema_compatibility` must not weaken this fail-closed guarantee
+    /// (oracle-ajm2.17).
+    #[test]
+    fn doctor_gate_rejects_major_bump_and_wrong_id_fail_closed() {
+        use plsql_output::SchemaVersion;
+
+        let canonical = ANALYSIS_RUN_SCHEMA.version;
+
+        // Different major — incompatible wire shape.
+        let next_major = SchemaVersion::new(canonical.major + 1, 0, 0);
+        let err = check_artifact_schema(ANALYSIS_RUN_SCHEMA.id, next_major)
+            .expect_err("a next-major artifact must be rejected");
+        assert!(
+            matches!(err, CliError::IncompatibleSchema { .. }),
+            "expected IncompatibleSchema, got {err:?}"
+        );
+        assert_eq!(err.exit_code(), 2, "incompatible artifact is an invocation failure");
+
+        // Right version, wrong schema_id — wrong payload shape (e.g. a
+        // doctor report masquerading as a run artifact).
+        let err = check_artifact_schema("plsql.engine.doctor", canonical)
+            .expect_err("a mismatched schema_id must be rejected even at the right version");
+        assert!(
+            matches!(err, CliError::IncompatibleSchema { .. }),
+            "expected IncompatibleSchema for wrong schema_id, got {err:?}"
         );
     }
 }

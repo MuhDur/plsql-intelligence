@@ -193,11 +193,16 @@ pub use plsql_depgraph::DepGraph;
 // ---------------------------------------------------------------------------
 
 /// Robot-JSON schema for the reusable [`AnalysisRun`] artifact
-/// emitted by `plsql-engine analyze`. Every downstream CLI (the
-/// SAST scan harness, MCP foundation tools, engine doctor) loads
-/// an artifact tagged with this id/version and runs
-/// [`AnalysisArtifactManifest::is_readable_by`] /
-/// [`schema_compatibility`] before trusting it.
+/// emitted by `plsql-engine analyze`. The engine `doctor` gate
+/// (`plsql-engine doctor --run`) classifies a loaded artifact's
+/// `(schema_id, schema_version)` through [`schema_compatibility`]
+/// before trusting the payload: a same-id artifact whose minor
+/// version is `>=` this build's is accepted (the additive-minor
+/// forward-compat tolerance), and only a differing `schema_id` or
+/// major version is rejected. The same [`schema_compatibility`] /
+/// [`AnalysisArtifactManifest::is_readable_by`] helpers back any
+/// downstream consumer (the SAST scan harness, MCP foundation
+/// tools) that gates on the embedded manifest version.
 pub const ANALYSIS_RUN_SCHEMA: plsql_output::SchemaDescriptor = plsql_output::SchemaDescriptor {
     id: "plsql.engine.analysis_run",
     // 1.1.0: additive honest-completeness signals (oracle-bh4p) —
@@ -702,7 +707,13 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
     // path so that doctor reports always reflect the wired backend (not "<none>").
     run.parser_backend = "antlr4rust".to_string();
     run.artifacts = AnalysisArtifactManifest {
-        schema_version: plsql_output::SchemaVersion::new(1, 0, 0),
+        // Stamp the embedded manifest with the single-source-of-truth
+        // schema version so the producer and ANALYSIS_RUN_SCHEMA cannot
+        // drift apart when the schema advances. A hardcoded literal here
+        // would mislabel a 1.1.0-field-bearing artifact as 1.0.0 and make
+        // a consumer that gates on the manifest (compatibility_with /
+        // is_readable_by) read it as Compatible instead of ForwardCompatible.
+        schema_version: ANALYSIS_RUN_SCHEMA.version,
         artifact_digests: Vec::new(),
         redaction_policy: req.redaction_policy.clone(),
     };
@@ -1631,6 +1642,27 @@ mod tests {
         );
         assert!(m.is_readable_by(SchemaVersion::new(1, 1, 0)));
         assert!(!m.is_readable_by(SchemaVersion::new(2, 0, 0)));
+    }
+
+    /// The producer must stamp the embedded `AnalysisArtifactManifest`
+    /// with the single-source-of-truth `ANALYSIS_RUN_SCHEMA.version`,
+    /// never a hardcoded literal. A stale stamp (e.g. 1.0.0 while the
+    /// canonical schema is 1.1.0) would make a consumer that gates on
+    /// the manifest version (`compatibility_with` / `is_readable_by`)
+    /// mis-classify a real 1.1.0-field-bearing artifact as Compatible
+    /// for an older minor instead of ForwardCompatible — silently
+    /// trusting fields it may not understand. Guards against drift
+    /// when the schema advances (oracle-ajm2.19).
+    #[test]
+    fn producer_stamps_manifest_with_canonical_schema_version() {
+        use crate::ANALYSIS_RUN_SCHEMA;
+        let run = analyze_project(AnalysisRequest::default()).expect("empty run ok");
+        assert_eq!(
+            run.artifacts.schema_version,
+            ANALYSIS_RUN_SCHEMA.version,
+            "embedded manifest schema_version must equal ANALYSIS_RUN_SCHEMA.version, \
+             not a hardcoded literal"
+        );
     }
 
     /// D2 Phase 1: lowering routine-body SQL/DML must produce a

@@ -279,9 +279,15 @@ Every wire envelope carries a `(schema_id, schema_version)` tuple from
    step.
 2. **Tolerate additive minor bumps** — new optional fields can land in
    a minor version. Mandatory fields stay stable until a major bump.
-3. **Validate via `matches_schema()`** — every envelope exposes
-   `envelope.matches_schema(SCHEMA)` for callers that want a one-shot
-   compatibility check before processing the payload.
+3. **Pick the matching check** — `envelope.matches_schema(SCHEMA)` is a
+   strict same-`(schema_id, schema_version)` identity test; use it only
+   when you require an *exact* version match. To honor the additive-minor
+   tolerance of (2), classify the version instead through the
+   compatibility tiers (same-major, `produced.minor >= consumer.minor`
+   ⇒ readable), the way the `plsql-engine doctor` gate does via
+   `schema_compatibility()` / `AnalysisArtifactManifest::is_readable_by()`.
+   `matches_schema()` alone does **not** implement (2) — it would reject
+   any minor bump.
 
 The `LINEAGE_SCHEMAS: [SchemaDescriptor; 14]` const enumerates every
 schema this crate emits. Each is registered in the workspace's
