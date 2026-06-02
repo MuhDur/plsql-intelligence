@@ -603,6 +603,47 @@ fn recursion_limit_diagnostic(
     )
 }
 
+/// Recover a typed [`plsql_ir::SqlVerb`] when the ANTLR lowerer tagged a SQL
+/// statement with the generic `"SQL"` sentinel (anything that is not one of the
+/// five DML verbs). Returns the matching verb ONLY if the raw statement text
+/// genuinely *leads* with that DML keyword on a word boundary — so a true DML
+/// statement the grammar failed to classify still yields correct table edges,
+/// while a non-DML construct (`EXPLAIN PLAN FOR …`, `LOCK TABLE …`, `OPEN c FOR
+/// …`, `COMMIT`, …) returns `None` and is routed to `Statement::Unrecognized`
+/// by the caller. The word boundary is essential: a `DELETED_FLAG := …` LHS
+/// must never be read as a `DELETE` verb. (oracle-j1ep.4)
+fn leading_dml_verb(raw_text: &str) -> Option<plsql_ir::SqlVerb> {
+    use plsql_ir::SqlVerb;
+    let trimmed = raw_text.trim_start();
+    for (kw, verb) in [
+        ("SELECT", SqlVerb::Select),
+        ("INSERT", SqlVerb::Insert),
+        ("UPDATE", SqlVerb::Update),
+        ("DELETE", SqlVerb::Delete),
+        ("MERGE", SqlVerb::Merge),
+    ] {
+        // Case-insensitive prefix match. `get(..kw.len())` is char-boundary
+        // safe: `kw` is ASCII, so byte index `kw.len()` is a valid boundary
+        // whenever it is `<= trimmed.len()`; a multibyte leading char simply
+        // fails the ASCII prefix compare and falls through.
+        if let Some(head) = trimmed.get(..kw.len()) {
+            if head.eq_ignore_ascii_case(kw) {
+                // Require a word boundary after the keyword: the next char (if
+                // any) must NOT continue an identifier, else `UPDATES_LOG` /
+                // `DELETED_FLAG` would masquerade as a verb.
+                let boundary = match trimmed[kw.len()..].chars().next() {
+                    None => true,
+                    Some(c) => !(c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '#'),
+                };
+                if boundary {
+                    return Some(verb);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn ast_stmts_to_ir(ast_stmts: &[plsql_parser::ast::AstStatement]) -> Vec<plsql_ir::Statement> {
     use plsql_ir::{SqlVerb, Statement, UnknownStatementReason};
     use plsql_parser::ast::AstStatement;
@@ -632,18 +673,45 @@ fn ast_stmts_to_ir(ast_stmts: &[plsql_parser::ast::AstStatement]) -> Vec<plsql_i
                 has_bind_variables: *has_using,
             }],
             AstStatement::Sql { verb, raw_text, .. } => {
+                // Map ONLY the five DML verbs to a typed `SqlVerb`. The ANTLR
+                // lowerer (`tree_lower.rs`) tags every other SQL construct with
+                // the sentinel verb `"SQL"` — cursor manipulation (OPEN/CLOSE/
+                // FETCH), transaction control (COMMIT/ROLLBACK/LOCK TABLE), and
+                // any `data_manipulation_language_statements` the grammar could
+                // not classify (e.g. `EXPLAIN PLAN FOR SELECT … FROM t`).
+                //
+                // Coercing that sentinel to `SqlVerb::Select` (the old fallback)
+                // both DROPPED the R13 typed-uncertainty signal AND minted
+                // spurious `Reads` edges: `accesses_from_sql` scans a Select's
+                // raw text for a whole-word `FROM`/`JOIN`, so an EXPLAIN PLAN
+                // body invented a bogus `Reads t` (EXPLAIN writes PLAN_TABLE and
+                // does not read `t`). We now route unknown verbs to
+                // `Statement::Unrecognized`, matching the sibling text-scanner
+                // (`plsql_ir::stmt::classify`) and preserving typed uncertainty.
+                //
+                // To keep the one beneficial case — an unclassified statement
+                // whose text genuinely *leads* with a DML verb still yields
+                // correct table edges — we recover the verb by word-boundary
+                // matching the leading keyword of the raw text before falling
+                // back to Unrecognized. (oracle-j1ep.4)
                 let sql_verb = match verb.to_ascii_uppercase().as_str() {
-                    "SELECT" => SqlVerb::Select,
-                    "INSERT" => SqlVerb::Insert,
-                    "UPDATE" => SqlVerb::Update,
-                    "DELETE" => SqlVerb::Delete,
-                    "MERGE" => SqlVerb::Merge,
-                    _ => SqlVerb::Select, // fallback
+                    "SELECT" => Some(SqlVerb::Select),
+                    "INSERT" => Some(SqlVerb::Insert),
+                    "UPDATE" => Some(SqlVerb::Update),
+                    "DELETE" => Some(SqlVerb::Delete),
+                    "MERGE" => Some(SqlVerb::Merge),
+                    _ => leading_dml_verb(raw_text),
                 };
-                vec![Statement::Sql {
-                    verb: sql_verb,
-                    raw_text: raw_text.clone(),
-                }]
+                match sql_verb {
+                    Some(verb) => vec![Statement::Sql {
+                        verb,
+                        raw_text: raw_text.clone(),
+                    }],
+                    None => vec![Statement::Unrecognized {
+                        raw_text: raw_text.clone(),
+                        unknown_reason: UnknownStatementReason::UnrecognizedKeyword,
+                    }],
+                }
             }
             AstStatement::Call { callee, .. } => {
                 // A call statement: emit as Unrecognized with raw_text of the
@@ -1217,7 +1285,100 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
 
 #[cfg(test)]
 mod tests {
-    use crate::{AnalysisRequest, analyze_project};
+    use crate::{AnalysisRequest, analyze_project, ast_stmts_to_ir, leading_dml_verb};
+
+    /// Build an `AstStatement::Sql` carrying the ANTLR lowerer's generic
+    /// `"SQL"` sentinel verb (the value emitted for any SQL construct that is
+    /// not one of the five DML verbs — cursor manipulation, transaction
+    /// control, or DML the grammar cannot classify such as `EXPLAIN PLAN`).
+    fn sql_sentinel(raw_text: &str) -> plsql_parser::ast::AstStatement {
+        use plsql_core::{FileId, Position, Span};
+        let pos = Position::new(1, 1, 0);
+        plsql_parser::ast::AstStatement::Sql {
+            verb: "SQL".to_string(),
+            raw_text: raw_text.to_string(),
+            span: Span::new(FileId::new(0), pos, pos),
+        }
+    }
+
+    /// oracle-j1ep.4 regression: the ANTLR `"SQL"` sentinel verb (e.g. an
+    /// `EXPLAIN PLAN FOR SELECT … FROM t` body) must NOT be coerced to
+    /// `SqlVerb::Select`. Coercion both dropped the R13 typed-uncertainty
+    /// signal and minted a spurious `Reads t` edge (EXPLAIN writes PLAN_TABLE
+    /// and does not read `t`). It must now lower to `Statement::Unrecognized`
+    /// and yield zero table accesses — matching the sibling text-scanner.
+    #[test]
+    fn unknown_sql_verb_lowers_to_unrecognized_not_spurious_read() {
+        use plsql_ir::{Statement, UnknownStatementReason, extract_table_accesses};
+
+        for raw in [
+            "EXPLAIN PLAN FOR SELECT col FROM t",
+            "LOCK TABLE t IN EXCLUSIVE MODE",
+            "OPEN c FOR SELECT col FROM t",
+            "COMMIT",
+            "ROLLBACK TO sp",
+            "FETCH c INTO v",
+            "CLOSE c",
+        ] {
+            let ir = ast_stmts_to_ir(&[sql_sentinel(raw)]);
+            assert_eq!(ir.len(), 1, "exactly one IR statement for `{raw}`");
+            assert!(
+                matches!(
+                    ir[0],
+                    Statement::Unrecognized {
+                        unknown_reason: UnknownStatementReason::UnrecognizedKeyword,
+                        ..
+                    }
+                ),
+                "`{raw}` must be Unrecognized, not coerced to a SqlVerb; got {:?}",
+                ir[0]
+            );
+            assert!(
+                extract_table_accesses(&ir).is_empty(),
+                "`{raw}` must mint zero table accesses (no spurious Read), got {:?}",
+                extract_table_accesses(&ir)
+            );
+        }
+    }
+
+    /// The beneficial case must survive: a SQL statement the grammar tagged
+    /// generically but whose text genuinely *leads* with a DML verb still
+    /// recovers the correct typed verb and table edges.
+    #[test]
+    fn unknown_sql_verb_with_leading_dml_keyword_recovers_verb_and_reads() {
+        use plsql_ir::{AccessKind, SqlVerb, Statement, extract_table_accesses};
+
+        let ir = ast_stmts_to_ir(&[sql_sentinel("SELECT col FROM t")]);
+        assert!(
+            matches!(ir[0], Statement::Sql { verb: SqlVerb::Select, .. }),
+            "leading SELECT recovers SqlVerb::Select, got {:?}",
+            ir[0]
+        );
+        let accesses = extract_table_accesses(&ir);
+        assert_eq!(accesses.len(), 1, "one Read on T, got {accesses:?}");
+        assert_eq!(accesses[0].table, "T");
+        assert_eq!(accesses[0].access, AccessKind::Read);
+    }
+
+    /// Word-boundary discipline: a verb prefix on an identifier must NOT match.
+    /// `DELETED_FLAG := …` and `UPDATES_LOG` are not DELETE / UPDATE verbs.
+    #[test]
+    fn leading_dml_verb_is_word_boundaried() {
+        use plsql_ir::SqlVerb;
+        assert_eq!(leading_dml_verb("SELECT 1 FROM dual"), Some(SqlVerb::Select));
+        assert_eq!(leading_dml_verb("  delete from t"), Some(SqlVerb::Delete));
+        assert_eq!(leading_dml_verb("MERGE INTO t USING s ON (..)"), Some(SqlVerb::Merge));
+        // Identifier continuations must not be read as verbs.
+        assert_eq!(leading_dml_verb("DELETED_FLAG := 1"), None);
+        assert_eq!(leading_dml_verb("UPDATES_LOG.write(x)"), None);
+        assert_eq!(leading_dml_verb("SELECTED := TRUE"), None);
+        // Non-DML constructs.
+        assert_eq!(leading_dml_verb("EXPLAIN PLAN FOR SELECT 1 FROM t"), None);
+        assert_eq!(leading_dml_verb("COMMIT"), None);
+        assert_eq!(leading_dml_verb(""), None);
+        // Multibyte leading char must not panic and must not match.
+        assert_eq!(leading_dml_verb("é := 1"), None);
+    }
 
     #[test]
     fn analysis_request_default_is_constructible() {
