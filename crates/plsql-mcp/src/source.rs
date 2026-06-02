@@ -1,12 +1,17 @@
 //! `get_object_source`, `get_clob`, and `get_errors` tools.
 //!
-//! All three are read-only ALL_*/USER_* queries. `get_object_source` and
-//! `get_clob` route their textual output through the same K18 sanitizer
-//! used by `query`. `get_errors` returns a
-//! structured shape from `USER_ERRORS` / `ALL_ERRORS` instead of free text
-//! so agents can reason about line / column / position numerically.
+//! All three are read-only ALL_*/USER_* queries. Every one routes its
+//! textual output through the same K18 sanitizer used by `query`.
+//! `get_object_source` and `get_clob` scrub their primary source/CLOB
+//! payload; `get_errors` returns a structured shape from `USER_ERRORS` /
+//! `ALL_ERRORS` so agents can reason about line / column / position
+//! numerically, but its free-text fields (owner / object_name /
+//! object_type / attribute / text) are still attacker-influenceable —
+//! Oracle echoes identifier names into `ALL_ERRORS.TEXT` — so they are
+//! K18-sanitized exactly like the source/CLOB paths before they can reach
+//! an agent.
 
-use plsql_catalog::{CatalogError, OracleBind, OracleConnection};
+use plsql_catalog::{CatalogError, OracleBind, OracleConnection, OracleRow};
 use plsql_core::UnknownReason;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -50,6 +55,9 @@ pub struct ObjectError {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GetErrorsResponse {
     pub errors: Vec<ObjectError>,
+    /// `UnknownReason::ResponseSanitized` is appended whenever the K18
+    /// scrubber rewrote any free-text field on any error row.
+    pub unknown_reasons: Vec<UnknownReason>,
 }
 
 #[derive(Debug, Error)]
@@ -171,32 +179,55 @@ pub fn run_get_errors<C: OracleConnection>(
         )?
     };
 
+    // Free-text fields carry attacker-influenceable content (Oracle echoes
+    // schema-owner-controlled identifier names into `ALL_ERRORS.TEXT`), so
+    // route each one through the K18 sanitizer exactly as the source/CLOB
+    // paths do. The numeric line/position/message_number fields are parsed
+    // integers and need no scrubbing. `field()` ORs each cell's `changed`
+    // flag into a per-response indicator so a single scrubbed cell anywhere
+    // surfaces `ResponseSanitized`.
+    let mut any_sanitized = false;
+    let mut field = |row: &OracleRow, column: &str| -> String {
+        let (scrubbed, was_sanitized) = sanitize(row.text(column).unwrap_or(""));
+        if was_sanitized {
+            any_sanitized = true;
+        }
+        scrubbed
+    };
+
     let mut errors = Vec::with_capacity(rows.len());
     for row in &rows {
         errors.push(ObjectError {
-            owner: row.text("OWNER").unwrap_or("").to_string(),
-            object_name: row.text("NAME").unwrap_or("").to_string(),
-            object_type: row.text("TYPE").unwrap_or("").to_string(),
+            owner: field(row, "OWNER"),
+            object_name: field(row, "NAME"),
+            object_type: field(row, "TYPE"),
             line: row.text("LINE").and_then(|t| t.parse().ok()).unwrap_or(0),
             position: row
                 .text("POSITION")
                 .and_then(|t| t.parse().ok())
                 .unwrap_or(0),
-            attribute: row.text("ATTRIBUTE").unwrap_or("").to_string(),
+            attribute: field(row, "ATTRIBUTE"),
             message_number: row
                 .text("MESSAGE_NUMBER")
                 .and_then(|t| t.parse().ok())
                 .unwrap_or(0),
-            text: row.text("TEXT").unwrap_or("").to_string(),
+            text: field(row, "TEXT"),
         });
     }
-    Ok(GetErrorsResponse { errors })
+    let mut unknown_reasons = Vec::new();
+    if any_sanitized {
+        unknown_reasons.push(UnknownReason::ResponseSanitized);
+    }
+    Ok(GetErrorsResponse {
+        errors,
+        unknown_reasons,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plsql_catalog::{OracleBackend, OracleConnectionInfo, OracleRow};
+    use plsql_catalog::{OracleBackend, OracleConnectionInfo};
 
     #[derive(Default, Clone)]
     struct StubConn {
@@ -342,5 +373,58 @@ mod tests {
         let conn = StubConn::default();
         let response = run_get_errors(&conn, "", "BILLING_PKG").unwrap();
         assert!(response.errors.is_empty());
+        assert!(response.unknown_reasons.is_empty());
+    }
+
+    #[test]
+    fn get_errors_clean_rows_emit_no_sanitized_reason() {
+        let conn = StubConn {
+            rows: vec![error_row(2, "ERROR", "PLS-00201: identifier 'FOO'")],
+        };
+        let response = run_get_errors(&conn, "BILLING", "BILLING_PKG").unwrap();
+        assert_eq!(response.errors.len(), 1);
+        assert!(
+            response.unknown_reasons.is_empty(),
+            "benign rows must not trip the sanitized flag"
+        );
+    }
+
+    #[test]
+    fn get_errors_sanitizes_free_text_fields() {
+        // A compromised schema owner can embed tool-call markup in an
+        // identifier name that Oracle echoes verbatim into ALL_ERRORS.TEXT
+        // (and ATTRIBUTE). Assemble the injection shape at runtime so the
+        // source file does not itself carry the literal pattern, then plant
+        // it in the TEXT and ATTRIBUTE columns. The K18 sanitizer must
+        // neutralize every angle bracket and the response must flag
+        // ResponseSanitized.
+        let tainted_text = format!(
+            "PLS-00201: identifier {lt}{slash}tool_call{gt} must be declared",
+            lt = '<',
+            gt = '>',
+            slash = '/'
+        );
+        let tainted_attribute = format!("{lt}system{gt}", lt = '<', gt = '>');
+        let conn = StubConn {
+            rows: vec![error_row(2, &tainted_attribute, &tainted_text)],
+        };
+        let response = run_get_errors(&conn, "BILLING", "BILLING_PKG").unwrap();
+        assert_eq!(response.errors.len(), 1);
+        let row = &response.errors[0];
+        // No surviving ASCII angle brackets anywhere in the free-text fields.
+        for field in [&row.text, &row.attribute, &row.owner, &row.object_name, &row.object_type] {
+            assert!(
+                !field.contains('<') && !field.contains('>'),
+                "free-text field retained a raw angle bracket: {field:?}"
+            );
+        }
+        // The structural pass leaves the visible fullwidth look-alikes.
+        assert!(row.text.contains('\u{FF1C}') || row.text.contains("[redacted]"));
+        assert!(
+            response
+                .unknown_reasons
+                .contains(&UnknownReason::ResponseSanitized),
+            "scrubbed free-text must surface ResponseSanitized"
+        );
     }
 }

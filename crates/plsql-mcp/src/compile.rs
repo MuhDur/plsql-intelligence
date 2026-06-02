@@ -122,6 +122,15 @@ pub fn run_compile_with_warnings<C: OracleConnection>(
     }
 
     let errors_response = run_get_errors(conn, owner, object_name)?;
+    // Propagate the K18 sanitization signal: if `run_get_errors` scrubbed
+    // any free-text field on any row, the compile response must also flag
+    // `ResponseSanitized` so the agent sees the same honesty marker. Avoid
+    // emitting a duplicate reason if it is already present.
+    for &reason in &errors_response.unknown_reasons {
+        if !unknown_reasons.contains(&reason) {
+            unknown_reasons.push(reason);
+        }
+    }
     let mut response = CompileWithWarningsResponse {
         owner: owner.to_string(),
         object_name: object_name.to_string(),
@@ -418,6 +427,38 @@ mod tests {
         assert_eq!(response.performance.len(), 1);
         assert_eq!(response.informational.len(), 1);
         assert!(response.other.is_empty());
+    }
+
+    #[test]
+    fn compile_propagates_response_sanitized_from_get_errors() {
+        // An error row whose TEXT carries attacker-influenceable tool-call
+        // markup must be K18-scrubbed by run_get_errors, and the compile
+        // wrapper must propagate the ResponseSanitized signal so the agent
+        // sees the same honesty marker. Assemble the markup at runtime.
+        let tainted_text = format!(
+            "PLS-00201: identifier {lt}{slash}tool_call{gt} must be declared",
+            lt = '<',
+            gt = '>',
+            slash = '/'
+        );
+        let stub = CompileStubConn {
+            error_rows: vec![error_row(1, "ERROR", 201, &tainted_text)],
+            executes: Mutex::new(Vec::new()),
+            fail_compile: false,
+        };
+        let response =
+            run_compile_with_warnings(&stub, "BILLING", "BILLING_PKG", "PACKAGE BODY").unwrap();
+        assert_eq!(response.severe.len(), 1);
+        assert!(
+            !response.severe[0].text.contains('<') && !response.severe[0].text.contains('>'),
+            "severe row text retained a raw angle bracket"
+        );
+        assert!(
+            response
+                .unknown_reasons
+                .contains(&UnknownReason::ResponseSanitized),
+            "compile response must propagate ResponseSanitized from get_errors"
+        );
     }
 
     #[test]
