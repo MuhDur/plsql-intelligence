@@ -403,8 +403,20 @@ fn is_read_only_sql(sql: &str) -> bool {
 /// separated by a newline, tab, `\r\n`, multiple spaces, or preceded by
 /// a `)` is still recognised. `FOR` and `UPDATE` must each be a whole
 /// token — a column named `FORUPDATE` or `FOR_TOTAL` does not trip it.
+///
+/// Oracle treats `/* … */` and `-- … \n` comments as whitespace-equivalent
+/// token separators, so a comment spliced between `FOR` and `UPDATE`
+/// (`FOR/* x */UPDATE`) parses as a live row lock at the server even though
+/// a naive token scan would see the comment word `x` as an intervening
+/// token and miss the adjacency. To stay aligned with Oracle's lexer (and
+/// fail closed) the scan runs on a comment-stripped copy of the SQL — the
+/// same comment-awareness `is_read_only_sql` already applies to the leading
+/// token. Comment stripping is string-literal aware so a `/*` or `--`
+/// sitting *inside* a quoted literal does not swallow a real trailing
+/// `FOR UPDATE` clause.
 fn has_for_update_lock(sql: &str) -> bool {
-    let upper = sql.to_ascii_uppercase();
+    let stripped = strip_sql_comments(sql);
+    let upper = stripped.to_ascii_uppercase();
     // Split on any non-identifier character so `)FOR` and `\nFOR` both
     // surface `FOR` as a standalone token. Identifier chars keep words
     // like `FORUPDATE` / `FOR_TOTAL` intact so they are not mistaken
@@ -418,6 +430,95 @@ fn has_for_update_lock(sql: &str) -> bool {
         }
     }
     false
+}
+
+/// Collapse Oracle `/* … */` and `-- … \n` comments to a single space,
+/// matching the database lexer where a comment is a token separator.
+///
+/// The pass is string-literal aware: single-quoted (`'…'`, with `''`
+/// recognised as an embedded escaped quote) and double-quoted identifier
+/// (`"…"`) spans are copied verbatim so a comment-introducer that lives
+/// *inside* a literal is not treated as a comment. It is intentionally
+/// conservative everywhere else — any ambiguity (e.g. the `q'[…]'` quote
+/// operator) leans toward leaving more text in place, so the downstream
+/// row-lock scan over-detects rather than under-detects, never opening a
+/// fail-open hole in the `FOR UPDATE` gate.
+fn strip_sql_comments(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0usize;
+    let mut in_squote = false;
+    let mut in_dquote = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_squote {
+            out.push(b as char);
+            if b == b'\'' {
+                in_squote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_dquote {
+            out.push(b as char);
+            if b == b'"' {
+                in_dquote = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' => {
+                in_squote = true;
+                out.push(b as char);
+                i += 1;
+            }
+            b'"' => {
+                in_dquote = true;
+                out.push(b as char);
+                i += 1;
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                // Block comment → single space; skip to the closing `*/`
+                // (or to end-of-input for an unterminated comment).
+                out.push(' ');
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+            }
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                // Line comment → single space; skip to (but keep) the
+                // newline so the line break still separates tokens.
+                out.push(' ');
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            // Any non-ASCII (multi-byte UTF-8) lead/continuation byte is not
+            // a comment or quote delimiter; copy the whole char so we never
+            // split a code point. ASCII bytes copy as-is.
+            _ => {
+                let ch_len = utf8_char_len(b);
+                let end = (i + ch_len).min(bytes.len());
+                out.push_str(&sql[i..end]);
+                i = end;
+            }
+        }
+    }
+    out
+}
+
+/// Length in bytes of the UTF-8 character whose lead byte is `b`.
+const fn utf8_char_len(b: u8) -> usize {
+    match b {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        _ => 4,
+    }
 }
 
 /// Returns `true` when `sql` contains a `;` followed by any
@@ -636,6 +737,47 @@ mod tests {
         assert!(is_read_only_sql("SELECT forupdate FROM t"));
         // A column literally named FOR is not a lock clause without UPDATE.
         assert!(is_read_only_sql("SELECT for_total FROM t"));
+        // oracle-ajm2.16: Oracle treats `/* … */` and `-- … \n` comments as
+        // whitespace-equivalent token separators, so a comment spliced
+        // between FOR and UPDATE still parses as a live row lock and must
+        // route through enable_writes. A naive adjacency scan would see the
+        // comment's word token as intervening and miss the lock.
+        assert!(!is_read_only_sql("SELECT dummy FROM dual FOR/* x */UPDATE"));
+        assert!(!is_read_only_sql("SELECT id FROM invoices FOR /* x */ UPDATE"));
+        assert!(!is_read_only_sql("SELECT id FROM invoices FOR -- c\nUPDATE"));
+        // Empty / word-less comment forms remain caught.
+        assert!(!is_read_only_sql("SELECT id FROM invoices FOR/**/UPDATE"));
+        // Comment before the keyword pair also separates correctly.
+        assert!(!is_read_only_sql(
+            "SELECT id FROM invoices /* lock */ FOR UPDATE OF id"
+        ));
+    }
+
+    #[test]
+    fn read_only_predicate_for_update_inside_string_literal_is_comment_aware() {
+        // oracle-ajm2.16 regression guard: comment stripping must be
+        // string-literal aware so a fake comment-introducer (`/*` / `--`)
+        // *inside* a quoted literal does not swallow a real trailing
+        // FOR UPDATE clause (which would silently re-open the write gate).
+        assert!(!is_read_only_sql("SELECT '/* ' FROM t FOR UPDATE"));
+        assert!(!is_read_only_sql("SELECT '-- ' AS x FROM t FOR UPDATE"));
+        // Doubled-quote escape (`'it''s'`) keeps the literal balanced so the
+        // `/*` stays quoted and the real lock after it is still detected.
+        assert!(!is_read_only_sql("SELECT 'it''s /*' FROM t FOR UPDATE"));
+    }
+
+    #[test]
+    fn strip_sql_comments_collapses_comments_and_respects_literals() {
+        // Block and line comments collapse to whitespace.
+        assert_eq!(strip_sql_comments("a/* x */b"), "a b");
+        assert_eq!(strip_sql_comments("a-- c\nb"), "a \nb");
+        // Unterminated block comment is consumed to end-of-input.
+        assert_eq!(strip_sql_comments("a/* unterminated"), "a ");
+        // A comment-introducer inside a literal is preserved verbatim.
+        assert_eq!(strip_sql_comments("'/* not a comment */'"), "'/* not a comment */'");
+        assert_eq!(strip_sql_comments("'-- not a comment'"), "'-- not a comment'");
+        // Non-ASCII content is copied without splitting code points.
+        assert_eq!(strip_sql_comments("café/* x */ over"), "café  over");
     }
 
     #[test]
