@@ -21,8 +21,16 @@
 //!    * if two overloads still resolve to the same Rust name (an
 //!      empty suffix on zero-parameter overloads, or equal non-empty
 //!      suffixes when the shared-prefix scan stops at index 0), append
-//!      a deterministic `_<i+1>` ordinal so every emitted `pub fn`
-//!      name is unique.
+//!      a deterministic `_<i+1>` ordinal.
+//! 4. Finally, every assignment is reserved against a single
+//!    cross-bucket `taken` set: uniqueness is enforced *globally* across
+//!    the whole package, not merely within one overload group. A name
+//!    minted in one bucket can never duplicate one minted in another
+//!    (e.g. the `get(x_a)`/`get_x(a)` pair both reaching for `get_x_a`,
+//!    or an ordinal `proc_1` clashing with an unrelated singleton named
+//!    `proc_1`); the loser deterministically escalates with a `_<n>`
+//!    ordinal. This is what makes the "every emitted `pub fn` name is
+//!    unique" guarantee true for the entire emitted module.
 //!
 //! Parameter names are case-folded and snake-cased before suffix
 //! assembly so the resulting Rust name is stable across PL/SQL
@@ -47,7 +55,7 @@
 //!   overload set comes from `ALL_PROCEDURES.OVERLOAD` (a single
 //!   string per overload slot, 1-based).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::RoutineBinding;
 
@@ -67,13 +75,39 @@ pub fn disambiguate_overloads(routines: &[RoutineBinding]) -> Vec<String> {
     }
 
     let mut out: Vec<String> = vec![String::new(); routines.len()];
-    for (base_name, indices) in buckets {
+
+    // Global uniqueness is enforced across ALL buckets, not just within
+    // one overload group. `taken` records every Rust identifier already
+    // emitted so a name minted in one bucket (a singleton, an ordinal, or
+    // a parameter-name suffix) can never silently duplicate one minted in
+    // another (e.g. the `get`/`get_x` cross-bucket collision, or an
+    // ordinal `proc_1` clashing with an unrelated singleton named
+    // `proc_1`). Without this the emitter could write two identical
+    // `pub fn`s into one module (rustc E0428).
+    let mut taken: BTreeSet<String> = BTreeSet::new();
+
+    // Pass A — seed singletons first, verbatim. A singleton's PL/SQL name
+    // is left untouched (the documented contract), and seeding before any
+    // overload bucket gives real singletons precedence: an overload-derived
+    // name that would collide with a singleton yields and escalates, never
+    // the other way round. Singletons cannot collide with each other —
+    // buckets are keyed by lowercased name, so equal names share a bucket.
+    for indices in buckets.values() {
         if indices.len() == 1 {
             let only = indices[0];
-            out[only] = routines[only].name.clone();
-            continue;
+            let name = routines[only].name.clone();
+            taken.insert(name.clone());
+            out[only] = name;
         }
-        let suffixes = assemble_suffixes(routines, &indices);
+    }
+
+    // Pass B — disambiguate overload groups in deterministic BTreeMap key
+    // order, probing `taken` for global uniqueness.
+    for (base_name, indices) in &buckets {
+        if indices.len() == 1 {
+            continue; // already emitted in Pass A
+        }
+        let suffixes = assemble_suffixes(routines, indices);
         // Pass 1: build candidate names (empty suffix → ordinal, else
         // base_suffix).
         let mut candidates: Vec<String> = Vec::with_capacity(indices.len());
@@ -90,26 +124,48 @@ pub fn disambiguate_overloads(routines: &[RoutineBinding]) -> Vec<String> {
         }
         // Pass 2: two overloads can still share a non-empty suffix (e.g.
         // `proc(p_val)` twice alongside `proc(p_other)` — `shared_prefix`
-        // is 0 so neither name is dropped). Disambiguate any duplicate by
-        // appending `_<i+1>` (input-order index within the group) to each
-        // colliding occurrence. This keeps every name unique (line-77
-        // contract) and deterministic for a fixed input order (the
-        // stability property), without perturbing names that are already
-        // unique.
+        // is 0 so neither name is dropped). Disambiguate any within-group
+        // duplicate by appending `_<i+1>` (input-order index within the
+        // group) to each colliding occurrence — this keeps the suffix
+        // deterministic for a fixed input order (the stability property)
+        // without perturbing names that are already unique in the group.
+        // Then run EVERY assignment (collision or not) through `claim`,
+        // which guarantees global uniqueness by probing a deterministic
+        // `_<n>` ordinal until the name is free.
         let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
         for name in &candidates {
             *counts.entry(name.as_str()).or_default() += 1;
         }
         for (i, idx) in indices.iter().enumerate() {
             let name = &candidates[i];
-            if counts.get(name.as_str()).copied().unwrap_or(0) > 1 {
-                out[*idx] = format!("{name}_{}", i + 1);
+            let base = if counts.get(name.as_str()).copied().unwrap_or(0) > 1 {
+                format!("{name}_{}", i + 1)
             } else {
-                out[*idx] = name.clone();
-            }
+                name.clone()
+            };
+            out[*idx] = claim(base, &mut taken);
         }
     }
     out
+}
+
+/// Reserve a globally-unique Rust identifier derived from `base`, recording
+/// it in `taken`. If `base` is free it is taken verbatim; otherwise a
+/// deterministic `_2`, `_3`, … ordinal is appended until a free name is
+/// found. Determinism (for a fixed bucket iteration order) is what keeps the
+/// emitter's output stable release-to-release.
+fn claim(base: String, taken: &mut BTreeSet<String>) -> String {
+    if taken.insert(base.clone()) {
+        return base;
+    }
+    let mut n = 2_usize;
+    loop {
+        let candidate = format!("{base}_{n}");
+        if taken.insert(candidate.clone()) {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// Compute the disambiguating suffix for each overload in the
@@ -307,6 +363,83 @@ mod tests {
             let unique: std::collections::BTreeSet<_> = names.iter().collect();
             assert_eq!(unique.len(), 3, "{names:?}");
         }
+    }
+
+    #[test]
+    fn ordinal_does_not_collide_with_unique_sibling_suffix() {
+        // oracle-ajm2.15: [proc(x), proc(x), proc(x_2)] — the colliding
+        // `proc_x` pair gets `_1`/`_2` ordinals, but `proc_x_2` (the i=1
+        // ordinal) is ALSO the literal candidate for the unique third
+        // overload `proc(x_2)`. The pre-fix Pass-2 consulted only the
+        // original candidate multiset and emitted
+        // ["proc_x_1","proc_x_2","proc_x_2"] — a duplicate. Global `claim`
+        // probing must now keep all three distinct.
+        let routines = vec![
+            rb("proc", vec!["x"]),
+            rb("proc", vec!["x"]),
+            rb("proc", vec!["x_2"]),
+        ];
+        let names = disambiguate_overloads(&routines);
+        let unique: std::collections::BTreeSet<_> = names.iter().collect();
+        assert_eq!(
+            unique.len(),
+            3,
+            "ordinal must not collide with a unique sibling's literal suffix: {names:?}"
+        );
+        assert_eq!(names, vec!["proc_x_1", "proc_x_2", "proc_x_2_2"], "{names:?}");
+    }
+
+    #[test]
+    fn cross_bucket_names_are_globally_unique() {
+        // oracle-ajm2.21: two distinct overload buckets `get` and `get_x`
+        // both mint `get_x_a` / `get_x_b`. Per-bucket uniqueness is not
+        // enough — the emitted module would carry duplicate `pub fn`s
+        // (rustc E0428). The cross-bucket `taken` set must escalate the
+        // second bucket's collisions.
+        let routines = vec![
+            rb("get", vec!["x_a"]),
+            rb("get", vec!["x_b"]),
+            rb("get_x", vec!["a"]),
+            rb("get_x", vec!["b"]),
+        ];
+        let names = disambiguate_overloads(&routines);
+        let unique: std::collections::BTreeSet<_> = names.iter().collect();
+        assert_eq!(
+            unique.len(),
+            4,
+            "cross-bucket overload names must be globally unique: {names:?}"
+        );
+        // `get` is iterated before `get_x` (BTreeMap key order), so the
+        // `get` bucket claims the bare names and `get_x` escalates.
+        assert_eq!(
+            names,
+            vec!["get_x_a", "get_x_b", "get_x_a_2", "get_x_b_2"],
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn overload_ordinal_yields_to_a_real_singleton_of_the_same_name() {
+        // oracle-ajm2.21: two zero-param `touch` overloads mint the
+        // ordinals `touch_1`/`touch_2`, but a genuine singleton routine
+        // is also named `touch_1`. Singletons are seeded first and keep
+        // their verbatim name; the colliding ordinal escalates.
+        let routines = vec![
+            rb("touch", vec![]),
+            rb("touch", vec![]),
+            rb("touch_1", vec!["p_id"]),
+        ];
+        let names = disambiguate_overloads(&routines);
+        let unique: std::collections::BTreeSet<_> = names.iter().collect();
+        assert_eq!(
+            unique.len(),
+            3,
+            "an overload ordinal must not duplicate a real singleton: {names:?}"
+        );
+        // The real singleton keeps `touch_1`; the overload ordinal that
+        // would have been `touch_1` escalates to `touch_1_2`.
+        assert_eq!(names[2], "touch_1", "singleton keeps its verbatim name: {names:?}");
+        assert_eq!(names, vec!["touch_1_2", "touch_2", "touch_1"], "{names:?}");
     }
 
     #[test]

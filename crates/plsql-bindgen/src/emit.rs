@@ -154,6 +154,30 @@ fn emit_routine(out: &mut String, package_id: &str, r: &RoutineBinding) {
     let return_type = compute_return_type(r);
     let _ = writeln!(out, ") -> Result<{return_type}, ExecutionError> {{");
 
+    // A function carrying neither a RETURN type nor any OUT / IN OUT
+    // parameter is degenerate: there is nothing for the wrapper to
+    // return, yet a function MUST yield a value. This shape never comes
+    // from the parser/catalog path, but the CLI deserializes an
+    // untrusted `BindingPlan` via plain serde (main.rs), so a hand-rolled
+    // or upstream-buggy plan can present it. Emit a typed-error body
+    // (mirroring the unsupported_type path) instead of panicking — the
+    // "never panic on bad input" contract requires exit 0 with valid Rust
+    // + a typed BINDING_* failure, not a SIGABRT.
+    if is_degenerate_function(r) {
+        let _ = writeln!(
+            out,
+            "    let _ = executor;\n    \
+             // bindgen: function `{0}` declares no RETURN type and no OUT / IN OUT \
+             parameter; there is no value for the wrapper to produce.\n    \
+             Err(ExecutionError {{ code: \"BINDING_DEGENERATE_FUNCTION\".to_string(), \
+             message: \"{0}: function has no return type and no OUT/IN OUT parameter; the \
+             BindingPlan is malformed (a function must return a value)\".to_string() }})",
+            r.name
+        );
+        let _ = writeln!(out, "}}");
+        return;
+    }
+
     // Types we cannot scalar-marshal get a typed error body — never
     // a runtime `unimplemented!()` panic (the BG-004 audit defect).
     if let Some(why) = unsupported_type(r) {
@@ -544,14 +568,32 @@ fn compute_return_type(r: &RoutineBinding) -> String {
         }
     }
     match parts.len() {
-        0 => {
-            // Procedure with no OUT params.
-            assert!(matches!(r.kind, RoutineKind::Procedure));
-            "()".to_string()
-        }
+        // No RETURN and no OUT / IN OUT param. For a procedure this is the
+        // unit return. For a (degenerate, malformed-plan) function this is
+        // never reached down the happy path — `emit_routine` diverts such a
+        // routine to a typed-error body via `is_degenerate_function` before
+        // the value is consumed — but we still return `()` rather than
+        // asserting so this helper never panics on untrusted input (the CLI
+        // deserializes an unvalidated `BindingPlan`). Asserting on
+        // attacker-shaped input was the BINDING_DEGENERATE_FUNCTION defect.
+        0 => "()".to_string(),
         1 => parts.into_iter().next().unwrap(),
         _ => format!("({})", parts.join(", ")),
     }
+}
+
+/// A function with neither a RETURN type nor any OUT / IN OUT parameter is
+/// degenerate: a function must produce a value, yet this shape yields none.
+/// The parser / catalog path can never construct it, but the CLI accepts an
+/// untrusted `BindingPlan` over serde, so the emitter must fail closed with a
+/// typed diagnostic rather than panic.
+fn is_degenerate_function(r: &RoutineBinding) -> bool {
+    matches!(r.kind, RoutineKind::Function)
+        && r.return_type.is_none()
+        && !r
+            .parameters
+            .iter()
+            .any(|p| matches!(p.mode, ParameterMode::Out | ParameterMode::InOut))
 }
 
 fn rust_type_str(rt: &RustTypeRef) -> String {
@@ -976,6 +1018,81 @@ mod tests {
             src.contains("chrono::NaiveDate"),
             "error must name the offending type: {src}"
         );
+    }
+
+    // --- oracle-ajm2.8: a degenerate function (no RETURN type, no OUT /
+    // IN OUT parameter) is a malformed BindingPlan the untrusted-input CLI
+    // can deserialize. The emitter must fail closed with a typed error body,
+    // never an `assert!` panic / SIGABRT. ---
+
+    #[test]
+    fn degenerate_function_emits_typed_error_not_panic() {
+        // Before the fix this routine drove compute_return_type into
+        // `assert!(matches!(r.kind, Procedure))` and aborted. It must now
+        // produce valid Rust with a typed BINDING_DEGENERATE_FUNCTION body.
+        let r = RoutineBinding {
+            name: "f".into(),
+            kind: RoutineKind::Function,
+            parameters: vec![],
+            return_type: None,
+            autonomous_transaction: false,
+        };
+        // emit_wrappers must not panic on this untrusted shape.
+        let src = emit_wrappers(&plan(vec![r]));
+        assert!(
+            src.contains("BINDING_DEGENERATE_FUNCTION"),
+            "degenerate function must emit a typed error body: {src}"
+        );
+        assert!(!src.contains("unimplemented!"), "must not panic-body: {src}");
+        // The signature still type-checks: a function with no return is
+        // forced to `Result<(), _>` so the emitted error body is valid Rust.
+        assert!(
+            src.contains("pub fn f(executor: &mut impl OracleExecutor) -> Result<(), ExecutionError>"),
+            "degenerate function signature must be well-formed: {src}"
+        );
+        // No executor call is composed — there is nothing to invoke.
+        assert!(
+            !src.contains("executor.call_routine("),
+            "degenerate function must not compose a server call: {src}"
+        );
+    }
+
+    #[test]
+    fn compute_return_type_does_not_panic_on_degenerate_function() {
+        // Direct unit guard on the helper that previously asserted: a
+        // Function with no return / no OUT param must yield `()` (and not
+        // abort), so any caller is panic-safe on untrusted input.
+        let r = RoutineBinding {
+            name: "f".into(),
+            kind: RoutineKind::Function,
+            parameters: vec![],
+            return_type: None,
+            autonomous_transaction: false,
+        };
+        assert_eq!(compute_return_type(&r), "()");
+        assert!(is_degenerate_function(&r));
+        // A normal function is not flagged degenerate.
+        let ok = RoutineBinding {
+            name: "g".into(),
+            kind: RoutineKind::Function,
+            parameters: vec![],
+            return_type: Some(RustTypeRef {
+                path: "i64".into(),
+                nullable: false,
+            }),
+            autonomous_transaction: false,
+        };
+        assert!(!is_degenerate_function(&ok));
+        // A plain procedure with no OUT is the legitimate unit case.
+        let proc = RoutineBinding {
+            name: "p".into(),
+            kind: RoutineKind::Procedure,
+            parameters: vec![],
+            return_type: None,
+            autonomous_transaction: false,
+        };
+        assert!(!is_degenerate_function(&proc));
+        assert_eq!(compute_return_type(&proc), "()");
     }
 
     // --- oracle-qm3q.13: defaulted IN / IN OUT params must surface as
