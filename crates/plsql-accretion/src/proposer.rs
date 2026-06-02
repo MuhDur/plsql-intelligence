@@ -759,7 +759,11 @@ impl SubprocessBackend {
     /// Wrap a model CLI. `program` is the executable (looked up on
     /// `PATH`); `args` are fixed leading arguments (e.g.
     /// `["run", "llama3"]`). The repair prompt is supplied on stdin,
-    /// never as an argument — so an arbitrarily long prompt is safe.
+    /// never as an argument. The prompt is written from a dedicated
+    /// writer thread while the parent drains stdout/stderr, so an
+    /// arbitrarily long prompt is safe — there is no pipe-buffer
+    /// deadlock even against a CLI that streams output before reading
+    /// all of stdin (see [`SubprocessBackend::complete`]).
     pub fn new<S, I, A>(program: S, args: I) -> Self
     where
         S: Into<String>,
@@ -785,17 +789,53 @@ impl CompletionBackend for SubprocessBackend {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("model CLI {:?} could not be spawned: {e}", self.program))?;
-        // Write the prompt to stdin, then drop the handle so the child
-        // sees EOF (a model CLI blocks reading until EOF).
-        child
+        // Write the prompt from a dedicated thread while the parent
+        // drains stdout/stderr below, so the two halves of the pipe
+        // never deadlock: a prompt larger than the stdin pipe buffer
+        // (~64KB) against a CLI that streams stdout before reading all
+        // of stdin would otherwise hang both processes forever — the
+        // parent blocked in `write_all`, the child blocked writing to a
+        // full stdout pipe nobody is reading. The thread drops `stdin`
+        // when it returns, sending EOF (a model CLI blocks reading
+        // until EOF). A `BrokenPipe` write error is tolerated: a CLI
+        // that reads only a prefix of the prompt and exits is not a
+        // failure — its exit status / output, checked below, is the
+        // real verdict.
+        let mut stdin = child
             .stdin
             .take()
-            .ok_or_else(|| "model CLI stdin pipe unavailable".to_string())?
-            .write_all(prompt.as_bytes())
-            .map_err(|e| format!("writing prompt to model CLI {:?} failed: {e}", self.program))?;
+            .ok_or_else(|| "model CLI stdin pipe unavailable".to_string())?;
+        let prompt_bytes = prompt.as_bytes().to_vec();
+        let writer = std::thread::spawn(move || {
+            let res = stdin.write_all(&prompt_bytes);
+            // Drop `stdin` here (end of scope) to send EOF before join.
+            match res {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                Err(e) => Err(e),
+            }
+        });
         let out = child
             .wait_with_output()
             .map_err(|e| format!("model CLI {:?} did not complete: {e}", self.program))?;
+        // Join the writer: surface a genuine stdin write failure (but a
+        // panic in the writer thread is mapped to a refusal, never a
+        // re-panic that would poison the proposer).
+        match writer.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return Err(format!(
+                    "writing prompt to model CLI {:?} failed: {e}",
+                    self.program
+                ));
+            }
+            Err(_) => {
+                return Err(format!(
+                    "writing prompt to model CLI {:?} panicked",
+                    self.program
+                ));
+            }
+        }
         if !out.status.success() {
             // A non-zero model CLI is a refusal — never a guess.
             return Err(format!(
@@ -1212,6 +1252,31 @@ mod tests {
         let reply = backend.complete("hello model").expect("cat echoes stdin");
         assert_eq!(reply, "hello model");
         assert_eq!(backend.tag(), "llm:cat");
+    }
+
+    #[test]
+    fn subprocess_backend_large_prompt_does_not_deadlock() {
+        // Regression for the stdin/stdout pipe deadlock: a prompt
+        // larger than the ~64KB stdin pipe buffer fed to a CLI that
+        // streams its stdout before draining stdin (`cat`) would, under
+        // a single-threaded write-then-drain, hang both processes
+        // forever (parent blocked in `write_all`, child blocked writing
+        // a full stdout pipe nobody reads). The concurrent-writer fix
+        // makes this return. We bound the work in a watchdog thread so a
+        // regression surfaces as a test FAILURE, not a frozen suite.
+        let prompt = "x\n".repeat(200_000); // ~400KB, well over the buffer.
+        let expected = prompt.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let backend = SubprocessBackend::new("cat", std::iter::empty::<&str>());
+            let reply = backend.complete(&prompt).expect("cat echoes a large stdin");
+            let _ = tx.send(reply);
+        });
+        let reply = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("complete() must not deadlock on a >64KB prompt");
+        worker.join().expect("writer/drain threads joined cleanly");
+        assert_eq!(reply, expected, "cat must echo the full prompt verbatim");
     }
 
     #[test]
