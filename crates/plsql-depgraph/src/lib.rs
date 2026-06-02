@@ -1362,9 +1362,12 @@ impl DepGraph {
     /// rows from `snapshot`, classifying each pair as a match,
     /// `OurExtra`, `OracleOnly`, `KindMismatch`, or `ExpectedGap`.
     ///
-    /// Used by:
-    /// - `lineage compare-oracle-deps` customer report
-    /// - completeness gates in `plsql-engine` doctor output
+    /// Consumed only by the advisory `lineage compare-oracle-deps` drift
+    /// report. It is *not* a release gate and nothing in `plsql-engine`
+    /// `doctor` reads it; the buckets are pair-level by design (matching
+    /// Oracle's object-pair `ALL_DEPENDENCIES` granularity), while
+    /// `total_our_edges` is a raw edge count, so the two need not
+    /// reconcile.
     #[must_use]
     #[instrument(level = "trace", skip(self, snapshot, interner))]
     pub fn cross_check_with_catalog(
@@ -1539,8 +1542,17 @@ fn catalog_cross_check(
         }
     }
 
-    // Build our edge key map: (from, to) → (EdgeKind, Confidence).
-    let mut our_index: BTreeMap<(String, String), (EdgeKind, ConfidenceLevel)> = BTreeMap::new();
+    // Build our edge key map: (from, to) → list of (EdgeKind, Confidence).
+    //
+    // Parallel engine edges of different kinds can collapse to the same
+    // object pair (e.g. a package that both `Calls` and `References` the
+    // same object, or 3-part `schema.pkg.member` ids reduced to
+    // `schema.pkg` by `normalised_object_key`). We accumulate every
+    // distinct kind per pair rather than last-write-wins so a mismatching
+    // sibling is never masked by a compatible one (which would make the
+    // drift report order-dependent for identical input).
+    let mut our_index: BTreeMap<(String, String), Vec<(EdgeKind, ConfidenceLevel)>> =
+        BTreeMap::new();
     for edge in &graph.edges {
         summary.total_our_edges += 1;
         let Some(from_node) = graph.nodes.get(&edge.from) else {
@@ -1551,7 +1563,13 @@ fn catalog_cross_check(
         };
         let from = normalised_object_key(from_node.logical_id.as_str());
         let to = normalised_object_key(to_node.logical_id.as_str());
-        our_index.insert((from, to), (edge.kind, edge.confidence.level));
+        let kinds = our_index.entry((from, to)).or_default();
+        // De-duplicate identical (kind, confidence) pairs so genuinely
+        // parallel-but-redundant edges don't inflate per-pair counts; a
+        // distinct kind is always retained.
+        if !kinds.contains(&(edge.kind, edge.confidence.level)) {
+            kinds.push((edge.kind, edge.confidence.level));
+        }
     }
 
     // Walk our edges against the catalog index.
@@ -1559,43 +1577,48 @@ fn catalog_cross_check(
     let catalog_keys: std::collections::BTreeSet<_> = catalog_index.keys().cloned().collect();
 
     for key in our_keys.intersection(&catalog_keys) {
-        let (kind, _conf) = our_index[key];
         let oracle_kind = catalog_index[key];
-        let our_label = kind.as_str();
         let oracle_label = catalog_dep_kind_label(oracle_kind);
-        if catalog_kinds_compatible(kind, oracle_kind) {
-            summary.matches += 1;
-        } else {
-            summary.kind_mismatches += 1;
-            mismatches.push(CrossCheckMismatch::KindMismatch {
-                from: key.0.clone(),
-                to: key.1.clone(),
-                our_kind: our_label.to_owned(),
-                oracle_kind: oracle_label.to_owned(),
-            });
+        // Classify every distinct engine kind for this pair independently
+        // so a compatible sibling can never mask an incompatible one.
+        for &(kind, _conf) in &our_index[key] {
+            if catalog_kinds_compatible(kind, oracle_kind) {
+                summary.matches += 1;
+            } else {
+                summary.kind_mismatches += 1;
+                mismatches.push(CrossCheckMismatch::KindMismatch {
+                    from: key.0.clone(),
+                    to: key.1.clone(),
+                    our_kind: kind.as_str().to_owned(),
+                    oracle_kind: oracle_label.to_owned(),
+                });
+            }
         }
     }
 
     for key in our_keys.difference(&catalog_keys) {
-        let (kind, conf) = our_index[key];
-        if edge_kind_is_expected_gap(kind) {
-            summary.expected_gaps += 1;
-            mismatches.push(CrossCheckMismatch::ExpectedGap {
-                from: key.0.clone(),
-                to: key.1.clone(),
-                reason: format!(
-                    "Edge kind {} is not tracked by ALL_DEPENDENCIES",
-                    kind.as_str()
-                ),
-            });
-        } else {
-            summary.our_extras += 1;
-            mismatches.push(CrossCheckMismatch::OurExtra {
-                from: key.0.clone(),
-                to: key.1.clone(),
-                edge_kind: kind.as_str().to_owned(),
-                confidence: confidence_level_name(conf).to_owned(),
-            });
+        // Classify each distinct engine kind independently so an
+        // expected-gap sibling can't mask a genuine `OurExtra`.
+        for &(kind, conf) in &our_index[key] {
+            if edge_kind_is_expected_gap(kind) {
+                summary.expected_gaps += 1;
+                mismatches.push(CrossCheckMismatch::ExpectedGap {
+                    from: key.0.clone(),
+                    to: key.1.clone(),
+                    reason: format!(
+                        "Edge kind {} is not tracked by ALL_DEPENDENCIES",
+                        kind.as_str()
+                    ),
+                });
+            } else {
+                summary.our_extras += 1;
+                mismatches.push(CrossCheckMismatch::OurExtra {
+                    from: key.0.clone(),
+                    to: key.1.clone(),
+                    edge_kind: kind.as_str().to_owned(),
+                    confidence: confidence_level_name(conf).to_owned(),
+                });
+            }
         }
     }
     for key in catalog_keys.difference(&our_keys) {
@@ -2964,6 +2987,121 @@ mod tests {
                 assert_eq!(oracle_kind, "REF");
             }
             _ => unreachable!(),
+        }
+    }
+
+    /// Regression for oracle-qm3q.19: two parallel engine edges of
+    /// different Oracle-compatibility classes between the SAME object
+    /// pair must not let a compatible sibling mask an incompatible one,
+    /// and the verdict must not depend on edge insertion order.
+    ///
+    /// `billing.caller_pkg -> billing.callee_t` has both `Calls`
+    /// (compatible with HARD) and `References` (only compatible with
+    /// REF). The single Oracle dependency for that pair is HARD, so the
+    /// `References` edge is a genuine drift and must always surface a
+    /// `kind_mismatch`, while `Calls` is always a match — whichever edge
+    /// is pushed last.
+    #[test]
+    fn cross_check_parallel_edges_do_not_mask_kind_mismatch_regardless_of_order() {
+        fn build(calls_first: bool) -> CatalogCrossCheckReport {
+            let mut interner = SymbolInterner::new();
+            let billing = interner.intern("billing").expect("intern");
+            let caller = interner.intern("caller_pkg").expect("intern");
+            let callee = interner.intern("callee_t").expect("intern");
+
+            let mut graph = DepGraph::new();
+            graph.insert_node(Node::new(
+                NodeId::new(1),
+                LogicalObjectId::new("billing.caller_pkg"),
+                ObjectRevisionId::new("sha256:caller"),
+                QualifiedName::new(Some(SchemaName::from(billing)), ObjectName::from(caller)),
+                NodeIdentityKind::PackageBody,
+            ));
+            graph.insert_node(Node::new(
+                NodeId::new(2),
+                LogicalObjectId::new("billing.callee_t"),
+                ObjectRevisionId::new("sha256:callee"),
+                QualifiedName::new(Some(SchemaName::from(billing)), ObjectName::from(callee)),
+                NodeIdentityKind::Table,
+            ));
+
+            // Two parallel edges, same (from, to), incompatible classes.
+            let kinds_in_order = if calls_first {
+                [EdgeKind::Calls, EdgeKind::References]
+            } else {
+                [EdgeKind::References, EdgeKind::Calls]
+            };
+            for (i, kind) in kinds_in_order.into_iter().enumerate() {
+                graph.insert_edge(
+                    Edge::new(
+                        EdgeId::new(i as u64 + 1),
+                        NodeId::new(1),
+                        NodeId::new(2),
+                        kind,
+                        Confidence::new(ConfidenceLevel::High, None),
+                    ),
+                    Provenance::new(
+                        FileId::new(1),
+                        Span::new(
+                            FileId::new(1),
+                            Position::new(1, 1, 0),
+                            Position::new(1, 1, 0),
+                        ),
+                        ResolutionStrategy::CatalogLookup,
+                    ),
+                    None,
+                );
+            }
+
+            // Single Oracle dependency for the pair: HARD.
+            let mut snapshot = CatalogSnapshot::default();
+            let mut sc = SchemaCatalog::default();
+            sc.dependencies.push(CatalogDependency {
+                owner: SchemaName::from(billing),
+                name: ObjectName::from(caller),
+                object_type: ObjectType::Package,
+                referenced_owner: Some(SchemaName::from(billing)),
+                referenced_name: ObjectName::from(callee),
+                referenced_type: Some(ObjectType::Table),
+                dependency_kind: CatalogDependencyKind::Hard,
+                via_db_link: None,
+            });
+            snapshot.schemas.insert(SchemaName::from(billing), sc);
+
+            graph.cross_check_with_catalog(&snapshot, &interner)
+        }
+
+        let calls_last = build(false);
+        let references_last = build(true);
+
+        // The verdict must be identical regardless of insertion order.
+        assert_eq!(calls_last.summary, references_last.summary);
+
+        // And it must reflect BOTH a match (Calls vs HARD) and a real
+        // drift (References vs HARD) — never masking the latter.
+        for report in [&calls_last, &references_last] {
+            assert_eq!(report.summary.total_our_edges, 2);
+            assert_eq!(report.summary.matches, 1, "Calls is compatible with HARD");
+            assert_eq!(
+                report.summary.kind_mismatches, 1,
+                "References-vs-HARD drift must surface and not be masked"
+            );
+            assert_eq!(report.summary.our_extras, 0);
+            assert_eq!(report.summary.oracle_onlies, 0);
+
+            let mismatch = report
+                .mismatches
+                .iter()
+                .find_map(|m| match m {
+                    CrossCheckMismatch::KindMismatch {
+                        our_kind,
+                        oracle_kind,
+                        ..
+                    } => Some((our_kind.as_str(), oracle_kind.as_str())),
+                    _ => None,
+                })
+                .expect("a KindMismatch must surface for the References edge");
+            assert_eq!(mismatch, ("References", "HARD"));
         }
     }
 
