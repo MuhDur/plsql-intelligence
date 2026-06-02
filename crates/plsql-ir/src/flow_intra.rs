@@ -121,9 +121,35 @@ pub struct TaintSources {
 /// name that is only tainted on a later pass, `walk` is iterated to
 /// a fixpoint over the (finite) taint lattice before the env is
 /// returned.
+///
+/// Back-compat wrapper over [`analyze_flow_bounded`]: the per-pass
+/// re-lowering recursion is depth-guarded so a non-shrinking
+/// malformed body (e.g. the bare token `FOR UPDATE` that a
+/// `SELECT … FOR UPDATE;` fragment leaves behind, which classifies
+/// as a `BareLoop` whose `body_text` re-lowers to the *identical*
+/// `BareLoop`) terminates instead of overflowing the stack /
+/// aborting the process (R13). Callers that need to surface the
+/// typed degradation (`outcome.limit_hit`) should call
+/// [`analyze_flow_bounded`] directly.
 #[must_use]
 pub fn analyze_flow(stmts: &[Statement], sources: &TaintSources) -> FlowEnv {
+    analyze_flow_bounded(stmts, sources).0
+}
+
+/// Depth-bounded variant of [`analyze_flow`]. Returns the flow
+/// environment plus a [`RecursionOutcome`] recording whether (and
+/// how often) a nested re-lowered body was abandoned at the
+/// recursion-depth cap rather than walked unbounded. The caller is
+/// responsible for emitting an honest typed diagnostic when
+/// `outcome.limit_hit` (R13 — never silently truncate, never
+/// stack-overflow on a non-shrinking malformed slice).
+#[must_use]
+pub fn analyze_flow_bounded(
+    stmts: &[Statement],
+    sources: &TaintSources,
+) -> (FlowEnv, crate::RecursionOutcome) {
     let mut env = FlowEnv::default();
+    let mut outcome = crate::RecursionOutcome::default();
     // Iterate to a fixpoint: `merge_into` is monotone (it only ever
     // unions kinds/cleansers and joins value-sets upward), so the
     // finite lattice guarantees the env stops growing. The cap is a
@@ -132,15 +158,42 @@ pub fn analyze_flow(stmts: &[Statement], sources: &TaintSources) -> FlowEnv {
     const MAX_PASSES: usize = 64;
     for _ in 0..MAX_PASSES {
         let before = env.clone();
-        walk(stmts, sources, &mut env);
+        // Re-accumulate the truncation outcome each pass over a
+        // *fresh* outcome so the count reflects one pass, not the
+        // sum across passes; the env still folds monotonically.
+        let mut pass_outcome = crate::RecursionOutcome::default();
+        walk(stmts, sources, &mut env, 0, &mut pass_outcome);
+        outcome.absorb(pass_outcome);
         if env == before {
             break;
         }
     }
-    env
+    (env, outcome)
 }
 
-fn walk(stmts: &[Statement], sources: &TaintSources, env: &mut FlowEnv) {
+fn walk(
+    stmts: &[Statement],
+    sources: &TaintSources,
+    env: &mut FlowEnv,
+    depth: usize,
+    outcome: &mut crate::RecursionOutcome,
+) {
+    // Recurse into a re-lowered control-flow body only while we
+    // have depth budget left. At the cap we record the truncation
+    // and stop descending — never silently drop, never recurse
+    // unbounded (which stack-overflows on a non-shrinking malformed
+    // slice such as the bare `FOR UPDATE` token). Mirrors
+    // `calls.rs::walk_call_sites` / `dml_edges.rs::walk_table_accesses`.
+    macro_rules! recurse_body {
+        ($text:expr) => {{
+            if depth + 1 >= crate::MAX_RELOWER_DEPTH {
+                outcome.note_truncated();
+            } else {
+                let lowered = crate::lower_statement_body($text);
+                walk(&lowered, sources, env, depth + 1, outcome);
+            }
+        }};
+    }
     for s in stmts {
         match s {
             Statement::Assignment { target, rhs_text } => {
@@ -155,16 +208,16 @@ fn walk(stmts: &[Statement], sources: &TaintSources, env: &mut FlowEnv) {
                 else_body_text,
             } => {
                 for arm in arms {
-                    walk(&crate::lower_statement_body(&arm.body_text), sources, env);
+                    recurse_body!(&arm.body_text);
                 }
                 if let Some(eb) = else_body_text {
-                    walk(&crate::lower_statement_body(eb), sources, env);
+                    recurse_body!(eb);
                 }
             }
             Statement::ForLoop { body_text, .. }
             | Statement::WhileLoop { body_text, .. }
             | Statement::BareLoop { body_text } => {
-                walk(&crate::lower_statement_body(body_text), sources, env);
+                recurse_body!(body_text);
             }
             _ => {}
         }
@@ -667,6 +720,83 @@ mod tests {
         assert!(
             !f.taint.kinds.contains(&TaintKind::UserInput),
             "the sanitizer consumes the argument's taint"
+        );
+    }
+
+    // oracle-lokg.2: the exact crash shape from the bundled public
+    // fixture. A `SELECT … FOR UPDATE;` body fragment leaves the bare
+    // token `FOR UPDATE`; the text-scanner's `classify_loop` treats
+    // `FOR …` as a FOR-loop, finds no word-bounded `IN` and no
+    // `END LOOP`, and falls back to a `BareLoop` whose `body_text` is
+    // *the same string* `FOR UPDATE`. Re-lowering it yields the
+    // identical non-shrinking `BareLoop` → before the depth guard
+    // `walk` recursed unbounded and aborted the whole `analyze_flow`
+    // (SIGABRT / "stack overflow"; MAX_PASSES=64 bounds only the OUTER
+    // fixpoint, not the per-pass recursion). It must now terminate and
+    // report the truncation honestly (R13).
+    #[test]
+    fn non_shrinking_for_update_does_not_stack_overflow_and_reports_limit() {
+        let stmts = vec![Statement::BareLoop {
+            body_text: "FOR UPDATE".to_string(),
+        }];
+        let (env, outcome) = analyze_flow_bounded(&stmts, &src(&[]));
+        assert!(
+            outcome.limit_hit,
+            "the non-shrinking `FOR UPDATE` BareLoop must trip the \
+             bounded depth cap, outcome={outcome:?}"
+        );
+        assert!(outcome.truncated_bodies >= 1);
+        // No assignment can be recovered from the malformed fragment.
+        assert!(env.is_empty());
+        // The back-compat wrapper must also simply terminate
+        // (no panic / abort) rather than recurse unbounded.
+        let _ = analyze_flow(&stmts, &src(&[]));
+    }
+
+    // oracle-lokg.2: the same shape arrived at via the lowering path
+    // (not a hand-built `Statement`), proving the end-to-end public API
+    // `analyze_flow(&lower_statement_body("FOR UPDATE"), …)` terminates.
+    #[test]
+    fn analyze_flow_over_lowered_for_update_terminates() {
+        let stmts = lower_statement_body("FOR UPDATE");
+        let env = analyze_flow(&stmts, &TaintSources::default());
+        // We do not assert the env contents — only that the call
+        // returned at all (before the guard this aborted the process).
+        let _ = env.is_empty();
+    }
+
+    // oracle-lokg.2: a genuinely deep linear nesting chain must
+    // terminate at the depth cap with a clean typed truncation outcome
+    // instead of overflowing the stack. Each level is a `BareLoop`
+    // wrapping the next, so the re-lowered slice shrinks one level per
+    // recursion — but without the cap a sufficiently deep chain would
+    // overflow the native stack. DEPTH is set well above
+    // `MAX_RELOWER_DEPTH` (128) so the cap is guaranteed to fire while
+    // keeping the per-level re-lowering scan cheap; the same guard
+    // bounds the recursion to 128 frames no matter how deep the input.
+    #[test]
+    fn deep_nested_loop_chain_degrades_to_limit_not_overflow() {
+        const DEPTH: usize = 1_000;
+        // Compile-time invariant: DEPTH must exceed the cap so the
+        // truncation is guaranteed to fire.
+        const _: () = assert!(DEPTH > crate::MAX_RELOWER_DEPTH);
+        // Build the chain with a single linear pass (no quadratic
+        // string re-allocation): DEPTH `LOOP ` openers, the innermost
+        // assignment, then DEPTH ` END LOOP;` closers.
+        let mut body = String::with_capacity(DEPTH * 16 + 32);
+        for _ in 0..DEPTH {
+            body.push_str("LOOP ");
+        }
+        body.push_str("v_x := p_user; ");
+        for _ in 0..DEPTH {
+            body.push_str("END LOOP; ");
+        }
+        let stmts = lower_statement_body(&body);
+        let (_, outcome) = analyze_flow_bounded(&stmts, &src(&["p_user"]));
+        assert!(
+            outcome.limit_hit,
+            "a {DEPTH}-deep nested LOOP chain must trip the depth cap, \
+             outcome={outcome:?}"
         );
     }
 }

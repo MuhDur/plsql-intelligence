@@ -54,7 +54,7 @@ pub use flow::{ConstantValue, StringShape, Taint, TaintCleanser, TaintKind, Valu
 pub use flow_inter::{
     CallEdgeFlow, FlowUnknownFact, InterFlowResult, RoutineFlowSummary, propagate_inter,
 };
-pub use flow_intra::{FlowEnv, TaintSources, analyze_flow};
+pub use flow_intra::{FlowEnv, TaintSources, analyze_flow, analyze_flow_bounded};
 pub use flow_query::{FlowQuery, TaintAnswer};
 pub use lower::{LoweredFile, lower_top_level};
 pub use recursion_guard::{MAX_RELOWER_DEPTH, RecursionOutcome};
