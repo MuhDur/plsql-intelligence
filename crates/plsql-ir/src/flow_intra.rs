@@ -9,6 +9,14 @@
 //! LHS via `ValueSet::join`, which is sound for taint /
 //! string-shape over-approximation.
 //!
+//! Taint is *use-def transitive*: an RHS that references a local
+//! already tainted earlier in the body inherits that taint, so
+//! laundering through intermediates (`v_tmp := p_user;
+//! v_sql := v_tmp;`) cannot escape the analysis. The walk is
+//! iterated to a fixpoint over the finite taint lattice so a name
+//! tainted only on a later pass (e.g. across a loop back-edge) is
+//! still captured.
+//!
 //! Outputs a `FlowEnv` mapping each assigned name to its
 //! accumulated `ValueFlow`. SAST consumes this to answer "does
 //! tainted input reach a dynamic-SQL sink without a cleanser?".
@@ -59,7 +67,14 @@ impl FlowEnv {
     fn merge_into(&mut self, name: &str, flow: ValueFlow) {
         let key = name.to_ascii_uppercase();
         let entry = self.map.entry(key).or_default();
-        // Taint kinds accumulate (union); cleansers accumulate.
+        // Taint kinds accumulate (union) across the branch arms a may-analysis
+        // folds into one env. `cleansed_by` also accumulates, but ONLY for
+        // reporting: the alarm reads `kinds` (live, uncleansed taint), so a
+        // cleanser recorded on one arm cannot mask a live kind contributed by a
+        // sibling arm. (Under the former "tainted-but-cleansed" model this union
+        // was a fail-open at branch joins — oracle-qm3q.26; the live-kinds model
+        // from oracle-qm3q.1 makes the join sound without needing CFG-precise
+        // path-intersection of cleansers.)
         for k in flow.taint.kinds {
             if !entry.taint.kinds.contains(&k) {
                 entry.taint.kinds.push(k);
@@ -97,10 +112,31 @@ pub struct TaintSources {
 
 /// Run intra-procedural flow over `stmts`. `sources` declares
 /// which bare names are tainted on entry (public params, binds).
+///
+/// Taint propagates transitively through assignments: an RHS that
+/// references a previously-tainted *local* (`v_sql := v_tmp` after
+/// `v_tmp := p_user`) inherits that local's live taint, so
+/// multi-hop laundering through intermediate variables cannot
+/// escape the analysis. Because branches and loops can re-read a
+/// name that is only tainted on a later pass, `walk` is iterated to
+/// a fixpoint over the (finite) taint lattice before the env is
+/// returned.
 #[must_use]
 pub fn analyze_flow(stmts: &[Statement], sources: &TaintSources) -> FlowEnv {
     let mut env = FlowEnv::default();
-    walk(stmts, sources, &mut env);
+    // Iterate to a fixpoint: `merge_into` is monotone (it only ever
+    // unions kinds/cleansers and joins value-sets upward), so the
+    // finite lattice guarantees the env stops growing. The cap is a
+    // belt-and-suspenders bound (never expected to bind) so a
+    // pathological body can never spin forever.
+    const MAX_PASSES: usize = 64;
+    for _ in 0..MAX_PASSES {
+        let before = env.clone();
+        walk(stmts, sources, &mut env);
+        if env == before {
+            break;
+        }
+    }
     env
 }
 
@@ -109,7 +145,9 @@ fn walk(stmts: &[Statement], sources: &TaintSources, env: &mut FlowEnv) {
         match s {
             Statement::Assignment { target, rhs_text } => {
                 let rhs_expr = crate::expr::lower_expression(rhs_text);
-                let flow = expr_flow(&rhs_expr, sources);
+                // Read the live env (use-def aware) so taint already
+                // accumulated on a referenced local flows into the RHS.
+                let flow = expr_flow(&rhs_expr, sources, env);
                 env.merge_into(target, flow);
             }
             Statement::If {
@@ -134,14 +172,15 @@ fn walk(stmts: &[Statement], sources: &TaintSources, env: &mut FlowEnv) {
 }
 
 /// Compute the `ValueFlow` of an expression. Taint flows from any
-/// referenced source name; a `DBMS_ASSERT.*` call cleanses.
-fn expr_flow(expr: &Expr, sources: &TaintSources) -> ValueFlow {
+/// referenced source name OR any previously-tainted local recorded
+/// in `env` (use-def transitivity); a `DBMS_ASSERT.*` call cleanses.
+fn expr_flow(expr: &Expr, sources: &TaintSources, env: &FlowEnv) -> ValueFlow {
     let mut flow = ValueFlow::default();
-    collect_expr_flow(expr, sources, &mut flow);
+    collect_expr_flow(expr, sources, env, &mut flow);
     flow
 }
 
-fn collect_expr_flow(expr: &Expr, sources: &TaintSources, flow: &mut ValueFlow) {
+fn collect_expr_flow(expr: &Expr, sources: &TaintSources, env: &FlowEnv, flow: &mut ValueFlow) {
     match expr {
         Expr::Name(n) => {
             let head = n.parts.first().map(String::as_str).unwrap_or_default();
@@ -160,6 +199,29 @@ fn collect_expr_flow(expr: &Expr, sources: &TaintSources, flow: &mut ValueFlow) 
                 && !flow.taint.kinds.contains(&TaintKind::BindVariable)
             {
                 flow.taint.kinds.push(TaintKind::BindVariable);
+            }
+            // Use-def transitivity: a reference to a previously-assigned
+            // local inherits that local's accumulated flow, so taint
+            // laundered through an intermediate variable
+            // (`v_tmp := p_user; v_sql := v_tmp;`) still reaches the sink.
+            // Only LIVE kinds carry the alarm; `cleansed_by` is unioned for
+            // reporting (a recorded cleanser never masks a live kind — see
+            // `flags_alarm`). String shape is preserved only when the parent
+            // has none yet.
+            if let Some(prev) = env.get(head) {
+                for k in &prev.taint.kinds {
+                    if !flow.taint.kinds.contains(k) {
+                        flow.taint.kinds.push(*k);
+                    }
+                }
+                for c in &prev.taint.cleansed_by {
+                    if !flow.taint.cleansed_by.contains(c) {
+                        flow.taint.cleansed_by.push(*c);
+                    }
+                }
+                if flow.string_shape.is_none() {
+                    flow.string_shape = prev.string_shape.clone();
+                }
             }
         }
         Expr::BindRef(_) if !flow.taint.kinds.contains(&TaintKind::BindVariable) => {
@@ -187,7 +249,7 @@ fn collect_expr_flow(expr: &Expr, sources: &TaintSources, flow: &mut ValueFlow) 
                 // {UserInput, cleansed:DbmsAssert} → flags_alarm=false (fail-open).
                 let mut sanitized = ValueFlow::default();
                 for a in args {
-                    collect_expr_flow(a, sources, &mut sanitized);
+                    collect_expr_flow(a, sources, env, &mut sanitized);
                 }
                 // The sanitizer CONSUMES its argument's live taint: record the
                 // cleanser (for reporting) and DROP the kinds — they are no longer
@@ -207,15 +269,15 @@ fn collect_expr_flow(expr: &Expr, sources: &TaintSources, flow: &mut ValueFlow) 
                 // A non-sanitizing call is transparent to taint: its arguments'
                 // taint flows through to the enclosing expression.
                 for a in args {
-                    collect_expr_flow(a, sources, flow);
+                    collect_expr_flow(a, sources, env, flow);
                 }
             }
         }
         Expr::Binary { lhs, rhs, .. } => {
-            collect_expr_flow(lhs, sources, flow);
-            collect_expr_flow(rhs, sources, flow);
+            collect_expr_flow(lhs, sources, env, flow);
+            collect_expr_flow(rhs, sources, env, flow);
         }
-        Expr::Unary { operand, .. } => collect_expr_flow(operand, sources, flow),
+        Expr::Unary { operand, .. } => collect_expr_flow(operand, sources, env, flow),
         _ => {}
     }
 }
@@ -360,6 +422,36 @@ mod tests {
     }
 
     #[test]
+    fn branch_merge_sibling_cleanse_does_not_mask_live_kind() {
+        // Regression for oracle-qm3q.26 (cleanser-union fail-open across a
+        // branch join). One arm sanitises `v` with DBMS_ASSERT; the OTHER arm
+        // assigns raw `p_user`. `merge_into` unions the cleanser from the THEN
+        // arm with the live UserInput kind from the ELSE arm — but because
+        // `kinds` tracks only LIVE (uncleansed) taint and `flags_alarm` no
+        // longer depends on `cleansed_by`, the uncleansed ELSE path still
+        // alarms. (Under the old "tainted-but-cleansed" model the recorded
+        // DbmsAssert cleanser would have masked the live ELSE-path kind — a
+        // SEC001 fail-open.)
+        let s = lower_statement_body(
+            "IF c THEN v := DBMS_ASSERT.SIMPLE_SQL_NAME(p_user); ELSE v := p_user; END IF;",
+        );
+        let env = analyze_flow(&s, &src(&["p_user"]));
+        let f = env.get("v").unwrap();
+        assert!(
+            f.taint.kinds.contains(&TaintKind::UserInput),
+            "the uncleansed ELSE-path UserInput kind must survive the branch join"
+        );
+        assert!(
+            f.taint.cleansed_by.contains(&TaintCleanser::DbmsAssert),
+            "the THEN-path cleanser is still recorded for reporting"
+        );
+        assert!(
+            f.taint.flags_alarm(),
+            "a sibling cleanse on one branch must NOT mask the live kind on the other"
+        );
+    }
+
+    #[test]
     fn case_insensitive_source_match() {
         let s = lower_statement_body("v_x := P_USER;");
         let env = analyze_flow(&s, &src(&["p_user"]));
@@ -376,5 +468,89 @@ mod tests {
     fn empty_body_yields_empty_env() {
         let env = analyze_flow(&[], &src(&[]));
         assert!(env.is_empty());
+    }
+
+    #[test]
+    fn two_hop_local_laundering_propagates_taint() {
+        // Regression for oracle-qm3q.20 (transitive intra-procedural taint).
+        // `v_tmp` launders `p_user`; `v_sql := v_tmp` must inherit the taint so
+        // an EXECUTE IMMEDIATE built from v_sql is still flagged. Before the
+        // use-def fix, expr_flow only consulted the static `sources` set and
+        // never the live env, so v_sql came out clean (a SEC001 false negative).
+        let s = lower_statement_body("v_tmp := p_user; v_sql := v_tmp;");
+        let env = analyze_flow(&s, &src(&["p_user"]));
+        assert!(
+            env.get("v_tmp")
+                .unwrap()
+                .taint
+                .kinds
+                .contains(&TaintKind::UserInput),
+            "the first hop is tainted from the source"
+        );
+        let sql = env.get("v_sql").unwrap();
+        assert!(
+            sql.taint.kinds.contains(&TaintKind::UserInput),
+            "taint laundered through v_tmp must reach v_sql"
+        );
+        assert!(sql.taint.flags_alarm(), "the laundered value still alarms");
+    }
+
+    #[test]
+    fn n_hop_local_laundering_propagates_taint() {
+        // Deeper chain: p_user -> a -> b -> c. Each hop must carry the taint
+        // forward through the live env.
+        let s = lower_statement_body("v_a := p_user; v_b := v_a; v_c := v_b;");
+        let env = analyze_flow(&s, &src(&["p_user"]));
+        for name in ["v_a", "v_b", "v_c"] {
+            assert!(
+                env.get(name)
+                    .unwrap()
+                    .taint
+                    .kinds
+                    .contains(&TaintKind::UserInput),
+                "{name} must be tainted along the laundering chain"
+            );
+        }
+    }
+
+    #[test]
+    fn cleansed_local_then_reused_stays_clean() {
+        // The dual of laundering: once a local is sanitised by DBMS_ASSERT,
+        // reusing it must NOT resurrect a live UserInput kind. The transitive
+        // env-consult inherits cleansed_by (for reporting) but no live kind,
+        // because the sanitiser already drained the kinds it consumed.
+        let s = lower_statement_body(
+            "v_tmp := DBMS_ASSERT.SIMPLE_SQL_NAME(p_user); v_sql := v_tmp;",
+        );
+        let env = analyze_flow(&s, &src(&["p_user"]));
+        let sql = env.get("v_sql").unwrap();
+        assert!(
+            !sql.taint.kinds.contains(&TaintKind::UserInput),
+            "a reused sanitised local carries no live taint"
+        );
+        assert!(
+            !sql.taint.flags_alarm(),
+            "reusing a sanitised value must not alarm"
+        );
+        assert!(
+            sql.taint.cleansed_by.contains(&TaintCleanser::DbmsAssert),
+            "the cleanser is carried forward for reporting"
+        );
+    }
+
+    #[test]
+    fn taint_laundered_through_local_into_concatenation_alarms() {
+        // Combine transitivity with the sibling-cleanse guard: stage raw user
+        // input in a local, then concatenate it into a dynamic-SQL string.
+        let s = lower_statement_body(
+            "v_t := p_user; v_sql := 'SELECT * FROM ' || v_t;",
+        );
+        let env = analyze_flow(&s, &src(&["p_user"]));
+        let sql = env.get("v_sql").unwrap();
+        assert!(
+            sql.taint.kinds.contains(&TaintKind::UserInput),
+            "laundered taint concatenated into SQL must remain tainted"
+        );
+        assert!(sql.taint.flags_alarm());
     }
 }

@@ -1,16 +1,18 @@
-//! Bounded inter-procedural parameter/return flow.
+//! Single-hop inter-procedural parameter/return flow.
 //!
 //! FLOW-002 propagates taint within one routine. This pass joins
 //! routines: when routine A calls routine B, the taint of A's
 //! actual arguments flows into B's formal parameters, and B's
 //! return taint flows back to A's call-site assignment.
 //!
-//! The analysis is **bounded** — it does not iterate to a
-//! fixpoint across recursive cycles. Each call edge is followed
-//! at most `MAX_DEPTH` hops; anything deeper, or any call whose
-//! callee summary is missing (external package, db-link, dynamic
-//! dispatch), is recorded as a conservative [`FlowUnknownFact`]
-//! so R13 reporting never silently drops the boundary.
+//! Each call edge is resolved **once** against the callee's
+//! [`RoutineFlowSummary`] — a single hop. The pass does NOT follow
+//! transitive chains (A→B→C) or iterate a recursive frontier;
+//! multi-hop following is a future pass and is intentionally out of
+//! scope here. A direct self-call (A→A) and any call whose callee
+//! summary is missing (external package, db-link, dynamic dispatch)
+//! are recorded as conservative [`FlowUnknownFact`]s so R13
+//! reporting never silently drops the boundary.
 //!
 //! Routine summaries are supplied by the caller as
 //! [`RoutineFlowSummary`] records (param taint sensitivity +
@@ -31,9 +33,6 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::flow::TaintKind;
-
-/// Cap on inter-procedural call-chain following.
-pub const MAX_DEPTH: u8 = 6;
 
 /// Per-routine flow summary the caller supplies. `param_taints`
 /// maps a 0-based parameter index to the taint kinds that param
@@ -57,8 +56,8 @@ pub struct CallEdgeFlow {
 }
 
 /// Conservative boundary record (R13). Emitted whenever the pass
-/// cannot follow a call: missing callee summary, depth cap hit,
-/// or a recursion cycle.
+/// cannot resolve a call: missing callee summary, or a direct
+/// recursion (self-call).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FlowUnknownFact {
     pub at_caller: String,
@@ -72,9 +71,8 @@ pub enum FlowUnknownReason {
     /// No `RoutineFlowSummary` for the callee (external package,
     /// db-link, runtime dispatch).
     MissingCalleeSummary,
-    /// Call chain exceeded `MAX_DEPTH`.
-    DepthCapExceeded,
-    /// Callee already on the active call stack (recursion).
+    /// Callee is the caller itself (direct recursion); the
+    /// single-hop pass does not unfold the cycle.
     RecursionCycle,
 }
 
@@ -95,8 +93,9 @@ pub struct PropagatedReturn {
 }
 
 /// Propagate taint across `call_edges` using the supplied
-/// `summaries`. Bounded by `MAX_DEPTH`; cycles + missing
-/// summaries surface as `FlowUnknownFact`.
+/// `summaries`. Each edge is resolved one hop against its callee
+/// summary; a direct self-call and a missing summary surface as
+/// `FlowUnknownFact` (R13).
 #[must_use]
 pub fn propagate_inter(
     call_edges: &[CallEdgeFlow],
@@ -109,8 +108,7 @@ pub fn propagate_inter(
     let mut result = InterFlowResult::default();
 
     for edge in call_edges {
-        let mut stack: Vec<String> = vec![edge.caller.clone()];
-        resolve_edge(edge, &by_id, &mut stack, 0, &mut result);
+        resolve_edge(edge, &by_id, &mut result);
     }
     result
 }
@@ -118,19 +116,12 @@ pub fn propagate_inter(
 fn resolve_edge(
     edge: &CallEdgeFlow,
     by_id: &BTreeMap<&str, &RoutineFlowSummary>,
-    stack: &mut Vec<String>,
-    depth: u8,
     result: &mut InterFlowResult,
 ) {
-    if depth >= MAX_DEPTH {
-        result.unknowns.push(FlowUnknownFact {
-            at_caller: edge.caller.clone(),
-            callee: edge.callee.clone(),
-            reason: FlowUnknownReason::DepthCapExceeded,
-        });
-        return;
-    }
-    if stack.iter().any(|s| s == &edge.callee) {
+    // Single-hop: a callee that is the caller itself is a direct
+    // recursion the pass does not unfold. (Transitive cycles A→B→A
+    // are out of scope until multi-hop following lands.)
+    if edge.callee == edge.caller {
         result.unknowns.push(FlowUnknownFact {
             at_caller: edge.caller.clone(),
             callee: edge.callee.clone(),
@@ -169,7 +160,6 @@ fn resolve_edge(
         callee: edge.callee.clone(),
         result_taint,
     });
-    let _ = stack;
 }
 
 #[cfg(test)]
@@ -313,23 +303,82 @@ mod tests {
     }
 
     #[test]
-    fn depth_cap_fires_when_chain_exceeds_max() {
-        // Build a synthetic edge that the resolver hits at depth 0
-        // but with MAX_DEPTH forced via a deep pre-seeded stack
-        // would exceed — instead verify the constant drives the
-        // DepthCapExceeded branch through the public surface by
-        // checking a self-edge under a callee summary still
-        // resolves (depth 0 < cap) while the recursion guard is
-        // the live limiter. This keeps the bound exercised
-        // without an assertion-on-constant.
-        let edges = vec![CallEdgeFlow {
-            caller: "a".into(),
-            callee: "b".into(),
-            actual_arg_taints: vec![],
-        }];
-        let summaries = vec![summ("b", &[], &[])];
+    fn chain_is_resolved_single_hop_not_transitively() {
+        // The pass resolves each edge ONCE against its callee summary; it does
+        // not follow A→B→C transitively. With edges a→b and b→c where c returns
+        // DbLink, the result must contain two independent single-hop records and
+        // c's DbLink must NOT appear on a's record (no transitive composition).
+        // This pins the documented single-hop scope (replacing the former
+        // `depth_cap_fires_when_chain_exceeds_max` 6==6 tautology, which faked
+        // coverage of a depth cap that no input could ever trigger).
+        let edges = vec![
+            CallEdgeFlow {
+                caller: "a".into(),
+                callee: "b".into(),
+                actual_arg_taints: vec![vec![TaintKind::UserInput]],
+            },
+            CallEdgeFlow {
+                caller: "b".into(),
+                callee: "c".into(),
+                actual_arg_taints: vec![vec![TaintKind::UserInput]],
+            },
+        ];
+        let summaries = vec![
+            summ("b", &[(0, &[TaintKind::UserInput])], &[]),
+            summ("c", &[], &[TaintKind::DbLink]),
+        ];
         let r = propagate_inter(&edges, &summaries);
         assert!(r.unknowns.is_empty());
-        assert_eq!(usize::from(MAX_DEPTH).clamp(1, 16), MAX_DEPTH as usize);
+        assert_eq!(r.propagated_returns.len(), 2);
+
+        let a_rec = r
+            .propagated_returns
+            .iter()
+            .find(|p| p.caller == "a")
+            .expect("a→b record present");
+        assert!(
+            a_rec.result_taint.contains(&TaintKind::UserInput),
+            "a→b folds the actual's UserInput through b's propagating param"
+        );
+        assert!(
+            !a_rec.result_taint.contains(&TaintKind::DbLink),
+            "single-hop: c's DbLink must NOT transitively reach a"
+        );
+
+        let b_rec = r
+            .propagated_returns
+            .iter()
+            .find(|p| p.caller == "b")
+            .expect("b→c record present");
+        assert!(
+            b_rec.result_taint.contains(&TaintKind::DbLink),
+            "b→c carries c's declared return taint to b"
+        );
+    }
+
+    #[test]
+    fn distinct_caller_callee_with_same_name_in_two_edges_is_not_a_cycle() {
+        // Guard against over-eager cycle detection: a→b and b→a are two distinct
+        // single-hop edges (mutual recursion at the chain level), but NEITHER is
+        // a direct self-call, so both resolve and neither is flagged a cycle.
+        let edges = vec![
+            CallEdgeFlow {
+                caller: "a".into(),
+                callee: "b".into(),
+                actual_arg_taints: vec![],
+            },
+            CallEdgeFlow {
+                caller: "b".into(),
+                callee: "a".into(),
+                actual_arg_taints: vec![],
+            },
+        ];
+        let summaries = vec![summ("a", &[], &[]), summ("b", &[], &[])];
+        let r = propagate_inter(&edges, &summaries);
+        assert!(
+            r.unknowns.is_empty(),
+            "mutual edges are single-hop resolvable, not direct self-recursion"
+        );
+        assert_eq!(r.propagated_returns.len(), 2);
     }
 }
