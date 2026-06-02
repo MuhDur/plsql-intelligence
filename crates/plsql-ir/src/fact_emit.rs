@@ -344,14 +344,19 @@ const INSTRUMENTATION_MARKERS: &[&str] = &[
 ];
 
 fn body_has_dml(body: &str) -> bool {
-    for kw in ["insert ", "update ", "delete ", "merge "] {
-        if let Some(at) = body.find(kw)
-            && keyword_boundary_before(body, at)
-        {
-            return true;
-        }
-    }
-    false
+    // Scan *every* occurrence of each DML keyword, not just the first.
+    // A first-hit-only check under-reports when an earlier occurrence is
+    // the tail of an identifier (e.g. `v_last_update`, `deleted_flag`):
+    // the boundary check fails on that decoy and, without a retry loop,
+    // the genuine row-level `update t`/`delete from t` later in the body
+    // is never reached. Mirrors `scan_dml_in_function` (line ~692) and
+    // `scan_deterministic_misuse` (line ~812).
+    ["insert ", "update ", "delete ", "merge "]
+        .iter()
+        .any(|kw| {
+            body.match_indices(kw)
+                .any(|(at, _)| keyword_boundary_before(body, at))
+        })
 }
 
 /// Scan a routine `source` for cursor `FOR` loops, yielding one
@@ -1752,6 +1757,55 @@ mod tests {
         // Procedure with DML: not QUAL007's concern.
         assert!(
             scan_dml_in_function("hr.p", "procedure p is begin delete from t; end;").is_empty()
+        );
+    }
+
+    #[test]
+    fn scan_dml_in_function_finds_dml_after_identifier_decoy() {
+        // Regression (oracle-73t1.7): `body_has_dml` must scan *every*
+        // occurrence of a DML keyword, not just the first. A declared local
+        // whose name ends in the keyword (`v_last_update`, `deleted_flag`,
+        // `last_inserted`) is preceded by `_`, so its boundary check fails;
+        // a first-hit-only scan would stop there and miss the genuine
+        // row-level DML that follows.
+        assert_eq!(
+            scan_dml_in_function(
+                "hr.f",
+                "function f(p int) return number is v_last_update date; \
+                 begin update t set c = 1 where id = p; return 1; end;",
+            )
+            .len(),
+            1,
+            "decoy `v_last_update` local must not mask the genuine `update t`",
+        );
+        assert_eq!(
+            scan_dml_in_function(
+                "hr.f",
+                "function f(p int) return number is deleted_flag char(1); \
+                 begin delete from t where id = p; return 1; end;",
+            )
+            .len(),
+            1,
+            "decoy `deleted_flag` local must not mask the genuine `delete from t`",
+        );
+        assert_eq!(
+            scan_dml_in_function(
+                "hr.f",
+                "function f(p int) return number is last_inserted int; \
+                 begin insert into log values (p); return 1; end;",
+            )
+            .len(),
+            1,
+            "decoy `last_inserted` local must not mask the genuine `insert into`",
+        );
+        // No genuine DML behind the decoy ⇒ still clean (no false positive).
+        assert!(
+            scan_dml_in_function(
+                "hr.f",
+                "function f return number is v_last_update date; begin return 1; end;",
+            )
+            .is_empty(),
+            "identifier-only `v_last_update` must not be read as DML",
         );
     }
 
