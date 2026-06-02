@@ -201,6 +201,19 @@ fn split_statements(source: &str) -> Vec<StatementChunk> {
     let mut i = 0;
     let chars: Vec<char> = source.chars().collect();
     while i < chars.len() {
+        // Opaque spans — string literals (`'…''…'`), Oracle q-quotes
+        // (`q'X…X'`), and comments — are copied through verbatim WITHOUT
+        // scanning: a `;` inside a literal/comment is not a statement boundary,
+        // and a `BEGIN`/`END` inside one must not move the block-depth counter.
+        // (split_statements runs on the raw body before strip_comments, so it
+        // must skip comments itself.)
+        if let Some(end) = opaque_span_end(&chars, i) {
+            for &ch in &chars[i..end] {
+                buffer.push(ch);
+            }
+            i = end;
+            continue;
+        }
         let c = chars[i];
         // `END IF` / `END LOOP` / `END CASE` must be matched before a
         // bare `END`, otherwise the bare-`END` arm would consume the
@@ -240,6 +253,100 @@ fn split_statements(source: &str) -> Vec<StatementChunk> {
         });
     }
     out
+}
+
+/// If a string literal begins at `chars[i]` — a single-quoted `'…''…'`
+/// literal (doubled `''` escapes) or an Oracle alternative-quoting
+/// `q'X…X'` / `nq'X…X'` literal — return the index one past its end. An
+/// unterminated literal consumes to end-of-input so no `;`/keyword inside an
+/// open literal is ever treated as a boundary. `prev` (the char before `i`)
+/// guards the q-quote so an identifier ending in q/n (e.g. `acquire`) does not
+/// false-trigger. Mirrors the canonical scanner in plsql-parser-antlr::recover.
+fn string_literal_end(chars: &[char], i: usize) -> Option<usize> {
+    let len = chars.len();
+    if i >= len {
+        return None;
+    }
+    // q-quote: optional leading n/N, then q/Q, then `'`, then the delimiter.
+    let prev_is_ident = i > 0 && (chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_');
+    let q_at = if chars[i].eq_ignore_ascii_case(&'n') && i + 1 < len {
+        i + 1
+    } else {
+        i
+    };
+    if !prev_is_ident
+        && chars[q_at].eq_ignore_ascii_case(&'q')
+        && q_at + 2 < len
+        && chars[q_at + 1] == '\''
+    {
+        let open = chars[q_at + 2];
+        let close = match open {
+            '[' => ']',
+            '(' => ')',
+            '{' => '}',
+            '<' => '>',
+            other => other,
+        };
+        let mut j = q_at + 3;
+        while j + 1 < len {
+            if chars[j] == close && chars[j + 1] == '\'' {
+                return Some(j + 2);
+            }
+            j += 1;
+        }
+        return Some(len); // unterminated → consume to EOF
+    }
+    // Single-quoted string literal with doubled-`''` escape.
+    if chars[i] == '\'' {
+        let mut j = i + 1;
+        while j < len {
+            if chars[j] == '\'' {
+                if j + 1 < len && chars[j + 1] == '\'' {
+                    j += 2; // escaped ''
+                } else {
+                    return Some(j + 1);
+                }
+            } else {
+                j += 1;
+            }
+        }
+        return Some(len); // unterminated → consume to EOF
+    }
+    None
+}
+
+/// If an opaque span — a string literal (see [`string_literal_end`]) or a
+/// comment (`-- …` line / `/* … */` block) — begins at `chars[i]`, return the
+/// index one past its end. Used by [`split_statements`] to copy such spans
+/// through verbatim so their contents never affect `;`-splitting or block depth.
+fn opaque_span_end(chars: &[char], i: usize) -> Option<usize> {
+    if let Some(end) = string_literal_end(chars, i) {
+        return Some(end);
+    }
+    let len = chars.len();
+    // Line comment `-- …` (up to and including the newline).
+    if chars[i] == '-' && chars.get(i + 1) == Some(&'-') {
+        let mut j = i + 2;
+        while j < len && chars[j] != '\n' {
+            j += 1;
+        }
+        if j < len {
+            j += 1; // include the terminating newline
+        }
+        return Some(j);
+    }
+    // Block comment `/* … */`.
+    if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+        let mut j = i + 2;
+        while j < len {
+            if chars[j] == '*' && chars.get(j + 1) == Some(&'/') {
+                return Some(j + 2);
+            }
+            j += 1;
+        }
+        return Some(len); // unterminated
+    }
+    None
 }
 
 /// Match a block terminator at `pos`: `END IF`, `END LOOP`,
@@ -298,29 +405,47 @@ fn consume_keyword(chars: &[char], pos: usize, keyword: &str) -> Option<usize> {
 }
 
 fn strip_comments(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '-' && chars.peek().copied() == Some('-') {
-            for nc in chars.by_ref() {
-                if nc == '\n' {
-                    out.push('\n');
-                    break;
-                }
+    let mut i = 0;
+    while i < chars.len() {
+        // A string literal is opaque: copy it through verbatim so a `--` or
+        // `/*` *inside* a quoted (or q-quoted) literal is never mistaken for a
+        // comment and stripped — which would corrupt the statement's SQL text.
+        if let Some(end) = string_literal_end(&chars, i) {
+            for &ch in &chars[i..end] {
+                out.push(ch);
+            }
+            i = end;
+            continue;
+        }
+        let c = chars[i];
+        // Line comment `-- …`: drop it but keep the newline (line structure).
+        if c == '-' && chars.get(i + 1) == Some(&'-') {
+            i += 2;
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            if i < chars.len() {
+                out.push('\n');
+                i += 1;
             }
             continue;
         }
-        if c == '/' && chars.peek().copied() == Some('*') {
-            chars.next();
-            while let Some(nc) = chars.next() {
-                if nc == '*' && chars.peek().copied() == Some('/') {
-                    chars.next();
+        // Block comment `/* … */`: drop it entirely.
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i < chars.len() {
+                if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    i += 2;
                     break;
                 }
+                i += 1;
             }
             continue;
         }
         out.push(c);
+        i += 1;
     }
     out
 }
@@ -752,6 +877,55 @@ mod tests {
         let src = "v_x := 1; v_y := 2; NULL;";
         let r = lower_statement_body(src);
         assert_eq!(r.len(), 3);
+    }
+
+    #[test]
+    fn semicolon_inside_string_literal_is_not_a_boundary() {
+        // A `;` inside a single-quoted literal must not split the statement.
+        let r = lower_statement_body("v_msg := 'a; b; c'; NULL;");
+        assert_eq!(r.len(), 2, "the assignment (with its literal) + NULL");
+    }
+
+    #[test]
+    fn block_keywords_inside_string_literal_do_not_move_depth() {
+        // 'BEGIN'/'END' inside a literal are data, not block keywords — the
+        // top-level `;` after the assignment must still split into two.
+        let r = lower_statement_body("v_msg := 'BEGIN x END;'; v_y := 2;");
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn q_quote_with_embedded_end_and_semicolon_is_opaque() {
+        // q'{ … END; … }' is a single literal: neither a split nor a depth move.
+        let r = lower_statement_body("v_sql := q'{SELECT 1; END;}'; NULL;");
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn semicolon_inside_line_comment_is_not_a_boundary() {
+        // split runs on the raw body before strip_comments, so it must skip
+        // comments: the `;`s inside the trailing comment do not split.
+        let r = lower_statement_body("v_x := 1; -- trailing; comment; here\nNULL;");
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn semicolon_inside_block_comment_is_not_a_boundary() {
+        let r = lower_statement_body("v_x := 1 /* a; b; c */ + 2; NULL;");
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn comment_markers_inside_string_literal_are_preserved() {
+        // strip_comments must NOT treat `--` / `/*` inside a literal as a comment;
+        // stripping the literal's body would corrupt the statement's SQL text.
+        let r = lower_statement_body("v_msg := 'keep -- this and /* this */ too';");
+        assert_eq!(r.len(), 1);
+        let dbg = format!("{:?}", r[0]);
+        assert!(
+            dbg.contains("keep -- this") && dbg.contains("/* this */"),
+            "comment-like content inside the literal must survive strip_comments: {dbg}"
+        );
     }
 
     #[test]
