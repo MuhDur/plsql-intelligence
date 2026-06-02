@@ -612,8 +612,13 @@ fn classify_if(text: &str) -> Statement {
     let upper = text.to_ascii_uppercase();
     let end_pos = upper.rfind("END IF").unwrap_or(upper.len());
     let body = &text[..end_pos];
-    // Skip the leading "IF " token.
-    let after_if = &body[3..];
+    // Skip the leading "IF" keyword. `classify` only routes here via
+    // `starts_with_keyword(trimmed, "IF")`, which guarantees an ASCII "IF"
+    // prefix, so byte 2 is always a valid char boundary; the old hardcoded
+    // `&body[3..]` assumed a trailing ASCII space and panicked when the
+    // boundary char was multibyte (e.g. `IFé THEN …`). Slice char-safely and
+    // trim the leading separator. (oracle-clgt.1)
+    let after_if = body.get(2..).unwrap_or("").trim_start();
     let mut arms: Vec<IfArm> = Vec::new();
     let mut else_body_text: Option<String> = None;
     // `cond_start` points just past the keyword that introduces the
@@ -662,8 +667,11 @@ fn classify_loop(text: &str) -> Statement {
         let loop_pos = find_keyword(text, "LOOP", in_pos.unwrap_or(0));
         let end_loop = upper.rfind("END LOOP").unwrap_or(text.len());
         if let (Some(in_p), Some(loop_p)) = (in_pos, loop_pos) {
-            let iterator = text[4..in_p].trim().to_string();
-            let range_text = text[in_p + 2..loop_p].trim().to_string();
+            // Char-safe slicing: a multibyte char abutting `FOR`/`IN` (e.g.
+            // `FORé …`) must not panic on a mid-codepoint byte index.
+            // (oracle-clgt.5)
+            let iterator = text.get(4..in_p).unwrap_or("").trim().to_string();
+            let range_text = text.get(in_p + 2..loop_p).unwrap_or("").trim().to_string();
             let body = text
                 .get(loop_p + 4..end_loop)
                 .unwrap_or("")
@@ -680,7 +688,8 @@ fn classify_loop(text: &str) -> Statement {
         let loop_pos = find_keyword(text, "LOOP", 6);
         let end_loop = upper.rfind("END LOOP").unwrap_or(text.len());
         if let Some(loop_p) = loop_pos {
-            let cond_text = text[6..loop_p].trim().to_string();
+            // Char-safe slice past the `WHILE` keyword. (oracle-clgt.5)
+            let cond_text = text.get(6..loop_p).unwrap_or("").trim().to_string();
             let body = text
                 .get(loop_p + 4..end_loop)
                 .unwrap_or("")
@@ -694,7 +703,11 @@ fn classify_loop(text: &str) -> Statement {
     }
     let upper = text.to_ascii_uppercase();
     let body = if let Some(end_pos) = upper.rfind("END LOOP") {
-        text[4..end_pos].trim().to_string()
+        // Bare-loop fallthrough: `FORé LOOP … END LOOP;` reaches here when the
+        // FOR arm's IN/LOOP keywords are absent. Slice char-safely so a
+        // multibyte char at byte 4 cannot trigger a mid-codepoint panic.
+        // (oracle-clgt.5)
+        text.get(4..end_pos).unwrap_or("").trim().to_string()
     } else {
         text.trim_start_matches("LOOP")
             .trim_start_matches("loop")
@@ -1216,6 +1229,37 @@ mod tests {
                 assert_eq!(arms[2].body_text, "s3;");
             }
             other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    // oracle-clgt.1: a multibyte UTF-8 char abutting the IF keyword
+    // (`IFé THEN …`) used to slice `&body[3..]` mid-codepoint and panic,
+    // aborting the whole analysis run. classify_if must now strip the "IF"
+    // keyword char-safely and return without panicking.
+    #[test]
+    fn if_keyword_followed_by_multibyte_char_does_not_panic() {
+        let r = lower_statement_body("IFé THEN x := 1; END IF;");
+        assert_eq!(r.len(), 1, "expected a single classified statement");
+        assert!(
+            matches!(&r[0], Statement::If { .. }),
+            "expected If, got {:?}",
+            r[0]
+        );
+    }
+
+    // oracle-clgt.5: a multibyte UTF-8 char abutting FOR/WHILE/LOOP keywords
+    // (`FORé LOOP …`, `WHILEé …`) used to slice raw byte ranges mid-codepoint
+    // and panic. classify_loop must now slice char-safely and return without
+    // panicking for every loop arm.
+    #[test]
+    fn loop_keywords_followed_by_multibyte_char_do_not_panic() {
+        for input in [
+            "FORé LOOP NULL; END LOOP;",
+            "WHILEé LOOP NULL; END LOOP;",
+            "FORé i IN 1..3 LOOP NULL; END LOOP;",
+        ] {
+            let r = lower_statement_body(input);
+            assert_eq!(r.len(), 1, "expected one statement for {input:?}");
         }
     }
 }
