@@ -170,6 +170,19 @@ fn lower_expression_depth(source: &str, depth: usize) -> Expr {
         return s;
     }
 
+    // A whole-expression parenthesised group `( <expr> )` is unwrapped
+    // FIRST — before the binary split — so e.g. `('SELECT ' || p_user)`
+    // strips to its inner `||` chain (taint then survives), and a
+    // parenthesised call operand `(compute(x))` is not dropped as
+    // `Raw{UnrecognizedShape}`. It is placed ahead of
+    // `recognise_top_level_binary` so the inner operator splits normally
+    // on the unwrapped text; an outer binary like `(a) + (b)` is NOT a
+    // single group (depth returns to 0 mid-text), so it falls through to
+    // the binary split unchanged.
+    if let Some(e) = recognise_paren_group(trimmed, depth) {
+        return e;
+    }
+
     // Binary operator at the top level (lowest precedence first).
     if let Some(e) = recognise_top_level_binary(trimmed, depth) {
         return e;
@@ -326,6 +339,87 @@ fn recognise_substitution(text: &str) -> Option<Expr> {
         });
     }
     None
+}
+
+/// Unwrap a whole-expression parenthesised group `( <expr> )`.
+///
+/// Returns:
+/// * `None` — `text` does not start with `(` and end with `)`, OR it
+///   does but the leading `(` does NOT match the trailing `)` at the
+///   same nesting level (e.g. `(a) + (b)`, where the depth returns to 0
+///   mid-text). The caller then proceeds to the binary split etc.
+/// * `Some(Expr::Raw{UnbalancedParens})` — the parens do not balance
+///   (depth never closes, or closes early then reopens past the end);
+///   we surface the typed reason rather than mis-stripping.
+/// * `Some(<inner lowered>)` — a clean single group; the inner text is
+///   re-lowered at `depth + 1` so the existing `MAX_EXPR_DEPTH` backstop
+///   on deeply-nested parens still holds.
+///
+/// The scan tracks paren depth and `in_string` (mirroring
+/// [`find_all_top_level_ops`]); non-ASCII bytes are skipped so we never
+/// slice off a UTF-8 char boundary and never miscount on multi-byte
+/// content. The strip slices `[1 .. len-1]`, whose boundaries are the
+/// ASCII `(` / `)` bytes — always valid char boundaries.
+fn recognise_paren_group(text: &str, depth: usize) -> Option<Expr> {
+    let bytes = text.as_bytes();
+    if bytes.first() != Some(&b'(') || bytes.last() != Some(&b')') {
+        return None;
+    }
+    let mut pdepth: i32 = 0;
+    let mut in_string = false;
+    // We strip only when paren depth first returns to 0 *exactly* at the
+    // final byte — i.e. the leading `(` pairs with the trailing `)`. If
+    // depth hits 0 before the last byte, this is not a single group
+    // (`(a) + (b)`) and we return None so the binary split can run.
+    let last = bytes.len() - 1;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b >= 0x80 {
+            // Non-ASCII byte: cannot be a paren / quote; skip it.
+            i += 1;
+            continue;
+        }
+        if b == b'\'' {
+            in_string = !in_string;
+            i += 1;
+            continue;
+        }
+        if in_string {
+            i += 1;
+            continue;
+        }
+        if b == b'(' {
+            pdepth += 1;
+        } else if b == b')' {
+            pdepth -= 1;
+            if pdepth == 0 {
+                // The group opened at byte 0 just closed. If that is not
+                // the final byte, the leading `(` does not span the whole
+                // expression (`(a) + (b)`): not a single group.
+                if i != last {
+                    return None;
+                }
+                // Clean single group: strip the outer parens and re-lower.
+                let inner = &text[1..last];
+                return Some(lower_expression_depth(inner, depth + 1));
+            }
+            if pdepth < 0 {
+                // Closed more than opened before the end — unbalanced.
+                return Some(Expr::Raw {
+                    text: text.to_string(),
+                    reason: UnknownExprReason::UnbalancedParens,
+                });
+            }
+        }
+        i += 1;
+    }
+    // Reached the end with the group never closing (depth > 0) or an
+    // unterminated string: the parens do not balance.
+    Some(Expr::Raw {
+        text: text.to_string(),
+        reason: UnknownExprReason::UnbalancedParens,
+    })
 }
 
 /// Look for a binary operator at the **top level** (paren depth 0,
@@ -1105,5 +1199,66 @@ mod tests {
         }
         assert_eq!(names, n, "all operands preserved");
         assert_eq!(bins, n - 1, "one OR per gap");
+    }
+
+    // oracle-hrzg.5: a bare `(p_user)` group unwraps to the inner Name
+    // (it used to fall through to Raw{UnrecognizedShape}).
+    #[test]
+    fn paren_group_unwraps_to_inner_name() {
+        match lower_expression("(p_user)") {
+            Expr::Name(n) => assert_eq!(n.parts, vec!["P_USER"]),
+            other => panic!("expected Name, got {other:?}"),
+        }
+    }
+
+    // oracle-hrzg.5: a whole-expression group `('a' || p_user)` is
+    // unwrapped first, then the inner `||` splits, so the top node is the
+    // concatenation Binary — not a Raw.
+    #[test]
+    fn whole_expression_paren_group_unwraps_then_splits_inner_op() {
+        match lower_expression("('SELECT ' || p_user)") {
+            Expr::Binary { op, .. } => assert_eq!(op, "||"),
+            other => panic!("expected `||` Binary, got {other:?}"),
+        }
+    }
+
+    // oracle-hrzg.5: a parenthesised CALL operand `(compute(x))` unwraps
+    // to the inner Call (the call recogniser bailed on a bare `(...)`).
+    #[test]
+    fn paren_group_unwraps_to_inner_call() {
+        match lower_expression("(compute(x))") {
+            Expr::Call { callee, .. } => assert_eq!(callee.parts, vec!["COMPUTE"]),
+            other => panic!("expected Call, got {other:?}"),
+        }
+    }
+
+    // oracle-hrzg.5: `(a) + (b)` is NOT a single group — the leading `(`
+    // closes at the first `)` (mid-text), so the recognizer must return
+    // None and let the `+` split run. Mis-stripping it would corrupt the
+    // parse.
+    #[test]
+    fn two_adjacent_groups_are_not_stripped_as_one() {
+        match lower_expression("(a) + (b)") {
+            Expr::Binary { op, lhs, rhs } => {
+                assert_eq!(op, "+");
+                assert!(matches!(*lhs, Expr::Name(_)), "lhs `(a)` → Name: {lhs:?}");
+                assert!(matches!(*rhs, Expr::Name(_)), "rhs `(b)` → Name: {rhs:?}");
+            }
+            other => panic!("expected `+` Binary over two Names, got {other:?}"),
+        }
+    }
+
+    // oracle-hrzg.5: an expression that starts with `(` and ends with
+    // `)` but whose parens never balance (`((a)` — depth never returns
+    // to 0) degrades to the typed `UnbalancedParens` reason rather than
+    // mis-stripping a non-matching pair.
+    #[test]
+    fn unbalanced_paren_group_degrades_to_typed_reason() {
+        match lower_expression("((a)") {
+            Expr::Raw { reason, .. } => {
+                assert_eq!(reason, UnknownExprReason::UnbalancedParens)
+            }
+            other => panic!("expected UnbalancedParens Raw, got {other:?}"),
+        }
     }
 }

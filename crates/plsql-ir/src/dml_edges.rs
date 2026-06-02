@@ -132,6 +132,22 @@ fn walk_table_accesses(
             Statement::WhileLoop { body_text, .. } | Statement::BareLoop { body_text } => {
                 recurse_body!(body_text);
             }
+            Statement::NestedBlock { body_text } => {
+                // Anonymous `BEGIN … END` / `DECLARE … END` sub-block — a
+                // common idiom for scoped exception handling. Any DML inside
+                // it (`BEGIN UPDATE t SET … ; END;`) must still surface a
+                // Read/Write edge, or the routine shows no dependency on `t`
+                // with no diagnostic emitted. Strip the wrapper and re-lower
+                // the inner statements, mirroring
+                // `calls.rs::walk_call_sites`. Only recurse when the stripped
+                // slice differs from the original so the depth-guarded
+                // `recurse_body!` cannot spin on a non-stripping slice (the
+                // cap already bounds a non-shrinking one).
+                let inner = crate::calls::strip_block_wrapper(body_text);
+                if inner != body_text.as_str() {
+                    recurse_body!(inner);
+                }
+            }
             _ => {}
         }
     }
@@ -486,5 +502,58 @@ mod tests {
         );
         assert!(outcome.truncated_bodies >= 1);
         let _ = extract_table_accesses(&stmts);
+    }
+
+    // oracle-hrzg.3: a DML statement inside an anonymous BEGIN…END
+    // sub-block must still surface a Read/Write edge. Before the
+    // NestedBlock arm in `walk_table_accesses`, the `_ => {}` catch-all
+    // dropped the whole block, so a routine writing a table only via a
+    // nested block showed no Write edge — silently, with no diagnostic.
+    #[test]
+    fn nested_block_update_yields_write_edge() {
+        let s = lower_statement_body("BEGIN UPDATE secret_table SET x = 1 WHERE id = 9; END;");
+        let a = extract_table_accesses(&s);
+        assert!(
+            a.iter()
+                .any(|x| x.table == "SECRET_TABLE" && x.access == AccessKind::Write),
+            "a nested-block UPDATE must surface a Write of SECRET_TABLE: {a:?}"
+        );
+    }
+
+    // oracle-hrzg.3: a DECLARE…END sub-block (the other anonymous-block
+    // shape) with DML must also surface its accesses.
+    #[test]
+    fn nested_declare_block_dml_yields_edges() {
+        let s = lower_statement_body(
+            "DECLARE v NUMBER; BEGIN INSERT INTO audit_log SELECT id FROM staging; END;",
+        );
+        let a = extract_table_accesses(&s);
+        assert!(
+            a.iter()
+                .any(|x| x.table == "AUDIT_LOG" && x.access == AccessKind::Write),
+            "nested-block INSERT target must be a Write: {a:?}"
+        );
+        assert!(
+            a.iter()
+                .any(|x| x.table == "STAGING" && x.access == AccessKind::Read),
+            "nested-block sub-SELECT must be a Read: {a:?}"
+        );
+    }
+
+    // oracle-hrzg.3: an IF arm whose body is a nested BEGIN…END DML block
+    // exercises the parse-tree re-lower path (an arm body re-lowered to a
+    // NestedBlock), confirming the gap is closed there too, not just at
+    // the top level.
+    #[test]
+    fn if_arm_nested_block_dml_yields_edges() {
+        let s = lower_statement_body(
+            "IF p_flag = 1 THEN BEGIN UPDATE accounts SET bal = 0 WHERE id = 1; END; END IF;",
+        );
+        let a = extract_table_accesses(&s);
+        assert!(
+            a.iter()
+                .any(|x| x.table == "ACCOUNTS" && x.access == AccessKind::Write),
+            "an IF-arm nested-block UPDATE must surface a Write of ACCOUNTS: {a:?}"
+        );
     }
 }

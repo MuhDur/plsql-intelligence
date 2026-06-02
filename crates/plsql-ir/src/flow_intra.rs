@@ -219,6 +219,23 @@ fn walk(
             | Statement::BareLoop { body_text } => {
                 recurse_body!(body_text);
             }
+            Statement::NestedBlock { body_text } => {
+                // Anonymous `BEGIN … END` / `DECLARE … END` sub-block: a
+                // value laundered through it (`BEGIN v_sql := p_user; END;`)
+                // must still taint `v_sql`, or the FLOW-001 pass fails open
+                // for that name and SEC001 misses the injection. Strip the
+                // wrapper and re-lower the inner statements, mirroring
+                // `calls.rs::walk_call_sites` / `dml_edges.rs`. Only recurse
+                // when the stripped slice differs from the original so the
+                // depth-guarded `recurse_body!` cannot spin on a non-stripping
+                // slice (the cap already bounds a non-shrinking one). A block
+                // with no strippable wrapper carries no recoverable
+                // assignment, so it is left untouched.
+                let inner = crate::calls::strip_block_wrapper(body_text);
+                if inner != body_text.as_str() {
+                    recurse_body!(inner);
+                }
+            }
             _ => {}
         }
     }
@@ -798,5 +815,111 @@ mod tests {
             "a {DEPTH}-deep nested LOOP chain must trip the depth cap, \
              outcome={outcome:?}"
         );
+    }
+
+    // oracle-hrzg.2: taint laundered through an anonymous BEGIN…END
+    // sub-block must still reach the assigned name. Before the
+    // NestedBlock arm in `walk`, the `_ => {}` catch-all dropped the
+    // sub-block entirely, so `v_sql` came back UNtainted (FLOW-001
+    // fail-open → SEC001 misses the injection once wired).
+    #[test]
+    fn nested_begin_block_launders_taint_into_assignment() {
+        let s = lower_statement_body("BEGIN v_sql := p_user; END;");
+        let env = analyze_flow(&s, &src(&["p_user"]));
+        let f = env
+            .get("v_sql")
+            .expect("the nested-block assignment to v_sql must be recorded");
+        assert!(
+            f.taint.kinds.contains(&TaintKind::UserInput),
+            "taint laundered through a BEGIN…END sub-block must reach v_sql"
+        );
+        assert!(f.taint.flags_alarm(), "the laundered value still alarms");
+    }
+
+    // oracle-hrzg.2: the same, via a DECLARE…END wrapper (the other
+    // anonymous-block shape the classifier emits as NestedBlock).
+    #[test]
+    fn nested_declare_block_launders_taint_into_assignment() {
+        let s = lower_statement_body("DECLARE v_x NUMBER; BEGIN v_sql := p_user; END;");
+        let env = analyze_flow(&s, &src(&["p_user"]));
+        let f = env
+            .get("v_sql")
+            .expect("the DECLARE-wrapped assignment to v_sql must be recorded");
+        assert!(
+            f.taint.kinds.contains(&TaintKind::UserInput),
+            "taint laundered through a DECLARE…END sub-block must reach v_sql"
+        );
+        assert!(f.taint.flags_alarm());
+    }
+
+    // oracle-hrzg.2: a deeply nested chain of anonymous blocks must
+    // terminate at the MAX_RELOWER_DEPTH cap (honest typed truncation)
+    // rather than overflowing the stack — same posture as the loop-chain
+    // guard. Each level wraps the next in `BEGIN … END;` so the stripped
+    // slice shrinks one level per recursion.
+    #[test]
+    fn deep_nested_block_chain_degrades_to_limit_not_overflow() {
+        const DEPTH: usize = 1_000;
+        const _: () = assert!(DEPTH > crate::MAX_RELOWER_DEPTH);
+        let mut body = String::with_capacity(DEPTH * 12 + 32);
+        for _ in 0..DEPTH {
+            body.push_str("BEGIN ");
+        }
+        body.push_str("v_x := p_user; ");
+        for _ in 0..DEPTH {
+            body.push_str("END; ");
+        }
+        let stmts = lower_statement_body(&body);
+        let (_, outcome) = analyze_flow_bounded(&stmts, &src(&["p_user"]));
+        assert!(
+            outcome.limit_hit,
+            "a {DEPTH}-deep nested BEGIN chain must trip the depth cap, \
+             outcome={outcome:?}"
+        );
+    }
+
+    // oracle-hrzg.5: a parenthesised concatenation operand
+    // `'SELECT … ' || (p_user)` must keep p_user's taint — the paren
+    // group is unwrapped before the `||` split. Before the
+    // `recognise_paren_group` recognizer, `(p_user)` lowered to
+    // `Raw{UnrecognizedShape}`, contributing zero taint, and the byte-
+    // identical un-parenthesised form alarmed while this one did not
+    // (SEC001 fail-open on a no-obfuscation code shape).
+    #[test]
+    fn parenthesised_concat_operand_keeps_taint() {
+        let s = lower_statement_body("v_sql := 'SELECT * FROM ' || (p_user);");
+        let env = analyze_flow(&s, &src(&["p_user"]));
+        let f = env.get("v_sql").unwrap();
+        assert!(
+            f.taint.kinds.contains(&TaintKind::UserInput),
+            "a parenthesised tainted operand must remain tainted"
+        );
+        assert!(f.taint.flags_alarm());
+    }
+
+    // oracle-hrzg.5: a whole-RHS parenthesised group
+    // `('SELECT …' || p_user)` is unwrapped first, then the inner `||`
+    // splits normally so the taint survives.
+    #[test]
+    fn whole_rhs_paren_group_keeps_taint() {
+        let s = lower_statement_body("v_sql := ('SELECT * FROM ' || p_user);");
+        let env = analyze_flow(&s, &src(&["p_user"]));
+        let f = env.get("v_sql").unwrap();
+        assert!(
+            f.taint.kinds.contains(&TaintKind::UserInput),
+            "a whole-RHS parenthesised group must preserve inner taint"
+        );
+        assert!(f.taint.flags_alarm());
+    }
+
+    // oracle-hrzg.5: a bare `(p_user)` group is a Name, so it taints
+    // identically to the un-parenthesised reference.
+    #[test]
+    fn bare_paren_group_is_tainted_name() {
+        let s = lower_statement_body("v_sql := (p_user);");
+        let env = analyze_flow(&s, &src(&["p_user"]));
+        let f = env.get("v_sql").unwrap();
+        assert!(f.taint.kinds.contains(&TaintKind::UserInput));
+        assert!(f.taint.flags_alarm());
     }
 }

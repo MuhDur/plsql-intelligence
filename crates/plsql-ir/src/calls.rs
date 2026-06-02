@@ -184,7 +184,14 @@ fn walk_call_sites(
 /// Strip a leading `DECLARE`/`BEGIN` and a trailing `END[;]`
 /// from a block body so the inner statements can be re-lowered
 /// without re-triggering the NestedBlock classification.
-fn strip_block_wrapper(text: &str) -> &str {
+///
+/// Shared with the sibling re-lowering walks
+/// [`crate::flow_intra`] (taint) and [`crate::dml_edges`]
+/// (Reads/Writes edges) so all three descend into anonymous
+/// `BEGIN … END` / `DECLARE … END` sub-blocks identically — the
+/// returned slice is a sub-slice of `text`, so it is always on a
+/// UTF-8 char boundary even for multi-byte content.
+pub(crate) fn strip_block_wrapper(text: &str) -> &str {
     let trimmed = text.trim();
     let upper = trimmed.to_ascii_uppercase();
     let after_open = if let Some(rest) = upper.strip_prefix("DECLARE") {
@@ -375,5 +382,26 @@ mod tests {
         // The back-compat wrapper must also simply terminate
         // (no panic / abort) rather than recurse unbounded.
         let _ = extract_call_sites(&stmts);
+    }
+
+    // oracle-hrzg.5: a parenthesised call operand `nvl((compute(x)), 0)`
+    // must still record the inner `compute` call edge. Before the
+    // `recognise_paren_group` recognizer, the `(compute(x))` argument
+    // lowered to `Raw{UnrecognizedShape}` (the call recogniser bailed on
+    // a bare `(...)` whose name part is empty), dropping the COMPUTE call
+    // site that the un-parenthesised form records.
+    #[test]
+    fn parenthesised_call_operand_keeps_inner_call_edge() {
+        let stmts = lower_statement_body("v := nvl((compute(x)), 0);");
+        let calls = extract_call_sites(&stmts);
+        let names: Vec<&str> = calls.iter().map(|c| c.callee_display.as_str()).collect();
+        assert!(
+            names.contains(&"nvl"),
+            "outer nvl call must be recorded: {names:?}"
+        );
+        assert!(
+            names.contains(&"compute"),
+            "the parenthesised inner compute call must survive: {names:?}"
+        );
     }
 }
