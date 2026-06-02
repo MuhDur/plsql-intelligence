@@ -649,24 +649,33 @@ fn classify_statement(raw: &str, file_id: FileId, start: usize, end: usize) -> A
     let upper = text.to_ascii_uppercase();
     let u = upper.trim();
 
-    if u.starts_with("NULL") {
+    // Each leading-keyword classifier is gated on the whole-word helper
+    // `keyword_at(u, 0, kw)` rather than a bare `u.starts_with(kw)`. A bare
+    // prefix match misfires whenever an identifier merely *begins* with a
+    // keyword: `DELETED_FLAG := ...` would be classified as DML `DELETE`,
+    // `UPDATE_COUNT := p_user;` as DML `UPDATE`, and `NULL_DAYS := 0;` as a
+    // `NULL` statement — each dropping the real assignment (and, for the DML
+    // verbs, minting a phantom table edge). Word-boundaring the keyword lets
+    // such lines fall through to the `:=` assignment / call branches below.
+    // (oracle-rwjl.15)
+    if keyword_at(u, 0, "NULL") {
         return AstStatement::Null { span };
     }
-    if u.starts_with("RAISE") {
+    if keyword_at(u, 0, "RAISE") {
         let rest = text[5..].trim().trim_end_matches(';').trim();
         return AstStatement::Raise {
             exception: (!rest.is_empty()).then(|| rest.to_string()),
             span,
         };
     }
-    if u.starts_with("RETURN") {
+    if keyword_at(u, 0, "RETURN") {
         let rest = text[6..].trim().trim_end_matches(';').trim();
         return AstStatement::Return {
             value_text: (!rest.is_empty()).then(|| rest.to_string()),
             span,
         };
     }
-    if u.starts_with("EXECUTE IMMEDIATE") {
+    if keyword_at(u, 0, "EXECUTE IMMEDIATE") {
         let after = &text[17..];
         let sql_text = extract_first_quoted(after).unwrap_or_default();
         let has_using = after.to_ascii_uppercase().contains(" USING ");
@@ -677,7 +686,7 @@ fn classify_statement(raw: &str, file_id: FileId, start: usize, end: usize) -> A
         };
     }
     for verb in ["SELECT", "INSERT", "UPDATE", "DELETE", "MERGE"] {
-        if u.starts_with(verb) {
+        if keyword_at(u, 0, verb) {
             return AstStatement::Sql {
                 verb: verb.to_string(),
                 raw_text: text.trim().trim_end_matches(';').trim().to_string(),
@@ -685,15 +694,15 @@ fn classify_statement(raw: &str, file_id: FileId, start: usize, end: usize) -> A
             };
         }
     }
-    if u.starts_with("IF ") {
+    if keyword_at(u, 0, "IF") {
         let then_pos = upper.find("THEN").unwrap_or(text.len());
-        let cond = text[3..then_pos.min(text.len())].trim().to_string();
+        let cond = text[2..then_pos.min(text.len())].trim().to_string();
         return AstStatement::If {
             cond_text: cond,
             span,
         };
     }
-    if u.starts_with("LOOP") || u.starts_with("FOR ") || u.starts_with("WHILE ") {
+    if keyword_at(u, 0, "LOOP") || keyword_at(u, 0, "FOR") || keyword_at(u, 0, "WHILE") {
         let header_end = upper.find("LOOP").map_or(text.len(), |p| p + 4);
         return AstStatement::Loop {
             header_text: text[..header_end.min(text.len())].trim().to_string(),
@@ -1976,6 +1985,60 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
         let s = lower_statement_body("NULL;", fid(), 100);
         let span = s[0].span();
         assert!(span.start.offset >= 100);
+    }
+
+    // oracle-rwjl.15: the leading-keyword classifier must word-boundary each
+    // verb so an assignment whose target merely *starts* with a DML verb is
+    // not misread as DML (which would drop the assignment and mint a phantom
+    // table edge). `DELETED_FLAG := 'Y';` must classify as an Assignment, not
+    // a `DELETE` SQL statement.
+    #[test]
+    fn parse005_verb_prefixed_identifier_assignment_not_dml() {
+        for (src, target) in [
+            ("DELETED_FLAG := 'Y';", "DELETED_FLAG"),
+            ("UPDATE_COUNT := p_user;", "UPDATE_COUNT"),
+            ("INSERTED_AT := SYSDATE;", "INSERTED_AT"),
+            ("SELECTED_ID := 1;", "SELECTED_ID"),
+            ("MERGED := FALSE;", "MERGED"),
+            ("NULL_DAYS := 0;", "NULL_DAYS"),
+            ("RAISED_AMOUNT := 5;", "RAISED_AMOUNT"),
+            ("RETURNED_CODE := 0;", "RETURNED_CODE"),
+        ] {
+            let s = stmts(src);
+            assert_eq!(s.len(), 1, "{src}");
+            match &s[0] {
+                AstStatement::Assignment { target: t, .. } => assert_eq!(t, target, "{src}"),
+                other => panic!("{src} -> expected Assignment, got {other:?}"),
+            }
+        }
+    }
+
+    // oracle-rwjl.15: a statement-level call whose callee starts with a verb
+    // word must reach the Call branch, not be swallowed as DML.
+    #[test]
+    fn parse005_verb_prefixed_identifier_call_not_dml() {
+        let s = stmts("update_stats(p_id);");
+        match &s[0] {
+            AstStatement::Call { callee, .. } => assert_eq!(callee, "update_stats"),
+            other => panic!("expected Call, got {other:?}"),
+        }
+    }
+
+    // oracle-rwjl.15: genuine DML / keyword statements still classify as
+    // before — the word-boundary gate must not regress real keywords.
+    #[test]
+    fn parse005_genuine_keywords_still_classified() {
+        assert!(matches!(stmts("NULL;")[0], AstStatement::Null { .. }));
+        assert!(matches!(stmts("UPDATE t SET a = 1;")[0], AstStatement::Sql { .. }));
+        assert!(matches!(stmts("DELETE FROM t;")[0], AstStatement::Sql { .. }));
+        assert!(matches!(
+            stmts("IF v_x > 0 THEN NULL; END IF;")[0],
+            AstStatement::If { .. }
+        ));
+        assert!(matches!(
+            stmts("RAISE no_data_found;")[0],
+            AstStatement::Raise { .. }
+        ));
     }
 
     // -- PLSQL-PARSE-006: expression lowering --
