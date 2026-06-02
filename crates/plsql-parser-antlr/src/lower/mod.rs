@@ -179,7 +179,15 @@ fn lower_package(
     }
 
     let name = extract_identifier(source, pos);
-    let end = advance_to_decl_end(bytes, create_start);
+    // A package BODY opens an `AS|IS … END[ name];` envelope the byte scanner
+    // does not count; seed depth 1 so the span runs to the body's own trailing
+    // `END;` rather than truncating at the first nested routine's `END;`
+    // (oracle-clgt.7). A package SPEC has no such envelope: depth 0.
+    let end = if is_body {
+        advance_to_decl_end_with_depth(bytes, create_start, 1)
+    } else {
+        advance_to_decl_end(bytes, create_start)
+    };
     let span = make_span(file_id, create_start as u32, end as u32);
 
     if is_body {
@@ -279,7 +287,15 @@ fn lower_type(
     }
 
     let name = extract_identifier(source, pos);
-    let end = advance_to_decl_end(bytes, create_start);
+    // A type BODY opens an `AS|IS … END[ name];` envelope the byte scanner
+    // does not count; seed depth 1 so the span runs to the body's own trailing
+    // `END;` rather than truncating at the first member routine's `END;`
+    // (oracle-clgt.7). A type SPEC has no such envelope: depth 0.
+    let end = if is_body {
+        advance_to_decl_end_with_depth(bytes, create_start, 1)
+    } else {
+        advance_to_decl_end(bytes, create_start)
+    };
     let span = make_span(file_id, create_start as u32, end as u32);
 
     if is_body {
@@ -1196,9 +1212,29 @@ fn extract_identifier(source: &str, pos: usize) -> String {
 /// PL/SQL statements end at `;` (most statements) or `/` on its own line
 /// (SQL*Plus terminator, e.g. after type bodies).
 fn advance_to_decl_end(bytes: &[u8], start: usize) -> usize {
+    advance_to_decl_end_with_depth(bytes, start, 0)
+}
+
+/// Advance past the end of the current statement, seeding the initial
+/// `BEGIN…END` nesting depth.
+///
+/// PACKAGE/TYPE **bodies** open their own `AS|IS … END[ name];` envelope that
+/// the byte scanner's [`block_structure_step`](crate::recover::block_structure_step)
+/// never counts (it only opens on `BEGIN`/`IF`/`LOOP`/`CASE`). With a depth
+/// seed of `0`, a body containing two or more nested routines returned on the
+/// first nested routine's `END;` — silently truncating the declaration span
+/// and orphaning every later routine's source range (including its DML /
+/// `EXECUTE IMMEDIATE` sinks) from span-based IR consumers (oracle-clgt.7,
+/// contradicting R13 "no uncertainty is silently dropped"). Seeding depth `1`
+/// for body cases means the scan only returns on a `;` once the body's own
+/// trailing `END[ name];` has decremented the depth back to `0`. SPEC cases
+/// keep depth `0` (no `BEGIN…END` envelope). The SQL*Plus `/` terminator
+/// branch already requires `depth == 0` and so is only satisfied after the
+/// body `END`, leaving it unaffected.
+fn advance_to_decl_end_with_depth(bytes: &[u8], start: usize, initial_depth: usize) -> usize {
     let len = bytes.len();
     let mut i = start;
-    let mut depth = 0; // track BEGIN...END nesting
+    let mut depth = initial_depth; // track BEGIN...END nesting
 
     while i < len {
         // Skip comments and string/q-quote literals via the shared scanner
@@ -1225,9 +1261,9 @@ fn advance_to_decl_end(bytes: &[u8], start: usize) -> usize {
                     i += consumed;
                 }
                 crate::recover::BlockStep::Close { consumed } => {
-                    if depth > 0 {
-                        depth -= 1;
-                    }
+                    // Clamp at 0: a stray `END` past the seeded body envelope
+                    // (recovery from malformed input) must not underflow.
+                    depth = depth.saturating_sub(1);
                     i += consumed;
                 }
             }
@@ -1758,6 +1794,67 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
             );
             assert_eq!(ast.root.declarations.len(), 1, "{:?}", ast.root.declarations);
         }
+    }
+
+    #[test]
+    fn package_body_with_two_routines_does_not_truncate_decl_span() {
+        // oracle-clgt.7: a PACKAGE BODY opens an `AS … END pkg;` envelope the
+        // byte scanner never counts. With depth seed 0 the scan returned on the
+        // first nested routine's `END;` (offset 70), truncating the PackageBody
+        // span so p2's entire range — including its `INSERT INTO secret …` DML
+        // sink — and the trailing `END pkg;` lay outside the span, orphaned from
+        // every span-based IR consumer (R13 violation). Seeding depth 1 for body
+        // cases runs the span to the body's own trailing `END pkg;`.
+        let src = "CREATE OR REPLACE PACKAGE BODY pkg AS PROCEDURE p1 IS BEGIN NULL; END; PROCEDURE p2 IS BEGIN INSERT INTO secret VALUES(1); END; END pkg;";
+        let ast = lower_source(src, fid());
+        let body_span = ast
+            .root
+            .declarations
+            .iter()
+            .find_map(|d| match d {
+                AstDecl::PackageBody { name, span } if name == "pkg" => Some(*span),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("package body pkg missing from {:?}", ast.root.declarations));
+        assert_eq!(
+            body_span.end.offset,
+            src.len() as u32,
+            "package body span must run to the trailing END pkg; (full source), not the \
+             first nested routine's END; — got {} of {}",
+            body_span.end.offset,
+            src.len()
+        );
+        // Exactly one declaration: the second routine was not mis-promoted into
+        // a spurious top-level decl.
+        assert_eq!(ast.root.declarations.len(), 1, "{:?}", ast.root.declarations);
+    }
+
+    #[test]
+    fn type_body_with_two_members_does_not_truncate_decl_span() {
+        // oracle-clgt.7 (TYPE BODY arm): a TYPE BODY's `AS … END;` envelope is
+        // likewise uncounted; with depth seed 0 the span truncated at the first
+        // MEMBER FUNCTION's `END;`. Mirror the package-body assertion for a body
+        // with two member functions, the second carrying a DML sink.
+        let src = "CREATE OR REPLACE TYPE BODY tb AS MEMBER FUNCTION f1 RETURN NUMBER IS BEGIN RETURN 1; END; MEMBER FUNCTION f2 RETURN NUMBER IS BEGIN INSERT INTO secret VALUES(1); RETURN 2; END; END;";
+        let ast = lower_source(src, fid());
+        let body_span = ast
+            .root
+            .declarations
+            .iter()
+            .find_map(|d| match d {
+                AstDecl::TypeBody { name, span } if name == "tb" => Some(*span),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("type body tb missing from {:?}", ast.root.declarations));
+        assert_eq!(
+            body_span.end.offset,
+            src.len() as u32,
+            "type body span must run to the trailing END; (full source), not the \
+             first member function's END; — got {} of {}",
+            body_span.end.offset,
+            src.len()
+        );
+        assert_eq!(ast.root.declarations.len(), 1, "{:?}", ast.root.declarations);
     }
 
     #[test]
