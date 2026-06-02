@@ -1219,6 +1219,7 @@ dependencies = [
  "toml 0.8.23",
  "tower",
  "tracing",
+ "wait-timeout",
 ]
 
 [[package]]
