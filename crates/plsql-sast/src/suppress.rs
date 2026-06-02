@@ -16,6 +16,20 @@
 //!
 //! The comment marker is matched case-insensitively and may sit
 //! after code (`x := 1; -- plsql-scan:ignore SEC001`).
+//!
+//! ## Span-less (line-0) findings
+//!
+//! Many real findings are catalog/DDL-derived and carry no
+//! precise source line (`location.line == 0`) — e.g. a
+//! `GRANT … TO PUBLIC` (SEC006) attributed to the whole unit.
+//! Line-keyed inline matching can never reach those, so for a
+//! line-0 finding we fall back to **file-scoped** matching: any
+//! inline `plsql-scan:ignore`/`ignore-next-line` directive in the
+//! finding's file that names the rule suppresses it (the
+//! directive's own line is recorded for the audit trail). This
+//! keeps inline suppression honest for the span-less findings that
+//! make up most real catalog/DDL results, without the user having
+//! to guess a line number that does not exist.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -143,6 +157,35 @@ fn index_source(source: &str) -> InlineIndex {
     idx
 }
 
+/// Resolve an inline suppression reason for `f` against one file's
+/// parsed directives.
+///
+/// * A finding with a precise 1-based line matches a directive
+///   targeting exactly that line (same-line / next-line).
+/// * A **span-less** finding (`location.line == 0` — catalog/DDL
+///   facts that point at the whole unit) cannot key on a line, so
+///   it falls back to *file-scoped* matching: the first directive
+///   in the file (lowest comment line) whose rule set covers
+///   `f.rule_id` suppresses it. The directive's own comment line
+///   is preserved in the recorded reason for the audit trail.
+fn inline_reason_for(idx: &InlineIndex, f: &Finding) -> Option<SuppressionReason> {
+    if f.location.line != 0 {
+        return idx.by_line.get(&f.location.line).and_then(|dirs| {
+            dirs.iter()
+                .find(|d| d.rules.matches(&f.rule_id))
+                .map(|d| d.reason.clone())
+        });
+    }
+    // Span-less finding: scan every directive in the file in line
+    // order (BTreeMap iterates ascending) so the audit trail is
+    // deterministic — the earliest matching directive wins.
+    idx.by_line
+        .values()
+        .flatten()
+        .find(|d| d.rules.matches(&f.rule_id))
+        .map(|d| d.reason.clone())
+}
+
 fn config_reason(config: &SuppressionConfig, f: &Finding) -> Option<SuppressionReason> {
     if config.global_rules.contains(&f.rule_id) {
         return Some(SuppressionReason::ConfigGlobal);
@@ -187,12 +230,7 @@ pub fn apply_suppressions(
         }
         let inline_reason = indexes
             .get(&f.location.file)
-            .and_then(|idx| idx.by_line.get(&f.location.line))
-            .and_then(|dirs| {
-                dirs.iter()
-                    .find(|d| d.rules.matches(&f.rule_id))
-                    .map(|d| d.reason.clone())
-            });
+            .and_then(|idx| inline_reason_for(idx, f));
         if let Some(reason) = inline_reason {
             suppressed.push(SuppressedFinding {
                 finding: f.clone(),
@@ -415,6 +453,90 @@ mod tests {
             .map(|s| s.finding.rule_id.as_str())
             .collect();
         assert_eq!(ids, vec!["SEC001", "SEC006"]);
+    }
+
+    #[test]
+    fn inline_ignore_suppresses_span_less_line0_finding() {
+        // Regression for oracle-qm3q.16: fact-driven rules (SEC006,
+        // SEC001, …) emit findings at `location.line == 0` because
+        // catalog/DDL facts carry no precise span. Line-keyed inline
+        // matching could never reach them, so an inline
+        // `plsql-scan:ignore` directive was silently inert for every
+        // real finding. A line-0 finding must now fall back to
+        // file-scoped matching.
+        let src = "-- file header\nGRANT SELECT ON hr.t TO PUBLIC; -- plsql-scan:ignore SEC006\n";
+        let r = report(vec![finding(
+            "SEC006",
+            Severity::High,
+            "`GRANT SELECT ON hr.t TO PUBLIC` exposes hr.t to every database account",
+            "grants.sql",
+            0, // span-less: real fact-driven findings point at the unit
+            (0, 0),
+        )]);
+        let out = apply_suppressions(
+            &r,
+            &SuppressionConfig::default(),
+            &srcmap(&[("grants.sql", src)]),
+        );
+        assert!(
+            out.kept.findings.is_empty(),
+            "line-0 finding must be suppressed by a file-scoped inline directive"
+        );
+        assert_eq!(out.suppressed.len(), 1);
+        assert_eq!(
+            out.suppressed[0].reason,
+            SuppressionReason::InlineSameLine { comment_line: 2 },
+            "audit trail records the directive's own comment line"
+        );
+    }
+
+    #[test]
+    fn inline_ignore_line0_does_not_suppress_unnamed_rule() {
+        // File-scoped fallback must still respect the rule set: a
+        // directive naming a different rule leaves the line-0 finding
+        // intact (fail-closed — never over-suppress).
+        let src = "x; -- plsql-scan:ignore SEC001\n";
+        let r = report(vec![finding(
+            "SEC006",
+            Severity::High,
+            "grant to public",
+            "f.sql",
+            0,
+            (0, 0),
+        )]);
+        let out = apply_suppressions(
+            &r,
+            &SuppressionConfig::default(),
+            &srcmap(&[("f.sql", src)]),
+        );
+        assert_eq!(
+            out.kept.findings.len(),
+            1,
+            "directive named SEC001, not SEC006"
+        );
+        assert!(out.suppressed.is_empty());
+    }
+
+    #[test]
+    fn inline_ignore_line0_wildcard_suppresses_any_rule() {
+        // A `*` directive anywhere in the file suppresses a span-less
+        // finding regardless of rule id.
+        let src = "-- plsql-scan:ignore *\n";
+        let r = report(vec![finding(
+            "SEC006",
+            Severity::High,
+            "grant to public",
+            "f.sql",
+            0,
+            (0, 0),
+        )]);
+        let out = apply_suppressions(
+            &r,
+            &SuppressionConfig::default(),
+            &srcmap(&[("f.sql", src)]),
+        );
+        assert!(out.kept.findings.is_empty());
+        assert_eq!(out.suppressed.len(), 1);
     }
 
     #[test]

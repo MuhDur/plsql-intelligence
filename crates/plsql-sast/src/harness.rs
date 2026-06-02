@@ -18,7 +18,15 @@
 //!
 //! The aggregated [`ScanReport`] is deterministically ordered so
 //! it is stable machine output (R10/R11) regardless of the
-//! registry or unit iteration order.
+//! registry or unit iteration order. Exact logical duplicates are
+//! then collapsed on their location-insensitive `primary`
+//! fingerprint — an interim guard (oracle-qm3q.24) so a single
+//! project-wide fact (e.g. one `GRANT … TO PUBLIC`) is reported
+//! once even though fact-driven rules currently iterate the shared
+//! `FactStore` inside the per-unit loop. Correct *attribution* of
+//! such findings to the fact's own source still awaits
+//! fact-carried provenance and a per-unit / project-scoped rule
+//! split.
 //!
 //! ## Layer hygiene
 //!
@@ -172,6 +180,30 @@ pub fn run_scan(
                 b.location.byte_span,
             ))
     });
+
+    // Interim guard for the per-unit / project-scoped split
+    // (oracle-qm3q.24): fact-driven rules iterate the whole shared
+    // `FactStore` *inside* the per-unit loop, so a single
+    // catalog/DDL fact (e.g. one `GRANT … TO PUBLIC`) is emitted
+    // once per unit, each copy mis-stamped with the iterated unit's
+    // `source_file`. Until fact payloads carry their own source and
+    // such rules run once project-wide, collapse exact logical
+    // duplicates on the location-insensitive `primary` fingerprint.
+    //
+    // This is sound because every rule's message embeds the
+    // offending object / site / unit identity, so two findings that
+    // share a `primary` (rule_id + severity + message) are the same
+    // logical finding — never two distinct sites that merely happen
+    // to read alike. Dedup runs *after* the sort so the survivor is
+    // deterministic. It does not yet correct attribution (the
+    // surviving copy keeps the first sorted `source_file`); that
+    // needs fact-carried provenance and is tracked as deferred.
+    {
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        report
+            .findings
+            .retain(|f| seen.insert(crate::fingerprint(f).primary));
+    }
     report.skipped.sort_by(|a, b| {
         (&a.rule_id, &a.unit, skip_reason_rank(a.reason), &a.detail).cmp(&(
             &b.rule_id,
@@ -379,6 +411,111 @@ mod tests {
         let ra = run_scan(&a, &one_unit(&env), &facts, &snap);
         let rb = run_scan(&b, &one_unit(&env), &facts, &snap);
         assert_eq!(ra, rb, "aggregate must be order-independent");
+    }
+
+    #[test]
+    fn fact_driven_rule_over_many_units_emits_one_finding() {
+        // Regression for oracle-qm3q.24: a single project-wide fact
+        // (one GRANT … TO PUBLIC) shared across N ScanUnits must not
+        // be reported N times. Before the interim primary-fingerprint
+        // dedup, SEC006 fired once per unit, each copy mis-stamped
+        // with that unit's source_file.
+        use crate::rules::Sec006GrantToPublic;
+
+        let env = FlowEnv::default();
+        let mut facts = FactStore::default();
+        facts.push(mint_fact(
+            FactProvenance {
+                component: "plsql-sast-test".to_string(),
+                component_version: "0".to_string(),
+                run_id: String::new(),
+            },
+            FactPayload::Privilege {
+                grantee: "PUBLIC".to_string(),
+                privilege: "EXECUTE".to_string(),
+                on: "HR.PKG".to_string(),
+            },
+        ));
+        let units = vec![
+            ScanUnit {
+                unit_logical_id: "a",
+                source_file: "a.sql",
+                flow: &env,
+            },
+            ScanUnit {
+                unit_logical_id: "b",
+                source_file: "b.sql",
+                flow: &env,
+            },
+            ScanUnit {
+                unit_logical_id: "c",
+                source_file: "c.sql",
+                flow: &env,
+            },
+        ];
+        let snap = CompletenessSnapshot {
+            catalog_available: true,
+            ..CompletenessSnapshot::default()
+        };
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(Sec006GrantToPublic)];
+        let r = run_scan(&rules, &units, &facts, &snap);
+        assert_eq!(
+            r.findings.len(),
+            1,
+            "one fact -> one finding, not one per unit: {:?}",
+            r.findings
+        );
+        assert_eq!(r.findings[0].rule_id, "SEC006");
+        assert!(r.findings[0].message.contains("HR.PKG"));
+    }
+
+    #[test]
+    fn distinct_fact_findings_are_not_collapsed_by_dedup() {
+        // The interim dedup keys on the location-insensitive primary
+        // fingerprint (rule_id + severity + message). Two genuinely
+        // distinct grants produce distinct messages, so both survive
+        // — the guard collapses only true duplicates.
+        use crate::rules::Sec006GrantToPublic;
+
+        let env = FlowEnv::default();
+        let mut facts = FactStore::default();
+        for on in ["HR.PKG_A", "HR.PKG_B"] {
+            facts.push(mint_fact(
+                FactProvenance {
+                    component: "plsql-sast-test".to_string(),
+                    component_version: "0".to_string(),
+                    run_id: String::new(),
+                },
+                FactPayload::Privilege {
+                    grantee: "PUBLIC".to_string(),
+                    privilege: "EXECUTE".to_string(),
+                    on: on.to_string(),
+                },
+            ));
+        }
+        let units = vec![
+            ScanUnit {
+                unit_logical_id: "a",
+                source_file: "a.sql",
+                flow: &env,
+            },
+            ScanUnit {
+                unit_logical_id: "b",
+                source_file: "b.sql",
+                flow: &env,
+            },
+        ];
+        let snap = CompletenessSnapshot {
+            catalog_available: true,
+            ..CompletenessSnapshot::default()
+        };
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(Sec006GrantToPublic)];
+        let r = run_scan(&rules, &units, &facts, &snap);
+        assert_eq!(
+            r.findings.len(),
+            2,
+            "two distinct grants -> two findings, dedup must not merge them"
+        );
     }
 
     #[test]
