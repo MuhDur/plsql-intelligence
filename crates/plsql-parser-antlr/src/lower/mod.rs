@@ -528,6 +528,14 @@ pub fn lower_statement_body(body: &str, file_id: FileId, base_offset: usize) -> 
     // nested BEGIN…END / IF…END IF / LOOP…END LOOP / CASE…END CASE
     // does not split the statement.
     while i < bytes.len() {
+        // Skip comments and string/q-quote literals first so a `;`, `END`,
+        // `BEGIN`, `IF`, `LOOP`, or `CASE` embedded in a literal (common in
+        // dynamic SQL builders and dbms_output messages) does not mis-split
+        // the body or skew the block-depth bookkeeping.
+        if let Some(next) = crate::recover::skip_opaque_span(bytes, i, 0) {
+            i = next;
+            continue;
+        }
         // `END IF` / `END LOOP` / `END CASE` must be matched before a
         // bare `END`, otherwise the bare-`END` arm would consume the
         // `END` and the depth bookkeeping would double-count.
@@ -1169,24 +1177,11 @@ fn advance_to_decl_end(bytes: &[u8], start: usize) -> usize {
     let mut depth = 0; // track BEGIN...END nesting
 
     while i < len {
-        // Skip single-line comments
-        if i + 1 < len && bytes[i] == b'-' && bytes[i + 1] == b'-' {
-            while i < len && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-
-        // Skip block comments
-        if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < len {
-                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                    i += 2;
-                    break;
-                }
-                i += 1;
-            }
+        // Skip comments and string/q-quote literals via the shared scanner
+        // so an embedded `END`/`;` inside a literal (e.g. a dynamic-SQL or
+        // dbms_output message) cannot truncate the declaration span.
+        if let Some(next) = crate::recover::skip_opaque_span(bytes, i, start) {
+            i = next;
             continue;
         }
 
@@ -1635,6 +1630,76 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
             "procedure missing from {:?}",
             ast.root.declarations
         );
+    }
+
+    #[test]
+    fn end_and_semicolon_inside_string_do_not_truncate_decl_span() {
+        // oracle-qm3q.12: a string literal embedding `END;` (common in
+        // dynamic-SQL / dbms_output builders) must NOT terminate the
+        // declaration early. Before the fix, `advance_to_decl_end` saw the
+        // in-string `END` (depth 1 -> 0) and the in-string `;` and recorded
+        // a span truncated mid-literal at offset 64; the real trailing `END;`
+        // ends at offset 78 (== src.len()).
+        let src = "CREATE PROCEDURE p IS BEGIN dbms_output.put_line('msg with END; inside'); END;";
+        assert_eq!(src.len(), 78);
+        let ast = lower_source(src, fid());
+        let proc_span = ast
+            .root
+            .declarations
+            .iter()
+            .find_map(|d| match d {
+                AstDecl::Procedure { name, span } if name == "p" => Some(*span),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("procedure p missing from {:?}", ast.root.declarations));
+        assert_eq!(
+            proc_span.end.offset, 78,
+            "procedure span must run to the real trailing END; (offset 78), not the \
+             in-string END;/; — got {}",
+            proc_span.end.offset
+        );
+        // And there is exactly one declaration: the in-string text was not
+        // mis-promoted into a spurious second decl.
+        assert_eq!(ast.root.declarations.len(), 1, "{:?}", ast.root.declarations);
+    }
+
+    #[test]
+    fn semicolon_inside_string_does_not_split_statement_body() {
+        // oracle-qm3q.12: the `;` inside 'a ; b' must not split the call into
+        // extra statements. Before the fix this produced 3 statements with a
+        // truncated Call; after the fix it is 2 statements.
+        let s = stmts("dbms_output.put_line('a ; b'); v := 1;");
+        assert_eq!(s.len(), 2, "got {s:?}");
+        assert!(
+            matches!(&s[0], AstStatement::Call { .. } | AstStatement::Unknown { .. }),
+            "first statement should be the whole put_line call, got {:?}",
+            s[0]
+        );
+        match &s[1] {
+            AstStatement::Assignment { target, .. } => assert_eq!(target, "v"),
+            other => panic!("expected assignment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_keyword_inside_string_does_not_skew_body_depth() {
+        // oracle-qm3q.12: an `END IF;` embedded in a string literal inside a
+        // real IF…END IF block must NOT prematurely close the block. Before
+        // the fix, the in-string `END IF` decremented depth to 0 and the
+        // in-string `;` split the statement, fragmenting the IF body into
+        // multiple chunks. After the fix, the literal is skipped, the block
+        // stays one chunk, and the trailing assignment is its own statement.
+        let s = stmts("IF x THEN msg := 'END IF; oops'; END IF; v := 1;");
+        assert_eq!(s.len(), 2, "IF body must stay one chunk; got {s:?}");
+        assert!(
+            matches!(&s[0], AstStatement::If { .. }),
+            "first statement should be the whole IF block, got {:?}",
+            s[0]
+        );
+        match &s[1] {
+            AstStatement::Assignment { target, .. } => assert_eq!(target, "v"),
+            other => panic!("expected trailing assignment, got {other:?}"),
+        }
     }
 
     #[test]

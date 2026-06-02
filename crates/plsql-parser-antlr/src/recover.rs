@@ -49,88 +49,12 @@ pub fn recover_to_statement_boundary(
     let mut depth = 0; // track BEGIN/END nesting
 
     while i < len {
-        // Skip single-line comments
-        if i + 1 < len && bytes[i] == b'-' && bytes[i + 1] == b'-' {
-            while i < len && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-
-        // Skip block comments
-        if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < len {
-                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                    i += 2;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-
-        // Skip Oracle alternative-quoting (q-quote) literals:
-        // q'X...X'  /  nq'X...X'  (case-insensitive, optional n/N).
-        // The body may contain `;`, apostrophes, and newlines — none
-        // of which are statement boundaries. Delimiter `X` pairs
-        // ( )=, [ ]=, { }=, < >; any other char closes with itself.
-        // Guarded so identifiers ending in q/n (e.g. `acquire`) do
-        // not false-trigger: the q-quote must start a token.
-        {
-            let prev_is_ident =
-                i > start && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
-            let q_at = if (bytes[i] | 0x20) == b'n' && i + 1 < len {
-                i + 1
-            } else {
-                i
-            };
-            if !prev_is_ident
-                && (bytes[q_at] | 0x20) == b'q'
-                && q_at + 2 < len
-                && bytes[q_at + 1] == b'\''
-            {
-                let open = bytes[q_at + 2];
-                let close = match open {
-                    b'[' => b']',
-                    b'(' => b')',
-                    b'{' => b'}',
-                    b'<' => b'>',
-                    other => other,
-                };
-                let mut j = q_at + 3;
-                let mut closed = false;
-                while j + 1 < len {
-                    if bytes[j] == close && bytes[j + 1] == b'\'' {
-                        j += 2;
-                        closed = true;
-                        break;
-                    }
-                    j += 1;
-                }
-                // Terminated → resume right after the closing `X'`.
-                // Unterminated → consume to EOF (no spurious boundary
-                // inside an open literal).
-                i = if closed { j } else { len };
-                continue;
-            }
-        }
-
-        // Skip string literals (single-quoted)
-        if bytes[i] == b'\'' {
-            i += 1;
-            while i < len {
-                if bytes[i] == b'\'' {
-                    if i + 1 < len && bytes[i + 1] == b'\'' {
-                        i += 2; // escaped quote
-                    } else {
-                        i += 1;
-                        break;
-                    }
-                } else {
-                    i += 1;
-                }
-            }
+        // Skip comments and string/q-quote literals in one place so the
+        // three text scanners (here, `lower::advance_to_decl_end`, and
+        // `lower::lower_statement_body`) cannot drift apart on which
+        // opaque spans hide a `;`/`END` from boundary detection.
+        if let Some(next) = skip_opaque_span(bytes, i, start) {
+            i = next;
             continue;
         }
 
@@ -188,17 +112,133 @@ pub fn recover_to_statement_boundary(
 }
 
 /// Case-insensitive keyword match at a byte position (word-boundary check).
+///
+/// Mirrors `lower::matches_keyword_ignore_case`: an Oracle identifier
+/// continues with letters, digits, `_`, `$`, or `#`, so the keyword must
+/// be bounded on **both** sides by a non-identifier byte. Checking only the
+/// trailing side (the historic behaviour) let an identifier ending in the
+/// keyword — e.g. the `END` suffix of `x_END` inside a live `BEGIN…END`
+/// block — spuriously decrement the block depth and terminate recovery one
+/// statement early.
 fn matches_kw_at(bytes: &[u8], pos: usize, keyword: &[u8]) -> bool {
     let end = pos + keyword.len();
     if end > bytes.len() {
         return false;
     }
     let candidate = &bytes[pos..end];
-    // Word boundary: next char must not be alphanumeric
-    if end < bytes.len() && bytes[end].is_ascii_alphanumeric() {
+    let is_ident_cont = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c == b'#';
+    // Trailing word boundary: the keyword must not be a prefix of a longer
+    // identifier (e.g. `END_OF_DAY`).
+    if end < bytes.len() && is_ident_cont(bytes[end]) {
+        return false;
+    }
+    // Leading word boundary: the byte before `pos` must not be an identifier
+    // char either (e.g. `x_END`, `re_begin`).
+    if pos > 0 && is_ident_cont(bytes[pos - 1]) {
         return false;
     }
     candidate.eq_ignore_ascii_case(keyword)
+}
+
+/// If a comment or string/q-quote literal starts at byte `pos`, return the
+/// byte index immediately past it; otherwise return `None`.
+///
+/// `scan_start` is the absolute index the surrounding scan began at; it is
+/// only used to gate the q-quote guard so an identifier ending in `q`/`n`
+/// (e.g. `acquire`) at the very start of the scan is not misread as the
+/// opener of a `q'…'` literal.
+///
+/// This is the single source of truth for "opaque span" skipping shared by
+/// [`recover_to_statement_boundary`] and the `lower` module's two text
+/// scanners (`advance_to_decl_end`, `lower_statement_body`). Keeping it in
+/// one place prevents the divergence that let a `;`/`END` embedded in a
+/// string literal truncate a declaration span.
+pub(crate) fn skip_opaque_span(bytes: &[u8], pos: usize, scan_start: usize) -> Option<usize> {
+    let len = bytes.len();
+    if pos >= len {
+        return None;
+    }
+
+    // Single-line comment: `-- … <newline>`.
+    if pos + 1 < len && bytes[pos] == b'-' && bytes[pos + 1] == b'-' {
+        let mut i = pos;
+        while i < len && bytes[i] != b'\n' {
+            i += 1;
+        }
+        return Some(i);
+    }
+
+    // Block comment: `/* … */`.
+    if pos + 1 < len && bytes[pos] == b'/' && bytes[pos + 1] == b'*' {
+        let mut i = pos + 2;
+        while i + 1 < len {
+            if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                return Some(i + 2);
+            }
+            i += 1;
+        }
+        // Unterminated → consume to EOF.
+        return Some(len);
+    }
+
+    // Oracle alternative-quoting (q-quote) literals: `q'X…X'` / `nq'X…X'`
+    // (case-insensitive, optional leading n/N). The body may contain `;`,
+    // apostrophes, and newlines — none of which are statement boundaries.
+    // Delimiter `X` pairs ( )=, [ ]=, { }=, < >; any other char closes with
+    // itself. Guarded so identifiers ending in q/n do not false-trigger.
+    {
+        let prev_is_ident =
+            pos > scan_start && (bytes[pos - 1].is_ascii_alphanumeric() || bytes[pos - 1] == b'_');
+        let q_at = if (bytes[pos] | 0x20) == b'n' && pos + 1 < len {
+            pos + 1
+        } else {
+            pos
+        };
+        if !prev_is_ident
+            && (bytes[q_at] | 0x20) == b'q'
+            && q_at + 2 < len
+            && bytes[q_at + 1] == b'\''
+        {
+            let open = bytes[q_at + 2];
+            let close = match open {
+                b'[' => b']',
+                b'(' => b')',
+                b'{' => b'}',
+                b'<' => b'>',
+                other => other,
+            };
+            let mut j = q_at + 3;
+            while j + 1 < len {
+                if bytes[j] == close && bytes[j + 1] == b'\'' {
+                    return Some(j + 2);
+                }
+                j += 1;
+            }
+            // Unterminated → consume to EOF (no spurious boundary inside an
+            // open literal).
+            return Some(len);
+        }
+    }
+
+    // Ordinary single-quoted string literal, with `''` escape handling.
+    if bytes[pos] == b'\'' {
+        let mut i = pos + 1;
+        while i < len {
+            if bytes[i] == b'\'' {
+                if i + 1 < len && bytes[i + 1] == b'\'' {
+                    i += 2; // escaped quote
+                } else {
+                    return Some(i + 1);
+                }
+            } else {
+                i += 1;
+            }
+        }
+        // Unterminated → consume to EOF.
+        return Some(len);
+    }
+
+    None
 }
 
 /// Create a diagnostic for the recovered region.
@@ -292,6 +332,39 @@ mod tests {
         // BEGIN at depth 0 -> depth 1, ; doesn't terminate, END -> depth 0, ; terminates
         let result = recover_to_statement_boundary(src, 0, fid());
         assert_eq!(result.recovered_at, 20); // after the final ;
+    }
+
+    #[test]
+    fn recover_ignores_keyword_suffix_of_identifier() {
+        // oracle-qm3q.22: `x_END` is an identifier, not the `END` keyword.
+        // Without a leading word-boundary check, its `END` suffix falsely
+        // decremented the BEGIN depth (1 -> 0) so the first `;` terminated
+        // recovery one statement early (at offset 16). With the check, depth
+        // stays 1 through `x_END;` and recovery lands after the real
+        // trailing `END;` at offset 21.
+        let src = b"bad BEGIN x_END; END; rest";
+        let result = recover_to_statement_boundary(src, 0, fid());
+        assert_eq!(
+            result.recovered_at, 21,
+            "the END suffix of x_END must not satisfy the END keyword; recovery \
+             must land after the real trailing END; (offset 21)"
+        );
+    }
+
+    #[test]
+    fn recover_ignores_keyword_prefix_of_identifier() {
+        // An identifier *beginning* with a keyword (`BEGIN_OF_DAY`) must not
+        // be treated as the BEGIN block opener. Trailing boundary now also
+        // rejects `_`/`$`/`#` continuations, so the first top-level `;`
+        // terminates immediately.
+        //                0123456789012345678
+        let src = b"x BEGIN_OF_DAY := 1; rest";
+        let result = recover_to_statement_boundary(src, 0, fid());
+        assert_eq!(
+            result.recovered_at, 20,
+            "BEGIN_OF_DAY is an identifier, not a block opener; the ; at depth 0 \
+             must terminate recovery"
+        );
     }
 
     #[test]
