@@ -94,6 +94,16 @@ pub enum VerifyError {
     #[error("generated scratch schema name `{name}` does not start with `VERIFY_T_`")]
     InvalidScratchSchemaName { name: String },
 
+    /// The scratch-user password failed validation before being interpolated
+    /// into the `CREATE USER ... IDENTIFIED BY "..."` DDL. The password is
+    /// quoted into a single DDL statement, so a stray `"` (or other
+    /// out-of-allowlist character) would corrupt the statement and surface as
+    /// a confusing ORA error rather than a clear rejection. We reject up front
+    /// instead of escaping: a `"` in an operator-chosen password almost
+    /// certainly signals a misconfiguration.
+    #[error("invalid scratch-user password: {reason}")]
+    InvalidScratchPassword { reason: String },
+
     /// The changeset has no SQL statements to apply.
     #[error("changeset has no SQL statements to verify")]
     EmptyChangeset,
@@ -515,6 +525,55 @@ impl<C: OracleConnection> Drop for ScratchSchemaGuard<'_, C> {
 
 // ── Schema lifecycle helpers ──────────────────────────────────────────────────
 
+/// Maximum scratch-user password length we accept. Oracle (pre-12.2) caps
+/// passwords at 30 bytes; 12.2+ allows 128. We use the larger limit — every
+/// allowlisted character is a single ASCII byte, so length equals byte count.
+const MAX_SCRATCH_PASSWORD_LEN: usize = 128;
+
+/// Validate a scratch-user password before it is interpolated into the
+/// `CREATE USER ... IDENTIFIED BY "..."` DDL.
+///
+/// The password is double-quoted into a *single* DDL statement. A stray `"`
+/// would close the quoted literal early and corrupt the statement, surfacing
+/// as a confusing ORA error rather than a clear rejection. Rather than escape,
+/// we reject anything outside a conservative allowlist — a `"` (or shell/SQL
+/// metacharacter) in an operator-chosen password almost always signals a
+/// misconfiguration, so explicit rejection is the safer, clearer behaviour.
+///
+/// Accepts only `[A-Za-z0-9#_$.+-]`, rejects empty and over-length
+/// (> [`MAX_SCRATCH_PASSWORD_LEN`]) passwords.
+///
+/// # Errors
+///
+/// Returns [`VerifyError::InvalidScratchPassword`] if the password is empty,
+/// too long, or contains a disallowed character.
+pub fn validate_scratch_password(password: &str) -> Result<(), VerifyError> {
+    if password.is_empty() {
+        return Err(VerifyError::InvalidScratchPassword {
+            reason: "password must not be empty".to_string(),
+        });
+    }
+    if password.len() > MAX_SCRATCH_PASSWORD_LEN {
+        return Err(VerifyError::InvalidScratchPassword {
+            reason: format!(
+                "password is {} bytes; must be at most {MAX_SCRATCH_PASSWORD_LEN}",
+                password.len()
+            ),
+        });
+    }
+    if let Some(bad) = password
+        .chars()
+        .find(|c| !matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '#' | '_' | '$' | '.' | '+' | '-'))
+    {
+        return Err(VerifyError::InvalidScratchPassword {
+            reason: format!(
+                "password contains disallowed character `{bad}` — only [A-Za-z0-9#_$.+-] are permitted"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Create the scratch schema as a new Oracle user.
 ///
 /// Requires `conn` to have `CREATE USER`, `DROP USER`, and `GRANT` privileges
@@ -537,6 +596,11 @@ pub fn create_scratch_schema<C: OracleConnection>(
             name: schema.to_string(),
         });
     }
+
+    // The password is interpolated into a quoted DDL literal below; validate it
+    // up front so a stray `"` (or other metacharacter) is rejected cleanly
+    // instead of corrupting the CREATE USER statement (oracle-clgt.11).
+    validate_scratch_password(password)?;
 
     // CREATE USER
     conn.execute(
@@ -987,6 +1051,91 @@ mod tests {
         assert_eq!(report.ok_count(), 2);
         assert_eq!(report.failed_count(), 0);
         assert_eq!(report.skipped_count(), 0);
+    }
+
+    // ── validate_scratch_password (oracle-clgt.11) ────────────────────────────
+
+    #[test]
+    fn validate_scratch_password_accepts_default_and_allowlist() {
+        // The hard-coded default must pass.
+        validate_scratch_password("V3r1fyTmp#2026").expect("default password must validate");
+        // Every allowlisted character class.
+        validate_scratch_password("Aa0#_$.+-").expect("full allowlist must validate");
+    }
+
+    #[test]
+    fn validate_scratch_password_rejects_double_quote() {
+        // The headline defect: a `"` would close the quoted DDL literal early.
+        let err = validate_scratch_password("a\"b").expect_err("double-quote must be rejected");
+        assert!(
+            matches!(err, VerifyError::InvalidScratchPassword { .. }),
+            "expected InvalidScratchPassword, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_scratch_password_rejects_injection_shaped_value() {
+        // Even though OCI single-statement execution would reject the trailing
+        // statement, we refuse this up front so the operator gets a clear error.
+        let err = validate_scratch_password("pw\" ; GRANT DBA TO PUBLIC --")
+            .expect_err("injection-shaped password must be rejected");
+        assert!(matches!(err, VerifyError::InvalidScratchPassword { .. }));
+    }
+
+    #[test]
+    fn validate_scratch_password_rejects_empty() {
+        let err = validate_scratch_password("").expect_err("empty password must be rejected");
+        match err {
+            VerifyError::InvalidScratchPassword { reason } => {
+                assert!(reason.contains("empty"), "reason should mention empty: {reason}");
+            }
+            other => panic!("expected InvalidScratchPassword, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_scratch_password_rejects_over_length() {
+        let too_long = "A".repeat(MAX_SCRATCH_PASSWORD_LEN + 1);
+        let err =
+            validate_scratch_password(&too_long).expect_err("over-length password must be rejected");
+        assert!(matches!(err, VerifyError::InvalidScratchPassword { .. }));
+        // The boundary itself is accepted.
+        validate_scratch_password(&"A".repeat(MAX_SCRATCH_PASSWORD_LEN))
+            .expect("max-length password must validate");
+    }
+
+    #[test]
+    fn validate_scratch_password_rejects_common_metacharacters() {
+        for bad in ["a b", "a'b", "a;b", "a/b", "a*b", "a@b", "a%b"] {
+            let err = validate_scratch_password(bad)
+                .expect_err("metacharacter password must be rejected");
+            assert!(
+                matches!(err, VerifyError::InvalidScratchPassword { .. }),
+                "expected InvalidScratchPassword for `{bad}`, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_scratch_schema_rejects_bad_password_before_executing_ddl() {
+        // Regression: a corrupting `"` in the password must be rejected before
+        // any DDL is sent to the connection (oracle-clgt.11).
+        let conn = StubConn;
+        let err = create_scratch_schema(&conn, "VERIFY_T_77", "a\"b")
+            .expect_err("bad password must be rejected");
+        assert!(
+            matches!(err, VerifyError::InvalidScratchPassword { .. }),
+            "expected InvalidScratchPassword, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn create_scratch_schema_accepts_default_password() {
+        // The default password flows through create_scratch_schema cleanly
+        // against the always-Ok stub connection.
+        let conn = StubConn;
+        create_scratch_schema(&conn, "VERIFY_T_88", "V3r1fyTmp#2026")
+            .expect("default password must be accepted by create_scratch_schema");
     }
 
     #[test]
