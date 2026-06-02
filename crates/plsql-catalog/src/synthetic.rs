@@ -332,6 +332,9 @@ impl SyntheticCatalogBuilder {
             },
             interner: self.interner,
             editions: Vec::new(),
+            // Synthetic catalogs construct Grantee values directly, so they
+            // never route through ALL_USERS-based grantee classification.
+            known_users: None,
         }
     }
 

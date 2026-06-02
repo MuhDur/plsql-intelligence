@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 pub mod synthetic;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
@@ -183,6 +183,23 @@ pub struct CatalogSnapshot {
     /// is not in use.
     #[serde(default)]
     pub editions: Vec<Edition>,
+    /// Set of database usernames observed from `ALL_USERS`, used during
+    /// live extraction to discriminate an object-privilege grantee
+    /// (`ALL_TAB_PRIVS.GRANTEE`) between a real user and a database role —
+    /// Oracle's `ALL_TAB_PRIVS` carries no user/role discriminator column.
+    ///
+    /// `None` means the username set was never loaded (the `ALL_USERS`
+    /// probe was not run or failed); in that state grantee classification
+    /// is *undetermined* and, honoring R13, the extractor must NOT
+    /// silently assume a direct (high-confidence) user grant. `Some(_)`
+    /// (even when empty) means the set was loaded and is authoritative for
+    /// the schemas under analysis.
+    ///
+    /// This is transient extraction state: it is never serialized, because
+    /// the resulting `Grantee` discrimination is already baked into each
+    /// persisted `Grant`. JSON snapshots therefore round-trip unchanged.
+    #[serde(default, skip)]
+    pub known_users: Option<HashSet<UserName>>,
 }
 
 impl CatalogSnapshot {
@@ -202,7 +219,24 @@ impl CatalogSnapshot {
             source,
             interner: SymbolInterner::new(),
             editions: Vec::new(),
+            known_users: None,
         }
+    }
+
+    /// Intern `text` as a [`UserName`] without changing classification
+    /// state. Mirrors [`SymbolInterner::intern_user_name`] but routes
+    /// through this snapshot's interner.
+    #[must_use]
+    #[instrument(level = "trace", skip(self, text))]
+    pub fn intern_user_name(&mut self, text: impl Into<String>) -> Option<UserName> {
+        self.interner.intern_user_name(text)
+    }
+
+    /// Intern `text` as a [`RoleName`] through this snapshot's interner.
+    #[must_use]
+    #[instrument(level = "trace", skip(self, text))]
+    pub fn intern_role_name(&mut self, text: impl Into<String>) -> Option<RoleName> {
+        self.interner.intern_role_name(text)
     }
 
     #[must_use]
@@ -1352,6 +1386,9 @@ pub fn load_from_dbms_metadata_dir(dir: &std::path::Path) -> Result<CatalogSnaps
         },
         interner,
         editions: Vec::new(),
+        // DBMS_METADATA directory loads do not query ALL_USERS; grantee
+        // classification is not exercised on this path.
+        known_users: None,
     })
 }
 
@@ -1817,6 +1854,9 @@ pub fn load_snapshot_from_connection<C: OracleConnection>(
     load_catalog_mviews(conn, &mut snapshot, &resolved_schemas)?;
     load_catalog_sequences(conn, &mut snapshot, &resolved_schemas)?;
     load_catalog_type_attrs(conn, &mut snapshot, &resolved_schemas)?;
+    // Must precede grant extraction: ALL_TAB_PRIVS has no user/role
+    // discriminator, so grantee classification consults `known_users`.
+    load_catalog_users(conn, &mut snapshot)?;
     load_catalog_grants(conn, &mut snapshot, &resolved_schemas)?;
     load_catalog_db_links(conn, &mut snapshot, &resolved_schemas)?;
     load_catalog_table_comments(conn, &mut snapshot, &resolved_schemas)?;
@@ -3021,6 +3061,56 @@ order by owner, table_name, column_name
     Ok(())
 }
 
+/// Populate [`CatalogSnapshot::known_users`] from `ALL_USERS`.
+///
+/// `ALL_USERS` is readable by `PUBLIC` on a stock Oracle instance, so this
+/// needs no `SELECT_CATALOG_ROLE` / DBA grant. The resulting set lets
+/// [`grantee_from_dictionary_value`] discriminate object-privilege grantees
+/// (whose `ALL_TAB_PRIVS.GRANTEE` carries no user/role type column) into
+/// real users versus database roles.
+///
+/// Failure is non-fatal: if `ALL_USERS` cannot be read, the snapshot keeps
+/// `known_users == None` (an explicit "undetermined" state, R13) and records
+/// a [`CapabilityWarning`] rather than aborting the extraction. Callers must
+/// invoke this BEFORE [`load_catalog_grants`].
+fn load_catalog_users<C: OracleConnection>(
+    conn: &C,
+    snapshot: &mut CatalogSnapshot,
+) -> Result<(), CatalogError> {
+    let sql = "select username from all_users order by username";
+    match conn.query_rows(sql, &[]) {
+        Ok(rows) => {
+            let mut users = HashSet::with_capacity(rows.len());
+            for row in &rows {
+                let username = row.require_text("USERNAME")?;
+                let Some(user) = snapshot.intern_user_name(username) else {
+                    return Err(CatalogError::InvalidColumnValue {
+                        column: String::from("USERNAME"),
+                        expected: "interned user name",
+                        value: String::from(username),
+                    });
+                };
+                users.insert(user);
+            }
+            snapshot.known_users = Some(users);
+        }
+        Err(error) => {
+            // R13: do not fail the snapshot and do not silently pretend the
+            // grantee universe is known. Leave `known_users == None` so
+            // grantee classification stays conservative downstream.
+            snapshot.known_users = None;
+            snapshot.capabilities.warnings.push(CapabilityWarning {
+                code: String::from("all-users-probe"),
+                message: format!("ALL_USERS read failed: {error}"),
+                remediation: Some(String::from(
+                    "ensure the analysis user can SELECT ALL_USERS so object grants to roles are not misclassified as direct user grants.",
+                )),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn load_catalog_grants<C: OracleConnection>(
     conn: &C,
     snapshot: &mut CatalogSnapshot,
@@ -4141,6 +4231,24 @@ fn apply_grant_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<()
     Ok(())
 }
 
+/// Classify an `ALL_TAB_PRIVS.GRANTEE` value into a [`Grantee`].
+///
+/// `ALL_TAB_PRIVS` carries no user/role discriminator column, so the
+/// grantee universe — `{ user, role, PUBLIC }` — is resolved against the
+/// `ALL_USERS`-derived [`CatalogSnapshot::known_users`] set:
+///
+/// * `PUBLIC` -> [`Grantee::Public`].
+/// * known username -> [`Grantee::User`] (a statically certain direct grant).
+/// * loaded set, name absent -> [`Grantee::Role`] (the only remaining class;
+///   the resolver then caps it at Low confidence and emits a
+///   `RuntimeGrantOrRole` ambiguity because a role grant only applies when
+///   the role is enabled in `SESSION_ROLES` at runtime).
+/// * username set NOT loaded (`known_users == None`) -> [`Grantee::Role`]
+///   as well. This is the R13 fail-toward-restrictive choice: when the
+///   grantee class is genuinely undetermined we must NOT default to a
+///   high-confidence direct user grant (a fail-toward-permissive result in
+///   a privilege/SAST product); treating it as a role routes it through the
+///   runtime-ambiguity downgrade instead of over-claiming certainty.
 fn grantee_from_dictionary_value(
     snapshot: &mut CatalogSnapshot,
     text: &str,
@@ -4155,7 +4263,15 @@ fn grantee_from_dictionary_value(
             value: String::from(text),
         });
     };
-    Ok(Grantee::User(UserName::from(symbol)))
+    let is_known_user = snapshot
+        .known_users
+        .as_ref()
+        .is_some_and(|users| users.contains(&UserName::from(symbol)));
+    if is_known_user {
+        Ok(Grantee::User(UserName::from(symbol)))
+    } else {
+        Ok(Grantee::Role(RoleName::from(symbol)))
+    }
 }
 
 fn grant_privilege_from_dictionary_value(text: &str) -> GrantPrivilege {
@@ -5269,6 +5385,8 @@ mod tests {
     use tempfile::tempdir;
 
     #[cfg(not(feature = "oracle-driver"))]
+    use std::collections::HashSet;
+
     use crate::RustOracleConnection;
     use crate::{
         AccessibleByTarget, CATALOG_SNAPSHOT_SCHEMA_ID, CATALOG_SNAPSHOT_SCHEMA_VERSION,
@@ -5280,8 +5398,8 @@ mod tests {
         PackageMetadata, PlScopeAvailability, PlScopeSnapshot, RoutineSignature, SchemaCatalog,
         SynonymName, SynonymTarget, TableMetadata, TriggerEvent, TriggerLevel, TriggerName,
         TriggerTiming, TypeFinality, TypeInstantiable, export_snapshot_to_json,
-        load_from_dbms_metadata_dir, load_snapshot_from_connection, load_snapshot_from_json,
-        rust_oracle_driver_compiled,
+        grantee_from_dictionary_value, load_catalog_users, load_from_dbms_metadata_dir,
+        load_snapshot_from_connection, load_snapshot_from_json, rust_oracle_driver_compiled,
     };
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5389,6 +5507,22 @@ mod tests {
             rows: vec![],
         })
         .collect()
+    }
+
+    /// `ALL_USERS` extraction expectation. The live loader queries this
+    /// (database-wide, no schema bind) to learn which grantees are users so
+    /// `grantee_from_dictionary_value` can tell users from roles. Tests pass
+    /// the set of usernames they want to be classified as `Grantee::User`;
+    /// any grantee absent from this set is classified as `Grantee::Role`.
+    fn all_users_expectation(usernames: &[&str]) -> QueryExpectation {
+        QueryExpectation {
+            sql_contains: String::from("from all_users"),
+            params: vec![],
+            rows: usernames
+                .iter()
+                .map(|name| oracle_row(&[("USERNAME", "VARCHAR2(128)", Some(name))]))
+                .collect(),
+        }
     }
 
     #[test]
@@ -5825,6 +5959,9 @@ mod tests {
             ]),
         ];
         let mut expected_queries = capability_probe_expectations();
+        // REPORTING is a database user, so its object grant stays a direct
+        // (high-confidence) Grantee::User after the role-classification fix.
+        expected_queries.push(all_users_expectation(&["BILLING", "REPORTING"]));
         expected_queries.extend(vec![
                 QueryExpectation {
                     sql_contains: String::from("from all_objects"),
@@ -6241,8 +6378,104 @@ mod tests {
             reporting_grant.privilege,
             crate::GrantPrivilege::Select
         ));
+        // REPORTING appears in the ALL_USERS fixture, so it classifies as a
+        // direct user grant (and not, conservatively, as a role).
         assert!(matches!(reporting_grant.grantee, crate::Grantee::User(_)));
         assert!(!reporting_grant.grantable);
+    }
+
+    /// oracle-qm3q.2 regression: `grantee_from_dictionary_value` must
+    /// discriminate an object-privilege grantee against the loaded
+    /// `ALL_USERS` set. A grantee that is NOT a known user is a database
+    /// role (the only remaining grantee class besides PUBLIC), and must be
+    /// recorded as `Grantee::Role` so the privilege resolver downgrades it
+    /// to Low confidence with a `RuntimeGrantOrRole` ambiguity instead of
+    /// the previous, fail-toward-permissive `Grantee::User` (High).
+    #[test]
+    fn grantee_classification_uses_loaded_user_set() {
+        let mut snapshot = CatalogSnapshot::new(
+            plsql_core::AnalysisProfile::default(),
+            CatalogCapabilities::default(),
+            CatalogSource::default(),
+            DateTime::<Utc>::UNIX_EPOCH,
+        );
+
+        // Before the user set is loaded, the grantee class is undetermined.
+        // R13 / fail-toward-restrictive: an undetermined grantee must NOT be
+        // a high-confidence direct user grant — it routes through the role
+        // ambiguity path instead.
+        assert!(snapshot.known_users.is_none());
+        let undetermined =
+            grantee_from_dictionary_value(&mut snapshot, "MYSTERY_GRANTEE").expect("grantee");
+        assert!(
+            matches!(undetermined, crate::Grantee::Role(_)),
+            "undetermined grantee (ALL_USERS not loaded) must not be a direct user grant; got {undetermined:?}"
+        );
+
+        // Load a user set: APP_USER is a user, APP_READER_ROLE is not.
+        let app_user = snapshot.intern_user_name("APP_USER").expect("user");
+        let mut users = HashSet::new();
+        users.insert(app_user);
+        snapshot.known_users = Some(users);
+
+        // PUBLIC is always PUBLIC.
+        assert!(matches!(
+            grantee_from_dictionary_value(&mut snapshot, "PUBLIC").expect("grantee"),
+            crate::Grantee::Public
+        ));
+        // A known user classifies as a direct user grant.
+        assert!(matches!(
+            grantee_from_dictionary_value(&mut snapshot, "APP_USER").expect("grantee"),
+            crate::Grantee::User(_)
+        ));
+        // A grantee absent from ALL_USERS classifies as a role — the defect
+        // this bead fixes (previously always `Grantee::User`).
+        let role = grantee_from_dictionary_value(&mut snapshot, "APP_READER_ROLE").expect("grantee");
+        let crate::Grantee::Role(role_name) = role else {
+            panic!("APP_READER_ROLE must classify as a role, got {role:?}");
+        };
+        assert_eq!(
+            snapshot.interner.resolve(role_name.symbol()),
+            Some("APP_READER_ROLE")
+        );
+    }
+
+    /// oracle-qm3q.2: if `ALL_USERS` cannot be read, `load_catalog_users`
+    /// must leave `known_users == None` (so grantees stay conservatively
+    /// classified) and record a capability warning rather than aborting the
+    /// extraction or silently assuming the grantee universe.
+    #[test]
+    fn load_catalog_users_failure_is_nonfatal_and_marks_unknown() {
+        // A strict mock with NO matching expectation for `from all_users`
+        // makes the query fail.
+        let connection = StaticConnection {
+            expected_queries: vec![QueryExpectation {
+                sql_contains: String::from("from something_else"),
+                params: vec![],
+                rows: vec![],
+            }],
+            ..StaticConnection::default()
+        };
+        let mut snapshot = CatalogSnapshot::new(
+            plsql_core::AnalysisProfile::default(),
+            CatalogCapabilities::default(),
+            CatalogSource::default(),
+            DateTime::<Utc>::UNIX_EPOCH,
+        );
+
+        load_catalog_users(&connection, &mut snapshot).expect("non-fatal");
+        assert!(
+            snapshot.known_users.is_none(),
+            "failed ALL_USERS read must leave grantee universe undetermined"
+        );
+        assert!(
+            snapshot
+                .capabilities
+                .warnings
+                .iter()
+                .any(|w| w.code == "all-users-probe"),
+            "a capability warning must record the ALL_USERS read failure"
+        );
     }
 
     #[test]
@@ -6430,6 +6663,9 @@ mod tests {
 
         let billing_only = vec![OracleBind::from("BILLING")];
         let mut expected_queries = capability_probe_expectations();
+        // Only BILLING is a real user; REPORTING_ROLE is deliberately absent
+        // so the UPDATE grant to it classifies as a role, not a user.
+        expected_queries.push(all_users_expectation(&["BILLING"]));
         expected_queries.extend(vec![
             QueryExpectation {
                 sql_contains: String::from("from all_objects"),
@@ -6610,16 +6846,33 @@ mod tests {
             public_grant.privilege,
             crate::GrantPrivilege::Select
         ));
-        let user_grant = schema_catalog
+        // REPORTING_ROLE is not in the ALL_USERS fixture, so the UPDATE
+        // grant to it must classify as a role grant (it was previously,
+        // and incorrectly, recorded as a direct user grant — oracle-qm3q.2).
+        let role_grant = schema_catalog
             .grants
             .iter()
-            .find(|grant| matches!(grant.grantee, crate::Grantee::User(_)))
+            .find(|grant| matches!(grant.grantee, crate::Grantee::Role(_)))
             .expect("role grant present");
+        let crate::Grantee::Role(role) = &role_grant.grantee else {
+            unreachable!("matched Grantee::Role above");
+        };
+        assert_eq!(
+            snapshot.interner.resolve(role.symbol()),
+            Some("REPORTING_ROLE")
+        );
         assert!(matches!(
-            user_grant.privilege,
+            role_grant.privilege,
             crate::GrantPrivilege::Update
         ));
-        assert!(user_grant.grantable);
+        assert!(role_grant.grantable);
+        // And no grantee is misclassified as a direct user in this fixture.
+        assert!(
+            !schema_catalog
+                .grants
+                .iter()
+                .any(|grant| matches!(grant.grantee, crate::Grantee::User(_)))
+        );
 
         // PLSQL-CAT-NEW-1 / oracle-rr4y: ALL_DB_LINKS rows lower into
         // the owning schema's `db_links` list. The fixture seeds one
@@ -7207,6 +7460,9 @@ mod tests {
 
         let billing_only = vec![OracleBind::from("BILLING")];
         let mut expected_queries = capability_probe_expectations();
+        // No grants are asserted here, but live extraction still issues the
+        // ALL_USERS probe before ALL_TAB_PRIVS.
+        expected_queries.push(all_users_expectation(&["BILLING"]));
         expected_queries.extend(vec![
             QueryExpectation {
                 sql_contains: String::from("from all_objects"),
@@ -7556,6 +7812,8 @@ mod tests {
 
         let billing_only = vec![OracleBind::from("BILLING")];
         let mut expected_queries = capability_probe_expectations();
+        // Live extraction issues the ALL_USERS probe before ALL_TAB_PRIVS.
+        expected_queries.push(all_users_expectation(&["BILLING", "REPORTING"]));
         for fragment in [
             "from all_objects",
             "from all_tab_cols",
@@ -7661,6 +7919,8 @@ mod tests {
 
         let billing_only = vec![OracleBind::from("BILLING")];
         let mut expected_queries = capability_probe_expectations();
+        // Live extraction issues the ALL_USERS probe before ALL_TAB_PRIVS.
+        expected_queries.push(all_users_expectation(&["BILLING"]));
         for fragment in [
             "from all_objects",
             "from all_tab_cols",

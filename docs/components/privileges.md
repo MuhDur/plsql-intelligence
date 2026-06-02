@@ -24,7 +24,14 @@ procedure Y today?" without re-deriving the rules.
 ## Inputs
 
 - `CatalogSnapshot.grants` — vendored from `ALL_TAB_PRIVS`
-  (PLSQL-CAT-004) and `ALL_ROLE_PRIVS`
+  (PLSQL-CAT-004). `ALL_TAB_PRIVS` has no user/role discriminator
+  column, so each grantee is classified against
+  `CatalogSnapshot.known_users` (loaded from `ALL_USERS`): a grantee
+  that is not a known user is recorded as `Grantee::Role`. When the
+  user set could not be loaded the grantee class is undetermined and is
+  treated conservatively as a role (R13 — never a fail-toward-permissive
+  direct user grant). Role-mediated grants are downgraded to Low
+  confidence with a `RuntimeGrantOrRole` ambiguity by the resolver.
 - `SemanticModel` — to detect `AUTHID DEFINER` vs `CURRENT_USER`
 - `plsql-symbols` resolved bindings — to know what target object an
   identifier resolves to
