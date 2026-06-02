@@ -73,17 +73,25 @@ pub fn resolve_sql(raw: &str) -> SqlStatementModel {
             collect_from_and_joins(&upper, trimmed, &mut model, TableUsageKind::Read);
         }
         SqlSemanticVerb::Delete => {
-            // Only the FIRST `FROM` table is the DELETE target (a Write); any
-            // further `FROM`/`JOIN` tables come from a WHERE sub-SELECT and are
-            // Reads. The old code tagged every `FROM` triple Write, so
-            // `DELETE FROM t WHERE id IN (SELECT id FROM staging)` recorded
-            // STAGING as a Write with reversed data-flow direction.
-            // (oracle-rwjl.6)
-            let mut from_tables = tables_after_keyword(&upper, trimmed, "FROM").into_iter();
-            if let Some((s, t, a)) = from_tables.next() {
+            // The DELETE target is the identifier immediately after the
+            // `DELETE` keyword — the `FROM` is optional in Oracle, so
+            // `DELETE employees WHERE …` and `DELETE FROM employees WHERE …`
+            // write the same table. Deriving the target only from `FROM`
+            // silently produced no write model for a FROM-less DELETE
+            // (oracle-j1ep.2). Trailing `FROM`/`JOIN` tables that are NOT the
+            // target come from a WHERE sub-SELECT and are Reads — tagging them
+            // Write reverses the data-flow direction (oracle-rwjl.6).
+            let target = delete_target(&upper, trimmed);
+            let target_key = target.as_ref().map(|(s, t, _)| (s.clone(), t.clone()));
+            if let Some((s, t, a)) = target {
                 add(&mut model, s, t, a, TableUsageKind::Write);
             }
-            for (s, t, a) in from_tables {
+            let mut target_consumed = false;
+            for (s, t, a) in tables_after_keyword(&upper, trimmed, "FROM") {
+                if !target_consumed && target_key.as_ref() == Some(&(s.clone(), t.clone())) {
+                    target_consumed = true;
+                    continue;
+                }
                 add(&mut model, s, t, a, TableUsageKind::Read);
             }
             for (s, t, a) in tables_after_keyword(&upper, trimmed, "JOIN") {
@@ -288,6 +296,66 @@ fn tables_after_keyword(
     out
 }
 
+/// The `(schema, table, alias)` write target of a `DELETE`: the
+/// `[schema.]table [alias]` immediately after the `DELETE` keyword,
+/// skipping an optional leading `FROM`. Oracle accepts both
+/// `DELETE t …` and `DELETE FROM t …`; the table written is the same.
+/// `upper` is the case-folded buffer, `raw` the (trimmed) original they
+/// share offsets with — schema/table are returned case-folded to match
+/// [`tables_after_keyword`], the alias is preserved verbatim.
+fn delete_target(upper: &str, raw: &str) -> Option<(Option<String>, String, String)> {
+    let bytes = upper.as_bytes();
+    // Skip the leading `DELETE` keyword.
+    let mut i = 0;
+    while i < bytes.len() && (is_ident_byte(bytes[i]) || bytes[i] == b'.') {
+        i += 1;
+    }
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    // Skip an optional `FROM` keyword (whole-word).
+    if upper[i..].len() >= 4
+        && &upper[i..i + 4] == "FROM"
+        && (i + 4 >= bytes.len() || !is_ident_byte(bytes[i + 4]))
+    {
+        i += 4;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+    }
+    // Read the `[schema.]table` token.
+    let start = i;
+    while i < bytes.len() && (is_ident_byte(bytes[i]) || bytes[i] == b'.') {
+        i += 1;
+    }
+    if i == start {
+        return None;
+    }
+    let token_upper = upper[start..i].to_string();
+    // Optional alias (the next identifier token, unless it is `SET`).
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let mut alias = String::new();
+    if i < bytes.len() && is_ident_byte(bytes[i]) {
+        let a_start = i;
+        while i < bytes.len() && is_ident_byte(bytes[i]) {
+            i += 1;
+        }
+        let cand_upper = upper[a_start..i].to_string();
+        // `WHERE`/`SET`/`RETURNING` start the rest of the statement, not an
+        // alias. Anything else after the target table is the alias.
+        if cand_upper != "WHERE" && cand_upper != "SET" && cand_upper != "RETURNING" {
+            alias = raw[a_start..i].to_string();
+        }
+    }
+    let (schema, table) = match token_upper.rsplit_once('.') {
+        Some((s, t)) if !t.is_empty() => (Some(s.to_string()), t.to_string()),
+        _ => (None, token_upper),
+    };
+    Some((schema, table, alias))
+}
+
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'#'
 }
@@ -403,6 +471,56 @@ mod tests {
                 .iter()
                 .any(|t| t.table == "T" && t.usage == TableUsageKind::Write),
             "DELETE target T must be Write: {:?}",
+            m.tables
+        );
+        assert!(
+            m.tables
+                .iter()
+                .any(|t| t.table == "STAGING" && t.usage == TableUsageKind::Read),
+            "WHERE sub-SELECT table STAGING must be Read: {:?}",
+            m.tables
+        );
+        assert!(
+            !m.tables
+                .iter()
+                .any(|t| t.table == "STAGING" && t.usage == TableUsageKind::Write),
+            "STAGING must NEVER be Write: {:?}",
+            m.tables
+        );
+    }
+
+    // oracle-j1ep.2: Oracle's `FROM` is optional in a DELETE. A FROM-less
+    // `DELETE employees WHERE …` resolves the same write model as
+    // `DELETE FROM employees`. Deriving the target only from `FROM` produced
+    // an empty model for the FROM-less form.
+    #[test]
+    fn from_less_delete_resolves_write_target() {
+        let m = resolve_sql("DELETE employees WHERE id = 5");
+        assert_eq!(m.verb, SqlSemanticVerb::Delete);
+        assert_eq!(m.tables.len(), 1, "{:?}", m.tables);
+        assert_eq!(m.tables[0].table, "EMPLOYEES");
+        assert_eq!(m.tables[0].usage, TableUsageKind::Write);
+    }
+
+    #[test]
+    fn from_less_qualified_delete_resolves_schema() {
+        let m = resolve_sql("DELETE hr.audit_log WHERE ts < SYSDATE");
+        assert_eq!(m.verb, SqlSemanticVerb::Delete);
+        assert_eq!(m.tables[0].schema, "HR");
+        assert_eq!(m.tables[0].table, "AUDIT_LOG");
+        assert_eq!(m.tables[0].usage, TableUsageKind::Write);
+    }
+
+    // oracle-j1ep.2 + oracle-rwjl.6: FROM-less DELETE target is a Write, the
+    // WHERE sub-SELECT table is a Read — never Write.
+    #[test]
+    fn from_less_delete_subquery_target_write_subquery_read() {
+        let m = resolve_sql("DELETE t WHERE id IN (SELECT id FROM staging)");
+        assert!(
+            m.tables
+                .iter()
+                .any(|t| t.table == "T" && t.usage == TableUsageKind::Write),
+            "FROM-less DELETE target T must be Write: {:?}",
             m.tables
         );
         assert!(

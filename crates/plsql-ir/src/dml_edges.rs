@@ -192,18 +192,35 @@ fn accesses_from_sql(verb: SqlVerb, raw: &str, out: &mut Vec<TableAccess>) {
             }
         }
         SqlVerb::Delete => {
-            // Only the FIRST `FROM` table is the DELETE target (a Write). Any
-            // further `FROM` occurrences come from a WHERE sub-SELECT — e.g.
-            // `DELETE FROM t WHERE id IN (SELECT id FROM staging)` — and are
-            // READS, not writes. The old code pushed every `FROM` table as a
-            // Write, minting a spurious `Writes staging` edge with reversed
-            // data-flow direction. Subquery `JOIN` tables are reads too.
-            // (oracle-rwjl.6)
-            let mut from_tables = tables_after(&upper, raw, "FROM").into_iter();
-            if let Some(target) = from_tables.next() {
-                push(out, target, AccessKind::Write);
+            // The DELETE target is the identifier immediately after the
+            // `DELETE` keyword (the `FROM` is optional in Oracle:
+            // `DELETE employees WHERE …` and `DELETE FROM employees WHERE …`
+            // are both valid and write the same table). Deriving the target
+            // only from `FROM` silently dropped the Write of a FROM-less
+            // DELETE, so the dependency graph recorded no write on the
+            // destroyed table and a cross-schema FROM-less DELETE was never
+            // flagged DEP001 (oracle-j1ep.2).
+            //
+            // Trailing `FROM`/`JOIN` tables that are NOT the target come from a
+            // WHERE sub-SELECT — e.g. `DELETE t WHERE id IN (SELECT id FROM
+            // staging)` — and are READS, not writes. Pushing them as Writes
+            // would mint a spurious `Writes staging` edge with reversed
+            // data-flow direction (oracle-rwjl.6).
+            let target = delete_target(raw);
+            let target_folded = target.as_deref().map(folded_name);
+            if let Some(t) = target {
+                push(out, t, AccessKind::Write);
             }
-            for t in from_tables {
+            // The explicit `DELETE FROM t` form surfaces the target once in the
+            // FROM list; consume that single occurrence so it is not also
+            // tagged Read, but tag every other FROM table (sub-SELECT sources)
+            // as a Read.
+            let mut target_consumed = false;
+            for t in tables_after(&upper, raw, "FROM") {
+                if !target_consumed && Some(folded_name(&t)) == target_folded {
+                    target_consumed = true;
+                    continue;
+                }
                 push(out, t, AccessKind::Read);
             }
             for t in tables_after(&upper, raw, "JOIN") {
@@ -219,6 +236,52 @@ fn accesses_from_sql(verb: SqlVerb, raw: &str, out: &mut Vec<TableAccess>) {
             }
         }
     }
+}
+
+/// Case-fold a raw `[schema.]table` token the way [`push`] does, so a
+/// FROM-clause table can be compared against the DELETE target.
+fn folded_name(raw_name: &str) -> String {
+    raw_name.to_ascii_uppercase()
+}
+
+/// The write target of a `DELETE`: the `[schema.]table` identifier
+/// immediately after the `DELETE` keyword, skipping an optional leading
+/// `FROM`. Oracle accepts both `DELETE t …` and `DELETE FROM t …`; the
+/// table written is the same. Returns `None` only when no identifier
+/// follows (a malformed statement the caller leaves unresolved rather
+/// than guessing).
+fn delete_target(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    // Skip the leading `DELETE` keyword.
+    let mut i = 0;
+    while i < bytes.len() && (is_ident_byte(bytes[i]) || bytes[i] == b'.') {
+        i += 1;
+    }
+    i = skip_ws(bytes, i);
+    // Skip an optional `FROM` keyword (whole-word).
+    if raw[i..].len() >= 4
+        && raw[i..i + 4].eq_ignore_ascii_case("FROM")
+        && (i + 4 >= bytes.len() || !is_ident_byte(bytes[i + 4]))
+    {
+        i = skip_ws(bytes, i + 4);
+    }
+    // Read the `[schema.]table` token.
+    let start = i;
+    while i < bytes.len() && (is_ident_byte(bytes[i]) || bytes[i] == b'.') {
+        i += 1;
+    }
+    if i > start {
+        Some(raw[start..i].to_string())
+    } else {
+        None
+    }
+}
+
+fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
 }
 
 /// Pull the identifier(s) immediately following each occurrence
@@ -369,6 +432,58 @@ mod tests {
             a.iter()
                 .any(|x| x.table == "T" && x.access == AccessKind::Write),
             "DELETE target T must be a Write: {a:?}"
+        );
+        assert!(
+            a.iter()
+                .any(|x| x.table == "STAGING" && x.access == AccessKind::Read),
+            "WHERE sub-SELECT table STAGING must be a Read: {a:?}"
+        );
+        assert!(
+            !a.iter()
+                .any(|x| x.table == "STAGING" && x.access == AccessKind::Write),
+            "STAGING must NEVER be classified as a Write: {a:?}"
+        );
+    }
+
+    // oracle-j1ep.2: Oracle's `FROM` is optional in a DELETE. A FROM-less
+    // `DELETE employees WHERE …` writes EMPLOYEES exactly like
+    // `DELETE FROM employees`, but the old arm derived the target only from a
+    // `FROM` token and so produced no Write — the dependency graph recorded no
+    // write on the destroyed table. The target must be the identifier right
+    // after the DELETE keyword.
+    #[test]
+    fn from_less_delete_is_a_write() {
+        let s = lower_statement_body("DELETE employees WHERE id = 5;");
+        let a = extract_table_accesses(&s);
+        assert_eq!(a.len(), 1, "exactly one access expected: {a:?}");
+        assert_eq!(a[0].table, "EMPLOYEES");
+        assert_eq!(a[0].schema, None);
+        assert_eq!(a[0].access, AccessKind::Write);
+    }
+
+    // oracle-j1ep.2: a schema-qualified FROM-less DELETE writes the qualified
+    // table, so the cross-schema write surface is visible to DEP001 downstream.
+    #[test]
+    fn from_less_qualified_delete_is_a_write() {
+        let s = lower_statement_body("DELETE hr.audit_log WHERE ts < SYSDATE - 30;");
+        let a = extract_table_accesses(&s);
+        assert_eq!(a.len(), 1, "exactly one access expected: {a:?}");
+        assert_eq!(a[0].schema.as_deref(), Some("HR"));
+        assert_eq!(a[0].table, "AUDIT_LOG");
+        assert_eq!(a[0].access, AccessKind::Write);
+    }
+
+    // oracle-j1ep.2 + oracle-rwjl.6: a FROM-less DELETE whose WHERE reads a
+    // staging table via a subquery must tag the target Write and the subquery
+    // table Read — never Write, and never miss the target.
+    #[test]
+    fn from_less_delete_with_where_subquery_target_write_subquery_read() {
+        let s = lower_statement_body("DELETE t WHERE id IN (SELECT id FROM staging);");
+        let a = extract_table_accesses(&s);
+        assert!(
+            a.iter()
+                .any(|x| x.table == "T" && x.access == AccessKind::Write),
+            "FROM-less DELETE target T must be a Write: {a:?}"
         );
         assert!(
             a.iter()

@@ -421,9 +421,16 @@ pub fn scan_missing_instrumentation(
     source: &str,
 ) -> Vec<MissingInstrumentationSite> {
     let lower = source.to_ascii_lowercase();
+    // Scan *every* occurrence of `begin`, not just the first. A first-hit-only
+    // check under-reports when an earlier occurrence is the tail/head of an
+    // identifier (e.g. a `v_begin_dt` declared before the real BEGIN): the
+    // boundary check fails on that decoy and, without a retry loop, the genuine
+    // body-introducing BEGIN later in the source is never reached, so the
+    // routine is wrongly classified as a body-less spec and silently escapes
+    // STYLE001. Mirrors `body_has_dml` (oracle-j1ep.5).
     let has_body = lower
-        .find("begin")
-        .is_some_and(|at| keyword_boundary_before(&lower, at));
+        .match_indices("begin")
+        .any(|(at, _)| keyword_boundary_before(&lower, at));
     if !has_body {
         return Vec::new();
     }
@@ -994,7 +1001,12 @@ pub fn scan_cross_schema_write(unit_logical_id: &str, source: &str) -> Vec<Detai
         .to_ascii_lowercase();
     let m = mask_string_literals(&source.to_ascii_lowercase());
     let mut sites = Vec::new();
-    for lead in ["insert into ", "update ", "delete from ", "merge into "] {
+    // The DELETE lead is `delete ` (not `delete from `): Oracle's `FROM` is
+    // optional, so a FROM-less cross-schema `delete fin.audit where …` must be
+    // scanned too, or it silently escapes DEP001 (oracle-j1ep.2). After the
+    // lead we skip an optional `from ` before reading the target so both
+    // `delete fin.audit` and `delete from fin.audit` resolve to `fin.audit`.
+    for lead in ["insert into ", "update ", "delete ", "merge into "] {
         let mut from = 0;
         while let Some(rel) = m[from..].find(lead) {
             let at = from + rel;
@@ -1002,7 +1014,14 @@ pub fn scan_cross_schema_write(unit_logical_id: &str, source: &str) -> Vec<Detai
             if !keyword_boundary_before(&m, at) {
                 continue;
             }
-            let target = m[at + lead.len()..]
+            let mut rest = &m[at + lead.len()..];
+            if lead == "delete " {
+                rest = rest.trim_start();
+                if let Some(after_from) = rest.strip_prefix("from ") {
+                    rest = after_from.trim_start();
+                }
+            }
+            let target = rest
                 .split([' ', '(', ';', '\n', '\t'])
                 .next()
                 .unwrap_or("")
@@ -1624,6 +1643,26 @@ mod tests {
         assert!(s.is_empty(), "instrumented body must not flag, got {s:?}");
     }
 
+    // oracle-j1ep.5: a `_begin`-suffixed identifier in the declaration section
+    // (e.g. `v_begin_dt`) appears before the real BEGIN. A first-occurrence
+    // `find("begin")` lands inside that decoy whose preceding `_` fails the
+    // word-boundary check, short-circuiting `has_body` to false and silently
+    // skipping the STYLE001 instrumentation check. Scanning every `begin`
+    // occurrence (like `body_has_dml`) finds the genuine BEGIN.
+    #[test]
+    fn missing_instrumentation_flagged_past_begin_suffixed_decoy() {
+        let s = scan_missing_instrumentation(
+            "hr.pkg.silent",
+            "procedure p is v_begin_dt date; begin update t set x=1; end;",
+        );
+        assert_eq!(
+            s.len(),
+            1,
+            "real BEGIN past a v_begin_dt decoy must yield one site: {s:?}"
+        );
+        assert_eq!(s[0].unit_logical_id, "hr.pkg.silent");
+    }
+
     #[test]
     fn missing_instrumentation_skips_specs_without_body() {
         // No BEGIN ⇒ cannot see it executes ⇒ no fact (R13).
@@ -1968,6 +2007,29 @@ mod tests {
         );
         assert_eq!(s.len(), 1, "only the fin.* write is cross-schema: {s:?}");
         assert_eq!(s[0].detail, "fin.ledger");
+    }
+
+    // oracle-j1ep.2: Oracle's `FROM` is optional in a DELETE, so a FROM-less
+    // cross-schema `DELETE fin.audit_log WHERE …` must still be flagged DEP001.
+    // The old hardcoded `delete from ` lead matched only the FROM form, so a
+    // FROM-less cross-schema delete silently escaped the scan.
+    #[test]
+    fn scan_cross_schema_write_flags_from_less_delete() {
+        let s = scan_cross_schema_write("hr.proc1", "begin delete fin.audit_log where id = 5; end;");
+        assert_eq!(s.len(), 1, "FROM-less cross-schema delete must flag: {s:?}");
+        assert_eq!(s[0].detail, "fin.audit_log");
+    }
+
+    // Both `delete fin.audit` and `delete from fin.audit` must resolve to the
+    // same cross-schema target.
+    #[test]
+    fn scan_cross_schema_write_from_and_from_less_delete_agree() {
+        let with_from = scan_cross_schema_write("hr.p", "begin delete from fin.audit; end;");
+        let without_from = scan_cross_schema_write("hr.p", "begin delete fin.audit; end;");
+        assert_eq!(with_from.len(), 1);
+        assert_eq!(without_from.len(), 1);
+        assert_eq!(with_from[0].detail, without_from[0].detail);
+        assert_eq!(without_from[0].detail, "fin.audit");
     }
 
     #[test]
