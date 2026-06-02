@@ -44,7 +44,7 @@ use crate::cluster::GapCluster;
 use crate::gap::sha256_hex;
 use crate::gate::{GateError, GateOutcome, run_gate};
 use crate::ledger::{Ledger, LedgerBody, LedgerError};
-use crate::proposer::CandidateDiff;
+use crate::proposer::{CandidateDiff, path_is_r20_safe};
 
 /// Directory (under the repo root) where landed MinFixtures are added
 /// to the regression corpus. These are committed (unlike the
@@ -77,6 +77,18 @@ pub enum LandError {
     /// ledger append only run *after* a clean apply.
     #[error("land: diff apply failed (nothing landed, tree unchanged): {0}")]
     Apply(String),
+
+    /// Defense-in-depth backstop (R20 / I-ISOLATION): a file header in
+    /// the captured patch names a path outside the I-ISOLATION
+    /// allowlist. The proposer R20-validates before the gate, but a
+    /// future proposer regression (or a deletion target hidden only in a
+    /// `--- a/<path>` header behind a `+++ /dev/null`) must NEVER reach
+    /// `git apply`. Fail-closed: nothing is applied, the tree is
+    /// unchanged.
+    #[error(
+        "land: patch touches out-of-scope path {0:?} — refused before git apply (R20 / I-ISOLATION backstop, nothing landed)"
+    )]
+    R20Violation(String),
 
     /// Adding the MinFixture to the regression corpus failed.
     #[error("land: corpus fixture add failed: {0}")]
@@ -325,6 +337,28 @@ fn apply_diff_idempotent(repo_root: &Path, candidate: &CandidateDiff) -> Result<
         return Ok(true);
     }
 
+    // R20 / I-ISOLATION backstop (defense-in-depth). The proposer
+    // R20-validates `touched_paths` before the gate, but `touched_paths`
+    // is derived from the diff text — a regression there (e.g. a deletion
+    // target hidden behind `+++ /dev/null` whose only path is the
+    // `--- a/<path>` header) could otherwise reach `git apply` unchecked.
+    // Re-derive the scope from the captured patch and refuse, fail-closed,
+    // BEFORE any apply if any file header names an out-of-scope path. A
+    // `/dev/null` header carries no path (skip it).
+    for line in patch.lines() {
+        for pfx in ["--- a/", "+++ b/"] {
+            if let Some(rest) = line.strip_prefix(pfx) {
+                let p = rest.trim();
+                if p == "/dev/null" || p.is_empty() {
+                    continue;
+                }
+                if !path_is_r20_safe(p) {
+                    return Err(LandError::R20Violation(p.to_string()));
+                }
+            }
+        }
+    }
+
     let git = |args: &[&str], stdin: Option<&str>| -> std::io::Result<std::process::Output> {
         use std::io::Write;
         use std::process::Stdio;
@@ -532,6 +566,66 @@ pub fn land_candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a minimal candidate carrying `body` verbatim (the field
+    /// `apply_diff_idempotent` consumes). Other fields are inert for the
+    /// apply path and are filled with deterministic placeholders.
+    fn candidate_with_body(body: &str) -> CandidateDiff {
+        use crate::gap::RepairClass;
+        use crate::proposer::{HonestyManifest, RegressionTest};
+        CandidateDiff {
+            id: "deadbeef".to_string(),
+            signature: "sig".to_string(),
+            repair_class: RepairClass::Lowering,
+            body: body.to_string(),
+            touched_paths: vec![],
+            regression_test: RegressionTest {
+                path: "crates/plsql-parser-antlr/src/lower/t.rs".to_string(),
+                setup: "true".to_string(),
+                cmd: "true".to_string(),
+                revert: "true".to_string(),
+                restore: "true".to_string(),
+            },
+            honesty: HonestyManifest {
+                repair_class: "l".to_string(),
+                signature: "sig".to_string(),
+                diagnostics_resolved: 1,
+                extracted_semantics_delta: 2,
+                posture: "preserved".to_string(),
+                unknown_reason: String::new(),
+            },
+            estate_run_id: "run".to_string(),
+            proposed_at_commit: "commit".to_string(),
+            proposer: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn apply_refuses_out_of_scope_deletion_before_git_apply() {
+        // Defense-in-depth backstop: even if a future proposer regression
+        // let an out-of-scope DELETION through R20 (the path hidden in the
+        // `--- a/<path>` header behind a `+++ /dev/null`), `land.rs` must
+        // refuse it BEFORE `git apply` ever runs — the deletion of an
+        // arbitrary source file can never reach the working tree.
+        let body = "# usr-gate: repair-class=l signature=sig diagnostics-resolved=1 \
+                     extracted-semantics-delta=2 posture=preserved\n\
+                     # usr-gate-pins-cmd: true\n\
+                     --- a/crates/plsql-parser-antlr/src/lower/mod.rs\n\
+                     +++ b/crates/plsql-parser-antlr/src/lower/mod.rs\n@@ -0,0 +1,1 @@\n+// safe addition\n\
+                     --- a/crates/plsql-core/src/lib.rs\n\
+                     +++ /dev/null\n@@ -1,2 +0,0 @@\n-line one\n-line two\n";
+        let cand = candidate_with_body(body);
+        // Use a path that does not need to be a real git repo — the R20
+        // backstop fires before any `git` is spawned.
+        let err = apply_diff_idempotent(Path::new("/nonexistent-repo-root"), &cand)
+            .expect_err("out-of-scope deletion must be refused before git apply");
+        match err {
+            LandError::R20Violation(p) => {
+                assert_eq!(p, "crates/plsql-core/src/lib.rs");
+            }
+            other => panic!("expected R20Violation backstop, got {other:?}"),
+        }
+    }
 
     #[test]
     fn landed_commit_anchor_is_deterministic_and_distinct() {

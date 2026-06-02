@@ -988,15 +988,36 @@ impl<B: CompletionBackend> LlmProposer<B> {
         // path — additive, never weakened).
         let setup = directive("pins-setup").unwrap_or_else(|| "true".to_string());
 
-        // --- touched paths from the diff `+++ b/<path>` headers ---
-        let mut touched: Vec<String> = reply
-            .lines()
-            .filter_map(|l| l.strip_prefix("+++ b/").map(|s| s.trim().to_string()))
-            .collect();
+        // --- touched paths from the diff file headers ---
+        // Collect BOTH `+++ b/<path>` (additions/edits) AND `--- a/<path>`
+        // (the affected file for a deletion/rename, where `+++` is
+        // `/dev/null` and the path is invisible to a `+++ b/` scan). A
+        // `/dev/null` header carries no path — skip it explicitly. Every
+        // collected path is then routed through `validate_r20` below, so
+        // an out-of-scope DELETION (`+++ /dev/null`) can no longer bypass
+        // I-ISOLATION by hiding the target only in the `--- a/` header.
+        let strip_diff_path = |l: &str| -> Option<String> {
+            for pfx in ["+++ b/", "--- a/"] {
+                if let Some(rest) = l.strip_prefix(pfx) {
+                    let p = rest.trim();
+                    // `--- /dev/null` (a creation's source side) never
+                    // matches the `a/` prefix; guard the degenerate
+                    // `b//dev/null` / bare `/dev/null` just in case.
+                    if p == "/dev/null" || p.is_empty() {
+                        return None;
+                    }
+                    return Some(p.to_string());
+                }
+            }
+            None
+        };
+        let mut touched: Vec<String> = reply.lines().filter_map(strip_diff_path).collect();
         touched.sort();
         touched.dedup();
         if touched.is_empty() {
-            return Err(unparse("reply diff has no `+++ b/<path>` header"));
+            return Err(unparse(
+                "reply diff has no `+++ b/<path>` / `--- a/<path>` file header",
+            ));
         }
 
         // The added regression test path is declared in a
@@ -1227,6 +1248,41 @@ mod tests {
             .propose(&c, "r", "c")
             .unwrap_err();
         assert!(matches!(e, ProposerError::R20Violation { .. }), "{e:?}");
+    }
+
+    #[test]
+    fn llm_rejects_out_of_scope_deletion_via_dev_null_before_gate() {
+        // Adversarial/hallucinated reply: a SAFE in-scope addition (which
+        // alone would satisfy R20) PLUS an out-of-scope DELETION expressed
+        // as `+++ /dev/null` — the deleted file's path lives ONLY in the
+        // `--- a/<path>` header, invisible to a `+++ b/` scan. Before the
+        // fix, `touched_paths` held only the safe addition and
+        // `validate_r20` returned Ok, so the deletion of an arbitrary
+        // out-of-scope source file (here `crates/plsql-core/src/lib.rs`)
+        // sailed past I-ISOLATION into the gate/land flow. The deletion
+        // target must now be collected from `--- a/` and rejected as an
+        // R20 violation BEFORE the gate.
+        let c = cluster(Some("text_scan>drop"), "IR_DDL_NOT_LOWERED", &["fx1"]);
+        let reply = format!(
+            "# usr-gate: repair-class=l signature={sig} diagnostics-resolved=1 \
+             extracted-semantics-delta=2 posture=preserved\n\
+             # usr-gate-pins-cmd: true\n# usr-gate-pins-revert: true\n# usr-gate-pins-restore: true\n\
+             # usr-gate-test-path: crates/plsql-parser-antlr/src/lower/t.rs\n\
+             --- a/crates/plsql-parser-antlr/src/lower/mod.rs\n\
+             +++ b/crates/plsql-parser-antlr/src/lower/mod.rs\n@@ -0,0 +1,1 @@\n+// safe in-scope addition\n\
+             --- a/crates/plsql-core/src/lib.rs\n\
+             +++ /dev/null\n@@ -1,2 +0,0 @@\n-line one\n-line two\n",
+            sig = c.signature
+        );
+        let e = LlmProposer::new(CannedBackend { reply })
+            .propose(&c, "r", "c")
+            .unwrap_err();
+        match e {
+            ProposerError::R20Violation { path } => {
+                assert_eq!(path, "crates/plsql-core/src/lib.rs");
+            }
+            other => panic!("expected R20Violation for the /dev/null deletion target, got {other:?}"),
+        }
     }
 
     #[test]
