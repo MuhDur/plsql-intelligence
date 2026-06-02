@@ -1780,35 +1780,88 @@ impl<'a> Cursor<'a> {
 fn extract_owner_and_name(after_kind: &str) -> Option<(Option<String>, String)> {
     let after = after_kind.trim_start();
 
-    let token = after.split_whitespace().next()?;
-    // Drop a trailing `(` and any column-list punctuation that may abut
-    // the identifier.
-    let token = token
-        .trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '.' && c != '"');
-    if token.is_empty() {
-        return None;
-    }
+    // Scan the `[OWNER.]NAME` token honouring double-quoted Oracle
+    // identifiers. A `"..."` segment is a single token that may contain
+    // whitespace and runs to its closing `"`; an unquoted segment stops
+    // at whitespace, `(`, `;`, or other DDL punctuation. The owner/name
+    // split is the first top-level (outside-quotes) `.`.
+    let mut segments: Vec<Segment> = Vec::new();
+    let bytes = after.as_bytes();
+    let mut i = 0usize;
+    'scan: while i < bytes.len() {
+        if bytes[i] == b'"' {
+            // Quoted segment: consume up to (and including) the closing `"`.
+            let content_start = i + 1;
+            let mut j = content_start;
+            while j < bytes.len() && bytes[j] != b'"' {
+                j += 1;
+            }
+            // Unterminated quote ⇒ malformed header; give up.
+            if j >= bytes.len() {
+                return None;
+            }
+            segments.push(Segment {
+                text: after[content_start..j].to_string(),
+                quoted: true,
+            });
+            i = j + 1; // skip closing quote
+        } else {
+            // Unquoted run: identifier chars only. Anything else (space,
+            // `(`, `;`, `,`, …) terminates the `[OWNER.]NAME` token —
+            // except a top-level `.` which separates owner from name.
+            let start = i;
+            while i < bytes.len() {
+                let c = bytes[i] as char;
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            // An empty unquoted run means we hit a non-identifier byte
+            // that is not a segment separator: stop scanning the token.
+            if i == start {
+                break 'scan;
+            }
+            segments.push(Segment {
+                text: after[start..i].to_string(),
+                quoted: false,
+            });
+        }
 
-    // Split on `.` for `OWNER.NAME`. Tolerate quoted identifiers by
-    // stripping surrounding `"`.
-    let mut parts = token.split('.').map(|p| p.trim_matches('"'));
-    let first = parts.next()?;
-    let second = parts.next();
-
-    let (owner, name) = match second {
-        Some(name) if !name.is_empty() => (Some(first.to_string()), name.to_string()),
-        _ => (None, first.to_string()),
-    };
-    // The name must be a real identifier (alphanumeric / `_`).
-    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-        return None;
-    }
-    if let Some(owner) = &owner {
-        if owner.is_empty() || !owner.chars().all(|c| c.is_alphanumeric() || c == '_') {
-            return None;
+        // After a segment, a `.` continues into the next (NAME) segment;
+        // anything else ends the `[OWNER.]NAME` token.
+        if i < bytes.len() && bytes[i] == b'.' {
+            i += 1;
+        } else {
+            break 'scan;
         }
     }
-    Some((owner, name))
+
+    // Validate each segment: quoted segments accept any non-empty
+    // content; unquoted segments must be a real identifier.
+    let valid = |seg: &Segment| -> bool {
+        if seg.text.is_empty() {
+            return false;
+        }
+        seg.quoted || seg.text.chars().all(|c| c.is_alphanumeric() || c == '_')
+    };
+
+    match segments.as_slice() {
+        [name] if valid(name) => Some((None, name.text.clone())),
+        [owner, name] if valid(owner) && valid(name) => {
+            Some((Some(owner.text.clone()), name.text.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// One dot-delimited segment of a `[OWNER.]NAME` token, tracking whether
+/// it originated from a double-quoted Oracle identifier (which may hold
+/// whitespace and bypasses the unquoted identifier-char validity rule).
+struct Segment {
+    text: String,
+    quoted: bool,
 }
 #[instrument(level = "trace", skip(conn, request))]
 pub fn load_snapshot_from_connection<C: OracleConnection>(
@@ -8433,6 +8486,82 @@ mod tests {
         let ddl = "CREATE TABLE \"HR\".\"EMP\" (id NUMBER);";
         let (kind, _obj) = classify_single(ddl);
         assert_eq!(kind, ObjectType::Table);
+    }
+
+    /// A double-quoted Oracle identifier containing whitespace must be
+    /// kept whole — never truncated at the first interior space. The
+    /// prior `split_whitespace().next()` tokenizer cut `"MY TABLE"` down
+    /// to `MY`, corrupting the snapshot key. `extract_owner_and_name`
+    /// works on the already-upper-cased post-header remainder, so the
+    /// inputs here are upper-cased the way `upper_remainder()` produces.
+    #[test]
+    fn extract_owner_and_name_keeps_whitespace_in_quoted_identifiers() {
+        // OWNER.NAME, both quoted, name has a space.
+        assert_eq!(
+            crate::extract_owner_and_name("\"HR\".\"MY TABLE\" (ID NUMBER);"),
+            Some((Some("HR".to_string()), "MY TABLE".to_string())),
+        );
+        // Quoted OWNER with a space must not be dropped (no PUBLIC misroute).
+        assert_eq!(
+            crate::extract_owner_and_name("\"MY OWNER\".\"EMP\" (ID NUMBER);"),
+            Some((Some("MY OWNER".to_string()), "EMP".to_string())),
+        );
+        // Fully-quoted, unqualified, whitespace-bearing name.
+        assert_eq!(
+            crate::extract_owner_and_name("\"MY TABLE\" (ID NUMBER);"),
+            Some((None, "MY TABLE".to_string())),
+        );
+        // Spaceless quoted and unquoted inputs still resolve correctly.
+        assert_eq!(
+            crate::extract_owner_and_name("\"HR\".\"EMP\" (ID NUMBER);"),
+            Some((Some("HR".to_string()), "EMP".to_string())),
+        );
+        assert_eq!(
+            crate::extract_owner_and_name("HR.ORDERS (ID NUMBER);"),
+            Some((Some("HR".to_string()), "ORDERS".to_string())),
+        );
+    }
+
+    /// Two distinct whitespace-bearing quoted tables in one schema must
+    /// intern under distinct keys — the truncating tokenizer collapsed
+    /// both `"MY TABLE"` and `"MY OTHER"` to `MY` (last-write-wins).
+    #[test]
+    fn quoted_whitespace_names_intern_as_distinct_keys() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.sql"),
+            "CREATE TABLE \"HR\".\"MY TABLE\" (id NUMBER);",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b.sql"),
+            "CREATE TABLE \"HR\".\"MY OTHER\" (id NUMBER);",
+        )
+        .unwrap();
+        let snapshot = load_from_dbms_metadata_dir(dir.path()).unwrap();
+
+        // Both objects land in the HR schema (no PUBLIC misroute).
+        let hr = snapshot
+            .schemas
+            .iter()
+            .find(|(s, _)| snapshot.interner.resolve(s.symbol()) == Some("HR"))
+            .map(|(_, c)| c)
+            .expect("HR schema present");
+        assert_eq!(hr.objects.len(), 2, "two distinct objects, no collision");
+
+        let mut names: Vec<&str> = hr
+            .objects
+            .values()
+            .map(|o| {
+                let common = match o {
+                    CatalogObject::Table(m) => &m.common,
+                    _ => panic!("expected tables"),
+                };
+                snapshot.interner.resolve(common.name.symbol()).unwrap()
+            })
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["MY OTHER", "MY TABLE"]);
     }
 
     /// Plain CREATE TABLE still works (negative-of-negative regression).
