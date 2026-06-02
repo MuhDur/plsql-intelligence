@@ -180,7 +180,17 @@ fn extract_execute_immediate(
         return (vec![], vec![], false, vec![]);
     };
     let rest = &text[after_kw + "EXECUTE IMMEDIATE".len()..];
-    let using_pos = rest.to_ascii_uppercase().find(" USING ");
+    // The native dynamic-SQL `USING` bind clause always appears *after*
+    // the dynamic-SQL text expression is fully closed, so the split must
+    // ignore any ` USING ` keyword that lies *inside* a `'...'` string
+    // literal — a literal-blind `find(" USING ")` would otherwise truncate
+    // a MERGE/JOIN-`USING` statement mid-literal, leaving the walker stuck
+    // in an unterminated string at EOF (it never flushes the run), so the
+    // statement loses every fragment + candidate-object edge and is falsely
+    // stamped bind-parameterised at High confidence (oracle-73t1.3). The
+    // top-level scan reuses the walker's doubled-`''` escape rule so a real
+    // trailing bind clause is still detected.
+    let using_pos = top_level_using(rest);
     let body = if let Some(p) = using_pos {
         &rest[..p]
     } else {
@@ -258,6 +268,56 @@ fn extract_execute_immediate(
     let candidate_objects = candidate_objects_from_fragments(&fragments);
     let uses_binds = using_pos.is_some();
     (fragments, candidate_objects, uses_binds, expr_interpolations)
+}
+
+/// Find the byte offset of the native dynamic-SQL ` USING ` bind
+/// clause at the *top level* of an `EXECUTE IMMEDIATE` tail —
+/// i.e. the first ` USING ` keyword that lies *outside* any `'...'`
+/// SQL string literal. Returns the offset of the leading space of
+/// that ` USING ` (so the caller can split the body exactly where the
+/// literal-blind `find(" USING ")` used to, preserving the legitimate
+/// trailing-bind case) or `None` when the call is literal-only.
+///
+/// String tracking mirrors the walker in [`extract_execute_immediate`]:
+/// a `'` toggles in/out of a literal, and Oracle's doubled-`''` escape
+/// is one embedded quote, not a close/reopen — so a ` USING ` keyword
+/// embedded in the dynamic SQL *text* (a `MERGE ... USING`, a
+/// `JOIN ... USING (col)`, etc.) is never mistaken for the bind clause.
+fn top_level_using(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let mut in_string = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' {
+            if in_string && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                // Doubled `''` — one embedded quote, stay in the string.
+                i += 2;
+                continue;
+            }
+            in_string = !in_string;
+            i += 1;
+            continue;
+        }
+        if !in_string && b == b' ' {
+            // Candidate ` USING ` at top level: confirm the full
+            // space-bounded keyword case-insensitively on raw bytes (the
+            // ` USING ` keyword is pure ASCII, so byte comparison is
+            // char-boundary safe even when the surrounding dynamic-SQL
+            // text contains multibyte UTF-8). The trailing space matches
+            // the historical ` USING ` token exactly, so a bare
+            // `USINGTON`-style identifier is never a false positive.
+            let tail = &bytes[i + 1..];
+            if tail.len() >= 6
+                && tail[..5].eq_ignore_ascii_case(b"USING")
+                && tail[5] == b' '
+            {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Split a non-literal concatenation run into its top-level `||`
@@ -522,6 +582,150 @@ mod tests {
         )
         .unwrap();
         assert!(ev.uses_binds);
+    }
+
+    /// Regression for oracle-73t1.3: a `MERGE ... USING ...` statement
+    /// whose ` USING ` keyword lives *inside* the dynamic-SQL text
+    /// literal must not be mistaken for the native bind clause. Before
+    /// the fix the literal-blind `find(" USING ")` truncated the body
+    /// mid-literal, the walker hit EOF still in-string and never flushed,
+    /// so fragments + candidate objects came back empty, `uses_binds` was
+    /// falsely `true`, and the (now constant) statement was stamped
+    /// LiteralOnly/High.
+    #[test]
+    fn merge_using_inside_literal_not_a_bind_clause() {
+        let ev = recognise_dynamic_sql(
+            "EXECUTE IMMEDIATE 'MERGE INTO target t USING staging s ON (t.id=s.id) WHEN MATCHED THEN UPDATE SET t.val = s.val';",
+            "pkg.proc:101",
+        )
+        .unwrap();
+        // The literal closed before any real USING bind clause, so this
+        // is a literal-only constant statement.
+        assert_eq!(ev.opacity_reason, OpacityReason::LiteralOnly);
+        // The whole statement survives as a single literal fragment.
+        assert_eq!(
+            ev.fragments,
+            vec![
+                "MERGE INTO target t USING staging s ON (t.id=s.id) WHEN MATCHED THEN UPDATE SET t.val = s.val"
+            ],
+            "literal-internal USING truncated the body: {:?}",
+            ev.fragments
+        );
+        // The dependency edges must NOT be dropped.
+        let names: Vec<&str> = ev
+            .candidate_objects
+            .iter()
+            .map(|c| c.object.as_str())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.eq_ignore_ascii_case("target")),
+            "target edge dropped: {:?}",
+            ev.candidate_objects
+        );
+        assert!(
+            names.iter().any(|n| n.eq_ignore_ascii_case("staging")),
+            "staging edge dropped: {:?}",
+            ev.candidate_objects
+        );
+        // No native bind clause is present.
+        assert!(
+            !ev.uses_binds,
+            "literal-internal USING falsely reported as a bind clause"
+        );
+    }
+
+    /// Regression for oracle-73t1.3: a `JOIN ... USING (col)` keyword
+    /// inside the dynamic-SQL text literal is likewise not a native bind
+    /// clause and must leave the referenced-object edges intact.
+    #[test]
+    fn join_using_inside_literal_not_a_bind_clause() {
+        let ev = recognise_dynamic_sql(
+            "EXECUTE IMMEDIATE 'SELECT a.x FROM orders a JOIN line_items b USING (order_id)';",
+            "pkg.proc:102",
+        )
+        .unwrap();
+        assert_eq!(ev.opacity_reason, OpacityReason::LiteralOnly);
+        assert!(!ev.uses_binds, "JOIN-USING falsely reported as a bind clause");
+        let names: Vec<&str> = ev
+            .candidate_objects
+            .iter()
+            .map(|c| c.object.as_str())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.eq_ignore_ascii_case("orders")),
+            "orders edge dropped: {:?}",
+            ev.candidate_objects
+        );
+        assert!(
+            names.iter().any(|n| n.eq_ignore_ascii_case("line_items")),
+            "line_items edge dropped: {:?}",
+            ev.candidate_objects
+        );
+    }
+
+    /// A `MERGE ... USING <literal>' USING <bind>` statement that has a
+    /// USING keyword BOTH inside the literal AND as a real trailing bind
+    /// clause: the top-level scan must skip the literal-internal one and
+    /// split at the genuine trailing bind, so the bind is recognised
+    /// while the literal stays intact.
+    #[test]
+    fn literal_internal_using_then_real_trailing_bind() {
+        let ev = recognise_dynamic_sql(
+            "EXECUTE IMMEDIATE 'MERGE INTO target t USING staging s ON (t.id = :1)' USING v_id;",
+            "pkg.proc:103",
+        )
+        .unwrap();
+        assert_eq!(ev.opacity_reason, OpacityReason::LiteralOnly);
+        assert!(
+            ev.uses_binds,
+            "the genuine trailing USING bind clause was missed"
+        );
+        assert_eq!(
+            ev.fragments,
+            vec!["MERGE INTO target t USING staging s ON (t.id = :1)"],
+            "the body was split at the wrong USING: {:?}",
+            ev.fragments
+        );
+    }
+
+    /// A `USING` keyword embedded inside a doubled-`''` escaped literal
+    /// must still be treated as literal text, exercising the top-level
+    /// scan's doubled-quote handling rather than toggling out of the
+    /// string early.
+    #[test]
+    fn using_inside_doubled_quote_literal_not_a_bind_clause() {
+        let ev = recognise_dynamic_sql(
+            "EXECUTE IMMEDIATE 'INSERT INTO log VALUES (''ran MERGE USING staging'')';",
+            "pkg.proc:104",
+        )
+        .unwrap();
+        assert_eq!(ev.opacity_reason, OpacityReason::LiteralOnly);
+        assert!(!ev.uses_binds);
+        assert_eq!(
+            ev.fragments,
+            vec!["INSERT INTO log VALUES ('ran MERGE USING staging')"],
+            "doubled-quote literal mishandled by the top-level USING scan: {:?}",
+            ev.fragments
+        );
+    }
+
+    /// A non-ASCII (multibyte UTF-8) literal followed by a real trailing
+    /// bind clause must not panic the byte-level top-level scan and must
+    /// still find the genuine USING.
+    #[test]
+    fn multibyte_literal_with_trailing_bind_does_not_panic() {
+        let ev = recognise_dynamic_sql(
+            "EXECUTE IMMEDIATE 'UPDATE t SET note = ''naïve café résumé'' WHERE id = :1' USING v_id;",
+            "pkg.proc:105",
+        )
+        .unwrap();
+        assert!(ev.uses_binds, "trailing bind clause missed after multibyte literal");
+        assert_eq!(
+            ev.fragments,
+            vec!["UPDATE t SET note = 'naïve café résumé' WHERE id = :1"],
+            "multibyte literal body mis-sliced: {:?}",
+            ev.fragments
+        );
     }
 
     #[test]
