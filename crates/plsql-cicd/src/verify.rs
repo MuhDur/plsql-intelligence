@@ -141,12 +141,49 @@ pub fn scratch_schema_name_for_pid(pid: u32) -> String {
     format!("VERIFY_T_{pid}")
 }
 
-/// Return `true` iff `name` is a valid scratch schema name (case-insensitive
-/// `VERIFY_T_` prefix). `verify` will only create or drop schemas that pass
-/// this check.
+/// Maximum scratch-schema identifier length we accept. Oracle (pre-12.2) caps
+/// identifiers at 30 bytes; 12.2+ allows 128. We use the larger limit — every
+/// allowlisted character is a single ASCII byte, so length equals byte count.
+const MAX_SCRATCH_SCHEMA_LEN: usize = 128;
+
+/// Return `true` iff `name` is a valid scratch schema name.
+///
+/// A name is a scratch schema iff it
+/// 1. starts (case-insensitively) with the `VERIFY_T_` isolation prefix, and
+/// 2. consists, after that prefix, only of bytes in the strict Oracle-identifier
+///    allowlist `[A-Za-z0-9_$#]`, and
+/// 3. is no longer than [`MAX_SCRATCH_SCHEMA_LEN`] bytes.
+///
+/// `verify` will only create, grant to, switch into, or **irreversibly drop**
+/// schemas that pass this check, and the resulting name is interpolated into
+/// `CREATE USER` / `GRANT` / `ALTER SESSION` / `DROP USER … CASCADE` DDL. The
+/// suffix allowlist mirrors [`validate_scratch_password`]: it rejects quotes,
+/// spaces, semicolons and every other DDL metacharacter so that an
+/// operator- or config-supplied `schema_override` cannot break out of the
+/// identifier and redirect or corrupt that DDL (oracle-hrzg.8). A prefix-only
+/// check is *not* sufficient: e.g. `VERIFY_T_X" IDENTIFIED BY "attacker`
+/// starts with `VERIFY_T_` yet would close the identifier early.
 #[must_use]
 pub fn is_scratch_schema(name: &str) -> bool {
-    name.to_ascii_uppercase().starts_with("VERIFY_T_")
+    // Length cap first — also bounds the work done by the byte scan below.
+    if name.len() > MAX_SCRATCH_SCHEMA_LEN {
+        return false;
+    }
+    // Case-insensitive prefix check, then a strict allowlist on the remainder.
+    // We compare the prefix ASCII-case-insensitively without allocating an
+    // upper-cased copy of the whole string.
+    let prefix = b"VERIFY_T_";
+    let bytes = name.as_bytes();
+    if bytes.len() < prefix.len()
+        || !bytes[..prefix.len()].eq_ignore_ascii_case(prefix)
+    {
+        return false;
+    }
+    // Every remaining byte must be a safe Oracle-identifier character. This
+    // rejects `"`, `'`, `;`, spaces, `/`, `*`, `@`, `%`, `-`, `.`, `+`, etc.
+    bytes[prefix.len()..]
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$' | b'#'))
 }
 
 // ── Changeset DDL input ───────────────────────────────────────────────────────
@@ -779,6 +816,104 @@ mod tests {
         assert!(!is_scratch_schema("VERIFY_1234")); // missing T_
         assert!(!is_scratch_schema("MY_VERIFY_T_1234")); // wrong start
         assert!(!is_scratch_schema(""));
+    }
+
+    #[test]
+    fn is_scratch_schema_accepts_all_existing_suffix_shapes() {
+        // Every scratch name the test suite (unit + live) actually constructs
+        // must still pass after tightening the suffix allowlist (oracle-hrzg.8).
+        assert!(is_scratch_schema("VERIFY_T_")); // empty suffix
+        assert!(is_scratch_schema("VERIFY_T_1"));
+        assert!(is_scratch_schema("VERIFY_T_99"));
+        assert!(is_scratch_schema("VERIFY_T_1234"));
+        assert!(is_scratch_schema("VERIFY_T_4294967295")); // u32::MAX pid
+        assert!(is_scratch_schema("VERIFY_T_12345_cycle")); // cicd_cycle_live_xe
+        assert!(is_scratch_schema("VERIFY_T_12345_ord"));
+        assert!(is_scratch_schema("VERIFY_T_12345_2")); // verify_live_xe
+        assert!(is_scratch_schema("VERIFY_T_12345_3"));
+        // `$` and `#` are legal Oracle-identifier characters and stay allowed.
+        assert!(is_scratch_schema("VERIFY_T_abc$#_def"));
+    }
+
+    #[test]
+    fn is_scratch_schema_rejects_ddl_breaking_suffixes() {
+        // Regression for oracle-hrzg.8: a prefix-only check let these through,
+        // and the name is interpolated into CREATE USER / GRANT / ALTER SESSION /
+        // DROP USER … CASCADE DDL. The suffix allowlist must reject every
+        // character that could close the identifier or inject new DDL.
+        assert!(
+            !is_scratch_schema("VERIFY_T_X\" IDENTIFIED BY \"attacker"),
+            "embedded double-quote must be rejected"
+        );
+        assert!(
+            !is_scratch_schema("VERIFY_T_1; GRANT DBA TO PUBLIC"),
+            "semicolon + injected DDL must be rejected"
+        );
+        assert!(
+            !is_scratch_schema("VERIFY_T_1 CASCADE"),
+            "embedded space must be rejected"
+        );
+        assert!(
+            !is_scratch_schema("VERIFY_T_a'b"),
+            "single-quote must be rejected"
+        );
+        assert!(
+            !is_scratch_schema("VERIFY_T_a-b"),
+            "hyphen (SQL comment / arithmetic) must be rejected"
+        );
+        assert!(
+            !is_scratch_schema("VERIFY_T_a.b"),
+            "dot (qualified name) must be rejected"
+        );
+        assert!(
+            !is_scratch_schema("VERIFY_T_a\nb"),
+            "newline must be rejected"
+        );
+    }
+
+    #[test]
+    fn is_scratch_schema_rejects_over_length_name() {
+        // Defense in depth: an absurdly long identifier exceeds Oracle's cap and
+        // is rejected before any DDL interpolation (oracle-hrzg.8).
+        let too_long = format!("VERIFY_T_{}", "A".repeat(MAX_SCRATCH_SCHEMA_LEN));
+        assert!(too_long.len() > MAX_SCRATCH_SCHEMA_LEN);
+        assert!(!is_scratch_schema(&too_long));
+        // Exactly at the cap stays accepted.
+        let suffix_len = MAX_SCRATCH_SCHEMA_LEN - "VERIFY_T_".len();
+        let at_cap = format!("VERIFY_T_{}", "A".repeat(suffix_len));
+        assert_eq!(at_cap.len(), MAX_SCRATCH_SCHEMA_LEN);
+        assert!(is_scratch_schema(&at_cap));
+    }
+
+    #[test]
+    fn validated_schema_rejects_injection_shaped_override() {
+        // The attacker-supplied schema_override from the oracle-hrzg.8 repro must
+        // now be refused at the validation gate rather than flowing into
+        // CREATE USER … IDENTIFIED BY … DDL.
+        let opts = VerifyOptions {
+            allow_in_place: false,
+            schema_override: Some(String::from("VERIFY_T_X\" IDENTIFIED BY \"attacker")),
+            ..Default::default()
+        };
+        let err = opts.validated_schema().unwrap_err();
+        assert!(
+            matches!(err, VerifyError::InPlaceVerificationRefused { .. }),
+            "expected InPlaceVerificationRefused, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn create_scratch_schema_rejects_injection_shaped_name() {
+        // create_scratch_schema is a second gate: even if a caller bypassed
+        // validated_schema, the injection-shaped name must be rejected before any
+        // DDL is sent (oracle-hrzg.8).
+        let conn = StubConn;
+        let err = create_scratch_schema(&conn, "VERIFY_T_1; GRANT DBA TO PUBLIC", "V3r1fyTmp#2026")
+            .expect_err("injection-shaped schema name must be rejected");
+        assert!(
+            matches!(err, VerifyError::InvalidScratchSchemaName { .. }),
+            "expected InvalidScratchSchemaName, got {err:?}"
+        );
     }
 
     // ── VerifyOptions ─────────────────────────────────────────────────────────
