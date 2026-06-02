@@ -213,7 +213,13 @@ fn lower_procedure(
     pos += skip_whitespace(bytes, pos);
 
     let name = extract_identifier(source, pos);
-    let end = advance_to_decl_end(bytes, create_start);
+    // Anchor the body scan at the routine's `BEGIN` (depth 0) so a `;` in the
+    // `IS|AS` declaration section does not truncate the span; the matching body
+    // `END` returns depth to 0 so the trailing `;` terminates it (oracle-aqum.5).
+    let end = match find_body_begin(bytes, pos) {
+        Some(begin) => advance_to_decl_end_with_depth(bytes, begin, 0),
+        None => advance_to_decl_end(bytes, create_start),
+    };
     let span = make_span(file_id, create_start as u32, end as u32);
 
     AstDecl::Procedure { name, span }
@@ -231,7 +237,13 @@ fn lower_function(
     pos += skip_whitespace(bytes, pos);
 
     let name = extract_identifier(source, pos);
-    let end = advance_to_decl_end(bytes, create_start);
+    // See `lower_procedure`: anchor the body scan at `BEGIN` (depth 0) so a `;`
+    // in the `IS|AS` declaration section (or the `RETURN <type>` clause) does
+    // not truncate the function span (oracle-aqum.5).
+    let end = match find_body_begin(bytes, pos) {
+        Some(begin) => advance_to_decl_end_with_depth(bytes, begin, 0),
+        None => advance_to_decl_end(bytes, create_start),
+    };
     let span = make_span(file_id, create_start as u32, end as u32);
 
     AstDecl::Function { name, span }
@@ -249,7 +261,14 @@ fn lower_trigger(
     pos += skip_whitespace(bytes, pos);
 
     let name = extract_identifier(source, pos);
-    let end = advance_to_decl_end(bytes, create_start);
+    // See `lower_procedure`: anchor the body scan at `BEGIN` (depth 0) so a `;`
+    // in a `DECLARE` section does not truncate the trigger span. Triggers whose
+    // body is a bare SQL statement (no PL/SQL block) have no `BEGIN`, so fall
+    // back to the depth-0 scan from `create_start` (oracle-aqum.5).
+    let end = match find_body_begin(bytes, pos) {
+        Some(begin) => advance_to_decl_end_with_depth(bytes, begin, 0),
+        None => advance_to_decl_end(bytes, create_start),
+    };
     let span = make_span(file_id, create_start as u32, end as u32);
 
     AstDecl::Trigger { name, span }
@@ -1223,6 +1242,49 @@ fn advance_to_decl_end(bytes: &[u8], start: usize) -> usize {
     advance_to_decl_end_with_depth(bytes, start, 0)
 }
 
+/// Locate the byte offset of the routine body's `BEGIN` keyword, scanning
+/// forward from `start` in a string/comment-safe manner.
+///
+/// A standalone `CREATE PROCEDURE`/`FUNCTION`/`TRIGGER` has the shape
+/// `… IS|AS <decl-section> BEGIN <body> END[ name];`. The `IS|AS` envelope is
+/// **not** counted by [`block_structure_step`] (it only opens on
+/// `BEGIN`/`IF`/`LOOP`/`CASE`), so a `;` terminating a declaration-section
+/// variable (`v_x NUMBER;`) is the first `;` the depth-0 byte scanner reaches —
+/// truncating the routine span at the declaration instead of at the trailing
+/// `END;` and orphaning the entire body (its DML / `EXECUTE IMMEDIATE` sinks)
+/// from span-based IR consumers (oracle-aqum.5; contradicting R13).
+///
+/// Seeding depth 1 from `create_start` (as a PACKAGE body does) is **wrong**
+/// for a routine: unlike a package — whose `END name;` is a *separate* close
+/// for the `AS` envelope — a routine's single body `END` closes both the
+/// `BEGIN` block and the `IS|AS` envelope, so the trailing `;` would be reached
+/// at depth 1 and the scan would over-run into the following `CREATE`. Instead
+/// the scanner anchors at the body `BEGIN` with depth 0: the matching body
+/// `END` returns the depth to 0 so the routine's own trailing `;` terminates
+/// the span, and a following `CREATE` survives as a distinct declaration.
+///
+/// Returns `None` when no top-level `BEGIN` is found before EOF (a malformed or
+/// body-less routine on the degraded recovery path); the caller then falls back
+/// to a depth-0 scan from `create_start`.
+fn find_body_begin(bytes: &[u8], start: usize) -> Option<usize> {
+    let len = bytes.len();
+    let mut i = start;
+    while i < len {
+        // Strings, q-quotes, and comments may embed the bytes `BEGIN` without
+        // being a block opener; skip them opaquely (e.g. a default value of
+        // `'BEGIN'` or a `-- BEGIN here` comment in the declaration section).
+        if let Some(next) = crate::recover::skip_opaque_span(bytes, i, start) {
+            i = next;
+            continue;
+        }
+        if matches_keyword_ignore_case(bytes, i, b"BEGIN") {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Advance past the end of the current statement, seeding the initial
 /// `BEGIN…END` nesting depth.
 ///
@@ -1515,6 +1577,103 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
         assert_eq!(decls.len(), 1);
         assert_eq!(decls[0].1, 0); // starts at byte 0
         assert_eq!(decls[0].2, src.len() as u32); // ends at full length
+    }
+
+    // oracle-aqum.5: a declaration-section `;` (`v_x NUMBER;`) must NOT
+    // truncate the routine span. The byte scanner anchors at the body `BEGIN`
+    // (depth 0); the matching body `END` returns the depth to 0 so the trailing
+    // `;` terminates the span — covering the whole routine (including the body
+    // DML/`EXECUTE IMMEDIATE` sinks the dependency graph and taint analysis
+    // depend on).
+
+    #[test]
+    fn procedure_with_decl_section_spans_whole_routine() {
+        let src = "CREATE PROCEDURE p IS\n  v_x NUMBER;\nBEGIN\n  v_x:=1;\n  INSERT INTO audit VALUES(v_x);\nEND;";
+        let decls = lower_and_collect(src);
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].0, "p");
+        // Span must reach EOF, not stop at the `v_x NUMBER;` declaration.
+        assert_eq!(decls[0].1, 0);
+        assert_eq!(decls[0].2, src.len() as u32);
+    }
+
+    #[test]
+    fn function_with_decl_section_spans_whole_routine() {
+        let src = "CREATE FUNCTION f RETURN NUMBER IS\n  v_x NUMBER;\nBEGIN\n  v_x:=1;\n  RETURN v_x;\nEND;";
+        let decls = lower_and_collect(src);
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].0, "f");
+        assert_eq!(decls[0].1, 0);
+        assert_eq!(decls[0].2, src.len() as u32);
+    }
+
+    #[test]
+    fn trigger_with_declare_section_spans_whole_trigger() {
+        let src = "CREATE TRIGGER trg\nBEFORE INSERT ON t\nFOR EACH ROW\nDECLARE\n  v_x NUMBER;\nBEGIN\n  v_x:=1;\n  INSERT INTO audit VALUES(v_x);\nEND;";
+        let decls = lower_and_collect(src);
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].0, "trg");
+        assert_eq!(decls[0].1, 0);
+        assert_eq!(decls[0].2, src.len() as u32);
+    }
+
+    #[test]
+    fn procedure_with_decl_section_does_not_swallow_next_create() {
+        // Guards against the naive depth-1 over-run: the first routine's span
+        // must end at its own `END;`, and the second `CREATE` must survive as a
+        // distinct declaration.
+        let first = "CREATE PROCEDURE p IS\n  v_x NUMBER;\nBEGIN\n  v_x:=1;\nEND;\n";
+        let second = "CREATE PROCEDURE q IS\n  v_y NUMBER;\nBEGIN\n  v_y:=2;\nEND;\n";
+        let src = format!("{first}{second}");
+        let decls = lower_and_collect(&src);
+        assert_eq!(decls.len(), 2);
+        assert_eq!(decls[0].0, "p");
+        assert_eq!(decls[1].0, "q");
+        // First span ends just after its own trailing `;` (the byte before the
+        // separating `\n`), not somewhere inside `q`.
+        assert_eq!(decls[0].2, first.len() as u32 - 1);
+        // Second span starts at the second CREATE (after the `\n`) and reaches
+        // EOF.
+        assert_eq!(decls[1].1, first.len() as u32);
+        assert_eq!(decls[1].2, src.len() as u32 - 1);
+    }
+
+    #[test]
+    fn function_with_decl_section_does_not_swallow_next_create() {
+        let first = "CREATE FUNCTION f RETURN NUMBER IS\n  v_x NUMBER;\nBEGIN\n  RETURN v_x;\nEND;\n";
+        let second = "CREATE PROCEDURE q IS BEGIN NULL; END;\n";
+        let src = format!("{first}{second}");
+        let decls = lower_and_collect(&src);
+        assert_eq!(decls.len(), 2);
+        assert_eq!(decls[0].0, "f");
+        assert_eq!(decls[1].0, "q");
+        assert_eq!(decls[0].2, first.len() as u32 - 1);
+        assert_eq!(decls[1].1, first.len() as u32);
+    }
+
+    #[test]
+    fn trigger_with_declare_section_does_not_swallow_next_create() {
+        let first = "CREATE TRIGGER trg\nBEFORE INSERT ON t\nFOR EACH ROW\nDECLARE\n  v_x NUMBER;\nBEGIN\n  v_x:=1;\nEND;\n";
+        let second = "CREATE PROCEDURE q IS BEGIN NULL; END;\n";
+        let src = format!("{first}{second}");
+        let decls = lower_and_collect(&src);
+        assert_eq!(decls.len(), 2);
+        assert_eq!(decls[0].0, "trg");
+        assert_eq!(decls[1].0, "q");
+        assert_eq!(decls[0].2, first.len() as u32 - 1);
+        assert_eq!(decls[1].1, first.len() as u32);
+    }
+
+    #[test]
+    fn decl_section_string_with_begin_does_not_anchor_early() {
+        // A `'BEGIN'` literal in a default value must not be mistaken for the
+        // body opener (it is skipped opaquely); the real body `BEGIN` anchors
+        // the scan so the span still reaches EOF.
+        let src = "CREATE PROCEDURE p IS\n  v_x VARCHAR2(10) := 'BEGIN';\nBEGIN\n  v_x:='x';\nEND;";
+        let decls = lower_and_collect(src);
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].0, "p");
+        assert_eq!(decls[0].2, src.len() as u32);
     }
 
     #[test]
