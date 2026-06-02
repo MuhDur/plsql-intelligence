@@ -18,6 +18,11 @@
 //!    * for each overload, build a suffix from the remaining
 //!      parameter names joined by `_`.
 //!    * append `_<suffix>` to the routine name.
+//!    * if two overloads still resolve to the same Rust name (an
+//!      empty suffix on zero-parameter overloads, or equal non-empty
+//!      suffixes when the shared-prefix scan stops at index 0), append
+//!      a deterministic `_<i+1>` ordinal so every emitted `pub fn`
+//!      name is unique.
 //!
 //! Parameter names are case-folded and snake-cased before suffix
 //! assembly so the resulting Rust name is stable across PL/SQL
@@ -69,16 +74,38 @@ pub fn disambiguate_overloads(routines: &[RoutineBinding]) -> Vec<String> {
             continue;
         }
         let suffixes = assemble_suffixes(routines, &indices);
-        for (i, idx) in indices.iter().enumerate() {
-            let suffix = &suffixes[i];
+        // Pass 1: build candidate names (empty suffix → ordinal, else
+        // base_suffix).
+        let mut candidates: Vec<String> = Vec::with_capacity(indices.len());
+        for (i, suffix) in suffixes.iter().enumerate() {
             if suffix.is_empty() {
                 // Two zero-parameter overloads collide and we have
                 // nothing to disambiguate on — fall back to an
                 // ordinal suffix so the emitter never produces two
                 // identical Rust names.
-                out[*idx] = format!("{base_name}_{}", i + 1);
+                candidates.push(format!("{base_name}_{}", i + 1));
             } else {
-                out[*idx] = format!("{base_name}_{suffix}");
+                candidates.push(format!("{base_name}_{suffix}"));
+            }
+        }
+        // Pass 2: two overloads can still share a non-empty suffix (e.g.
+        // `proc(p_val)` twice alongside `proc(p_other)` — `shared_prefix`
+        // is 0 so neither name is dropped). Disambiguate any duplicate by
+        // appending `_<i+1>` (input-order index within the group) to each
+        // colliding occurrence. This keeps every name unique (line-77
+        // contract) and deterministic for a fixed input order (the
+        // stability property), without perturbing names that are already
+        // unique.
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for name in &candidates {
+            *counts.entry(name.as_str()).or_default() += 1;
+        }
+        for (i, idx) in indices.iter().enumerate() {
+            let name = &candidates[i];
+            if counts.get(name.as_str()).copied().unwrap_or(0) > 1 {
+                out[*idx] = format!("{name}_{}", i + 1);
+            } else {
+                out[*idx] = name.clone();
             }
         }
     }
@@ -226,6 +253,60 @@ mod tests {
         let routines = vec![rb("touch", vec![]), rb("touch", vec![])];
         let names = disambiguate_overloads(&routines);
         assert_eq!(names, vec!["touch_1", "touch_2"]);
+    }
+
+    #[test]
+    fn equal_nonempty_suffixes_are_ordinal_disambiguated() {
+        // oracle-qm3q.27: two overloads sharing a parameter name, next to
+        // a third with a different name, drove shared_prefix_len to 0 so
+        // neither shared suffix was dropped. The pre-fix algorithm emitted
+        // ["proc_p_val", "proc_p_val", "proc_p_other"] — a duplicate that
+        // violates the line-77 "never two identical Rust names" contract.
+        let routines = vec![
+            rb("proc", vec!["p_val"]),
+            rb("proc", vec!["p_val"]),
+            rb("proc", vec!["p_other"]),
+        ];
+        let names = disambiguate_overloads(&routines);
+        let unique: std::collections::BTreeSet<_> = names.iter().collect();
+        assert_eq!(
+            unique.len(),
+            3,
+            "all three Rust names must be unique, got {names:?}"
+        );
+        // Deterministic, input-order suffixes; the unique sibling is left
+        // untouched.
+        assert_eq!(
+            names,
+            vec!["proc_p_val_1", "proc_p_val_2", "proc_p_other"],
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn equal_suffix_disambiguation_is_input_order_stable() {
+        // Reordering the colliding pair must keep names position-matched,
+        // preserving the documented stability property.
+        let a = vec![
+            rb("proc", vec!["p_val"]),
+            rb("proc", vec!["p_val"]),
+            rb("proc", vec!["p_other"]),
+        ];
+        let b = vec![
+            rb("proc", vec!["p_other"]),
+            rb("proc", vec!["p_val"]),
+            rb("proc", vec!["p_val"]),
+        ];
+        let na = disambiguate_overloads(&a);
+        let nb = disambiguate_overloads(&b);
+        assert_eq!(na, vec!["proc_p_val_1", "proc_p_val_2", "proc_p_other"]);
+        // In b the unique sibling is first; the colliding pair occupies the
+        // 2nd/3rd group slots (i=1,2 within the group) → suffixes _2/_3.
+        assert_eq!(nb, vec!["proc_p_other", "proc_p_val_2", "proc_p_val_3"]);
+        for names in [&na, &nb] {
+            let unique: std::collections::BTreeSet<_> = names.iter().collect();
+            assert_eq!(unique.len(), 3, "{names:?}");
+        }
     }
 
     #[test]

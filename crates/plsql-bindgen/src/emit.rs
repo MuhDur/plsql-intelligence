@@ -43,7 +43,7 @@ use std::fmt::Write;
 
 use crate::{
     BindingDiagnostic, BindingPlan, ParameterBinding, ParameterMode, RoutineBinding, RoutineKind,
-    RustTypeRef,
+    RustTypeRef, should_use_defaulted,
 };
 
 /// Emit Rust source for every routine in `plan`. The output is a
@@ -148,7 +148,7 @@ fn emit_routine(out: &mut String, package_id: &str, r: &RoutineBinding) {
     let _ = write!(out, "pub fn {}(executor: &mut impl OracleExecutor", r.name);
     for p in &r.parameters {
         if matches!(p.mode, ParameterMode::In | ParameterMode::InOut) {
-            let _ = write!(out, ", {}: {}", p.name, rust_type_in(p));
+            let _ = write!(out, ", {}: {}", p.name, rust_type_sig(p));
         }
     }
     let return_type = compute_return_type(r);
@@ -170,11 +170,22 @@ fn emit_routine(out: &mut String, package_id: &str, r: &RoutineBinding) {
         return;
     }
 
+    // Any IN / IN OUT parameter carrying a `DEFAULT` clause turns the
+    // wrapper signature into `Defaulted<T>` and forces a runtime-dynamic
+    // bind layout: an `Omit` drops its bind variable entirely (named-
+    // argument notation keeps a middle omission legal) so the server
+    // evaluates the declared default. Routines with no defaulted params
+    // keep the simpler static layout below.
+    let is_function = matches!(r.kind, RoutineKind::Function);
+    if r.parameters.iter().any(should_use_defaulted) {
+        emit_routine_body_dynamic(out, package_id, r, is_function);
+        return;
+    }
+
     // Bind layout: slot :1 is the function return (if any), then one
     // slot per parameter in declaration order. This order is the
     // same one `compute_return_type` flattens its tuple in, so the
     // returned output-slot vec maps positionally onto the payload.
-    let is_function = matches!(r.kind, RoutineKind::Function);
     let mut binds: Vec<String> = Vec::new();
     let mut call_args: Vec<String> = Vec::new();
     let mut next_slot = 1;
@@ -280,11 +291,236 @@ fn emit_routine(out: &mut String, package_id: &str, r: &RoutineBinding) {
     let _ = writeln!(out, "}}");
 }
 
+/// The Rust type used for an IN / IN OUT parameter in the wrapper's
+/// *signature*. For a defaulted parameter this is `Defaulted<T>` (or
+/// `Defaulted<Option<T>>` when also nullable), mirroring
+/// [`crate::with_defaulted`]; otherwise it is the plain value type.
+fn rust_type_sig(p: &ParameterBinding) -> String {
+    let value = rust_type_in(p);
+    if should_use_defaulted(p) {
+        format!("Defaulted<{value}>")
+    } else {
+        value
+    }
+}
+
+/// The Rust type a parameter *carries by value* (`T` or `Option<T>`).
+/// Used for the return tuple, where even an IN OUT defaulted parameter
+/// surfaces its read-back value as `T`/`Option<T>`, never `Defaulted<T>`
+/// (the `Defaulted` wrapper only models the inbound omit/null/value
+/// choice, which has no meaning on the way back out).
 fn rust_type_in(p: &ParameterBinding) -> String {
     if p.rust_type.nullable {
         format!("Option<{}>", p.rust_type.path)
     } else {
         p.rust_type.path.clone()
+    }
+}
+
+/// Emit the body of a routine that has at least one defaulted IN / IN OUT
+/// parameter. The bind layout is built at runtime so that a
+/// `Defaulted::Omit` argument contributes no bind variable and the server
+/// evaluates the declared default. The anonymous block uses named-argument
+/// notation (`p_name => :n`) for every parameter so omitting a middle
+/// default-bearing argument remains legal PL/SQL; slot numbers are assigned
+/// dynamically as binds are pushed.
+fn emit_routine_body_dynamic(
+    out: &mut String,
+    package_id: &str,
+    r: &RoutineBinding,
+    is_function: bool,
+) {
+    // shape_err is needed whenever there is any output slot (a function
+    // return or any OUT / IN OUT parameter). Emit it up front when used.
+    let has_output = r.return_type.is_some()
+        || r.parameters
+            .iter()
+            .any(|p| matches!(p.mode, ParameterMode::Out | ParameterMode::InOut));
+    if has_output {
+        let _ = writeln!(out, "    fn shape_err() -> ExecutionError {{");
+        let _ = writeln!(
+            out,
+            "        ExecutionError {{ code: \"BINDING_RESULT_SHAPE\".to_string(), message: \"executor returned an output bind of an unexpected kind\".to_string() }}"
+        );
+        let _ = writeln!(out, "    }}");
+    }
+
+    let _ = writeln!(out, "    let mut __args: Vec<RoutineArg> = Vec::new();");
+    let _ = writeln!(out, "    let mut __call: Vec<String> = Vec::new();");
+    // :1 is reserved for the function return assignment; parameter slots
+    // start at :2 for functions and :1 for procedures. The counter holds
+    // the NEXT slot number to hand out.
+    let first_param_slot = if is_function { 2 } else { 1 };
+    let _ = writeln!(out, "    let mut __slot: u32 = {first_param_slot};");
+    if is_function {
+        // The return slot is always bound and always first in the output
+        // sequence; it never participates in named-argument notation.
+        let _ = writeln!(out, "    __args.push(RoutineArg::Out);");
+    }
+
+    for p in &r.parameters {
+        emit_dynamic_param_bind(out, p);
+    }
+
+    let prefix = if is_function { ":1 := " } else { "" };
+    let _ = writeln!(
+        out,
+        "    let __block = format!(\"BEGIN {prefix}{package_id}.{}({{}}); END;\", __call.join(\", \"));",
+        r.name
+    );
+    let _ = writeln!(
+        out,
+        "    let __out = executor.call_routine(&__block, &__args)?;"
+    );
+
+    // Output extraction. Output slots arrive in the order they were pushed
+    // into __args: the function return first (if any), then each OUT slot
+    // and each non-omitted IN OUT slot in declaration order. Because an
+    // omitted IN OUT contributes no output, we cannot statically index the
+    // return vec; we walk it positionally at runtime via a cursor.
+    let mut out_types: Vec<(&RustTypeRef, Option<&ParameterBinding>)> = Vec::new();
+    if let Some(rt) = &r.return_type {
+        out_types.push((rt, None));
+    }
+    for p in &r.parameters {
+        if matches!(p.mode, ParameterMode::Out | ParameterMode::InOut) {
+            out_types.push((&p.rust_type, Some(p)));
+        }
+    }
+
+    if out_types.is_empty() {
+        let _ = writeln!(out, "    let _ = __out;");
+        let _ = writeln!(out, "    Ok(())");
+    } else {
+        let _ = writeln!(out, "    let mut __cursor = 0usize;");
+        let mut exprs: Vec<String> = Vec::new();
+        for (idx, (rt, owner)) in out_types.iter().enumerate() {
+            let bind = format!("__b{idx}");
+            // An omitted IN OUT defaulted parameter has no output slot to
+            // read back: omitting an IN OUT means there is no actual
+            // argument for the server to write into. Surface that as a
+            // typed error rather than mis-aligning the output cursor.
+            let omittable_inout = owner.is_some_and(|p| {
+                matches!(p.mode, ParameterMode::InOut) && should_use_defaulted(p)
+            });
+            let core = scalar_out_extract(&rt.path, &bind).expect("checked by unsupported_type");
+            let value_expr = if rt.nullable {
+                format!("if matches!({bind}, BindValue::Null) {{ None }} else {{ Some({core}) }}")
+            } else {
+                core
+            };
+            if omittable_inout {
+                let pname = owner.expect("omittable_inout implies owner").name.as_str();
+                let _ = writeln!(
+                    out,
+                    "    let __r{idx} = if matches!({pname}, Defaulted::Omit) {{"
+                );
+                let _ = writeln!(
+                    out,
+                    "        return Err(ExecutionError {{ code: \"BINDING_OMIT_INOUT\".to_string(), message: \"IN OUT parameter `{pname}` was omitted; an omitted IN OUT has no output to read back\".to_string() }});"
+                );
+                let _ = writeln!(out, "    }} else {{");
+                let _ = writeln!(
+                    out,
+                    "        let {bind} = __out.get(__cursor).ok_or_else(shape_err)?;"
+                );
+                let _ = writeln!(out, "        __cursor += 1;");
+                let _ = writeln!(out, "        {value_expr}");
+                let _ = writeln!(out, "    }};");
+                exprs.push(format!("__r{idx}"));
+            } else {
+                let _ = writeln!(
+                    out,
+                    "    let {bind} = __out.get(__cursor).ok_or_else(shape_err)?;"
+                );
+                let _ = writeln!(out, "    __cursor += 1;");
+                exprs.push(value_expr);
+            }
+        }
+        if exprs.len() == 1 {
+            let _ = writeln!(out, "    Ok({})", exprs.into_iter().next().unwrap());
+        } else {
+            let _ = writeln!(out, "    Ok(({}))", exprs.join(", "));
+        }
+    }
+    let _ = writeln!(out, "}}");
+}
+
+/// Emit the runtime bind-push for a single parameter inside the dynamic
+/// body. OUT params always bind an `Out` slot with a fixed `:n`. IN / IN OUT
+/// params bind a value; defaulted ones branch on the three `Defaulted`
+/// states, with `Omit` skipping the bind entirely (named notation keeps the
+/// remaining slots legal).
+fn emit_dynamic_param_bind(out: &mut String, p: &ParameterBinding) {
+    let name = &p.name;
+    match p.mode {
+        ParameterMode::Out => {
+            let _ = writeln!(out, "    {{");
+            let _ = writeln!(out, "        let __n = __slot; __slot += 1;");
+            let _ = writeln!(out, "        __call.push(format!(\"{name} => :{{__n}}\"));");
+            let _ = writeln!(out, "        __args.push(RoutineArg::Out);");
+            let _ = writeln!(out, "    }}");
+        }
+        ParameterMode::In | ParameterMode::InOut => {
+            let variant = if matches!(p.mode, ParameterMode::InOut) {
+                "InOut"
+            } else {
+                "In"
+            };
+            if should_use_defaulted(p) {
+                // value_ctor marshals the inner value bound to `__v`
+                // (`Option<T>` when nullable, plain `T` otherwise).
+                let value_ctor = dynamic_value_ctor(p, "__v");
+                let _ = writeln!(out, "    match &{name} {{");
+                // Omit: contribute no bind variable; the named-argument
+                // notation already omits this position from the call.
+                let _ = writeln!(out, "        Defaulted::Omit => {{}}");
+                let _ = writeln!(out, "        Defaulted::Null => {{");
+                let _ = writeln!(out, "            let __n = __slot; __slot += 1;");
+                let _ = writeln!(out, "            __call.push(format!(\"{name} => :{{__n}}\"));");
+                let _ = writeln!(
+                    out,
+                    "            __args.push(RoutineArg::{variant}(BindValue::Null));"
+                );
+                let _ = writeln!(out, "        }}");
+                let _ = writeln!(out, "        Defaulted::Value(__v) => {{");
+                let _ = writeln!(out, "            let __n = __slot; __slot += 1;");
+                let _ = writeln!(out, "            __call.push(format!(\"{name} => :{{__n}}\"));");
+                let _ = writeln!(
+                    out,
+                    "            __args.push(RoutineArg::{variant}({value_ctor}));"
+                );
+                let _ = writeln!(out, "        }}");
+                let _ = writeln!(out, "    }}");
+            } else {
+                let by_ref = format!("&{name}");
+                let ctor = dynamic_value_ctor(p, &by_ref);
+                let _ = writeln!(out, "    {{");
+                let _ = writeln!(out, "        let __n = __slot; __slot += 1;");
+                let _ = writeln!(out, "        __call.push(format!(\"{name} => :{{__n}}\"));");
+                let _ = writeln!(out, "        __args.push(RoutineArg::{variant}({ctor}));");
+                let _ = writeln!(out, "    }}");
+            }
+        }
+    }
+}
+
+/// Build the `BindValue` constructor expression for an IN / IN OUT value
+/// held in `src`. When the parameter is nullable, `src` is an `Option<T>`
+/// (or `&Option<T>` reference) and we match Some/None; otherwise `src` is
+/// the value directly. The inner scalar is taken by value via `.clone()`
+/// of the matched binding so the dynamic match arms can borrow `&name`.
+fn dynamic_value_ctor(p: &ParameterBinding, src: &str) -> String {
+    let path = &p.rust_type.path;
+    if p.rust_type.nullable {
+        let inner = scalar_in_marshal(path, "__iv").expect("checked by unsupported_type");
+        format!("match {src} {{ Some(__iv) => {{ let __iv = (*__iv).clone(); {inner} }}, None => BindValue::Null }}")
+    } else {
+        // `src` is always a reference expression (`&name` or a `&T` match
+        // binding); parenthesise before `.clone()` so the cloned value is
+        // owned `T`, not `&T`.
+        let cloned = format!("({src}).clone()");
+        scalar_in_marshal(path, &cloned).expect("checked by unsupported_type")
     }
 }
 
@@ -366,6 +602,17 @@ mod tests {
             },
             has_default: false,
         }
+    }
+
+    fn defaulted_param(
+        name: &str,
+        path: &str,
+        mode: ParameterMode,
+        nullable: bool,
+    ) -> ParameterBinding {
+        let mut p = param(name, path, mode, nullable);
+        p.has_default = true;
+        p
     }
 
     #[test]
@@ -729,5 +976,249 @@ mod tests {
             src.contains("chrono::NaiveDate"),
             "error must name the offending type: {src}"
         );
+    }
+
+    // --- oracle-qm3q.13: defaulted IN / IN OUT params must surface as
+    // `Defaulted<T>` in the signature and bind via an omittable, named-
+    // argument layout so Oracle's declared-default path is reachable. ---
+
+    #[test]
+    fn defaulted_in_param_uses_defaulted_type_in_signature() {
+        // The defect: `proc(p_a IN NUMBER DEFAULT 5)` emitted a required
+        // `p_a: i64` and always bound :1, so the omit/declared-default
+        // path was inexpressible. It must now be `Defaulted<i64>`.
+        let r = RoutineBinding {
+            name: "proc_with_default".into(),
+            kind: RoutineKind::Procedure,
+            parameters: vec![defaulted_param("p_a", "i64", ParameterMode::In, false)],
+            return_type: None,
+            autonomous_transaction: false,
+        };
+        let src = emit_wrappers(&plan(vec![r]));
+        assert!(
+            src.contains("p_a: Defaulted<i64>"),
+            "defaulted IN param must surface as Defaulted<T>: {src}"
+        );
+        // Not the old required-binding shape.
+        assert!(
+            !src.contains(", p_a: i64)"),
+            "must NOT emit the plain required type: {src}"
+        );
+    }
+
+    #[test]
+    fn defaulted_param_omit_drops_bind_and_uses_named_notation() {
+        let r = RoutineBinding {
+            name: "proc_with_default".into(),
+            kind: RoutineKind::Procedure,
+            parameters: vec![defaulted_param("p_a", "i64", ParameterMode::In, false)],
+            return_type: None,
+            autonomous_transaction: false,
+        };
+        let src = emit_wrappers(&plan(vec![r]));
+        // Omit contributes no bind.
+        assert!(
+            src.contains("Defaulted::Omit => {}"),
+            "Omit must push no bind: {src}"
+        );
+        // Null binds an explicit NULL (distinct from Omit).
+        assert!(
+            src.contains("Defaulted::Null =>") && src.contains("RoutineArg::In(BindValue::Null)"),
+            "Null must bind BindValue::Null: {src}"
+        );
+        // Value marshals the scalar.
+        assert!(
+            src.contains("Defaulted::Value(__v) =>") && src.contains("BindValue::Int"),
+            "Value must marshal the scalar: {src}"
+        );
+        // Named-argument notation keeps a middle omission legal.
+        assert!(
+            src.contains("format!(\"p_a => :{__n}\")"),
+            "defaulted call must use named-argument notation: {src}"
+        );
+        // Dynamic block is composed at runtime, not as a static literal.
+        assert!(
+            src.contains("let __block = format!(\"BEGIN hr.demo_pkg.proc_with_default("),
+            "block must be built dynamically: {src}"
+        );
+    }
+
+    #[test]
+    fn defaulted_nullable_param_is_defaulted_option() {
+        let r = RoutineBinding {
+            name: "p".into(),
+            kind: RoutineKind::Procedure,
+            parameters: vec![defaulted_param("p_a", "String", ParameterMode::In, true)],
+            return_type: None,
+            autonomous_transaction: false,
+        };
+        let src = emit_wrappers(&plan(vec![r]));
+        assert!(
+            src.contains("p_a: Defaulted<Option<String>>"),
+            "nullable + defaulted must be Defaulted<Option<T>>: {src}"
+        );
+    }
+
+    #[test]
+    fn non_defaulted_routine_keeps_static_layout() {
+        // Routines with no defaulted params must keep the original static
+        // bind layout (positional binds, static vec!), unchanged.
+        let r = RoutineBinding {
+            name: "plain".into(),
+            kind: RoutineKind::Procedure,
+            parameters: vec![param("p_a", "i64", ParameterMode::In, false)],
+            return_type: None,
+            autonomous_transaction: false,
+        };
+        let src = emit_wrappers(&plan(vec![r]));
+        assert!(
+            src.contains("let __args: Vec<RoutineArg> = vec!["),
+            "non-defaulted routine must keep the static vec! layout: {src}"
+        );
+        assert!(
+            !src.contains("Defaulted::"),
+            "non-defaulted routine must not reference Defaulted: {src}"
+        );
+        assert!(
+            src.contains("BEGIN hr.demo_pkg.plain(:1); END;"),
+            "non-defaulted block stays positional and static: {src}"
+        );
+    }
+
+    #[test]
+    fn omitted_inout_default_is_a_typed_error_not_misaligned() {
+        // An IN OUT defaulted param surfaces as Defaulted<T>, but omitting
+        // it has no output to read back — the wrapper must fail closed with
+        // a typed error rather than silently mis-aligning the return tuple.
+        let r = RoutineBinding {
+            name: "io".into(),
+            kind: RoutineKind::Procedure,
+            parameters: vec![defaulted_param("p_io", "i64", ParameterMode::InOut, false)],
+            return_type: None,
+            autonomous_transaction: false,
+        };
+        let src = emit_wrappers(&plan(vec![r]));
+        assert!(
+            src.contains("p_io: Defaulted<i64>"),
+            "IN OUT defaulted must surface as Defaulted<T>: {src}"
+        );
+        assert!(
+            src.contains("BINDING_OMIT_INOUT"),
+            "omitting an IN OUT must be a typed error: {src}"
+        );
+    }
+
+    // A hand-mirrored copy of exactly what `emit_routine_body_dynamic`
+    // produces for `proc_with_default(p_a IN NUMBER DEFAULT 5)`. Compiling
+    // it proves the emitted Rust is valid; running it against a stub
+    // executor proves the three Defaulted states bind correctly. This is
+    // the behavioral teeth behind the string assertions above.
+    mod generated_shape {
+        use crate::executor::{BindValue, ExecutionError, OracleExecutor, Row, RoutineArg};
+        use crate::Defaulted;
+
+        /// Records the block + args the wrapper handed the executor.
+        #[derive(Default)]
+        struct RecordingExecutor {
+            last_block: std::cell::RefCell<String>,
+            last_args: std::cell::RefCell<Vec<RoutineArg>>,
+        }
+        impl OracleExecutor for RecordingExecutor {
+            fn execute(&self, _sql: &str, _binds: &[BindValue]) -> Result<u64, ExecutionError> {
+                Ok(0)
+            }
+            fn query(&self, _sql: &str, _binds: &[BindValue]) -> Result<Vec<Row>, ExecutionError> {
+                Ok(vec![])
+            }
+            fn call_routine(
+                &self,
+                plsql: &str,
+                args: &[RoutineArg],
+            ) -> Result<Vec<BindValue>, ExecutionError> {
+                *self.last_block.borrow_mut() = plsql.to_string();
+                *self.last_args.borrow_mut() = args.to_vec();
+                Ok(vec![])
+            }
+        }
+
+        // VERBATIM emitter output for proc_with_default — keep in lockstep
+        // with emit_routine_body_dynamic. The emitter marshals every IN
+        // value with `.clone()` because it is generic over Copy and
+        // non-Copy types alike (e.g. String); cloning the Copy `i64` here
+        // is the faithful generated shape, so silence the Copy lint.
+        #[allow(clippy::clone_on_copy)]
+        pub fn proc_with_default(
+            executor: &mut impl OracleExecutor,
+            p_a: Defaulted<i64>,
+        ) -> Result<(), ExecutionError> {
+            let mut __args: Vec<RoutineArg> = Vec::new();
+            let mut __call: Vec<String> = Vec::new();
+            let mut __slot: u32 = 1;
+            match &p_a {
+                Defaulted::Omit => {}
+                Defaulted::Null => {
+                    let __n = __slot;
+                    __slot += 1;
+                    __call.push(format!("p_a => :{__n}"));
+                    __args.push(RoutineArg::In(BindValue::Null));
+                }
+                Defaulted::Value(__v) => {
+                    let __n = __slot;
+                    __slot += 1;
+                    __call.push(format!("p_a => :{__n}"));
+                    __args.push(RoutineArg::In(BindValue::Int((__v).clone())));
+                }
+            }
+            let _ = __slot;
+            let __block =
+                format!("BEGIN hr.demo_pkg.proc_with_default({}); END;", __call.join(", "));
+            let __out = executor.call_routine(&__block, &__args)?;
+            let _ = __out;
+            Ok(())
+        }
+
+        #[test]
+        fn omit_binds_nothing_and_lets_server_default() {
+            let mut exec = RecordingExecutor::default();
+            proc_with_default(&mut exec, Defaulted::Omit).unwrap();
+            assert!(
+                exec.last_args.borrow().is_empty(),
+                "Omit must bind no slot so the server evaluates the default"
+            );
+            assert_eq!(
+                *exec.last_block.borrow(),
+                "BEGIN hr.demo_pkg.proc_with_default(); END;",
+                "Omit drops the argument entirely"
+            );
+        }
+
+        #[test]
+        fn null_binds_explicit_null_distinct_from_omit() {
+            let mut exec = RecordingExecutor::default();
+            proc_with_default(&mut exec, Defaulted::Null).unwrap();
+            assert_eq!(
+                *exec.last_args.borrow(),
+                vec![RoutineArg::In(BindValue::Null)],
+                "Null binds an explicit NULL, not the default"
+            );
+            assert_eq!(
+                *exec.last_block.borrow(),
+                "BEGIN hr.demo_pkg.proc_with_default(p_a => :1); END;"
+            );
+        }
+
+        #[test]
+        fn value_marshals_the_supplied_scalar() {
+            let mut exec = RecordingExecutor::default();
+            proc_with_default(&mut exec, Defaulted::Value(42)).unwrap();
+            assert_eq!(
+                *exec.last_args.borrow(),
+                vec![RoutineArg::In(BindValue::Int(42))]
+            );
+            assert_eq!(
+                *exec.last_block.borrow(),
+                "BEGIN hr.demo_pkg.proc_with_default(p_a => :1); END;"
+            );
+        }
     }
 }

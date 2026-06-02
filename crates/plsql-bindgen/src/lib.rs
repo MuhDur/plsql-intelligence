@@ -86,8 +86,11 @@ pub struct ParameterBinding {
     pub name: String,
     pub mode: ParameterMode,
     pub rust_type: RustTypeRef,
-    /// Whether the parameter has a default (`DEFAULT` clause); affects whether
-    /// the Rust wrapper exposes it as `Option<T>` or required.
+    /// Whether the parameter has a default (`DEFAULT` clause). When `true`
+    /// for an IN / IN OUT parameter, the emitted wrapper exposes it as
+    /// `Defaulted<T>` (or `Defaulted<Option<T>>` when also nullable) so the
+    /// caller can choose `Omit` (server evaluates the declared default),
+    /// `Null` (explicit NULL bind), or `Value(T)`. See `defaulted.rs`.
     pub has_default: bool,
 }
 
