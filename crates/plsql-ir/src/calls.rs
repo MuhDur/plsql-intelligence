@@ -319,6 +319,36 @@ mod tests {
         assert!(calls.iter().any(|c| c.callee_display == "inner_proc"));
     }
 
+    // oracle-aqum.1: the UNGUARDED expression-walk path. An
+    // assignment whose RHS is a crafted flat binary chain
+    // `a OR a OR … OR a` (here with calls so `collect_calls` has work
+    // to do) used to lower into a recursion-depth tree as deep as the
+    // operand count, and `collect_calls` (calls.rs:118) re-walked that
+    // `Box<Expr>` chain to the same depth — overflowing the stack and
+    // aborting `analyze`. With the lowering depth cap the produced tree
+    // is bounded, so this walk terminates without a panic / SIGABRT.
+    #[test]
+    fn wide_assignment_rhs_chain_does_not_overflow_call_walk() {
+        let n = 500_000usize;
+        let mut rhs = String::with_capacity(n * 8);
+        for i in 0..n {
+            if i > 0 {
+                rhs.push_str(" OR ");
+            }
+            rhs.push_str("f(x)");
+        }
+        let stmt = format!("v := {rhs};");
+        let stmts = lower_statement_body(&stmt);
+        // Must simply terminate (no stack overflow / abort). We do not
+        // assert the call count — the deep tail is honestly truncated at
+        // the depth cap — only that the walk is bounded and safe.
+        let calls = extract_call_sites(&stmts);
+        assert!(
+            !calls.is_empty(),
+            "the shallow prefix of the chain still yields call sites"
+        );
+    }
+
     // oracle-v4wa: the exact crash shape from the bundled public
     // fixture `corpus/synthetic/l1/pkg_error_handling.pkb`. A
     // `SELECT … FOR UPDATE;` body fragment leaves the bare token
