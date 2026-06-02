@@ -781,6 +781,12 @@ mod live {
                 .unwrap_or_default()
                 .as_secs(),
             ttl_seconds: ENABLE_WRITES_TOKEN_TTL_SECONDS,
+            // A *live* monotonic deadline (mirrors the production mint path) so the
+            // injected token is otherwise valid: the only reason enable_writes must
+            // still refuse is the PermanentlyReadOnly profile — not token expiry.
+            deadline: Some(plsql_mcp::MonotonicDeadline::after(
+                std::time::Duration::from_secs(ENABLE_WRITES_TOKEN_TTL_SECONDS),
+            )),
         });
 
         let now = std::time::SystemTime::now()

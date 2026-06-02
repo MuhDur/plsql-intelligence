@@ -222,6 +222,10 @@ pub use safety::{
     ENABLE_WRITES_TOKEN_TTL_SECONDS, EnableWritesToken, SafetyProfile, SafetyProfileError,
     SessionSafetyState,
 };
+// Re-exported because it is the type of the public `EnableWritesToken::deadline`
+// field; without this re-export external callers (and integration tests) cannot
+// name the field's type to construct or match an `EnableWritesToken`.
+pub use oraclemcp_guard::MonotonicDeadline;
 pub use tools::{ToolDescriptor, ToolRegistry, ToolTier};
 
 /// Build the canonical tool registry the `serve` command exposes.
