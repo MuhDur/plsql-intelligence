@@ -299,15 +299,59 @@ fn split_top_level_concat(run: &str) -> Vec<&str> {
 }
 
 /// True iff a single top-level `||` operand of a non-literal
-/// concatenation run routed its value through a
+/// concatenation run routed its value through a *validating*
 /// `DBMS_ASSERT.<fn>(...)` sanitiser. Purely textual: the caller
 /// passes one operand (already split out by
-/// [`split_top_level_concat`]), so a `DBMS_ASSERT.` mention means
+/// [`split_top_level_concat`]), so a validating-assert mention means
 /// *this* substituted identifier is bounded by the asserted name —
 /// it can no longer claim sanitisation for an adjacent operand that
 /// merely shared the same `||` run.
+///
+/// Recognition is gated on a VALIDATORS allowlist that mirrors
+/// `plsql-ir/src/flow_intra.rs::is_dbms_assert_sanitizer` — a bare
+/// `contains("DBMS_ASSERT.")` is *not* enough. `DBMS_ASSERT.NOOP` is
+/// Oracle's documented identity pass-through that performs zero
+/// validation and returns its argument unchanged (it is detected
+/// textually by [`detect_dbms_assert_calls`] for evidence, but it is
+/// **not** a sanitiser); it, and any unknown or future `DBMS_ASSERT`
+/// entry point, must fall through to `false` so the operand stays
+/// unsanitised and the scorer reports the injection surface honestly
+/// instead of falsely claiming the object set is bounded
+/// (oracle-clgt.2). An optional leading schema segment
+/// (`SYS.DBMS_ASSERT.SIMPLE_SQL_NAME`) is tolerated.
 fn run_is_dbms_assert(run: &str) -> bool {
-    run.to_ascii_uppercase().contains("DBMS_ASSERT.")
+    /// Validating `DBMS_ASSERT` entry points — those that actually
+    /// bound the substituted name. Mirrors the IR taint engine's
+    /// allowlist; NOOP is deliberately absent (identity pass-through,
+    /// not a validator).
+    const VALIDATORS: &[&str] = &[
+        "SIMPLE_SQL_NAME",
+        "QUALIFIED_SQL_NAME",
+        "SCHEMA_NAME",
+        "ENQUOTE_NAME",
+        "SQL_OBJECT_NAME",
+        "ENQUOTE_LITERAL",
+    ];
+    let upper = run.to_ascii_uppercase();
+    // Scan every `DBMS_ASSERT.` occurrence in the operand and accept
+    // the operand iff at least one names a validating function. The
+    // function token is the run of identifier characters immediately
+    // after the dot; comparing the *exact* token (not a prefix)
+    // ensures `NOOP` and unknown entry points never match.
+    let needle = "DBMS_ASSERT.";
+    let mut cursor = 0;
+    while let Some(rel) = upper[cursor..].find(needle) {
+        let fn_start = cursor + rel + needle.len();
+        let func: String = upper[fn_start..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$' || *c == '#')
+            .collect();
+        if VALIDATORS.contains(&func.as_str()) {
+            return true;
+        }
+        cursor = fn_start;
+    }
+    false
 }
 
 /// Blank out embedded single-quoted SQL string literals inside a
@@ -615,6 +659,83 @@ mod tests {
         assert!(
             ev.expr_interpolations[0].sanitised,
             "the lone operand is the DBMS_ASSERT call and is sanitised: {:?}",
+            ev.expr_interpolations
+        );
+    }
+
+    /// Regression for oracle-clgt.2: `DBMS_ASSERT.NOOP` is Oracle's
+    /// documented identity pass-through — it validates nothing and
+    /// returns its argument unchanged, so it must NOT mark an
+    /// interpolation as sanitised. Before the fix `run_is_dbms_assert`
+    /// used a bare `contains("DBMS_ASSERT.")`, so a NOOP-wrapped raw
+    /// value was falsely tagged `sanitised:true` (and the scorer then
+    /// claimed the object set was bounded — an injection fail-open).
+    #[test]
+    fn dbms_assert_noop_is_not_a_sanitiser() {
+        let ev = recognise_dynamic_sql(
+            "EXECUTE IMMEDIATE 'SELECT * FROM ' || DBMS_ASSERT.NOOP(p_tab);",
+            "pkg.proc:70",
+        )
+        .unwrap();
+        // NOOP is still recorded textually for evidence...
+        assert!(
+            ev.dbms_assert_calls.iter().any(|c| c.function == "NOOP"),
+            "NOOP should still be detected textually: {:?}",
+            ev.dbms_assert_calls
+        );
+        // ...but it must NOT count as sanitisation.
+        assert_eq!(
+            ev.expr_interpolations.len(),
+            1,
+            "one interpolation for the NOOP-wrapped operand: {:?}",
+            ev.expr_interpolations
+        );
+        assert!(
+            !ev.expr_interpolations[0].sanitised,
+            "NOOP performs no validation — the operand must be unsanitised: {:?}",
+            ev.expr_interpolations
+        );
+    }
+
+    /// Regression for oracle-clgt.2: an unknown / future `DBMS_ASSERT`
+    /// entry point (not on the validator allowlist) must also fall
+    /// through to unsanitised rather than being trusted on the bare
+    /// `DBMS_ASSERT.` prefix.
+    #[test]
+    fn unknown_dbms_assert_fn_is_not_a_sanitiser() {
+        let ev = recognise_dynamic_sql(
+            "EXECUTE IMMEDIATE 'SELECT * FROM ' || DBMS_ASSERT.SOME_FUTURE_FN(p_tab);",
+            "pkg.proc:71",
+        )
+        .unwrap();
+        assert_eq!(
+            ev.expr_interpolations.len(),
+            1,
+            "one interpolation for the wrapped operand: {:?}",
+            ev.expr_interpolations
+        );
+        assert!(
+            !ev.expr_interpolations[0].sanitised,
+            "an unrecognised DBMS_ASSERT entry point must not claim sanitisation: {:?}",
+            ev.expr_interpolations
+        );
+    }
+
+    /// A real validating entry point reached through a schema prefix
+    /// (`SYS.DBMS_ASSERT.SIMPLE_SQL_NAME`) must still be recognised as
+    /// a sanitiser — the allowlist gate must not over-correct and drop
+    /// genuinely cleansed values.
+    #[test]
+    fn schema_qualified_dbms_assert_validator_is_sanitiser() {
+        let ev = recognise_dynamic_sql(
+            "EXECUTE IMMEDIATE 'DROP TABLE ' || SYS.DBMS_ASSERT.SIMPLE_SQL_NAME(p_tab);",
+            "pkg.proc:72",
+        )
+        .unwrap();
+        assert_eq!(ev.expr_interpolations.len(), 1);
+        assert!(
+            ev.expr_interpolations[0].sanitised,
+            "schema-qualified SIMPLE_SQL_NAME must be sanitised: {:?}",
             ev.expr_interpolations
         );
     }

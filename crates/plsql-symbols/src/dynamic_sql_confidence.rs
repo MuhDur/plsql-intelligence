@@ -282,6 +282,66 @@ mod tests {
         );
     }
 
+    /// Regression for oracle-clgt.2: an EXECUTE IMMEDIATE whose only
+    /// interpolation is wrapped in `DBMS_ASSERT.NOOP` (the identity
+    /// pass-through that validates nothing) must score Low — never
+    /// Medium / "object set is bounded". Before the fix the recogniser
+    /// tagged the NOOP-wrapped run sanitised on a bare
+    /// `contains("DBMS_ASSERT.")`, so the scorer falsely declared the
+    /// object set bounded for what is an unbounded injection surface.
+    #[test]
+    fn dbms_assert_noop_scores_low_not_medium() {
+        let ev = recognise_dynamic_sql(
+            "EXECUTE IMMEDIATE 'SELECT * FROM ' || DBMS_ASSERT.NOOP(p_tab);",
+            "p:11",
+        )
+        .unwrap();
+        // The lone interpolation must be unsanitised.
+        assert_eq!(ev.expr_interpolations.len(), 1);
+        assert!(
+            !ev.expr_interpolations[0].sanitised,
+            "NOOP must not mark the interpolation sanitised: {:?}",
+            ev.expr_interpolations
+        );
+
+        let c = score_dynamic_sql_edge(&ev);
+        assert_eq!(
+            c.level,
+            ConfidenceLevel::Low,
+            "NOOP-wrapped interpolation must stay Low, not Medium"
+        );
+        let explanation = c.explanation.unwrap();
+        assert!(
+            !explanation.contains("bounded"),
+            "explanation must not claim the object set is bounded for a NOOP wrap: {explanation}"
+        );
+        assert!(
+            explanation.contains("no DBMS_ASSERT sanitisation"),
+            "explanation should report no sanitisation: {explanation}"
+        );
+    }
+
+    /// Companion to the NOOP case: an unknown / future `DBMS_ASSERT`
+    /// entry point must also score Low.
+    #[test]
+    fn unknown_dbms_assert_fn_scores_low_not_medium() {
+        let ev = recognise_dynamic_sql(
+            "EXECUTE IMMEDIATE 'SELECT * FROM ' || DBMS_ASSERT.SOME_FUTURE_FN(p_tab);",
+            "p:12",
+        )
+        .unwrap();
+        let c = score_dynamic_sql_edge(&ev);
+        assert_eq!(
+            c.level,
+            ConfidenceLevel::Low,
+            "an unrecognised DBMS_ASSERT entry point must stay Low, not Medium"
+        );
+        assert!(
+            !c.explanation.unwrap().contains("bounded"),
+            "explanation must not claim bounded for an unknown DBMS_ASSERT fn"
+        );
+    }
+
     /// Full coverage (every interpolation asserted) stays Medium and
     /// reports honest "bounded" language.
     #[test]
