@@ -232,6 +232,56 @@ mod tests {
         );
     }
 
+    /// Regression for oracle-rwjl.12: the adjacent-`||` shape that the
+    /// existing `partial_dbms_assert_coverage_is_low_not_medium` test
+    /// misses. Here the asserted identifier and the raw identifier are
+    /// concatenated with no string literal between them
+    /// (`DBMS_ASSERT.SIMPLE_SQL_NAME(p_tab) || p_raw`). Before the fix
+    /// the whole non-literal run collapsed into one `<expr>` tagged
+    /// sanitised, so the scorer wrongly stamped Medium / "object set is
+    /// bounded". After splitting the run on top-level `||`, the raw
+    /// operand surfaces as unsanitised and the verdict drops to Low.
+    #[test]
+    fn adjacent_concat_partial_coverage_is_low_not_medium() {
+        let ev = recognise_dynamic_sql(
+            "EXECUTE IMMEDIATE 'SELECT * FROM ' || DBMS_ASSERT.SIMPLE_SQL_NAME(p_tab) || p_raw || ' WHERE 1=1';",
+            "p:10",
+        )
+        .unwrap();
+        // The adjacent operands must each get their own interpolation:
+        // one asserted, one raw.
+        assert_eq!(
+            ev.expr_interpolations.len(),
+            2,
+            "adjacent `||` operands must split: {:?}",
+            ev.expr_interpolations
+        );
+        assert!(
+            ev.expr_interpolations.iter().any(|e| e.sanitised),
+            "the DBMS_ASSERT operand should be sanitised"
+        );
+        assert!(
+            ev.expr_interpolations.iter().any(|e| !e.sanitised),
+            "the bare p_raw operand should be unsanitised"
+        );
+
+        let c = score_dynamic_sql_edge(&ev);
+        assert_eq!(
+            c.level,
+            ConfidenceLevel::Low,
+            "adjacent-|| partial sanitisation must stay Low, not Medium"
+        );
+        let explanation = c.explanation.unwrap();
+        assert!(
+            !explanation.contains("bounded"),
+            "explanation must not claim the object set is bounded: {explanation}"
+        );
+        assert!(
+            explanation.contains("partial"),
+            "explanation should name the partial sanitisation: {explanation}"
+        );
+    }
+
     /// Full coverage (every interpolation asserted) stays Medium and
     /// reports honest "bounded" language.
     #[test]

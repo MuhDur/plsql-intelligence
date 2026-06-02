@@ -189,17 +189,31 @@ fn extract_execute_immediate(
     let body = body.trim().trim_end_matches(';').trim();
 
     // Walk by character; collect runs inside `'...'` as literal
-    // fragments, runs outside as `<expr>` placeholders (collapsed
-    // around `||`). For each `<expr>` we also capture the verbatim
-    // source of the non-literal run so we can tag whether that
-    // specific interpolation was routed through a DBMS_ASSERT
-    // sanitiser (per-interpolation coverage, not a flat count).
+    // fragments, runs outside as `<expr>` placeholders. Each
+    // non-literal run is split on its top-level `||` operators so a
+    // run that concatenates several substituted expressions (with no
+    // intervening string literal, e.g. `DBMS_ASSERT.X(p) || p_raw`)
+    // yields one `<expr>` placeholder and one [`ExprInterpolation`]
+    // per operand. Tagging each operand independently keeps
+    // per-interpolation coverage honest — an unsanitised operand
+    // adjacent to an asserted one is no longer hidden behind the
+    // asserted one (oracle-rwjl.12). Splitting respects paren depth
+    // so a `DBMS_ASSERT(a || b)` argument is never torn apart.
     let mut fragments: Vec<String> = Vec::new();
     let mut expr_interpolations: Vec<ExprInterpolation> = Vec::new();
     let mut in_string = false;
     let mut current_lit = String::new();
     let mut current_expr = String::new();
     let mut current_expr_open = false;
+    let flush_expr_run =
+        |run: &str, frags: &mut Vec<String>, interps: &mut Vec<ExprInterpolation>| {
+            for operand in split_top_level_concat(run) {
+                frags.push("<expr>".into());
+                interps.push(ExprInterpolation {
+                    sanitised: run_is_dbms_assert(operand),
+                });
+            }
+        };
     let mut chars = body.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\'' {
@@ -220,10 +234,7 @@ fn extract_execute_immediate(
                 in_string = false;
             } else {
                 if current_expr_open {
-                    fragments.push("<expr>".into());
-                    expr_interpolations.push(ExprInterpolation {
-                        sanitised: run_is_dbms_assert(&current_expr),
-                    });
+                    flush_expr_run(&current_expr, &mut fragments, &mut expr_interpolations);
                     current_expr.clear();
                     current_expr_open = false;
                 }
@@ -241,10 +252,7 @@ fn extract_execute_immediate(
         }
     }
     if current_expr_open {
-        fragments.push("<expr>".into());
-        expr_interpolations.push(ExprInterpolation {
-            sanitised: run_is_dbms_assert(&current_expr),
-        });
+        flush_expr_run(&current_expr, &mut fragments, &mut expr_interpolations);
     }
 
     let candidate_objects = candidate_objects_from_fragments(&fragments);
@@ -252,11 +260,52 @@ fn extract_execute_immediate(
     (fragments, candidate_objects, uses_binds, expr_interpolations)
 }
 
-/// True iff a single non-literal concatenation run routed its
-/// value through a `DBMS_ASSERT.<fn>(...)` sanitiser. Purely
-/// textual — the run is one `||`-delimited expression chunk, so a
-/// `DBMS_ASSERT.` prefix means the substituted identifier is
-/// bounded by the asserted name.
+/// Split a non-literal concatenation run into its top-level `||`
+/// operands, returning each operand trimmed of surrounding
+/// whitespace with empty operands dropped. The split honours paren
+/// depth so a `||` *inside* a call argument (e.g.
+/// `DBMS_ASSERT.SIMPLE_SQL_NAME(a || b)`) is not treated as an
+/// operand separator. The run is always outside any SQL string
+/// literal (the walker handles `'...'` separately), so a single
+/// quote never appears here and only paren depth matters.
+fn split_top_level_concat(run: &str) -> Vec<&str> {
+    let bytes = run.as_bytes();
+    let mut operands: Vec<&str> = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b'|' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'|' => {
+                let piece = run[start..i].trim();
+                if !piece.is_empty() {
+                    operands.push(piece);
+                }
+                i += 2;
+                start = i;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let piece = run[start..].trim();
+    if !piece.is_empty() {
+        operands.push(piece);
+    }
+    operands
+}
+
+/// True iff a single top-level `||` operand of a non-literal
+/// concatenation run routed its value through a
+/// `DBMS_ASSERT.<fn>(...)` sanitiser. Purely textual: the caller
+/// passes one operand (already split out by
+/// [`split_top_level_concat`]), so a `DBMS_ASSERT.` mention means
+/// *this* substituted identifier is bounded by the asserted name —
+/// it can no longer claim sanitisation for an adjacent operand that
+/// merely shared the same `||` run.
 fn run_is_dbms_assert(run: &str) -> bool {
     run.to_ascii_uppercase().contains("DBMS_ASSERT.")
 }
@@ -497,6 +546,75 @@ mod tests {
         assert!(
             ev.expr_interpolations.iter().all(|e| e.sanitised),
             "every interpolation should be sanitised: {:?}",
+            ev.expr_interpolations
+        );
+    }
+
+    /// Regression for oracle-rwjl.12: when an asserted identifier and
+    /// a raw identifier are concatenated *adjacently* with `||` (no
+    /// intervening string literal), the recogniser must split the run
+    /// on the top-level `||` and tag each operand independently.
+    /// Before the fix the whole run collapsed into a single `<expr>`
+    /// tagged `sanitised:true` (a bare `contains("DBMS_ASSERT.")`),
+    /// falsely reporting the unsanitised `p_raw` operand as bounded.
+    #[test]
+    fn adjacent_concat_run_split_per_operand_sanitisation() {
+        let ev = recognise_dynamic_sql(
+            "EXECUTE IMMEDIATE 'SELECT * FROM ' || DBMS_ASSERT.SIMPLE_SQL_NAME(p_tab) || p_raw || ' WHERE 1=1';",
+            "pkg.proc:60",
+        )
+        .unwrap();
+        // The asserted-then-raw run must yield TWO interpolations, not
+        // one collapsed run.
+        assert_eq!(
+            ev.expr_interpolations.len(),
+            2,
+            "adjacent `||` operands must each get their own interpolation: {:?}",
+            ev.expr_interpolations
+        );
+        // One placeholder per operand keeps the documented 1:1
+        // fragment↔interpolation correspondence.
+        assert_eq!(
+            ev.fragments.iter().filter(|f| *f == "<expr>").count(),
+            2,
+            "one <expr> placeholder per operand: {:?}",
+            ev.fragments
+        );
+        assert!(
+            ev.expr_interpolations.iter().any(|e| e.sanitised),
+            "DBMS_ASSERT operand should be sanitised: {:?}",
+            ev.expr_interpolations
+        );
+        assert!(
+            ev.expr_interpolations.iter().any(|e| !e.sanitised),
+            "bare p_raw operand must be unsanitised, not hidden behind the asserted one: {:?}",
+            ev.expr_interpolations
+        );
+    }
+
+    /// A `||` *inside* a DBMS_ASSERT argument must not be treated as a
+    /// top-level operand separator: the whole call (with its nested
+    /// concatenation) is one sanitised operand. (No embedded string
+    /// literal here — the outer walker splits the run at `'...'`, so
+    /// the paren-depth logic only governs literal-free runs.)
+    #[test]
+    fn concat_inside_assert_argument_not_split() {
+        let ev = recognise_dynamic_sql(
+            "EXECUTE IMMEDIATE 'DROP TABLE ' || DBMS_ASSERT.SIMPLE_SQL_NAME(p_schema || p_sep || p_tab);",
+            "pkg.proc:61",
+        )
+        .unwrap();
+        // The nested `||` lives inside the call parens, so the run is a
+        // single asserted operand.
+        assert_eq!(
+            ev.expr_interpolations.len(),
+            1,
+            "nested `||` inside the assert arg must not split the run: {:?}",
+            ev.expr_interpolations
+        );
+        assert!(
+            ev.expr_interpolations[0].sanitised,
+            "the lone operand is the DBMS_ASSERT call and is sanitised: {:?}",
             ev.expr_interpolations
         );
     }
