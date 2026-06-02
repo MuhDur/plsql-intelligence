@@ -28,8 +28,12 @@
 //! min_confidence = "medium"
 //!
 //! # Refuse to gate if any uncertainty record carries a reason in
-//! # this list (e.g. you want to block on opaque dynamic SQL).
-//! blocking_unknown_reasons = ["OpaqueDynamicSql", "DbLinkReference"]
+//! # this list (e.g. you want to block on opaque dynamic SQL). Each
+//! # entry must be a canonical `UnknownReason` variant name as emitted
+//! # by the analyzer (`DynamicSqlOpaque`, `DbLinkRemoteObject`, …); an
+//! # unrecognised name is rejected at parse time rather than silently
+//! # never matching.
+//! blocking_unknown_reasons = ["DynamicSqlOpaque", "DbLinkRemoteObject"]
 //! ```
 //!
 //! ## /oracle evidence
@@ -131,9 +135,67 @@ pub enum GateError {
 
 /// Load a policy from a TOML string. The CLI pairs this with a file
 /// reader.
+///
+/// After deserialization the policy is validated: every entry of
+/// `blocking_unknown_reasons` must be a canonical [`UnknownReason`]
+/// variant name (the exact strings [`unknown_reason_name`] emits). An
+/// unrecognised name — e.g. a typo or a stale `"OpaqueDynamicSql"`
+/// copied from old docs — is a [`GateError::Parse`] rather than an
+/// entry that silently never matches and lets the gate fail open
+/// (oracle-qm3q.7).
 pub fn parse_policy(toml_text: &str) -> Result<GatePolicy, GateError> {
-    toml::from_str(toml_text).map_err(|e| GateError::Parse(e.to_string()))
+    let policy: GatePolicy =
+        toml::from_str(toml_text).map_err(|e| GateError::Parse(e.to_string()))?;
+    validate_policy(&policy)?;
+    Ok(policy)
 }
+
+/// Reject policies that name an unknown-reason matcher string the
+/// analyzer never emits. Without this guard a mistyped
+/// `blocking_unknown_reasons` entry would compare-not-equal to every
+/// emitted reason, so the rule never fires and the gate fails open
+/// while the operator believes the changeset is blocked.
+fn validate_policy(policy: &GatePolicy) -> Result<(), GateError> {
+    for reason in &policy.blocking_unknown_reasons {
+        if !is_known_reason_name(reason) {
+            return Err(GateError::Parse(format!(
+                "blocking_unknown_reasons contains unknown reason {reason:?}; \
+                 valid reasons are: {valid}",
+                valid = ALL_REASON_NAMES.join(", "),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `true` when `name` is a canonical [`UnknownReason`] variant name as
+/// emitted by [`unknown_reason_name`]. Matching is exact and
+/// case-sensitive — the policy file stores the variant name verbatim.
+#[must_use]
+fn is_known_reason_name(name: &str) -> bool {
+    ALL_REASON_NAMES.contains(&name)
+}
+
+/// Every canonical [`UnknownReason`] name a policy may list under
+/// `blocking_unknown_reasons`. Kept in lock-step with
+/// [`unknown_reason_name`] by the `all_reason_names_match_emitter`
+/// test, which fails if a new enum variant is added without a matching
+/// entry here.
+const ALL_REASON_NAMES: &[&str] = &[
+    "DynamicSqlOpaque",
+    "DbLinkRemoteObject",
+    "WrappedSource",
+    "MissingCatalogObject",
+    "MissingPackageBody",
+    "ConditionalCompilationBranch",
+    "EditionedObject",
+    "InvokerRightsRuntimeResolution",
+    "RuntimeGrantOrRole",
+    "UnsupportedDialectFeature",
+    "ParserRecoveryRegion",
+    "AnalysisRecursionLimit",
+    "ResponseSanitized",
+];
 
 // `PLSQL-CICD-014` (oracle-vvxw): PR-comment JSON output. The shape is
 // a typed envelope with format/schema_id/schema_version (matching the
@@ -265,6 +327,13 @@ fn build_pr_comment_body(decision: &GateDecision, headline: &str) -> String {
 /// decision is `allowed: false` if any rule fires, with one
 /// `GateFailure` per rule (we collect them all so the operator sees
 /// every reason in one CI run rather than fixing-then-re-running).
+///
+/// Scope note (oracle-qm3q.7 / .17): `max_invalidations` counts the
+/// rows in `prediction.predicted_invalidations`. Today `predict`
+/// emits only direct (`distance == 1`) invalidations — there is no
+/// transitive lineage walk — so this cap bounds *direct* invalidations
+/// only. If transitive (`distance > 1`) rows are introduced later they
+/// will be counted by the same length check.
 #[must_use]
 pub fn run_gate(prediction: &InvalidationPrediction, policy: &GatePolicy) -> GateDecision {
     let mut failures: Vec<GateFailure> = Vec::new();
@@ -594,6 +663,117 @@ mod tests {
         let toml = "max_invalidations = 50\nfoobar = \"bad\"\n";
         let err = parse_policy(toml).unwrap_err();
         assert!(matches!(err, GateError::Parse(_)));
+    }
+
+    /// **oracle-qm3q.7 regression — fail-open on a stale reason name.**
+    /// The old docstring advertised `blocking_unknown_reasons =
+    /// ["OpaqueDynamicSql", ...]`, but the analyzer emits
+    /// `DynamicSqlOpaque`. An operator copying that example got a
+    /// matcher string that never equals any emitted reason, so the
+    /// rule never fired and opaque dynamic SQL sailed through the gate
+    /// while the operator believed it was blocked. `parse_policy` must
+    /// now reject the unknown name at load time instead.
+    #[test]
+    fn parse_policy_rejects_stale_blocking_reason_name() {
+        // The exact stale name from the pre-fix docstring.
+        let toml = "blocking_unknown_reasons = [\"OpaqueDynamicSql\"]\n";
+        let err = parse_policy(toml).unwrap_err();
+        let GateError::Parse(msg) = err else {
+            panic!("expected GateError::Parse, got {err:?}");
+        };
+        assert!(
+            msg.contains("OpaqueDynamicSql"),
+            "error should name the offending entry: {msg}"
+        );
+        assert!(
+            msg.contains("DynamicSqlOpaque"),
+            "error should list the valid canonical names: {msg}"
+        );
+
+        // A second-typo reason ("DbLinkReference" — also from the old
+        // docstring; only `DbLinkRemoteObject` is real) is rejected too.
+        assert!(matches!(
+            parse_policy("blocking_unknown_reasons = [\"DbLinkReference\"]\n").unwrap_err(),
+            GateError::Parse(_)
+        ));
+    }
+
+    /// Every canonical reason name `unknown_reason_name` can emit must
+    /// be accepted by `parse_policy`. This is the "passes after the
+    /// fix" half of the regression and guards against the validator
+    /// rejecting a name the matcher actually produces.
+    #[test]
+    fn parse_policy_accepts_every_canonical_reason_name() {
+        for name in ALL_REASON_NAMES {
+            let toml = format!("blocking_unknown_reasons = [{name:?}]\n");
+            let policy = parse_policy(&toml)
+                .unwrap_or_else(|e| panic!("canonical reason {name:?} must parse: {e}"));
+            assert_eq!(policy.blocking_unknown_reasons, vec![(*name).to_string()]);
+        }
+    }
+
+    /// **Anti-drift guard.** `ALL_REASON_NAMES` (used by the validator)
+    /// and `unknown_reason_name` (used by the matcher) must agree on
+    /// every `UnknownReason` variant. Iterating an explicit list of all
+    /// variants makes adding a variant without updating both sites a
+    /// compile error (non-exhaustive match) or a test failure — so the
+    /// docstring/matcher/validator can never silently diverge again.
+    #[test]
+    fn all_reason_names_match_emitter() {
+        use plsql_core::UnknownReason as R;
+        // Exhaustive: a new variant forces an update here (no `_` arm).
+        let all_variants = [
+            R::DynamicSqlOpaque,
+            R::DbLinkRemoteObject,
+            R::WrappedSource,
+            R::MissingCatalogObject,
+            R::MissingPackageBody,
+            R::ConditionalCompilationBranch,
+            R::EditionedObject,
+            R::InvokerRightsRuntimeResolution,
+            R::RuntimeGrantOrRole,
+            R::UnsupportedDialectFeature,
+            R::ParserRecoveryRegion,
+            R::AnalysisRecursionLimit,
+            R::ResponseSanitized,
+        ];
+        // Compile-time exhaustiveness: this match must cover every
+        // variant, mirroring `unknown_reason_name`.
+        for v in &all_variants {
+            let _: () = match v {
+                R::DynamicSqlOpaque
+                | R::DbLinkRemoteObject
+                | R::WrappedSource
+                | R::MissingCatalogObject
+                | R::MissingPackageBody
+                | R::ConditionalCompilationBranch
+                | R::EditionedObject
+                | R::InvokerRightsRuntimeResolution
+                | R::RuntimeGrantOrRole
+                | R::UnsupportedDialectFeature
+                | R::ParserRecoveryRegion
+                | R::AnalysisRecursionLimit
+                | R::ResponseSanitized => (),
+            };
+        }
+
+        // Every emitted name is in the allow-list…
+        let emitted: Vec<&'static str> =
+            all_variants.iter().map(|v| unknown_reason_name(v)).collect();
+        for name in &emitted {
+            assert!(
+                is_known_reason_name(name),
+                "{name} is emitted by unknown_reason_name but missing from ALL_REASON_NAMES"
+            );
+        }
+        // …and the allow-list has no extras the matcher cannot emit.
+        for name in ALL_REASON_NAMES {
+            assert!(
+                emitted.contains(name),
+                "{name} is in ALL_REASON_NAMES but unknown_reason_name never emits it"
+            );
+        }
+        assert_eq!(emitted.len(), ALL_REASON_NAMES.len());
     }
 
     #[test]

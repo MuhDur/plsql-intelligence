@@ -7,9 +7,17 @@
 //! emits, and the confidence band — so adding a new Oracle 23ai rule
 //! is one row, not a code re-architecture.
 //!
-//! When a lineage `DepGraph` is supplied (`predict_with_lineage`), the
-//! function walks dependents via the lineage crate's `impact()` and
-//! attaches each transitive dependent as a `PredictedInvalidation`.
+//! ## Scope: direct (single-hop) invalidations only
+//!
+//! Every row this module emits is `distance: 1` — the directly changed
+//! object. Transitive blast-radius (walking dependents through a
+//! lineage `DepGraph` via `plsql_lineage::impact()` and attaching each
+//! transitive dependent as a `distance > 1` `PredictedInvalidation`) is
+//! **not yet implemented here**: `plsql-cicd` does not depend on
+//! `plsql-lineage`, and there is no `predict_with_lineage` entry point.
+//! When transitive coverage lands it will be a separate, explicitly
+//! lineage-fed walker; until then callers must treat the gate's
+//! `max_invalidations` as a bound on *direct* invalidations only.
 
 use plsql_core::{Confidence, ConfidenceLevel, UnknownReason};
 
@@ -85,7 +93,9 @@ fn apply_oracle_invalidation_rules(
     let confidence = confidence_for_mode(mode);
     // Each match arm is one Oracle-specific invalidation rule. The
     // `distance: 1` annotation marks them as direct (single-hop)
-    // invalidations; transitive ones land via `predict_with_lineage`.
+    // invalidations. Transitive (`distance > 1`) rows are out of scope
+    // for this module — see the module-level docs; no lineage walk runs
+    // here.
     match changed.kind {
         ChangedObjectKind::PackageSpec => {
             out.predicted_invalidations.push(PredictedInvalidation {
@@ -463,6 +473,56 @@ mod tests {
             .map(|r| r.name.symbol().get())
             .collect();
         assert_eq!(symbols, vec![100, 150, 200]);
+    }
+
+    /// **oracle-qm3q.17 regression — single-hop scope is honest.**
+    /// The module docs previously advertised a `predict_with_lineage`
+    /// transitive walker that does not exist; in reality every emitted
+    /// row is direct (`distance == 1`). Exercise every emitting
+    /// `ChangedObjectKind` and assert no row claims a transitive
+    /// distance, so the docs and behaviour cannot drift: if a real
+    /// lineage walk is wired into `predict` it will trip this test and
+    /// force the module docs / gate scope note to be updated
+    /// deliberately.
+    #[test]
+    fn predict_emits_only_direct_distance_one_rows() {
+        let emitting_kinds = vec![
+            ChangedObjectKind::PackageSpec,
+            ChangedObjectKind::StandaloneRoutineSignature,
+            ChangedObjectKind::TableAdditiveDdl,
+            ChangedObjectKind::TableDestructiveDdl,
+            ChangedObjectKind::TypeEvolution,
+            ChangedObjectKind::SynonymRetargeting,
+            ChangedObjectKind::GrantOrRevoke,
+            ChangedObjectKind::EditionedObjectChange,
+            ChangedObjectKind::MaterializedViewRefreshAffecting,
+            ChangedObjectKind::ViewDefinitionChange,
+            ChangedObjectKind::TriggerChange,
+            ChangedObjectKind::OtherKnownKind {
+                object_type: String::from("CONTEXT"),
+            },
+        ];
+        let objects: Vec<ChangedObject> = emitting_kinds
+            .into_iter()
+            .enumerate()
+            .map(|(i, kind)| changed(kind, 500 + i as u64))
+            .collect();
+        let changeset = ChangeSet {
+            objects,
+            ..ChangeSet::empty()
+        };
+        let prediction = predict(&changeset, PredictMode::CatalogAware);
+        assert!(
+            !prediction.predicted_invalidations.is_empty(),
+            "every emitting kind should produce at least one row"
+        );
+        for row in &prediction.predicted_invalidations {
+            assert_eq!(
+                row.distance, 1,
+                "predict only emits direct (single-hop) invalidations; \
+                 transitive distance>1 is not yet implemented (oracle-qm3q.17): {row:?}"
+            );
+        }
     }
 
     #[test]
