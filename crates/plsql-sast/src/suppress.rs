@@ -117,18 +117,91 @@ fn parse_rule_list(rest: &str) -> RuleSet {
     rs
 }
 
+/// Byte offset of the first `--` on `raw` that begins a *genuine*
+/// Oracle line comment, skipping any `--` that lives inside a
+/// single-quoted string literal or a `/* … */` block comment.
+///
+/// Oracle lexical rules honoured:
+/// * single-quoted strings close on the next `'` that is not part of
+///   a doubled `''` escape; a `--` inside one is not a comment;
+/// * block comments run `/*` … `*/` (Oracle does not nest them) and
+///   may span lines, so the open state is threaded across calls via
+///   `in_block`;
+/// * a `'` or `/*` that opens inside a comment, and a `--` or `/*`
+///   that opens inside a string, are inert — whichever construct
+///   opens first at a given offset wins.
+///
+/// `in_block` carries the multi-line block-comment state in and out:
+/// it is `true` on entry when a prior line left a block comment
+/// open, and is updated to reflect the state at end-of-line.
+fn first_line_comment_offset(raw: &str, in_block: &mut bool) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    let mut in_string = false;
+    while i < bytes.len() {
+        if *in_block {
+            // Inside a block comment: only `*/` matters.
+            if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                *in_block = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if in_string {
+            // Inside a single-quoted literal: only `'` matters, and a
+            // doubled `''` is an escaped quote that stays in-string.
+            if bytes[i] == b'\'' {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                } else {
+                    in_string = false;
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        // Bare code: whichever construct opens first at `i` wins.
+        match bytes[i] {
+            b'-' if bytes.get(i + 1) == Some(&b'-') => return Some(i),
+            b'\'' => {
+                in_string = true;
+                i += 1;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                *in_block = true;
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 /// Scan one file's source for inline directives. 1-based lines.
 fn index_source(source: &str) -> InlineIndex {
     let mut idx = InlineIndex::default();
+    // Multi-line `/* … */` block-comment state, threaded line to line
+    // so a marker buried in a block comment never hosts a directive.
+    let mut in_block = false;
     for (i, raw) in source.lines().enumerate() {
         let line_no = (i + 1) as u32;
         let lower = raw.to_ascii_lowercase();
+        // Resolve the genuine line-comment start first so the block
+        // state is advanced for *every* line, even ones with no
+        // marker (otherwise an open block comment would leak).
+        let cpos = first_line_comment_offset(raw, &mut in_block);
         let Some(mpos) = lower.find(MARKER) else {
             continue;
         };
-        // Require it to be inside a `--` comment (Oracle line
-        // comment). Anything before `--` is code we ignore.
-        let Some(cpos) = raw.find("--") else {
+        // Require the marker to sit inside a genuine `--` line comment
+        // (string-/block-comment aware). A `--` buried in a literal or
+        // block comment is not a comment start and cannot host a
+        // directive. Fail-closed: no genuine comment ⇒ no directive.
+        let Some(cpos) = cpos else {
             continue;
         };
         if mpos < cpos {
@@ -529,6 +602,167 @@ mod tests {
             "f.sql",
             0,
             (0, 0),
+        )]);
+        let out = apply_suppressions(
+            &r,
+            &SuppressionConfig::default(),
+            &srcmap(&[("f.sql", src)]),
+        );
+        assert!(out.kept.findings.is_empty());
+        assert_eq!(out.suppressed.len(), 1);
+    }
+
+    #[test]
+    fn marker_with_dashes_inside_string_does_not_suppress() {
+        // Regression for oracle-ajm2.7: a `--` plus the marker buried
+        // inside a single-quoted literal must NOT be read as a real
+        // line comment. The trailing-space sibling of the report's
+        // payload (`'-- plsql-scan:ignore SEC001 '`) parses a clean
+        // `SEC001` token, so the *only* thing standing between it and a
+        // file-wide fail-open is comment-start awareness. Covers the
+        // precise-line finding here and the line-0 path below.
+        let src = "v := '-- plsql-scan:ignore SEC001 ';\n";
+        let r = report(vec![finding(
+            "SEC001",
+            Severity::Critical,
+            "inj",
+            "f.sql",
+            1,
+            (0, 1),
+        )]);
+        let out = apply_suppressions(
+            &r,
+            &SuppressionConfig::default(),
+            &srcmap(&[("f.sql", src)]),
+        );
+        assert_eq!(
+            out.kept.findings.len(),
+            1,
+            "a directive inside a string literal must not suppress"
+        );
+        assert!(out.suppressed.is_empty());
+    }
+
+    #[test]
+    fn wildcard_marker_inside_string_does_not_suppress_line0() {
+        // The most dangerous variant: an in-string wildcard directive
+        // would silence *every* span-less (line-0) finding file-wide
+        // via the fallback path. Must stay fail-closed.
+        let src = "v := '-- plsql-scan:ignore * ';\n";
+        let r = report(vec![finding(
+            "SEC006",
+            Severity::High,
+            "grant to public",
+            "f.sql",
+            0, // span-less → file-scoped fallback
+            (0, 0),
+        )]);
+        let out = apply_suppressions(
+            &r,
+            &SuppressionConfig::default(),
+            &srcmap(&[("f.sql", src)]),
+        );
+        assert_eq!(
+            out.kept.findings.len(),
+            1,
+            "an in-string wildcard must not silence line-0 findings"
+        );
+        assert!(out.suppressed.is_empty());
+    }
+
+    #[test]
+    fn marker_inside_block_comment_does_not_suppress() {
+        // A `/* … */` block comment is not a `--` line comment, so a
+        // marker carried inside one cannot host a directive.
+        let src = "/* -- plsql-scan:ignore SEC001 */\n";
+        let r = report(vec![finding(
+            "SEC001",
+            Severity::Critical,
+            "inj",
+            "f.sql",
+            1,
+            (0, 1),
+        )]);
+        let out = apply_suppressions(
+            &r,
+            &SuppressionConfig::default(),
+            &srcmap(&[("f.sql", src)]),
+        );
+        assert_eq!(
+            out.kept.findings.len(),
+            1,
+            "a directive inside a block comment must not suppress"
+        );
+        assert!(out.suppressed.is_empty());
+    }
+
+    #[test]
+    fn marker_inside_multiline_block_comment_does_not_suppress() {
+        // Block comments may span lines; the open state is threaded
+        // across lines so a marker on an interior line stays inert.
+        let src = "/* opening\n-- plsql-scan:ignore *\nstill comment */\n";
+        let r = report(vec![finding(
+            "SEC006",
+            Severity::High,
+            "grant to public",
+            "f.sql",
+            0,
+            (0, 0),
+        )]);
+        let out = apply_suppressions(
+            &r,
+            &SuppressionConfig::default(),
+            &srcmap(&[("f.sql", src)]),
+        );
+        assert_eq!(
+            out.kept.findings.len(),
+            1,
+            "a directive inside a multi-line block comment must not suppress"
+        );
+        assert!(out.suppressed.is_empty());
+    }
+
+    #[test]
+    fn legitimate_directive_after_string_with_dashes_still_suppresses() {
+        // The string contains a `--` but no marker; the *real* line
+        // comment after it carries the directive and must still work.
+        let src = "v := 'foo -- bar' || baz; -- plsql-scan:ignore SEC001\n";
+        let r = report(vec![finding(
+            "SEC001",
+            Severity::Critical,
+            "inj",
+            "f.sql",
+            1,
+            (0, 1),
+        )]);
+        let out = apply_suppressions(
+            &r,
+            &SuppressionConfig::default(),
+            &srcmap(&[("f.sql", src)]),
+        );
+        assert!(
+            out.kept.findings.is_empty(),
+            "a genuine directive after a string containing `--` must suppress"
+        );
+        assert_eq!(out.suppressed.len(), 1);
+        assert_eq!(
+            out.suppressed[0].reason,
+            SuppressionReason::InlineSameLine { comment_line: 1 },
+        );
+    }
+
+    #[test]
+    fn directive_after_closing_block_comment_still_suppresses() {
+        // A block comment that closes mid-line, followed by a genuine
+        // `--` directive on the same line, must still register.
+        let src = "/* note */ x; -- plsql-scan:ignore SEC001\n";
+        let r = report(vec![finding(
+            "SEC001",
+            Severity::Critical,
+            "inj",
+            "f.sql",
+            1,
+            (0, 1),
         )]);
         let out = apply_suppressions(
             &r,
