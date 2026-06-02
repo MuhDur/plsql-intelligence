@@ -2203,8 +2203,17 @@ pub fn classify_rename(changes: &SemanticChangeSet, hints: &RenameHints) -> Rena
 
     let mut candidates: Vec<RenameCandidate> = Vec::new();
 
+    // NOTE: gate each pairing on a non-mutating `contains` check for BOTH
+    // endpoints before removing either. `deletes.remove(before) && creates.remove(after)`
+    // would short-circuit: the left `remove` mutates the set, and on a false
+    // right operand `before` is left consumed-but-unreported, so a genuinely
+    // dropped object silently vanishes from `unmatched_deletes` (and never
+    // surfaces as a rename candidate either). Only mutate once a full pair is
+    // confirmed so unmatched endpoints stay in their bucket (plan §10.3).
     for (before, after) in &hints.explicit_mappings {
-        if deletes.remove(before) && creates.remove(after) {
+        if deletes.contains(before) && creates.contains(after) {
+            deletes.remove(before);
+            creates.remove(after);
             candidates.push(RenameCandidate {
                 before_logical_id: before.clone(),
                 after_logical_id: after.clone(),
@@ -2214,7 +2223,9 @@ pub fn classify_rename(changes: &SemanticChangeSet, hints: &RenameHints) -> Rena
         }
     }
     for (before, after) in &hints.persistent_id_pairs {
-        if deletes.remove(before) && creates.remove(after) {
+        if deletes.contains(before) && creates.contains(after) {
+            deletes.remove(before);
+            creates.remove(after);
             candidates.push(RenameCandidate {
                 before_logical_id: before.clone(),
                 after_logical_id: after.clone(),
@@ -2227,7 +2238,9 @@ pub fn classify_rename(changes: &SemanticChangeSet, hints: &RenameHints) -> Rena
         if hint.similarity < GIT_RENAME_THRESHOLD {
             continue;
         }
-        if deletes.remove(&hint.from) && creates.remove(&hint.to) {
+        if deletes.contains(&hint.from) && creates.contains(&hint.to) {
+            deletes.remove(&hint.from);
+            creates.remove(&hint.to);
             candidates.push(RenameCandidate {
                 before_logical_id: hint.from.clone(),
                 after_logical_id: hint.to.clone(),
@@ -4932,6 +4945,75 @@ mod impact_tests {
         let c = &out.candidates[0];
         assert_eq!(c.after_logical_id, "billing.new_pkg");
         assert!(matches!(c.evidence, RenameEvidence::Explicit));
+    }
+
+    // oracle-clgt.15 — a half-matched hint (valid `before`, non-existent
+    // `after`) must NOT silently consume the dropped object. The short-circuit
+    // `deletes.remove(before) && creates.remove(after)` used to mutate the
+    // delete set on the false branch, so `billing.old_pkg` vanished from
+    // `unmatched_deletes` entirely — neither a rename candidate nor an
+    // unmatched delete. With the fix the object stays in its bucket.
+    #[test]
+    fn classify_rename_half_matched_explicit_keeps_delete() {
+        let cs = rename_changeset();
+        let mut hints = RenameHints::default();
+        // `after` is a typo that matches no Created object.
+        hints
+            .explicit_mappings
+            .insert("billing.old_pkg".into(), "billing.TYPO".into());
+        let out = classify_rename(&cs, &hints);
+        assert!(
+            out.candidates.is_empty(),
+            "no rename candidate without a full pair"
+        );
+        assert!(
+            out.unmatched_deletes.contains(&"billing.old_pkg".to_string()),
+            "dropped object must survive in unmatched_deletes, got {:?}",
+            out.unmatched_deletes
+        );
+        // Nothing was consumed: both deletes and both creates stay unmatched.
+        assert_eq!(out.unmatched_deletes.len(), 2);
+        assert_eq!(out.unmatched_creates.len(), 2);
+    }
+
+    #[test]
+    fn classify_rename_half_matched_persistent_id_keeps_delete() {
+        let cs = rename_changeset();
+        let mut hints = RenameHints::default();
+        hints
+            .persistent_id_pairs
+            .push(("billing.old_pkg".into(), "billing.TYPO".into()));
+        let out = classify_rename(&cs, &hints);
+        assert!(out.candidates.is_empty());
+        assert!(
+            out.unmatched_deletes.contains(&"billing.old_pkg".to_string()),
+            "dropped object must survive in unmatched_deletes, got {:?}",
+            out.unmatched_deletes
+        );
+        assert_eq!(out.unmatched_deletes.len(), 2);
+        assert_eq!(out.unmatched_creates.len(), 2);
+    }
+
+    #[test]
+    fn classify_rename_half_matched_git_rename_keeps_delete() {
+        let cs = rename_changeset();
+        let hints = RenameHints {
+            git_renames: vec![GitRenameHint {
+                from: "billing.old_pkg".into(),
+                to: "billing.TYPO".into(),
+                similarity: 95,
+            }],
+            ..RenameHints::default()
+        };
+        let out = classify_rename(&cs, &hints);
+        assert!(out.candidates.is_empty());
+        assert!(
+            out.unmatched_deletes.contains(&"billing.old_pkg".to_string()),
+            "dropped object must survive in unmatched_deletes, got {:?}",
+            out.unmatched_deletes
+        );
+        assert_eq!(out.unmatched_deletes.len(), 2);
+        assert_eq!(out.unmatched_creates.len(), 2);
     }
 
     // -----------------------------------------------------------------
