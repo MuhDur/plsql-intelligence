@@ -148,10 +148,29 @@ fn scan_declarations(source: &str, file_id: FileId) -> Vec<AstDecl> {
             lower_unknown_create(bytes, source, file_id, create_start, pos)
         };
 
+        // Advance past the ENTIRE just-lowered declaration using the
+        // depth-aware end its lowering helper already computed (the decl span
+        // end), NOT a fresh depth-0 `advance_past_statement_end` from after the
+        // kind keyword. The shallow recompute stopped at the first NESTED `END;`
+        // inside a 2+ subprogram PACKAGE/TYPE BODY, leaving the cursor inside the
+        // body and re-exposing its interior to this top-level keyword scan —
+        // which then fabricated a phantom top-level `AstDecl::Ddl` from a DDL
+        // verb buried in the body (e.g. `EXECUTE IMMEDIATE 'DROP TABLE secret'`)
+        // (oracle-y54x.4). The span end is the depth-aware
+        // `advance_to_decl_end_with_depth` result, so it covers the whole
+        // package/type body and never lands inside a nested routine.
+        use plsql_parser::Spanned;
+        let decl_end = decl.span().end.offset as usize;
         decls.push(decl);
 
-        // Advance past this declaration to avoid re-matching
-        pos = advance_past_statement_end(bytes, pos);
+        // Forward-progress guard: if the computed end is not strictly past the
+        // current cursor (a degenerate/zero-width span), fall back to the
+        // shallow advance so the loop can never stall or loop forever.
+        pos = if decl_end > pos {
+            decl_end
+        } else {
+            advance_past_statement_end(bytes, pos)
+        };
     }
 
     decls

@@ -313,9 +313,16 @@ fn delete_target(upper: &str, raw: &str) -> Option<(Option<String>, String, Stri
     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
         i += 1;
     }
-    // Skip an optional `FROM` keyword (whole-word).
-    if upper[i..].len() >= 4
-        && &upper[i..i + 4] == "FROM"
+    // Skip an optional `FROM` keyword (whole-word). Compare on the raw
+    // byte slice (`bytes` == `upper.as_bytes()`) so a multi-byte
+    // identifier immediately after `DELETE` (`DELETE é★ …`) can never
+    // slice across a UTF-8 char boundary: `i` is anchored to the start
+    // of an arbitrary user token here, not to a found ASCII delimiter,
+    // so a blind `upper[i..i + 4]` could land inside a codepoint and
+    // panic (oracle-y54x.3 char-boundary fix).
+    if bytes[i..]
+        .get(..4)
+        .is_some_and(|w| w.eq_ignore_ascii_case(b"FROM"))
         && (i + 4 >= bytes.len() || !is_ident_byte(bytes[i + 4]))
     {
         i += 4;
@@ -457,6 +464,18 @@ mod tests {
         assert_eq!(m.verb, SqlSemanticVerb::Delete);
         assert_eq!(m.tables[0].table, "STALE");
         assert_eq!(m.tables[0].usage, TableUsageKind::Write);
+    }
+
+    #[test]
+    fn delete_with_multibyte_first_token_does_not_panic() {
+        // oracle-y54x.3: delete_target()'s optional-FROM probe did a blind
+        // `upper[i..i + 4]` slice anchored at the start of the user token after
+        // `DELETE`. A multi-byte first token (`DELETE é★ …`) put `i + 4` inside a
+        // UTF-8 codepoint and panicked ("not a char boundary"). The byte-level
+        // `bytes[i..].get(..4)` check is char-boundary-safe. Resolving must not
+        // panic; the exact table extracted is irrelevant here.
+        let _ = resolve_sql("DELETE é★ WHERE x = 1");
+        let _ = resolve_sql("DELETE é★"); // no trailing tokens after the target
     }
 
     // oracle-rwjl.6: a DELETE whose WHERE reads a staging table via a

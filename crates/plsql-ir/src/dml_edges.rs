@@ -258,9 +258,15 @@ fn delete_target(raw: &str) -> Option<String> {
         i += 1;
     }
     i = skip_ws(bytes, i);
-    // Skip an optional `FROM` keyword (whole-word).
-    if raw[i..].len() >= 4
-        && raw[i..i + 4].eq_ignore_ascii_case("FROM")
+    // Skip an optional `FROM` keyword (whole-word). Compare on the raw
+    // byte slice so a multi-byte identifier immediately after `DELETE`
+    // (`DELETE é★ …`) can never slice across a UTF-8 char boundary:
+    // here `i` is anchored to the start of an arbitrary user token, not
+    // to a found ASCII delimiter, so a blind `raw[i..i + 4]` could land
+    // inside a codepoint and panic (oracle-y54x.2 char-boundary fix).
+    if bytes[i..]
+        .get(..4)
+        .is_some_and(|w| w.eq_ignore_ascii_case(b"FROM"))
         && (i + 4 >= bytes.len() || !is_ident_byte(bytes[i + 4]))
     {
         i = skip_ws(bytes, i + 4);
@@ -373,6 +379,20 @@ mod tests {
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].table, "EMPLOYEES");
         assert_eq!(a[0].access, AccessKind::Read);
+    }
+
+    #[test]
+    fn delete_with_multibyte_first_token_does_not_panic() {
+        // oracle-y54x.2: delete_target()'s optional-FROM probe did a blind
+        // `raw[i..i + 4]` slice anchored at the start of the user token after
+        // `DELETE`. A multi-byte first token (`DELETE é★ …`) put `i + 4` inside a
+        // UTF-8 codepoint and panicked ("not a char boundary"). The byte-level
+        // `bytes[i..].get(..4)` check is char-boundary-safe — extraction must
+        // complete without panicking.
+        let s = lower_statement_body("DELETE é★ WHERE x = 1;");
+        let _ = extract_table_accesses(&s);
+        let s2 = lower_statement_body("DELETE é★"); // no trailing tokens
+        let _ = extract_table_accesses(&s2);
     }
 
     #[test]
