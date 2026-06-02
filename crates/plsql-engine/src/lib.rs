@@ -900,7 +900,28 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
         // Use body_statements from the real ANTLR parse tree if populated
         // (non-empty), otherwise fall back to the text scanner for each
         // declaration's source span.
-        for (decl_idx, decl) in lowered.declarations.iter().enumerate() {
+        //
+        // `ast.body_statements` is parallel with `ast.root.declarations`
+        // (the *unfiltered* parser output), NOT with `lowered.declarations`
+        // (a filtered subset — DDL/Unknown decls are dropped during
+        // lowering, see plsql_ir::lower_top_level). Indexing the parser-
+        // parallel bodies with the *lowered* loop index therefore misattributes
+        // a later object's body to an earlier slot whenever a dropped
+        // (DDL/Unknown) declaration precedes a real one, silently corrupting
+        // Calls/Reads/Writes edges (oracle-qm3q.9). Pair them by source span
+        // instead: each lowered Declaration carries the same span the parser
+        // recorded on its AstDecl (lower_top_level threads it through
+        // make_common), so a span-keyed map recovers the correct body
+        // regardless of how many decls were filtered out ahead of it.
+        let body_by_span: std::collections::HashMap<plsql_core::Span, &Vec<plsql_parser::ast::AstStatement>> =
+            ast.root
+                .declarations
+                .iter()
+                .map(plsql_parser::ast::Spanned::span)
+                .zip(ast.body_statements.iter())
+                .collect();
+
+        for decl in &lowered.declarations {
             let caller_id_str = interner
                 .resolve(decl.common().name)
                 .unwrap_or("")
@@ -910,9 +931,12 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
             };
 
             // Get body statements: prefer real parse-tree lowering, fall back
-            // to text-scanner on the span slice.
-            let body_stmts: Vec<plsql_ir::Statement> = if let Some(ast_stmts) =
-                ast.body_statements.get(decl_idx).filter(|s| !s.is_empty())
+            // to text-scanner on the span slice. Look the parse-tree body up
+            // by span (not loop position) — see the note above.
+            let body_stmts: Vec<plsql_ir::Statement> = if let Some(ast_stmts) = body_by_span
+                .get(&decl.common().span)
+                .copied()
+                .filter(|s| !s.is_empty())
             {
                 // Convert AstStatement → plsql_ir::Statement.
                 ast_stmts_to_ir(ast_stmts)
@@ -1679,6 +1703,93 @@ mod tests {
                 .iter()
                 .map(|e| e.kind)
                 .collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// oracle-qm3q.9 regression: when a dropped top-level declaration
+    /// (a CREATE TABLE DDL, which `lower_top_level` filters out) precedes
+    /// two real procedures, the parser-parallel `ast.body_statements`
+    /// array no longer aligns positionally with the *filtered*
+    /// `lowered.declarations`. The old code indexed `body_statements`
+    /// with the lowered loop index, so P2 (lowered[1]) picked up P1's
+    /// body (body_statements[1], because the DDL occupies body_statements[0]),
+    /// and P2 was attributed a Writes edge to P1's table. Pairing by span
+    /// fixes it: P2 must write its OWN table (T2), never P1's (T1).
+    #[test]
+    fn qm3q9_ddl_before_two_procs_pairs_bodies_by_span_not_index() {
+        use plsql_depgraph::EdgeKind;
+
+        let base = std::env::temp_dir().join(format!(
+            "plsql-qm3q9-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let proj = base.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        // A DDL (dropped by lowering) ahead of two procedures, each
+        // writing a DISTINCT table. The DDL slot lands in
+        // body_statements[0], shifting the later (non-empty) bodies
+        // relative to the filtered lowered.declarations.
+        std::fs::write(
+            proj.join("deploy.sql"),
+            "CREATE TABLE foo (id NUMBER);\n/\n\
+             CREATE OR REPLACE PROCEDURE p1 IS BEGIN INSERT INTO t1 VALUES(1); END;\n/\n\
+             CREATE OR REPLACE PROCEDURE p2 IS BEGIN INSERT INTO t2 VALUES(2); END;\n/\n",
+        )
+        .unwrap();
+
+        let run = analyze_project(AnalysisRequest {
+            project_root: proj.clone(),
+            ..AnalysisRequest::default()
+        })
+        .expect("analyze ok");
+
+        // Map every Writes edge to (caller logical-id, table logical-id).
+        let writes: Vec<(String, String)> = run
+            .dep_graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Writes)
+            .filter_map(|e| {
+                let from = run.dep_graph.nodes.get(&e.from)?;
+                let to = run.dep_graph.nodes.get(&e.to)?;
+                Some((
+                    from.logical_id.as_str().to_string(),
+                    to.logical_id.as_str().to_string(),
+                ))
+            })
+            .collect();
+
+        // P2 must write T2 (its own body) ...
+        assert!(
+            writes
+                .iter()
+                .any(|(caller, table)| caller == "P2" && table == "T2"),
+            "P2 must Writes its own table T2, writes={writes:?}"
+        );
+        // ... and must NOT be credited with P1's table T1 (the bug).
+        assert!(
+            !writes
+                .iter()
+                .any(|(caller, table)| caller == "P2" && table == "T1"),
+            "P2 must NOT be attributed a Writes edge to P1's table T1, writes={writes:?}"
+        );
+        // Symmetrically, P1 keeps its own table and never picks up T2.
+        assert!(
+            writes
+                .iter()
+                .any(|(caller, table)| caller == "P1" && table == "T1"),
+            "P1 must Writes its own table T1, writes={writes:?}"
+        );
+        assert!(
+            !writes
+                .iter()
+                .any(|(caller, table)| caller == "P1" && table == "T2"),
+            "P1 must NOT be attributed a Writes edge to T2, writes={writes:?}"
         );
 
         let _ = std::fs::remove_dir_all(&base);
