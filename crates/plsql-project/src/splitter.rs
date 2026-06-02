@@ -133,6 +133,16 @@ pub fn split_script(text: &str) -> Vec<Statement> {
                 StatementKind::Sql
             };
             let raw = buffer.trim_end_matches('\n').to_string();
+            // A lone `/` with nothing buffered before it (e.g. the
+            // SQL*Plus re-execute idiom `...;` then a bare `/`) is a
+            // no-op terminator, not statement bytes — mirror the
+            // trailing-flush guard and skip the empty push so callers
+            // never see a phantom zero-width Statement.
+            if raw.is_empty() {
+                buffer.clear();
+                in_plsql = false;
+                continue;
+            }
             out.push(Statement {
                 kind,
                 line_start: buffer_start_line,
@@ -155,8 +165,14 @@ pub fn split_script(text: &str) -> Vec<Statement> {
 
         // Detect entry into a PL/SQL block — `BEGIN`, `DECLARE`,
         // or a CREATE-FUNCTION-style header. Cheap heuristic
-        // because we are not parsing yet.
-        if looks_like_plsql_opener(line_no_terminator) {
+        // because we are not parsing yet. Only honour the opener
+        // keyword when THIS line began at top level (not inside an
+        // open string literal or block comment): a continuation line
+        // of a multi-line string whose content happens to start with
+        // `BEGIN`/`DECLARE` is pure string bytes, not a block opener,
+        // and must not flip `in_plsql` (which would otherwise swallow
+        // the genuine top-level `;` terminator and merge statements).
+        if at_top_level_at_line_start && looks_like_plsql_opener(line_no_terminator) {
             in_plsql = true;
         }
 
@@ -490,5 +506,48 @@ mod tests {
         let s = split_script(src);
         assert_eq!(s.len(), 1);
         assert!(matches!(s[0].kind, StatementKind::Sql));
+    }
+
+    #[test]
+    fn plsql_opener_inside_multiline_string_does_not_flip_plsql_mode() {
+        // The continuation line of the INSERT's multi-line string
+        // literally starts with `BEGIN`, but it is pure string
+        // content — the opener heuristic must not fire while the
+        // string is still open, or the genuine top-level `;` on the
+        // third line is suppressed and the following SELECT is
+        // silently absorbed into a mislabeled PlSqlBlock.
+        let src = "INSERT INTO t VALUES ('line one\nBEGIN inside the string\nstill data');\nSELECT 2 FROM dual;\n";
+        let s = split_script(src);
+        assert_eq!(s.len(), 2, "string-content BEGIN must not merge: {s:?}");
+        assert!(matches!(s[0].kind, StatementKind::Sql));
+        assert!(matches!(s[1].kind, StatementKind::Sql));
+        assert!(s[0].raw.contains("BEGIN inside the string"));
+        assert!(s[1].raw.contains("SELECT 2"));
+    }
+
+    #[test]
+    fn plsql_declare_inside_multiline_string_does_not_flip_plsql_mode() {
+        // Same defect via the UPDATE-with-DECLARE-in-string variant.
+        let src = "UPDATE t SET c = ('row\nDECLARE this is data\nnot code') WHERE id = 1;\nSELECT 9 FROM dual;\n";
+        let s = split_script(src);
+        assert_eq!(s.len(), 2, "string-content DECLARE must not merge: {s:?}");
+        assert!(matches!(s[0].kind, StatementKind::Sql));
+        assert!(matches!(s[1].kind, StatementKind::Sql));
+        assert!(s[1].raw.contains("SELECT 9"));
+    }
+
+    #[test]
+    fn lone_slash_after_semicolon_terminated_sql_emits_no_phantom_statement() {
+        // The SQL*Plus re-execute idiom: a `;`-terminated statement
+        // followed by a bare `/` on its own line. The `/` re-runs the
+        // buffer (already flushed and empty) and must NOT yield a
+        // spurious zero-width Statement.
+        let src = "CREATE TABLE t (id NUMBER);\n/\n";
+        let s = split_script(src);
+        assert_eq!(s.len(), 1, "lone `/` after `;` must not add a phantom: {s:?}");
+        assert!(matches!(s[0].kind, StatementKind::Sql));
+        assert_eq!(s[0].raw, "CREATE TABLE t (id NUMBER);");
+        assert_eq!(s[0].line_start, 1);
+        assert_eq!(s[0].line_end, 1);
     }
 }
