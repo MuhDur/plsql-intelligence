@@ -9,7 +9,7 @@
 //!
 //! No PL/Scope dependency — the warning categorization is derived from the
 //! Oracle error-code ranges documented in the database error reference
-//! (PLW-05xxx = severe, PLW-06xxx = performance, PLW-07xxx = informational).
+//! (PLW-05xxx = severe, PLW-06xxx = informational, PLW-07xxx = performance).
 
 use plsql_catalog::{CatalogError, OracleConnection};
 use plsql_core::UnknownReason;
@@ -24,9 +24,10 @@ use crate::source::{ObjectError, run_get_errors};
 pub enum WarningCategory {
     /// Compile-blocker error / non-warning row from `USER_ERRORS`.
     Severe,
-    /// `PLW-06xxx` — performance hints.
+    /// `PLW-07xxx` — performance hints (e.g. NOCOPY benefit).
     Performance,
-    /// `PLW-07xxx` — informational hints / unused identifiers / etc.
+    /// `PLW-06xxx` — informational hints / unused identifiers / implicit
+    /// truncation / etc.
     Informational,
     /// Catch-all when the message number does not match any known range.
     Other,
@@ -41,12 +42,15 @@ pub fn categorize_error(error: &ObjectError) -> WarningCategory {
         return WarningCategory::Severe;
     }
     let code = error.message_number;
+    // Oracle's documented PLW ranges: SEVERE = PLW-05xxx (5000-5999),
+    // INFORMATIONAL = PLW-06xxx (6000-6249), PERFORMANCE = PLW-07xxx
+    // (7000-7249). The 6xxx and 7xxx buckets must NOT be swapped.
     if (5000..6000).contains(&code) {
         WarningCategory::Severe
     } else if (6000..7000).contains(&code) {
-        WarningCategory::Performance
-    } else if (7000..8000).contains(&code) {
         WarningCategory::Informational
+    } else if (7000..8000).contains(&code) {
+        WarningCategory::Performance
     } else {
         WarningCategory::Other
     }
@@ -306,7 +310,8 @@ mod tests {
                 message_number: 6010,
                 text: String::new(),
             }),
-            WarningCategory::Performance
+            WarningCategory::Informational,
+            "PLW-06xxx is Oracle INFORMATIONAL, not performance"
         );
         assert_eq!(
             categorize_error(&ObjectError {
@@ -319,7 +324,8 @@ mod tests {
                 message_number: 7203,
                 text: String::new(),
             }),
-            WarningCategory::Informational
+            WarningCategory::Performance,
+            "PLW-07203 (NOCOPY benefit) is Oracle PERFORMANCE, not informational"
         );
         assert_eq!(
             categorize_error(&ObjectError {
@@ -427,6 +433,22 @@ mod tests {
         assert_eq!(response.performance.len(), 1);
         assert_eq!(response.informational.len(), 1);
         assert!(response.other.is_empty());
+        // Pin each row to its correct Oracle-documented bucket so the
+        // 6xxx/7xxx mapping cannot silently invert again:
+        //   PLW-06005 (implicit truncation) is INFORMATIONAL,
+        //   PLW-07203 (NOCOPY benefit)       is PERFORMANCE.
+        assert_eq!(
+            response.informational[0].message_number, 6005,
+            "PLW-06005 must land in the informational bucket"
+        );
+        assert_eq!(
+            response.performance[0].message_number, 7203,
+            "PLW-07203 must land in the performance bucket"
+        );
+        assert_eq!(
+            response.severe[0].message_number, 201,
+            "PLS-00201 ERROR row must land in the severe bucket"
+        );
     }
 
     #[test]
