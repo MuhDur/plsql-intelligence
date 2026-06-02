@@ -223,8 +223,15 @@ pub fn build_deploy_plan(job_name: &str, ddl_bytes: &str) -> DeployDdlPlan {
         job = job,
         job_action_literal = job_action_literal,
     );
+    // oracle-rwjl.11: interpolate the already-''-escaped `job`, not the
+    // raw `job_name`. A job_name carrying a single quote would otherwise
+    // close the poll literal early (`WHERE job_name = 'x'y'`) — a malformed
+    // poll query while submit_block stayed balanced. Keep the escaping
+    // symmetric with submit_block so both literals are always closeable
+    // only by their own emitted delimiter.
     let poll_sql = format!(
-        "SELECT status, additional_info, run_duration\n  FROM USER_SCHEDULER_JOB_RUN_DETAILS\n WHERE job_name = '{job_name}'\n ORDER BY log_date DESC\n FETCH FIRST 1 ROWS ONLY"
+        "SELECT status, additional_info, run_duration\n  FROM USER_SCHEDULER_JOB_RUN_DETAILS\n WHERE job_name = '{job}'\n ORDER BY log_date DESC\n FETCH FIRST 1 ROWS ONLY",
+        job = job,
     );
     DeployDdlPlan {
         job_name: job_name.to_string(),
@@ -463,6 +470,84 @@ mod tests {
     }
 
     #[test]
+    fn execute_approved_spaced_qualifier_is_not_same_schema() {
+        // oracle-rwjl.8: a BILLING principal deploying a header with a
+        // whitespace-spaced qualifier (`ANALYTICS . PKG`) targets schema
+        // ANALYTICS, so it must NOT be classified same-schema and must demand
+        // the operator-typed destination. Previously parse_target_schema saw a
+        // bare `ANALYTICS` token (no dot) and returned None, defaulting the
+        // effective target to the BILLING principal and waving the write
+        // through with no confirmation.
+        use crate::create_or_replace::{
+            CreateOrReplaceMode, CreateOrReplaceRequest, run_create_or_replace,
+        };
+        let spaced_ddl =
+            "CREATE OR REPLACE PACKAGE BODY ANALYTICS . PKG AS BEGIN NULL; END;";
+        let mut registry = PreviewRegistry::new();
+        run_create_or_replace(
+            &mut registry,
+            CreateOrReplaceRequest {
+                connection: "billing-dev".into(),
+                operation_summary: "replace spaced-qualifier package body".into(),
+                ddl_bytes: spaced_ddl.into(),
+                mode: CreateOrReplaceMode::DryRun,
+            },
+            fixed("tok-sp"),
+        )
+        .unwrap();
+
+        // No operator-typed confirmation ⇒ refused as a cross-schema write.
+        let req = ExecuteApprovedRequest {
+            connection: "billing-dev".into(),
+            token: "tok-sp".into(),
+            ddl_bytes: spaced_ddl.into(),
+            principal_schema: "BILLING".into(),
+            target_schema: String::new(),
+            operator_typed_schema: None,
+        };
+        let err = run_execute_approved(&mut registry, req).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ExecuteApprovedError::CrossSchema(CrossSchemaError::ConfirmationMissing { .. })
+            ),
+            "spaced cross-schema header must require typed confirmation, got {err:?}"
+        );
+
+        // With the typed destination it is accepted as a confirmed
+        // cross-schema write (re-mint: the dry-run token is single-use).
+        run_create_or_replace(
+            &mut registry,
+            CreateOrReplaceRequest {
+                connection: "billing-dev".into(),
+                operation_summary: "replace spaced-qualifier package body".into(),
+                ddl_bytes: spaced_ddl.into(),
+                mode: CreateOrReplaceMode::DryRun,
+            },
+            fixed("tok-sp2"),
+        )
+        .unwrap();
+        let req_ok = ExecuteApprovedRequest {
+            connection: "billing-dev".into(),
+            token: "tok-sp2".into(),
+            ddl_bytes: spaced_ddl.into(),
+            principal_schema: "BILLING".into(),
+            target_schema: "ANALYTICS".into(),
+            operator_typed_schema: Some("ANALYTICS".into()),
+        };
+        let plan = run_execute_approved(&mut registry, req_ok).unwrap();
+        assert!(plan.cross_schema.confirmed);
+        assert!(
+            matches!(
+                plan.cross_schema.decision,
+                crate::cross_schema::CrossSchemaDecision::CrossSchemaConfirmed { .. }
+            ),
+            "spaced qualifier must classify as cross-schema: {:?}",
+            plan.cross_schema.decision
+        );
+    }
+
+    #[test]
     fn empty_inputs_rejected() {
         let mut registry = PreviewRegistry::new();
         let mut req = approved_request("tok");
@@ -524,6 +609,28 @@ mod tests {
         // own emitted delimiter.
         assert_eq!(plan.submit_block.matches('\'').count() % 2, 0);
         assert!(plan.submit_block.contains("EXECUTE IMMEDIATE"));
+        // oracle-rwjl.11: the poll_sql job_name literal must also be
+        // ''-balanced. A job_name containing a single quote previously
+        // produced `WHERE job_name = 'x'y'` (odd quote count, literal
+        // closes early) because poll_sql interpolated the raw name.
+        let plan = build_deploy_plan("x'y", "CREATE TABLE t (a NUMBER)");
+        assert_eq!(
+            plan.submit_block.matches('\'').count() % 2,
+            0,
+            "submit_block must stay balanced for a quoted job_name"
+        );
+        assert_eq!(
+            plan.poll_sql.matches('\'').count() % 2,
+            0,
+            "poll_sql must stay balanced for a quoted job_name: {}",
+            plan.poll_sql
+        );
+        // The escaped name appears doubled in the poll predicate.
+        assert!(
+            plan.poll_sql.contains("job_name = 'x''y'"),
+            "poll_sql must use the ''-escaped job_name: {}",
+            plan.poll_sql
+        );
     }
 
     #[test]

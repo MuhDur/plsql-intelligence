@@ -324,31 +324,68 @@ fn replace_case_insensitive(haystack: &str, needle: &str, replacement: &str) -> 
     if needle.is_empty() {
         return haystack.to_string();
     }
-    let hay_lower = haystack.to_lowercase();
-    let needle_lower = needle.to_lowercase();
-    let mut out = String::with_capacity(haystack.len());
-    let mut cursor = 0usize;
-    // `to_lowercase` can change byte length; to keep byte offsets
-    // aligned with the original we scan char-by-char by re-lowercasing
-    // progressively shrinking suffixes. Simpler and correct: rebuild
-    // from the original using the lowercased view only for matching
-    // when the two have equal byte length, else fall back to a
-    // char-window scan.
-    if hay_lower.len() == haystack.len() && needle_lower.len() == needle.len() {
-        while let Some(rel) = hay_lower[cursor..].find(&needle_lower) {
-            let start = cursor + rel;
-            out.push_str(&haystack[cursor..start]);
-            out.push_str(replacement);
-            cursor = start + needle.len();
+    // PLSQL-MCP-SEC (oracle-rwjl.2): the previous implementation matched
+    // against a lowercased *copy* of the haystack and then sliced the
+    // ORIGINAL string at offsets derived from that copy. `to_lowercase`
+    // can preserve the total byte length while shifting individual
+    // codepoint boundaries (e.g. `İ` U+0130 → 2→3 bytes, `Ω` U+2126 →
+    // 3→2 bytes), so the equal-total-length guard fired yet the derived
+    // offsets landed mid-codepoint, panicking on a hostile DB cell and
+    // aborting the whole server (content-driven DoS). The fix never
+    // mixes lowercased-copy offsets with original-string slicing.
+    if needle.is_ascii() {
+        // All reachable plain markers are ASCII; match with an ASCII
+        // case-insensitive window over the ORIGINAL bytes. The window
+        // start/end indices come directly from a byte scan of the
+        // original, so every slice boundary is honoured (a window only
+        // matches when the bytes equal the needle ignoring ASCII case,
+        // which forces the boundaries to be real char boundaries).
+        let hay = haystack.as_bytes();
+        let nee = needle.as_bytes();
+        let mut out = String::with_capacity(haystack.len());
+        let mut cursor = 0usize;
+        let mut i = 0usize;
+        while i + nee.len() <= hay.len() {
+            if hay[i..i + nee.len()].eq_ignore_ascii_case(nee) {
+                out.push_str(&haystack[cursor..i]);
+                out.push_str(replacement);
+                i += nee.len();
+                cursor = i;
+            } else {
+                i += 1;
+            }
         }
         out.push_str(&haystack[cursor..]);
         out
     } else {
-        // ASCII-folding changed length (rare for our markers, which
-        // are ASCII) — fall back to exact (case-sensitive) replace,
-        // still correct because the structural pass already handled
-        // the unsafe delimiters.
-        haystack.replace(needle, replacement)
+        // The needle carries non-ASCII chars (the structural pass
+        // rewrites `<`/`>` to fullwidth look-alikes). Scan the original
+        // by char boundaries so a slice can never land mid-codepoint.
+        let needle_lower = needle.to_lowercase();
+        let needle_char_count = needle.chars().count();
+        let mut out = String::with_capacity(haystack.len());
+        let char_indices: Vec<(usize, char)> = haystack.char_indices().collect();
+        let mut idx = 0usize;
+        while idx < char_indices.len() {
+            if idx + needle_char_count <= char_indices.len() {
+                let window: String = char_indices[idx..idx + needle_char_count]
+                    .iter()
+                    .map(|(_, c)| *c)
+                    .collect();
+                if window.to_lowercase() == needle_lower {
+                    out.push_str(replacement);
+                    idx += needle_char_count;
+                    continue;
+                }
+                // No match here; emit this char and advance one codepoint.
+                out.push(char_indices[idx].1);
+                idx += 1;
+            } else {
+                out.push(char_indices[idx].1);
+                idx += 1;
+            }
+        }
+        out
     }
 }
 
@@ -945,5 +982,60 @@ mod tests {
             "no markup survives the end-to-end path: {cell:?}"
         );
         assert!(response.rows[0].cells[0].sanitized);
+    }
+
+    #[test]
+    fn sanitize_does_not_panic_on_charboundary_shifting_lowercase() {
+        // oracle-rwjl.2: a hostile DB cell whose lowercasing preserves the
+        // *total* byte length but shifts internal codepoint boundaries used
+        // to drive the old `replace_case_insensitive` fast path mid-codepoint,
+        // panicking and aborting the server (content-driven DoS). The
+        // `assistant: ` / `user: ` role markers are ASCII blocklist needles,
+        // so a value embedding one between length-shifting codepoints reaches
+        // `replace_case_insensitive`. These must redact without panicking.
+        //
+        // İ (U+0130) lowercases to 2 bytes -> 3 bytes (+1); Ω (U+2126 OHM)
+        // lowercases 3 -> 2 (-1); ẞ (U+1E9E) lowercases 3 -> 2 (-1). The
+        // canceling deltas make total lengths match, the historic trigger.
+        let ohm = '\u{2126}'; // OHM SIGN (NOT GREEK CAPITAL OMEGA U+03A9)
+        let dotted_i = '\u{0130}'; // LATIN CAPITAL LETTER I WITH DOT ABOVE
+        let eszett = '\u{1E9E}'; // LATIN CAPITAL LETTER SHARP S
+        for payload in [
+            format!("{dotted_i}user: {ohm}"),
+            format!("aa{dotted_i}assistant: {eszett}"),
+            format!("{ohm}{ohm}system: {dotted_i}{eszett}"),
+        ] {
+            let (out, changed) = sanitize(&payload);
+            assert!(changed, "role marker in {payload:?} must be neutralized");
+            assert!(
+                out.contains("[redacted]"),
+                "role marker must be redacted, got {out:?}"
+            );
+            // The surviving non-marker codepoints must remain intact.
+            assert!(
+                out.chars().any(|c| c == ohm || c == dotted_i || c == eszett),
+                "boundary-shifting chars must survive intact: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn replace_case_insensitive_handles_unicode_without_panic() {
+        // Direct unit coverage of the helper at the heart of oracle-rwjl.2:
+        // an ASCII needle surrounded by multi-byte, boundary-shifting chars.
+        let ohm = '\u{2126}';
+        let dotted_i = '\u{0130}';
+        let hay = format!("{dotted_i}USER: {ohm}");
+        let out = replace_case_insensitive(&hay, "user: ", "[redacted]");
+        assert_eq!(out, format!("{dotted_i}[redacted]{ohm}"));
+
+        // Non-ASCII needle (the structural fullwidth-bracket form) must also
+        // scan by char boundary rather than byte offset.
+        let fullwidth_lt = '\u{FF1C}';
+        let fullwidth_gt = '\u{FF1E}';
+        let needle = format!("{fullwidth_lt}tool_call{fullwidth_gt}");
+        let hay2 = format!("{dotted_i}{needle}{ohm}");
+        let out2 = replace_case_insensitive(&hay2, &needle, "[redacted]");
+        assert_eq!(out2, format!("{dotted_i}[redacted]{ohm}"));
     }
 }

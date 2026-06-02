@@ -81,6 +81,11 @@ pub enum CreateOrReplaceError {
     UnsupportedKind { kind: String },
     #[error("create_or_replace refused: operation_summary is empty")]
     EmptySummary,
+    #[error(
+        "create_or_replace refused: schema-qualified object name {name:?} is malformed \
+         (an empty owner or object around the `.` is ambiguous)"
+    )]
+    MalformedQualifiedName { name: String },
     #[error("create_or_replace preview registry error: {0}")]
     Preview(#[from] PreviewError),
 }
@@ -218,22 +223,49 @@ pub fn parse_target_schema(ddl: &str) -> Result<Option<String>, CreateOrReplaceE
     let tokens: Vec<&str> = upper.split_whitespace().collect();
     let name_idx = 3 + kind.split_whitespace().count();
 
-    let Some(name_raw) = tokens.get(name_idx) else {
+    if tokens.get(name_idx).is_none() {
         return Ok(None);
-    };
-    // The object name ends at the first `(` — a PROCEDURE/FUNCTION parameter list
-    // may abut the name with no separating whitespace (e.g. `FOO(p IN NUMBER)`).
-    let name_token = name_raw.split('(').next().unwrap_or("");
+    }
+    // oracle-rwjl.8: the schema qualifier dot may be surrounded by whitespace
+    // (`OWNER . OBJECT`, `OWNER .OBJECT`, `OWNER. OBJECT`). Oracle treats those
+    // as the *same* qualified name `OWNER.OBJECT`, but a per-token scan that
+    // only looked at `tokens[name_idx]` saw the bare `OWNER` (no dot) and
+    // misclassified the write as same-schema, silently skipping the operator
+    // typed cross-schema confirmation. Reassemble the object-name region from
+    // `name_idx` onward and collapse whitespace immediately around the dot so
+    // every spaced form normalises to `OWNER.OBJECT` BEFORE the `(` cut.
+    let tail = tokens[name_idx..].join(" ");
+    let normalised = tail
+        .replace(" . ", ".")
+        .replace(" .", ".")
+        .replace(". ", ".");
+    // The object name region runs up to the first whitespace (the rest of the
+    // header — `AS`, `IS`, a parameter list with internal spaces, …). The name
+    // itself ends at the first `(`: a PROCEDURE/FUNCTION parameter list may abut
+    // the name with no separating whitespace (e.g. `FOO(p IN NUMBER)`).
+    let name_region = normalised.split_whitespace().next().unwrap_or("");
+    let name_token = name_region.split('(').next().unwrap_or("");
     if name_token.is_empty() {
         return Ok(None);
     }
-    // `OWNER.OBJECT` ⇒ the owner is everything before the first `.`.
-    match name_token.split_once('.') {
-        Some((owner, object)) if !owner.is_empty() && !object.is_empty() => {
-            Ok(Some(owner.to_string()))
-        }
-        // No dot, or a malformed dotted form — treat as unqualified.
-        _ => Ok(None),
+    // No dot at all — a genuinely unqualified name targeting the
+    // current/principal schema.
+    if !name_token.contains('.') {
+        return Ok(None);
+    }
+    // A dot is present: the name is schema-qualified. A well-formed Oracle
+    // qualified name is exactly `OWNER.OBJECT` — two non-empty segments. Any
+    // other shape (`OWNER.`, `.OBJECT`, `OWNER..OBJECT`, `A.B.C`) is ambiguous
+    // / malformed; fail CLOSED rather than silently treating it as unqualified
+    // (which would route it to the principal schema and skip the operator
+    // typed cross-schema confirmation).
+    let segments: Vec<&str> = name_token.split('.').collect();
+    if segments.len() == 2 && !segments[0].is_empty() && !segments[1].is_empty() {
+        Ok(Some(segments[0].to_string()))
+    } else {
+        Err(CreateOrReplaceError::MalformedQualifiedName {
+            name: name_token.to_string(),
+        })
     }
 }
 
@@ -463,6 +495,64 @@ mod tests {
     #[test]
     fn parse_target_schema_rejects_non_create_or_replace() {
         assert!(parse_target_schema("DROP TABLE billing.t;").is_err());
+    }
+
+    #[test]
+    fn parse_target_schema_normalises_whitespace_around_qualifier_dot() {
+        // oracle-rwjl.8: Oracle treats `OWNER . OBJECT`, `OWNER .OBJECT`, and
+        // `OWNER. OBJECT` as the same qualified name `OWNER.OBJECT`. A per-token
+        // scan that looked only at the token immediately after the kind saw a
+        // bare `ANALYTICS` (no dot) and misclassified the write as same-schema,
+        // silently skipping the operator-typed cross-schema confirmation while
+        // Oracle still routed the object to ANALYTICS. All spaced forms must
+        // now yield the owner.
+        for spaced in [
+            "CREATE OR REPLACE PACKAGE BODY ANALYTICS . PKG AS BEGIN NULL; END;",
+            "CREATE OR REPLACE PACKAGE BODY ANALYTICS .PKG AS BEGIN NULL; END;",
+            "CREATE OR REPLACE PACKAGE BODY ANALYTICS. PKG AS BEGIN NULL; END;",
+        ] {
+            assert_eq!(
+                parse_target_schema(spaced).unwrap(),
+                Some("ANALYTICS".to_string()),
+                "spaced qualifier {spaced:?} must resolve the owner"
+            );
+        }
+        // The same normalisation must happen BEFORE the `(` cut so a
+        // PROCEDURE parameter list cannot hide the spaced dot.
+        assert_eq!(
+            parse_target_schema(
+                "CREATE OR REPLACE PROCEDURE OPS . DO_IT(p IN NUMBER) AS BEGIN NULL; END;"
+            )
+            .unwrap(),
+            Some("OPS".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_target_schema_fails_closed_on_malformed_qualified_name() {
+        // A dot is present but the owner or object around it is empty, or the
+        // name has more than two parts. Treating any of these as unqualified
+        // would route it to the principal schema and skip the cross-schema
+        // confirmation, so it must fail CLOSED instead.
+        for malformed in [
+            // Leading dot — empty owner.
+            "CREATE OR REPLACE VIEW .V AS SELECT 1 FROM dual;",
+            // Leading dot with the qualifier space normalised away.
+            "CREATE OR REPLACE VIEW . V AS SELECT 1 FROM dual;",
+            // Double dot — empty middle segment.
+            "CREATE OR REPLACE PACKAGE BODY ANALYTICS..PKG AS BEGIN NULL; END;",
+            // Three-part name — not a valid CREATE OR REPLACE target.
+            "CREATE OR REPLACE VIEW A.B.C AS SELECT 1 FROM dual;",
+        ] {
+            assert!(
+                matches!(
+                    parse_target_schema(malformed),
+                    Err(CreateOrReplaceError::MalformedQualifiedName { .. })
+                ),
+                "malformed qualified name {malformed:?} must fail closed, got {:?}",
+                parse_target_schema(malformed)
+            );
+        }
     }
 
     #[test]
