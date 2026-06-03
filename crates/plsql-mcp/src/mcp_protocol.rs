@@ -192,13 +192,24 @@ fn handle_tools_list(id: Value, registry: &ToolRegistry) -> JsonRpcResponse {
 }
 
 fn tool_to_mcp_value(t: &ToolDescriptor) -> Value {
+    // Advertise the tool's real argument schema when it has one, so an agent can
+    // construct a valid call first-try instead of probing -32602 InvalidArguments
+    // (oracle-da9j.1); fall back to the permissive object otherwise. Surface
+    // destructive intent via the MCP-standard tool annotations (readOnlyHint /
+    // destructiveHint) so an agent can isolate the write cluster from read-only
+    // tools (oracle-da9j.9).
+    let input_schema = t
+        .input_schema
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({ "type": "object", "additionalProperties": true }));
     serde_json::json!({
         "name": t.name,
         "description": t.summary,
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": true,
-        }
+        "inputSchema": input_schema,
+        "annotations": {
+            "readOnlyHint": !t.destructive,
+            "destructiveHint": t.destructive,
+        },
     })
 }
 
@@ -347,6 +358,56 @@ mod tests {
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
         assert!(tools.iter().any(|t| t["name"] == "query"));
+    }
+
+    #[test]
+    fn tools_list_advertises_real_schemas_and_destructive_annotations() {
+        // oracle-da9j.1 + .9: tools/list must advertise each tool's real argument
+        // schema (so an agent can construct a valid first call) and surface
+        // destructive intent via the MCP-standard annotations.
+        let r = crate::default_tool_registry();
+        let resp = handle_request(&req(7, "tools/list", None), &r).unwrap();
+        let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+        let by = |name: &str| -> Value {
+            tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("tool {name} advertised"))
+                .clone()
+        };
+        // Real schemas with the right required fields (.1).
+        for (name, field) in [
+            ("query", "sql"),
+            ("parse_file", "source"),
+            ("get_symbol", "source"),
+            ("find_callers", "target"),
+            ("analyze_project", "project_root"),
+            ("plsql_analyze", "project_root"),
+        ] {
+            let t = by(name);
+            let req_arr = t["inputSchema"]["required"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name} has a required[] (not the permissive blob)"));
+            assert!(
+                req_arr.iter().any(|v| v == field),
+                "{name} inputSchema.required must contain {field}: {t}"
+            );
+            assert_eq!(
+                t["annotations"]["readOnlyHint"],
+                Value::Bool(true),
+                "{name} is read-only"
+            );
+        }
+        // Destructive write tools carry destructiveHint (.9).
+        for name in ["deploy_ddl", "create_or_replace", "execute_approved", "patch_package"] {
+            let t = by(name);
+            assert_eq!(
+                t["annotations"]["destructiveHint"],
+                Value::Bool(true),
+                "{name} must be flagged destructive"
+            );
+            assert_eq!(t["annotations"]["readOnlyHint"], Value::Bool(false));
+        }
     }
 
     #[test]

@@ -112,20 +112,22 @@ pub use trust::{TrustBlock, attach_trust_block, trust_block_value};
 
 /// Register the `execute_approved` + `deploy_ddl` tool descriptors.
 pub fn register_execute_approved_tools(registry: &mut ToolRegistry) {
-    registry.register(ToolDescriptor {
-        name: String::from("execute_approved"),
-        tier: ToolTier::FoundationLiveDb,
-        summary: String::from(
+    registry.register(
+        ToolDescriptor::new(
+            "execute_approved",
+            ToolTier::FoundationLiveDb,
             "Run a previously-previewed DDL statement under its approval token. Verifies the supplied bytes against the previewed payload byte-for-byte and runs the cross-schema typed-name guard before returning the execution plan.",
-        ),
-    });
-    registry.register(ToolDescriptor {
-        name: String::from("deploy_ddl"),
-        tier: ToolTier::FoundationLiveDb,
-        summary: String::from(
+        )
+        .destructive(),
+    );
+    registry.register(
+        ToolDescriptor::new(
+            "deploy_ddl",
+            ToolTier::FoundationLiveDb,
             "Lock-free DDL deployment via a one-shot DBMS_SCHEDULER PLSQL_BLOCK job. Returns the submit block + the USER_SCHEDULER_JOB_RUN_DETAILS poll query.",
-        ),
-    });
+        )
+        .destructive(),
+    );
 }
 pub use patch::{
     PackagePart, PatchMode, PatchPackageError, PatchPackageRequest, PatchPackageResponse,
@@ -135,13 +137,14 @@ pub use patch::{
 
 /// Register the `patch_view` tool descriptor.
 pub fn register_patch_view_tool(registry: &mut ToolRegistry) {
-    registry.register(ToolDescriptor {
-        name: String::from("patch_view"),
-        tier: ToolTier::FoundationLiveDb,
-        summary: String::from(
+    registry.register(
+        ToolDescriptor::new(
+            "patch_view",
+            ToolTier::FoundationLiveDb,
             "Targeted view replacement. `dry_run` synthesises CREATE OR REPLACE VIEW <schema>.<name> AS … and mints a 60s approval token; `apply` verifies the supplied query byte-for-byte against the previewed payload before returning the executable DDL.",
-        ),
-    });
+        )
+        .destructive(),
+    );
 }
 pub use mcp_protocol::{
     JsonRpcError, JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION, handle_request,
@@ -151,24 +154,26 @@ pub use preview::{PreviewError, PreviewRegistry, PreviewedDdl};
 
 /// Register the `create_or_replace` tool descriptor.
 pub fn register_create_or_replace_tool(registry: &mut ToolRegistry) {
-    registry.register(ToolDescriptor {
-        name: String::from("create_or_replace"),
-        tier: ToolTier::FoundationLiveDb,
-        summary: String::from(
+    registry.register(
+        ToolDescriptor::new(
+            "create_or_replace",
+            ToolTier::FoundationLiveDb,
             "Full-DDL deployment under per-operation approval. Accepts CREATE OR REPLACE … for PACKAGE [BODY] / PROCEDURE / FUNCTION / TRIGGER / VIEW / TYPE [BODY] / SYNONYM / LIBRARY. `dry_run` mints a 60s approval token; `apply` verifies byte-for-byte and returns the executable DDL.",
-        ),
-    });
+        )
+        .destructive(),
+    );
 }
 
 /// Register the `patch_package` tool descriptor.
 pub fn register_patch_package_tool(registry: &mut ToolRegistry) {
-    registry.register(ToolDescriptor {
-        name: String::from("patch_package"),
-        tier: ToolTier::FoundationLiveDb,
-        summary: String::from(
+    registry.register(
+        ToolDescriptor::new(
+            "patch_package",
+            ToolTier::FoundationLiveDb,
             "Targeted REPLACE-based package edit. `dry_run` synthesises CREATE OR REPLACE PACKAGE [BODY] DDL and mints a 60s approval token via the preview registry; `apply` verifies the supplied source byte-for-byte against the previewed payload before returning the executable DDL.",
-        ),
-    });
+        )
+        .destructive(),
+    );
 }
 
 pub use describe::{
@@ -203,13 +208,23 @@ pub use query::{
 
 /// Register the read-only `query` tool descriptor.
 pub fn register_query_tool(registry: &mut ToolRegistry) {
-    registry.register(ToolDescriptor {
-        name: String::from("query"),
-        tier: ToolTier::FoundationLiveDb,
-        summary: String::from(
+    registry.register(
+        ToolDescriptor::new(
+            "query",
+            ToolTier::FoundationLiveDb,
             "Run a SELECT / WITH against the active Oracle connection and return structured rows. Result cells are untrusted data: markup-shaped sequences are structurally neutralized (casing/spacing/unicode-robust) and the response carries an explicit data-envelope notice; LOB cells truncate to a per-call limit.",
-        ),
-    });
+        )
+        .with_input_schema(serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["sql"],
+            "properties": {
+                "sql": {"type": "string", "description": "A read-only SELECT / WITH statement. Writes/DDL are rejected by the SQL guard."},
+                "connection": {"type": ["string", "null"], "description": "Optional named connection profile; defaults to the active connection."},
+                "lob_truncation_chars": {"type": ["integer", "null"], "minimum": 0, "description": "Per-cell LOB truncation limit for this call."},
+            },
+        })),
+    );
 }
 
 pub use audit::{APPLICATION_MODULE, AuditClient, AuditPlan, AuditSink};
@@ -286,11 +301,11 @@ pub fn register_safety_tools(registry: &mut ToolRegistry) {
         ),
     ];
     for (name, summary) in descriptors {
-        registry.register(ToolDescriptor {
-            name: String::from(name),
-            tier: ToolTier::FoundationLiveDb,
-            summary: String::from(summary),
-        });
+        registry.register(ToolDescriptor::new(
+            name,
+            ToolTier::FoundationLiveDb,
+            summary,
+        ));
     }
 }
 
@@ -318,10 +333,10 @@ pub fn register_connection_tools(registry: &mut ToolRegistry) {
         ),
     ];
     for (name, summary) in descriptors {
-        registry.register(ToolDescriptor {
-            name: String::from(name),
-            tier: ToolTier::FoundationLiveDb,
-            summary: String::from(summary),
-        });
+        registry.register(ToolDescriptor::new(
+            name,
+            ToolTier::FoundationLiveDb,
+            summary,
+        ));
     }
 }

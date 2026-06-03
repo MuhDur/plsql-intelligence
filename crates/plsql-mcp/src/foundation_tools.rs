@@ -133,11 +133,11 @@ pub fn register_foundation_tools(registry: &mut ToolRegistry) {
              filtered by a case-insensitive query against tag or body.",
         ),
     ] {
-        registry.register(ToolDescriptor {
-            name: String::from(name),
-            tier: ToolTier::FoundationStatic,
-            summary: String::from(summary),
-        });
+        registry.register(ToolDescriptor::new(
+            name,
+            ToolTier::FoundationStatic,
+            summary,
+        ));
     }
 }
 

@@ -279,16 +279,27 @@ fn cyclomatic(src: &str) -> u32 {
 
 /// Register the `plsql_analyze` descriptor (foundation-static — no live DB).
 pub fn register_plsql_analyze_tool(registry: &mut ToolRegistry) {
-    registry.register(ToolDescriptor {
-        name: String::from("plsql_analyze"),
-        tier: ToolTier::FoundationStatic,
-        summary: String::from(
+    registry.register(
+        ToolDescriptor::new(
+            "plsql_analyze",
+            ToolTier::FoundationStatic,
             "Static PL/SQL analysis of a project (the oracle_plsql_analyze capability): \
              routine/object inventory, call/reference summary, lint findings, and per-file \
              cyclomatic complexity, as structured JSON. Offline (engine source analysis); \
              full ALL_ARGUMENTS parameter signatures are the live-DB enrichment.",
-        ),
-    });
+        )
+        .with_input_schema(serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["project_root"],
+            "properties": {
+                "project_root": {
+                    "type": "string",
+                    "description": "Filesystem path to the project root to analyze.",
+                },
+            },
+        })),
+    );
 }
 
 #[cfg(test)]

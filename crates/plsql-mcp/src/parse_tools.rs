@@ -164,6 +164,33 @@ pub fn run_inspect_profile() -> InspectProfileResponse {
     }
 }
 
+/// The advertised argument JSON-Schema for a parse tool (oracle-da9j.1), so an
+/// agent can construct a valid call first-try instead of probing -32602s.
+fn parse_tool_schema(name: &str) -> Option<serde_json::Value> {
+    use serde_json::json;
+    let source = json!({"type": "string", "description": "PL/SQL source text to lower."});
+    match name {
+        "parse_file" | "compile_check" => Some(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["source"],
+            "properties": { "source": source },
+        })),
+        "get_symbol" => Some(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["source", "symbol"],
+            "properties": {
+                "source": source,
+                "symbol": {"type": "string", "description": "Bare (unqualified) declaration name to look up."},
+            },
+        })),
+        // inspect_profile takes no arguments.
+        "inspect_profile" => Some(json!({"type": "object", "additionalProperties": false, "properties": {}})),
+        _ => None,
+    }
+}
+
 /// Register the four descriptors. Foundation-static tier.
 pub fn register_parse_tools(registry: &mut ToolRegistry) {
     for (name, summary) in [
@@ -188,11 +215,11 @@ pub fn register_parse_tools(registry: &mut ToolRegistry) {
              feature_policy) the engine applies when a request does not override it.",
         ),
     ] {
-        registry.register(ToolDescriptor {
-            name: String::from(name),
-            tier: ToolTier::FoundationStatic,
-            summary: String::from(summary),
-        });
+        let mut d = ToolDescriptor::new(name, ToolTier::FoundationStatic, summary);
+        if let Some(schema) = parse_tool_schema(name) {
+            d = d.with_input_schema(schema);
+        }
+        registry.register(d);
     }
 }
 

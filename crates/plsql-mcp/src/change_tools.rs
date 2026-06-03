@@ -164,11 +164,11 @@ pub fn register_change_tools(registry: &mut ToolRegistry) {
             "Lifecycle explanation of a node (in/out edges, summary).",
         ),
     ] {
-        registry.register(ToolDescriptor {
-            name: String::from(name),
-            tier: ToolTier::FoundationStatic,
-            summary: String::from(summary),
-        });
+        registry.register(ToolDescriptor::new(
+            name,
+            ToolTier::FoundationStatic,
+            summary,
+        ));
     }
 }
 

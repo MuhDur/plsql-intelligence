@@ -69,15 +69,26 @@ pub fn run_analyze_project(
 /// tier — available regardless of safety profile / license, no
 /// live DB.
 pub fn register_analyze_project_tool(registry: &mut ToolRegistry) {
-    registry.register(ToolDescriptor {
-        name: String::from("analyze_project"),
-        tier: ToolTier::FoundationStatic,
-        summary: String::from(
+    registry.register(
+        ToolDescriptor::new(
+            "analyze_project",
+            ToolTier::FoundationStatic,
             "Load the engine and run the canonical analysis pipeline over a project root; \
              returns an AnalysisRun summary (object/declaration counts, parsed-vs-recovered, \
              catalog/PL-Scope availability, diagnostic count, schema id/version).",
-        ),
-    });
+        )
+        .with_input_schema(serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["project_root"],
+            "properties": {
+                "project_root": {
+                    "type": "string",
+                    "description": "Filesystem path to the project root to analyze.",
+                },
+            },
+        })),
+    );
 }
 
 #[cfg(test)]

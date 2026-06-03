@@ -118,11 +118,25 @@ pub fn register_graph_tools(registry: &mut ToolRegistry) {
              (forward edges reshaped to a flat list).",
         ),
     ] {
-        registry.register(ToolDescriptor {
-            name: String::from(name),
-            tier: ToolTier::FoundationStatic,
-            summary: String::from(summary),
+        // All three graph tools take a single `target` logical object id in the
+        // arity-form the engine assigns (oracle-da9j.1). Run plsql_analyze /
+        // analyze_project first to obtain a valid id.
+        let schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["target"],
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "Logical object id of the target node in arity form, \
+                                    e.g. `billing.claims_pkg.calculate/1`. Obtain valid ids \
+                                    from plsql_analyze / analyze_project output.",
+                },
+            },
         });
+        registry.register(
+            ToolDescriptor::new(name, ToolTier::FoundationStatic, summary).with_input_schema(schema),
+        );
     }
 }
 
