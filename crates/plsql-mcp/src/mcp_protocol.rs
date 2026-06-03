@@ -97,6 +97,23 @@ impl JsonRpcResponse {
             }),
         }
     }
+
+    /// A JSON-RPC error whose `data` carries a structured [`ErrorEnvelope`]
+    /// (error_class + fuzzy_matches + suggested_tool + next_steps) so an agent
+    /// can self-heal in one round instead of parsing a bare string
+    /// (oracle-da9j.2). The standard `code`/`message` are preserved.
+    fn err_with_data(id: Value, code: i32, message: impl Into<String>, data: Value) -> Self {
+        Self {
+            jsonrpc: "2.0".into(),
+            id,
+            result: None,
+            error: Some(JsonRpcError {
+                code,
+                message: message.into(),
+                data: Some(data),
+            }),
+        }
+    }
 }
 
 /// Dispatch a single JSON-RPC frame against `registry`. Returns:
@@ -227,9 +244,23 @@ fn handle_tools_call(
         return JsonRpcResponse::err(id, -32602, "tools/call params missing `name`");
     };
     // The tool must be advertised — `tools/list` and `tools/call`
-    // share `registry` as the single source of truth.
+    // share `registry` as the single source of truth. On a miss, carry a
+    // structured ErrorEnvelope with fuzzy "did you mean" candidates so a
+    // misspelled name self-heals in one round (oracle-da9j.2).
     if !registry.tools.iter().any(|t| t.name == name) {
-        return JsonRpcResponse::err(id, -32601, format!("tool not found: {name}"));
+        let names: Vec<&str> = registry.tools.iter().map(|t| t.name.as_str()).collect();
+        let envelope = oraclemcp_error::ErrorEnvelope::new(
+            oraclemcp_error::ErrorClass::InvalidArguments,
+            format!("tool not found: {name}"),
+        )
+        .with_fuzzy_matches(oraclemcp_error::fuzzy_suggest(name, &names, 5))
+        .with_next_step("Call tools/list to see the exact tool names, then retry with one of them.");
+        return JsonRpcResponse::err_with_data(
+            id,
+            -32601,
+            format!("tool not found: {name}"),
+            envelope.to_json(),
+        );
     }
 
     // `arguments` is optional per MCP; a missing object means "no
@@ -250,21 +281,69 @@ fn handle_tools_call(
             tool_result(&structured_text(name, &structured), false, Some(structured)),
         ),
         Ok(DispatchOutcome::RuntimeStateRequired(kind)) => {
-            // Wired, arguments validated — but the runtime state is
-            // absent. Honest error *result* (transport-level call
-            // succeeded; the tool reports it cannot run here).
-            JsonRpcResponse::ok(id, tool_result(&kind.message(name), true, None))
+            // Wired, arguments validated — but the runtime state is absent.
+            // Honest error *result* (transport-level call succeeded; the tool
+            // reports it cannot run here) carrying a structured envelope that
+            // names the REAL tool to call next (oracle-da9j.2).
+            let msg = kind.message(name);
+            let envelope = oraclemcp_error::ErrorEnvelope::new(
+                oraclemcp_error::ErrorClass::RuntimeStateRequired,
+                msg.clone(),
+            )
+            .with_suggested_tool(runtime_kind_recovery_tool(kind))
+            .with_next_step(format!(
+                "Call `{}` to provide the missing runtime state, then retry `{name}`.",
+                runtime_kind_recovery_tool(kind)
+            ));
+            JsonRpcResponse::ok(id, tool_result(&msg, true, Some(envelope.to_json())))
         }
         Err(DispatchError::UnknownTool(tool)) => {
-            // Registry/dispatch drift — should be impossible (the
-            // lockstep test guards it), but never panic.
-            JsonRpcResponse::err(id, -32601, format!("tool not found: {tool}"))
+            // Registry/dispatch drift — should be impossible (the lockstep test
+            // guards it), but never panic.
+            let names: Vec<&str> = registry.tools.iter().map(|t| t.name.as_str()).collect();
+            let envelope = oraclemcp_error::ErrorEnvelope::new(
+                oraclemcp_error::ErrorClass::InvalidArguments,
+                format!("tool not found: {tool}"),
+            )
+            .with_fuzzy_matches(oraclemcp_error::fuzzy_suggest(&tool, &names, 5));
+            JsonRpcResponse::err_with_data(
+                id,
+                -32601,
+                format!("tool not found: {tool}"),
+                envelope.to_json(),
+            )
         }
-        Err(DispatchError::InvalidArguments { tool, detail }) => JsonRpcResponse::err(
-            id,
-            -32602,
-            format!("invalid arguments for tool `{tool}`: {detail}"),
-        ),
+        Err(DispatchError::InvalidArguments { tool, detail }) => {
+            let envelope = oraclemcp_error::ErrorEnvelope::new(
+                oraclemcp_error::ErrorClass::InvalidArguments,
+                format!("invalid arguments for tool `{tool}`: {detail}"),
+            )
+            .with_next_step(format!(
+                "Inspect `{tool}`'s inputSchema in tools/list and supply the required fields."
+            ));
+            JsonRpcResponse::err_with_data(
+                id,
+                -32602,
+                format!("invalid arguments for tool `{tool}`: {detail}"),
+                envelope.to_json(),
+            )
+        }
+    }
+}
+
+/// The real plsql-mcp tool an agent should call to satisfy a
+/// [`RuntimeKind`]'s missing state (oracle-da9j.2 — names a tool that actually
+/// exists on the surface, not a placeholder).
+fn runtime_kind_recovery_tool(kind: crate::dispatch::RuntimeKind) -> &'static str {
+    use crate::dispatch::RuntimeKind;
+    match kind {
+        // A loaded dependency graph comes from a project analysis.
+        RuntimeKind::DependencyGraph => "analyze_project",
+        // Live connection / preview / session state all require an active
+        // connected live-db session, entered via `connect`.
+        RuntimeKind::LiveConnection
+        | RuntimeKind::PreviewSession
+        | RuntimeKind::SessionState => "connect",
     }
 }
 
@@ -408,6 +487,78 @@ mod tests {
             );
             assert_eq!(t["annotations"]["readOnlyHint"], Value::Bool(false));
         }
+    }
+
+    #[test]
+    fn unknown_tool_error_carries_fuzzy_suggestions() {
+        // oracle-da9j.2: a misspelled tool name returns a structured ErrorEnvelope
+        // in error.data with fuzzy "did you mean" candidates, so an agent
+        // self-heals in one round instead of parsing a bare string.
+        let r = crate::default_tool_registry();
+        let resp = handle_request(
+            &req(
+                8,
+                "tools/call",
+                Some(serde_json::json!({"name": "parse_fil", "arguments": {}})),
+            ),
+            &r,
+        )
+        .unwrap();
+        let err = resp.error.expect("protocol error");
+        assert_eq!(err.code, -32601);
+        let data = err.data.expect("structured envelope in error.data");
+        let fuzzy = data["fuzzy_matches"].as_array().expect("fuzzy_matches present");
+        assert!(
+            fuzzy.iter().any(|v| v == "parse_file"),
+            "fuzzy_matches should suggest parse_file: {data}"
+        );
+    }
+
+    #[test]
+    fn runtime_state_required_result_names_the_real_recovery_tool() {
+        // oracle-da9j.2: a wired tool needing runtime state returns an honest
+        // isError result whose structuredContent envelope names a REAL recovery
+        // tool (find_callers needs a DepGraph -> analyze_project).
+        let r = crate::default_tool_registry();
+        let resp = handle_request(
+            &req(
+                9,
+                "tools/call",
+                Some(serde_json::json!({"name": "find_callers", "arguments": {"target": "a.b/1"}})),
+            ),
+            &r,
+        )
+        .unwrap();
+        let result = resp.result.expect("ok result");
+        assert_eq!(result["isError"], Value::Bool(true));
+        let env = &result["structuredContent"];
+        assert_eq!(env["error_class"], "RUNTIME_STATE_REQUIRED");
+        assert_eq!(env["suggested_tool"], "analyze_project");
+    }
+
+    #[test]
+    fn invalid_arguments_error_carries_a_next_step() {
+        // oracle-da9j.2: bad arguments return -32602 with an envelope that points
+        // the agent at the tool's inputSchema.
+        let r = crate::default_tool_registry();
+        let resp = handle_request(
+            &req(
+                10,
+                "tools/call",
+                // get_symbol requires `source` + `symbol`; omit both.
+                Some(serde_json::json!({"name": "get_symbol", "arguments": {"wrong": 1}})),
+            ),
+            &r,
+        )
+        .unwrap();
+        let err = resp.error.expect("protocol error");
+        assert_eq!(err.code, -32602);
+        let data = err.data.expect("structured envelope");
+        assert_eq!(data["error_class"], "INVALID_ARGUMENTS");
+        assert!(
+            !data["next_steps"].as_array().unwrap().is_empty(),
+            "next_steps should guide the agent: {data}"
+        );
     }
 
     #[test]
