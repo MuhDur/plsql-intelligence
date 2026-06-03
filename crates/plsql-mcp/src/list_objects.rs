@@ -185,7 +185,15 @@ fn build_query(
             params.push(OracleBind::from(state.owner.clone()));
             params.push(OracleBind::from(state.name.clone()));
         } else {
-            where_clauses.push(format!("object_name > :{name_index}"));
+            // user_objects path: only ONE bind (the name) is pushed, and it
+            // lands at owner_index (= params.len()+1). Referencing name_index
+            // (params.len()+2) here left the pushed bind unreferenced and made
+            // the seek placeholder ALIAS the `fetch first :N` bind pushed
+            // immediately afterward (same K+2 slot) — so the cursor seek bound
+            // the page-size value instead of the last name, breaking
+            // user_objects pagination. Use owner_index to match the bind
+            // (oracle-b6yl.3).
+            where_clauses.push(format!("object_name > :{owner_index}"));
             params.push(OracleBind::from(state.name.clone()));
         }
     }
@@ -400,5 +408,39 @@ mod tests {
         .unwrap();
         assert!(response.issued_sql.contains("object_type ="));
         assert!(response.issued_sql.contains("object_name like"));
+    }
+
+    #[test]
+    fn user_objects_cursor_seek_binds_its_own_index_not_the_fetch_index() {
+        // oracle-b6yl.3: on the no-schema (user_objects) cursor path exactly ONE
+        // seek bind (the last name) is pushed, landing at :1; the `fetch first`
+        // bind lands at :2. The seek placeholder must reference :1 (its own
+        // bind), NOT :2 — referencing :2 aliased the page-size bind and silently
+        // broke user_objects pagination. Every other cursor test sets a schema
+        // (all_objects/two-bind path), so this locks the user_objects coverage.
+        let request = ListObjectsRequest {
+            schema: None,
+            page_size: Some(2),
+            ..Default::default()
+        };
+        let cursor = Some(CursorState {
+            owner: String::from("BILLING"),
+            name: String::from("INVOICES"),
+        });
+        let (sql, params) = build_query(&request, &cursor, 3);
+        assert!(sql.contains("from user_objects"), "{sql}");
+        assert!(
+            sql.contains("object_name > :1"),
+            "seek must bind :1 (its own pushed name): {sql}"
+        );
+        assert!(
+            sql.contains("fetch first :2 rows only"),
+            "fetch must be a distinct :2: {sql}"
+        );
+        assert!(
+            !sql.contains("object_name > :2"),
+            "seek must NOT alias the fetch bind: {sql}"
+        );
+        assert_eq!(params.len(), 2, "one seek bind + one fetch bind");
     }
 }

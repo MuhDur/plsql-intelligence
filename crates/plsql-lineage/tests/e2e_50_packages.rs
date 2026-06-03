@@ -117,25 +117,29 @@ fn build_fixture() -> TestFixture {
             NodeIdentityKind::PackageBody,
         );
         packages.push(pkg);
-        // Read 1-3 tables; the table index is (i + offset) mod 10.
-        // Edge direction is `tableX → pkg` ("change in tableX impacts pkg").
+        // Read 1-3 tables; the table index is (i + offset) mod 10. Engine
+        // convention from=dependent->to=dependency: the package reads (depends
+        // on) the table, so the edge is `pkg -> tableX` (oracle-b6yl.4 — this
+        // fixture previously built every edge backwards, masking the transposed
+        // dependencies()/impact()/recompile_order()).
         let reads_count = (i % 3) + 1;
         for r in 0..reads_count {
             let table_idx = (i + r) % 10;
-            mk_edge(&mut graph, tables[table_idx], pkg, EdgeKind::Reads);
+            mk_edge(&mut graph, pkg, tables[table_idx], EdgeKind::Reads);
         }
-        // PKG_even writes to table i%10 → pkg → table.
+        // PKG_even writes table i%10; the writer depends on the table → pkg -> table.
         if i % 2 == 0 {
             mk_edge(&mut graph, pkg, tables[i % 10], EdgeKind::Writes);
         }
-        // Call chain: PKG(i-1) → PKG(i) ("change in i-1 impacts i").
+        // Call chain: PKG(i) calls PKG(i-1), so PKG(i) depends on PKG(i-1) →
+        // edge `PKG(i) -> PKG(i-1)`.
         if (1..10).contains(&i) {
-            mk_edge(&mut graph, packages[i - 1], pkg, EdgeKind::Calls);
+            mk_edge(&mut graph, pkg, packages[i - 1], EdgeKind::Calls);
         }
     }
 
-    // 10 views, each projects from one table.
-    // Edge direction is `table → view` ("change in table impacts view").
+    // 10 views, each projects from one table. The view reads (depends on) the
+    // table → edge `view -> table` (engine convention).
     for (i, table) in tables.iter().enumerate().take(10) {
         let view = mk_node(
             &mut graph,
@@ -144,11 +148,11 @@ fn build_fixture() -> TestFixture {
             &format!("V{i:02}"),
             NodeIdentityKind::PackageBody,
         );
-        mk_edge(&mut graph, *table, view, EdgeKind::Reads);
+        mk_edge(&mut graph, view, *table, EdgeKind::Reads);
     }
 
-    // 5 triggers, each fires on one table.
-    // Edge direction: `table → trigger` ("change in table impacts trigger").
+    // 5 triggers, each fires on one table. The trigger depends on the table →
+    // edge `trigger -> table` (engine convention).
     for (i, table) in tables.iter().enumerate().take(5) {
         let trg = mk_node(
             &mut graph,
@@ -157,7 +161,7 @@ fn build_fixture() -> TestFixture {
             &format!("TRG{i:02}"),
             NodeIdentityKind::PackageBody,
         );
-        mk_edge(&mut graph, *table, trg, EdgeKind::TriggersOn);
+        mk_edge(&mut graph, trg, *table, EdgeKind::TriggersOn);
     }
 
     // 5 sequences (standalone nodes — no incoming edges).

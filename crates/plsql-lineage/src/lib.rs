@@ -905,33 +905,39 @@ pub fn dependencies(graph: &DepGraph, node: &NodeId, max_depth: Option<u32>) -> 
             continue;
         }
 
-        // Find all incoming edges (edge.to == current)
-        let nr = graph.query_reverse_neighbors(&NodeSelector::NodeId(current));
-        let incoming = match nr {
+        // Walk OUTGOING edges (edge.from == current). Under the engine
+        // convention from=dependent -> to=dependency (plsql-engine builds every
+        // Calls/Reads/Writes edge caller->callee; Oracle ALL_DEPENDENCIES is
+        // NAME -> REFERENCED_NAME), an outgoing edge current->D means current
+        // DEPENDS ON D. "What does X depend on?" must therefore walk FORWARD and
+        // collect the `to` side — matching graph_tools::run_get_dependencies
+        // (forward, edge.to) and the inverse of the same crate's
+        // callers()/impact() (reverse). The previous reverse walk collected the
+        // DEPENDENTS of X (impact()'s answer) — the two were transposed
+        // (oracle-b6yl.4).
+        let nr = graph.query_neighbors(&NodeSelector::NodeId(current));
+        let outgoing = match nr {
             Ok(result) => result.edges,
             Err(_) => continue,
         };
 
-        for edge in &incoming {
-            let source_node = &edge.from;
-            let source_id = NodeId::new(source_node.id.get());
+        for edge in &outgoing {
+            // The dependency end (what `current` points at) is `edge.to`; the
+            // LineageEdge still records the literal edge (from -> to).
+            let dep_node = &edge.to;
+            let dep_id = NodeId::new(dep_node.id.get());
 
             let lineage_confidence = depgraph_confidence_to_lineage(&edge.confidence);
 
-            // Apply confidence filter if the query specifies one.
-            // We push the edge regardless — the caller can filter on
-            // `min_confidence` post-hoc, but we also record unknown edges
-            // for low-confidence entries.
-
             result.edges.push(LineageEdge {
-                source: source_node.logical_id.clone(),
+                source: edge.from.logical_id.clone(),
                 target: edge.to.logical_id.clone(),
                 kind: edge.kind.as_str().to_string(),
                 confidence: lineage_confidence,
             });
 
-            if visited.insert(source_id) {
-                queue.push_back((source_id, depth + 1));
+            if visited.insert(dep_id) {
+                queue.push_back((dep_id, depth + 1));
             }
         }
     }
@@ -1281,16 +1287,18 @@ pub fn recompile_order(graph: &DepGraph, set: &[&str]) -> RecompilePlan {
             in_set.contains_key(&edge.from),
             in_set.contains_key(&edge.to),
         );
-        // Convention in this graph: an edge `A -> B` means B reads / depends
-        // on A (the impact walk uses this to find downstream nodes). For
-        // recompile ordering, A must therefore be recompiled before B, so B
-        // gains A as a predecessor and A gains B as a successor.
+        // Engine convention: an edge `from -> to` means `from` (the dependent /
+        // caller) depends on `to` (the dependency / callee). For recompile
+        // ordering the dependency must be compiled BEFORE the dependent, so
+        // `to` must come before `from`: `from` gains `to` as a predecessor and
+        // `to` gains `from` as a successor (oracle-b6yl.4 — this previously used
+        // the inverted convention, ordering dependents before dependencies).
         if from_in && to_in && edge.from != edge.to {
             predecessors_of
-                .entry(edge.to)
+                .entry(edge.from)
                 .or_default()
-                .insert(edge.from);
-            successors_of.entry(edge.from).or_default().insert(edge.to);
+                .insert(edge.to);
+            successors_of.entry(edge.to).or_default().insert(edge.from);
         }
     }
 
@@ -1420,8 +1428,11 @@ impl Confidence {
 }
 
 /// Walk the dependency graph downstream from `node` to find every object
-/// that may be affected by a change to it. "Downstream" means: edges
-/// where `edge.from == node`, i.e. objects that depend on the anchor.
+/// that may be affected by a change to it. Under the engine convention
+/// from=dependent -> to=dependency, "what depends on the anchor" are the
+/// INCOMING edges (`edge.to == node`): each source `edge.from` is an object
+/// that depends on the anchor and would break if it changed. (This mirrors the
+/// same crate's `callers()` and is the inverse of `dependencies()`.)
 ///
 /// Confidence aggregation: the path-confidence reaching a node is the
 /// minimum confidence over edges in that path; if multiple paths reach
@@ -1455,15 +1466,22 @@ pub fn impact(graph: &DepGraph, node: &NodeId, max_depth: Option<u32>) -> Lineag
             continue;
         }
 
-        let outgoing = match graph.query_neighbors(&NodeSelector::NodeId(current)) {
+        // Walk INCOMING edges (edge.to == current). Under from=dependent ->
+        // to=dependency, an incoming edge S->current means S DEPENDS ON current,
+        // so S is in current's blast radius ("what breaks if I change current").
+        // Advance toward the dependent side (edge.from). The previous forward
+        // walk collected current's own dependencies (dependencies()'s answer) —
+        // the two were transposed (oracle-b6yl.4). Mirrors callers() (reverse).
+        let incoming = match graph.query_reverse_neighbors(&NodeSelector::NodeId(current)) {
             Ok(neighbors) => neighbors.edges,
             Err(_) => continue,
         };
 
-        for edge in &outgoing {
+        for edge in &incoming {
             let edge_conf = depgraph_confidence_to_lineage(&edge.confidence);
             let next_conf = path_conf.min(edge_conf);
-            let target_id = NodeId::new(edge.to.id.get());
+            // The dependent end (what points at `current`) is `edge.from`.
+            let target_id = NodeId::new(edge.from.id.get());
 
             if emitted_edges.insert(edge.id) {
                 result.edges.push(LineageEdge {
@@ -3270,36 +3288,43 @@ mod tests {
             )
         };
 
-        // B depends on A (edge: A -> B)
+        // Edges follow the ENGINE convention: from = dependent, to = dependency
+        // (plsql-engine builds every Calls/Reads/Writes edge caller -> callee;
+        // Oracle ALL_DEPENDENCIES is NAME -> REFERENCED_NAME). The chain is
+        // D depends on C depends on B depends on A (oracle-b6yl.4 corrected this
+        // fixture, which previously built the edges backwards and so masked the
+        // transposed dependencies()/impact() traversals).
+        //
+        // B depends on A — B reads A (edge: B -> A)
         g.insert_edge(
             DgEdge::new(
                 DgEdgeId::new(1),
-                DgNodeId::new(1),
                 DgNodeId::new(2),
+                DgNodeId::new(1),
                 DgEdgeKind::Reads,
                 DgConfidence::new(DgConfidenceLevel::High, None),
             ),
             prov(),
             None,
         );
-        // C depends on B (edge: B -> C)
+        // C depends on B — C calls B (edge: C -> B)
         g.insert_edge(
             DgEdge::new(
                 DgEdgeId::new(2),
-                DgNodeId::new(2),
                 DgNodeId::new(3),
+                DgNodeId::new(2),
                 DgEdgeKind::Calls,
                 DgConfidence::new(DgConfidenceLevel::High, None),
             ),
             prov(),
             None,
         );
-        // D depends on C (edge: C -> D)
+        // D depends on C — D reads C (edge: D -> C)
         g.insert_edge(
             DgEdge::new(
                 DgEdgeId::new(3),
-                DgNodeId::new(3),
                 DgNodeId::new(4),
+                DgNodeId::new(3),
                 DgEdgeKind::Reads,
                 DgConfidence::new(DgConfidenceLevel::Medium, None),
             ),
@@ -3312,11 +3337,12 @@ mod tests {
     #[test]
     fn dependencies_returns_direct_upstream() {
         let graph = dependency_fixture();
-        // What does table_b (node 2) depend on? -> table_a (node 1)
+        // What does table_b (node 2) depend on? -> table_a (node 1).
+        // Edge B->A under from=dependent->to=dependency: source=B, target=A.
         let result = super::dependencies(&graph, &DgNodeId::new(2), Some(1));
         assert_eq!(result.edges.len(), 1);
-        assert_eq!(result.edges[0].source, "schema.table_a");
-        assert_eq!(result.edges[0].target, "schema.table_b");
+        assert_eq!(result.edges[0].source, "schema.table_b");
+        assert_eq!(result.edges[0].target, "schema.table_a");
         assert_eq!(result.edges[0].kind, "Reads");
     }
 
@@ -3326,21 +3352,22 @@ mod tests {
         // What does func_d (node 4) depend on, 3 hops?
         // Direct: proc_c (node 3). Transitive: table_b (node 2), table_a (node 1).
         let result = super::dependencies(&graph, &DgNodeId::new(4), Some(3));
-        // Should find 3 edges: C->D, B->C, A->B
+        // Should find 3 edges: D->C, C->B, B->A. The dependencies of D (what D
+        // depends on, transitively) are the TARGET side: C, B, A.
         assert_eq!(result.edges.len(), 3);
-        let sources: Vec<&str> = result.edges.iter().map(|e| e.source.as_str()).collect();
-        assert!(sources.contains(&"schema.proc_c"));
-        assert!(sources.contains(&"schema.table_b"));
-        assert!(sources.contains(&"schema.table_a"));
+        let targets: Vec<&str> = result.edges.iter().map(|e| e.target.as_str()).collect();
+        assert!(targets.contains(&"schema.proc_c"));
+        assert!(targets.contains(&"schema.table_b"));
+        assert!(targets.contains(&"schema.table_a"));
     }
 
     #[test]
     fn dependencies_respects_max_depth() {
         let graph = dependency_fixture();
-        // depth=1 from node 4: only C
+        // depth=1 from node 4: only its direct dependency C (target side)
         let d1 = super::dependencies(&graph, &DgNodeId::new(4), Some(1));
         assert_eq!(d1.edges.len(), 1);
-        assert_eq!(d1.edges[0].source, "schema.proc_c");
+        assert_eq!(d1.edges[0].target, "schema.proc_c");
 
         // depth=2 from node 4: C and B
         let d2 = super::dependencies(&graph, &DgNodeId::new(4), Some(2));
@@ -3530,23 +3557,31 @@ mod impact_tests {
         )
     }
 
-    /// Linear chain: anchor → A → B → C, all High-confidence.
+    /// Linear dependency chain (engine convention from=dependent -> to=dependency):
+    /// summary_job depends on report_view depends on report_pkg depends on
+    /// customers, all High-confidence. So a change to `customers` (the anchor of
+    /// the impact tests) ripples out to report_pkg -> report_view -> summary_job.
+    /// (oracle-b6yl.4 reversed these edges, which previously pointed
+    /// dependency->dependent and masked the transposed impact()/dependencies().)
     fn linear_chain_graph() -> DepGraph {
         let mut g = DepGraph::new();
         g.insert_node(node(1, "billing.customers"));
         g.insert_node(node(2, "billing.report_pkg"));
         g.insert_node(node(3, "billing.report_view"));
         g.insert_node(node(4, "billing.summary_job"));
-        g.insert_edge(edge(1, 1, 2, ConfidenceLevel::High), provenance(), None);
-        g.insert_edge(edge(2, 2, 3, ConfidenceLevel::High), provenance(), None);
-        g.insert_edge(edge(3, 3, 4, ConfidenceLevel::High), provenance(), None);
+        g.insert_edge(edge(1, 2, 1, ConfidenceLevel::High), provenance(), None);
+        g.insert_edge(edge(2, 3, 2, ConfidenceLevel::High), provenance(), None);
+        g.insert_edge(edge(3, 4, 3, ConfidenceLevel::High), provenance(), None);
         g
     }
 
-    /// Branching graph with mixed confidences:
-    ///   anchor → A (High) → B (High)
-    ///   anchor → C (Medium) → B (High)
-    ///   anchor → D (Opaque)
+    /// Branching graph (engine convention from=dependent -> to=dependency); the
+    /// anchor `customers` is depended-on by:
+    ///   exact_dep (High) which merge_target (High) depends on
+    ///   heuristic_dep (Medium) which merge_target (High) depends on
+    ///   opaque_dep (Opaque)
+    /// so impact(customers) reaches exact_dep, heuristic_dep, opaque_dep, and
+    /// merge_target (via two paths, max-of-min path confidence = Exact).
     fn branching_graph() -> DepGraph {
         let mut g = DepGraph::new();
         g.insert_node(node(1, "billing.customers"));
@@ -3554,11 +3589,11 @@ mod impact_tests {
         g.insert_node(node(3, "billing.merge_target"));
         g.insert_node(node(4, "billing.heuristic_dep"));
         g.insert_node(node(5, "billing.opaque_dep"));
-        g.insert_edge(edge(1, 1, 2, ConfidenceLevel::High), provenance(), None);
-        g.insert_edge(edge(2, 2, 3, ConfidenceLevel::High), provenance(), None);
-        g.insert_edge(edge(3, 1, 4, ConfidenceLevel::Medium), provenance(), None);
-        g.insert_edge(edge(4, 4, 3, ConfidenceLevel::High), provenance(), None);
-        g.insert_edge(edge(5, 1, 5, ConfidenceLevel::Opaque), provenance(), None);
+        g.insert_edge(edge(1, 2, 1, ConfidenceLevel::High), provenance(), None);
+        g.insert_edge(edge(2, 3, 2, ConfidenceLevel::High), provenance(), None);
+        g.insert_edge(edge(3, 4, 1, ConfidenceLevel::Medium), provenance(), None);
+        g.insert_edge(edge(4, 3, 4, ConfidenceLevel::High), provenance(), None);
+        g.insert_edge(edge(5, 5, 1, ConfidenceLevel::Opaque), provenance(), None);
         g
     }
 
@@ -3641,7 +3676,9 @@ mod impact_tests {
         let res = impact(&g, &NodeId::new(1), None);
         assert_eq!(res.unknown_edges.len(), 1);
         let u = &res.unknown_edges[0];
-        assert_eq!(u.source, "billing.customers");
+        // The opaque edge is opaque_dep -> customers (opaque_dep depends on the
+        // anchor via dynamic SQL); the unknown edge records its `from` source.
+        assert_eq!(u.source, "billing.opaque_dep");
         assert_eq!(u.unknown_reason, "DynamicSqlOpaque");
     }
 
@@ -4079,8 +4116,11 @@ mod impact_tests {
     #[test]
     fn explain_path_aggregates_confidence_and_collects_blockers() {
         let g = branching_graph();
-        let from = NodeSelector::NodeId(NodeId::new(1));
-        let to = NodeSelector::NodeId(NodeId::new(5));
+        // The opaque edge runs opaque_dep(5) -> customers(1) (opaque_dep depends
+        // on the anchor via dynamic SQL), so the directed path with the blocker
+        // goes from 5 to 1 under the engine convention.
+        let from = NodeSelector::NodeId(NodeId::new(5));
+        let to = NodeSelector::NodeId(NodeId::new(1));
         let explanation = explain_path(&g, &from, &to).unwrap();
         match explanation {
             LineageExplanation::Path(p) => {
@@ -4138,10 +4178,10 @@ mod impact_tests {
                 "billing.customers",
             ],
         );
-        // In linear_chain_graph: customers → report_pkg → report_view → summary_job
-        // Recompile order: callees before callers, so:
-        //   customers (callee of report_pkg) first,
-        //   report_pkg next, report_view next, summary_job last.
+        // linear_chain_graph dependency chain: summary_job depends on report_view
+        // depends on report_pkg depends on customers. Recompile order is
+        // dependency (callee) first, so:
+        //   customers first, report_pkg, report_view, summary_job last.
         assert_eq!(
             plan.order,
             vec![
@@ -4210,8 +4250,9 @@ mod impact_tests {
         let g = linear_chain_graph();
         let plan = recompile_order(&g, &["billing.summary_job", "billing.report_view"]);
         // Even with two nodes that have intervening hops, only intra-set
-        // edges constrain ordering. The single direct edge
-        // report_view → summary_job is in-set, so report_view comes first.
+        // edges constrain ordering. The single direct edge summary_job ->
+        // report_view (summary_job depends on report_view) is in-set, so the
+        // dependency report_view is recompiled first.
         assert_eq!(
             plan.order,
             vec!["billing.report_view", "billing.summary_job"]
