@@ -186,14 +186,79 @@ fn is_plsql_source(path: &Path) -> bool {
         .is_some_and(|x| PLSQL_EXTS.contains(&x.as_str()))
 }
 
+/// Blank the CONTENTS of string literals (`'…'`, doubled-`''` aware), line
+/// comments (`-- …`), and block comments (`/* … */`) to spaces, so a branch
+/// keyword that appears only inside a literal or a comment
+/// (`v := 'IF a AND b'`, `-- WHILE loop`) is not counted as a decision point by
+/// [`cyclomatic`] (oracle-qbqf.3). The result is only tokenized, so exact byte
+/// offsets need not be preserved — replacing each masked char with a space is
+/// sufficient and keeps line structure intact.
+fn blank_strings_and_comments(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' {
+            out.push(' ');
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\'' {
+                    if chars.get(i + 1) == Some(&'\'') {
+                        out.push(' ');
+                        out.push(' ');
+                        i += 2;
+                        continue;
+                    }
+                    out.push(' ');
+                    i += 1;
+                    break;
+                }
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        if c == '-' && chars.get(i + 1) == Some(&'-') {
+            while i < chars.len() && chars[i] != '\n' {
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            out.push(' ');
+            out.push(' ');
+            i += 2;
+            while i < chars.len() {
+                if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                    break;
+                }
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 /// McCabe cyclomatic complexity = 1 + decision points. Counts the branch-
 /// introducing keywords (IF/ELSIF/CASE/WHEN/WHILE/FOR) and short-circuit
 /// operators (AND/OR), while NOT counting the `END IF`/`END CASE` closers
-/// (tracked via the previous token) or an unconditional bare `LOOP`.
+/// (tracked via the previous token) or an unconditional bare `LOOP`. String
+/// literals and comments are blanked first so a keyword inside them is not
+/// miscounted (oracle-qbqf.3).
 fn cyclomatic(src: &str) -> u32 {
+    let masked = blank_strings_and_comments(src);
     let mut count: u32 = 1;
     let mut prev = String::new();
-    for raw in src.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+    for raw in masked.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
         if raw.is_empty() {
             continue;
         }
@@ -259,6 +324,24 @@ mod tests {
     fn end_if_does_not_double_count() {
         // One IF, closed by END IF -> 1 decision -> complexity 2.
         assert_eq!(cyclomatic("IF a THEN b; END IF;"), 2);
+    }
+
+    #[test]
+    fn keywords_inside_strings_and_comments_are_not_counted() {
+        // oracle-qbqf.3: branch keywords appearing only inside a string literal
+        // or a comment must not inflate cyclomatic complexity.
+        assert_eq!(
+            cyclomatic("v := 'IF a AND b OR c WHILE x'; -- ELSIF FOR\n"),
+            1,
+            "literal + line-comment keywords must not count"
+        );
+        assert_eq!(
+            cyclomatic("/* CASE WHEN AND OR */ x := 1;"),
+            1,
+            "block-comment keywords must not count"
+        );
+        // Control: real decisions outside literals still count (IF + AND => 3).
+        assert_eq!(cyclomatic("IF a AND b THEN c := 'OR not counted'; END IF;"), 3);
     }
 
     #[test]

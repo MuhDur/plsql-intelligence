@@ -516,11 +516,16 @@ const CREDENTIAL_MARKERS: &[&str] = &[
 ];
 
 /// Blank the *contents* of every `'…'` string literal (keeping the
-/// quotes and the byte length) so a credential marker can never
-/// self-match inside a secret value (e.g. `secret` inside
-/// `'Sup3rSecret'`). Doubled `''` escapes are treated as literal
-/// content. ASCII-only transform; non-ASCII bytes are left as-is.
-fn mask_string_literals(lower: &str) -> String {
+/// quotes and the byte length) so a marker can never self-match inside a
+/// literal value (e.g. `secret` inside `'Sup3rSecret'`, or a clause keyword
+/// like `FROM`/`INTO` inside `'failed to INSERT INTO orders'`). Doubled `''`
+/// escapes are treated as literal content. Byte-length-preserving, so callers
+/// can scan the masked buffer for keyword positions and still slice the
+/// ORIGINAL buffer at the same offsets for the matched name. ASCII-only
+/// transform; non-ASCII bytes are left as-is. Shared with the DML table-access
+/// extractors (`dml_edges`, `sql_resolve`) which scan raw SQL for clause
+/// keywords and must not match one buried in a literal (oracle-qbqf.2).
+pub(crate) fn mask_string_literals(lower: &str) -> String {
     let bytes = lower.as_bytes();
     let mut out = String::with_capacity(lower.len());
     let mut i = 0;

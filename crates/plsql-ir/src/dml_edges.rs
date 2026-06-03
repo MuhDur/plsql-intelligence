@@ -164,7 +164,13 @@ fn parenthesised_query(range_text: &str) -> Option<&str> {
 }
 
 fn accesses_from_sql(verb: SqlVerb, raw: &str, out: &mut Vec<TableAccess>) {
-    let upper = raw.to_ascii_uppercase();
+    // Mask single-quoted string-literal CONTENTS before any clause-keyword scan
+    // so a `FROM`/`INTO`/`USING`/`UPDATE`/`JOIN` keyword buried inside a literal
+    // value (`UPDATE log SET msg = 'failed to INSERT INTO orders'`) cannot mint a
+    // phantom table access. Masking preserves byte length, so the `raw[start..i]`
+    // slices in `tables_after` stay offset-aligned and still read the real name
+    // (oracle-qbqf.2). `raw` itself stays unmasked for the emitted name.
+    let upper = crate::fact_emit::mask_string_literals(&raw.to_ascii_uppercase());
     match verb {
         SqlVerb::Select => {
             for t in tables_after(&upper, raw, "FROM") {
@@ -291,12 +297,18 @@ fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
 }
 
 /// Pull the identifier(s) immediately following each occurrence
-/// of `keyword` (whole-word) in `raw`. Stops at the first
-/// non-identifier token, so `FROM hr.employees e WHERE …` yields
-/// `hr.employees`.
+/// of `keyword` (whole-word) in `upper` (the scan buffer; names are
+/// sliced from `raw` at the same offsets). For the `FROM` keyword a
+/// top-level comma-separated table list is traversed so a legacy
+/// Oracle comma join (`FROM emp a, dept b`) yields BOTH tables, not
+/// just the first — every sibling is a real Read dependency
+/// (oracle-qbqf.1). Per-table aliases are skipped. For the other
+/// keywords (single-target INTO/UPDATE/USING; per-clause JOIN) only
+/// the first table after each occurrence is read, as before.
 fn tables_after(upper: &str, raw: &str, keyword: &str) -> Vec<String> {
     let mut out = Vec::new();
     let kw = keyword.to_ascii_uppercase();
+    let traverse_commas = kw == "FROM";
     let bytes = upper.as_bytes();
     let mut search = 0;
     while let Some(rel) = upper[search..].find(&kw) {
@@ -309,18 +321,42 @@ fn tables_after(upper: &str, raw: &str, keyword: &str) -> Vec<String> {
         if !(prev_ok && next_ok) {
             continue;
         }
-        // Skip whitespace, then read the identifier (allowing
-        // dotted `schema.table`).
         let mut i = after;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        let start = i;
-        while i < bytes.len() && (is_ident_byte(bytes[i]) || bytes[i] == b'.') {
-            i += 1;
-        }
-        if i > start {
+        loop {
+            // Skip whitespace, then read the `[schema.]table` token.
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            let start = i;
+            while i < bytes.len() && (is_ident_byte(bytes[i]) || bytes[i] == b'.') {
+                i += 1;
+            }
+            if i == start {
+                break;
+            }
             out.push(raw[start..i].to_string());
+            if !traverse_commas {
+                break;
+            }
+            // Skip an optional per-table alias (a bare identifier that is not a
+            // comma/clause boundary) so the comma after `emp a` is reached.
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < bytes.len() && is_ident_byte(bytes[i]) {
+                while i < bytes.len() && (is_ident_byte(bytes[i]) || bytes[i] == b'.') {
+                    i += 1;
+                }
+            }
+            // Continue only across a top-level comma; anything else (WHERE, a
+            // clause keyword, EOF, or a `(` sub-select) ends the FROM list.
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i >= bytes.len() || bytes[i] != b',' {
+                break;
+            }
+            i += 1; // consume the comma and read the next sibling table
         }
     }
     out
@@ -379,6 +415,45 @@ mod tests {
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].table, "EMPLOYEES");
         assert_eq!(a[0].access, AccessKind::Read);
+    }
+
+    #[test]
+    fn legacy_comma_join_reads_every_table() {
+        // oracle-qbqf.1: a comma-joined FROM list must yield a Read of EVERY
+        // sibling table, not just the first — each is a real dependency.
+        let s = lower_statement_body("SELECT a.x INTO v FROM emp a, dept b WHERE a.d = b.id;");
+        let acc = extract_table_accesses(&s);
+        for t in ["EMP", "DEPT"] {
+            assert!(
+                acc.iter().any(|x| x.table == t && x.access == AccessKind::Read),
+                "comma-join must read {t}: {acc:?}"
+            );
+        }
+        // Three-table comma list, no aliases.
+        let s3 = lower_statement_body("SELECT x INTO v FROM a, b, c WHERE 1 = 1;");
+        let acc3 = extract_table_accesses(&s3);
+        for t in ["A", "B", "C"] {
+            assert!(
+                acc3.iter().any(|x| x.table == t && x.access == AccessKind::Read),
+                "comma-join must read {t}: {acc3:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clause_keyword_inside_string_literal_is_not_a_phantom_table() {
+        // oracle-qbqf.2: a FROM/INTO/JOIN keyword buried in a string literal must
+        // not mint a phantom table access (string literals are masked first).
+        let s = lower_statement_body("UPDATE log SET msg = 'failed to INSERT INTO orders';");
+        let acc = extract_table_accesses(&s);
+        assert!(
+            !acc.iter().any(|x| x.table == "ORDERS"),
+            "INTO inside a literal must not mint a phantom ORDERS access: {acc:?}"
+        );
+        assert!(
+            acc.iter().any(|x| x.table == "LOG" && x.access == AccessKind::Write),
+            "the real UPDATE target LOG must still be a Write: {acc:?}"
+        );
     }
 
     #[test]

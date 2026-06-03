@@ -48,7 +48,13 @@ pub fn resolve_sql(raw: &str) -> SqlStatementModel {
     // (ASCII whitespace is single-byte, so `trimmed`/`upper` share offsets.)
     // (oracle-ajm2.18)
     let trimmed = raw.trim_start();
-    let upper = trimmed.to_ascii_uppercase();
+    // Mask single-quoted string-literal CONTENTS in the scan buffer so a clause
+    // keyword buried in a literal (`INSERT INTO log VALUES ('read FROM cache')`)
+    // cannot mint a phantom table use. Masking preserves byte length, so the
+    // `trimmed[..]` slices for the emitted schema/table/alias stay offset-aligned
+    // (oracle-qbqf.2). The leading verb is never inside a literal, so
+    // classify_verb is unaffected.
+    let upper = crate::fact_emit::mask_string_literals(&trimmed.to_ascii_uppercase());
     let verb = classify_verb(&upper);
     let mut model = SqlStatementModel {
         verb,
@@ -464,6 +470,23 @@ mod tests {
         assert_eq!(m.verb, SqlSemanticVerb::Delete);
         assert_eq!(m.tables[0].table, "STALE");
         assert_eq!(m.tables[0].usage, TableUsageKind::Write);
+    }
+
+    #[test]
+    fn clause_keyword_inside_string_literal_is_not_a_phantom_table() {
+        // oracle-qbqf.2: a FROM keyword buried in a string literal must not mint
+        // a phantom table use (the scan buffer masks string-literal contents).
+        let m = resolve_sql("INSERT INTO log VALUES ('read FROM cache')");
+        assert!(
+            !m.tables.iter().any(|t| t.table == "CACHE"),
+            "FROM inside a literal must not mint a phantom CACHE read: {:?}",
+            m.tables
+        );
+        assert!(
+            m.tables.iter().any(|t| t.table == "LOG" && t.usage == TableUsageKind::Write),
+            "the real INSERT target LOG must still be a Write: {:?}",
+            m.tables
+        );
     }
 
     #[test]
