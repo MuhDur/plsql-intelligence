@@ -115,7 +115,10 @@ pub fn register_graph_tools(registry: &mut ToolRegistry) {
         (
             "get_dependencies",
             "The sorted, de-duplicated set of logical object ids the target depends on \
-             (forward edges reshaped to a flat list).",
+             (forward edges reshaped to a flat list). When to use: prefer find_callees when \
+             you need per-edge kind/confidence detail — this returns only the flat id set. \
+             Run analyze_project (or plsql_analyze) first to load the graph and obtain valid \
+             target ids.",
         ),
     ] {
         // All three graph tools take a single `target` logical object id in the
