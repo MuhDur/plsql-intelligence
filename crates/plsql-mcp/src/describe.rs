@@ -136,6 +136,26 @@ pub enum DescribeError {
     },
 }
 
+/// Normalize a user-supplied Oracle identifier to the form the data dictionary
+/// stores: an UNQUOTED name folds to upper-case (Oracle's default for
+/// `ALL_OBJECTS.OWNER` / `OBJECT_NAME`), a double-quoted `"..."` name keeps its
+/// inner case verbatim (Oracle case-sensitive quoting). Applied at every
+/// describe / list_objects binding site so an agent that copies
+/// `billing.invoices` from lowercase source resolves against `BILLING.INVOICES`
+/// instead of getting a spurious NotFound / empty page (oracle-da9j.5).
+#[must_use]
+pub(crate) fn normalize_identifier(raw: &str) -> String {
+    let t = raw.trim();
+    let bytes = t.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
+        // Quoted: strip the surrounding quotes, keep the inner case verbatim
+        // (collapsing the `""` escape to a single `"`).
+        t[1..t.len() - 1].replace("\"\"", "\"")
+    } else {
+        t.to_ascii_uppercase()
+    }
+}
+
 /// `describe_table(owner, name)` — emits column, constraint, index,
 /// comment, and partition info for a single TABLE.
 pub fn run_describe_table<C: OracleConnection>(
@@ -143,6 +163,9 @@ pub fn run_describe_table<C: OracleConnection>(
     owner: &str,
     name: &str,
 ) -> Result<DescribeTableResponse, DescribeError> {
+    let owner = normalize_identifier(owner);
+    let name = normalize_identifier(name);
+    let (owner, name) = (owner.as_str(), name.as_str());
     let mut sanitized_fields = 0usize;
     let columns = load_columns(conn, owner, name, &mut sanitized_fields)?;
     let comment = load_table_comment(conn, owner, name, &mut sanitized_fields)?;
@@ -180,6 +203,9 @@ pub fn run_describe_view<C: OracleConnection>(
     name: &str,
     text_preview_chars: Option<usize>,
 ) -> Result<DescribeViewResponse, DescribeError> {
+    let owner = normalize_identifier(owner);
+    let name = normalize_identifier(name);
+    let (owner, name) = (owner.as_str(), name.as_str());
     let mut sanitized_fields = 0usize;
     let columns = load_columns(conn, owner, name, &mut sanitized_fields)?;
     let view_row = conn.query_rows(
@@ -234,6 +260,9 @@ pub fn run_describe_trigger<C: OracleConnection>(
     owner: &str,
     name: &str,
 ) -> Result<DescribeTriggerResponse, DescribeError> {
+    let owner = normalize_identifier(owner);
+    let name = normalize_identifier(name);
+    let (owner, name) = (owner.as_str(), name.as_str());
     let rows = conn.query_rows(
         "select trigger_type, triggering_event, table_owner, table_name, status, when_clause \
          from all_triggers where owner = :1 and trigger_name = :2",
@@ -281,6 +310,9 @@ pub fn run_describe_index<C: OracleConnection>(
     owner: &str,
     name: &str,
 ) -> Result<DescribeIndexResponse, DescribeError> {
+    let owner = normalize_identifier(owner);
+    let name = normalize_identifier(name);
+    let (owner, name) = (owner.as_str(), name.as_str());
     let header = conn.query_rows(
         "select table_owner, table_name, uniqueness, index_type, status \
          from all_indexes where owner = :1 and index_name = :2",
@@ -545,6 +577,16 @@ mod tests {
     use plsql_catalog::{OracleBackend, OracleConnectionInfo, OracleRow};
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    #[test]
+    fn normalize_identifier_folds_unquoted_and_preserves_quoted() {
+        // oracle-da9j.5: unquoted -> Oracle dictionary upper-case; double-quoted
+        // -> exact inner case (with `""` collapsed to `"`).
+        assert_eq!(normalize_identifier("billing"), "BILLING");
+        assert_eq!(normalize_identifier("  Hr  "), "HR");
+        assert_eq!(normalize_identifier("\"MixedCase\""), "MixedCase");
+        assert_eq!(normalize_identifier("\"with\"\"quote\""), "with\"quote");
+    }
 
     #[derive(Default)]
     struct RouterStub {

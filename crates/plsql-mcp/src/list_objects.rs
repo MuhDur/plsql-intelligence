@@ -11,6 +11,8 @@ use plsql_catalog::{CatalogError, OracleBind, OracleConnection};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::describe::normalize_identifier;
+
 /// Request shape consumed by the `list_objects` tool.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ListObjectsRequest {
@@ -162,17 +164,22 @@ fn build_query(
         "user_objects"
     };
 
+    // Oracle stores unquoted identifiers upper-cased; fold the schema/object-type
+    // filters the same way so natural lowercase input (`schema:'billing'`,
+    // `object_type:'table'`) resolves instead of returning an empty page
+    // indistinguishable from an empty schema, and match the name pattern
+    // case-insensitively as documented (oracle-da9j.5).
     if let Some(schema) = &request.schema {
         where_clauses.push(format!("owner = :{}", params.len() + 1));
-        params.push(OracleBind::from(schema.clone()));
+        params.push(OracleBind::from(normalize_identifier(schema)));
     }
     if let Some(object_type) = &request.object_type {
         where_clauses.push(format!("object_type = :{}", params.len() + 1));
-        params.push(OracleBind::from(object_type.clone()));
+        params.push(OracleBind::from(normalize_identifier(object_type)));
     }
     if let Some(pattern) = &request.name_pattern {
-        where_clauses.push(format!("object_name like :{}", params.len() + 1));
-        params.push(OracleBind::from(pattern.clone()));
+        where_clauses.push(format!("upper(object_name) like :{}", params.len() + 1));
+        params.push(OracleBind::from(pattern.to_ascii_uppercase()));
     }
     if let Some(state) = cursor {
         // Use the owner+name tuple as a stable seek predicate.
@@ -407,7 +414,39 @@ mod tests {
         )
         .unwrap();
         assert!(response.issued_sql.contains("object_type ="));
-        assert!(response.issued_sql.contains("object_name like"));
+        assert!(response.issued_sql.contains("upper(object_name) like"));
+    }
+
+    #[test]
+    fn lowercase_filters_are_folded_to_dictionary_case() {
+        // oracle-da9j.5: natural lowercase input must resolve against the
+        // upper-cased data-dictionary values (BILLING/TABLE), and the name
+        // pattern matches case-insensitively — otherwise an agent copying
+        // `billing.invoices` from lowercase source gets an empty page.
+        let (sql, params) = build_query(
+            &ListObjectsRequest {
+                schema: Some(String::from("billing")),
+                object_type: Some(String::from("table")),
+                name_pattern: Some(String::from("inv_%")),
+                ..Default::default()
+            },
+            &None,
+            6,
+        );
+        assert!(params.contains(&OracleBind::String("BILLING".into())), "{params:?}");
+        assert!(params.contains(&OracleBind::String("TABLE".into())), "{params:?}");
+        assert!(params.contains(&OracleBind::String("INV_%".into())), "{params:?}");
+        assert!(sql.contains("upper(object_name) like"));
+        // A double-quoted schema keeps its exact case (Oracle case-sensitive).
+        let (_, quoted) = build_query(
+            &ListObjectsRequest {
+                schema: Some(String::from("\"MixedCase\"")),
+                ..Default::default()
+            },
+            &None,
+            6,
+        );
+        assert!(quoted.contains(&OracleBind::String("MixedCase".into())), "{quoted:?}");
     }
 
     #[test]
