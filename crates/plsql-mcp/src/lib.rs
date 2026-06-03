@@ -116,7 +116,7 @@ pub fn register_execute_approved_tools(registry: &mut ToolRegistry) {
         ToolDescriptor::new(
             "execute_approved",
             ToolTier::FoundationLiveDb,
-            "Run a previously-previewed DDL statement under its approval token. Verifies the supplied bytes against the previewed payload byte-for-byte and runs the cross-schema typed-name guard before returning the execution plan.",
+            "Run a previously-previewed DDL statement under its approval token. Verifies the supplied bytes against the previewed payload byte-for-byte and runs the cross-schema typed-name guard before returning the execution plan. Prerequisites: a prior dry_run (create_or_replace / patch_package / patch_view) minted the 60s approval token, and the session is write-enabled (connect → enable_writes); call within 60s of the dry_run or re-preview.",
         )
         .destructive(),
     );
@@ -158,7 +158,7 @@ pub fn register_create_or_replace_tool(registry: &mut ToolRegistry) {
         ToolDescriptor::new(
             "create_or_replace",
             ToolTier::FoundationLiveDb,
-            "Full-DDL deployment under per-operation approval. Accepts CREATE OR REPLACE … for PACKAGE [BODY] / PROCEDURE / FUNCTION / TRIGGER / VIEW / TYPE [BODY] / SYNONYM / LIBRARY. `dry_run` mints a 60s approval token; `apply` verifies byte-for-byte and returns the executable DDL.",
+            "Full-DDL deployment under per-operation approval. Accepts CREATE OR REPLACE … for PACKAGE [BODY] / PROCEDURE / FUNCTION / TRIGGER / VIEW / TYPE [BODY] / SYNONYM / LIBRARY. Guarded-write workflow: connect → enable_writes (consumes the single-use operator token) → this tool with mode=dry_run (mints a 60s approval token) → mode=apply (verifies the supplied bytes against the previewed payload byte-for-byte under that token before returning the executable DDL). The approval token expires 60s after dry_run.",
         )
         .destructive(),
     );

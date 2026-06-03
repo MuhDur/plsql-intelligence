@@ -340,10 +340,18 @@ fn handle_tools_call(
     // "runtime state required" outcome for tools that need a live
     // connection / loaded graph / preview session.
     match dispatch_tool(name, arguments) {
-        Ok(DispatchOutcome::Ran(structured)) => JsonRpcResponse::ok(
-            id,
-            tool_result(&structured_text(name, &structured), false, Some(structured)),
-        ),
+        Ok(DispatchOutcome::Ran(structured)) => {
+            let mut result = tool_result(&structured_text(name, &structured), false, Some(structured));
+            // Workflow-first: attach the natural follow-up tools so an agent can
+            // chain a multi-step task without re-planning (oracle-da9j.7).
+            let next = next_actions_for(name);
+            if !next.is_empty() {
+                result["next_actions"] = Value::Array(
+                    next.into_iter().map(|s| Value::String(s.to_string())).collect(),
+                );
+            }
+            JsonRpcResponse::ok(id, result)
+        }
         Ok(DispatchOutcome::RuntimeStateRequired(kind)) => {
             // Wired, arguments validated — but the runtime state is absent.
             // Honest error *result* (transport-level call succeeded; the tool
@@ -414,6 +422,37 @@ fn runtime_kind_recovery_tool(kind: crate::dispatch::RuntimeKind) -> &'static st
 /// Build an MCP `tools/call` result object: a human-readable
 /// `content` text block, the `isError` flag, and (for tools that
 /// ran) the machine-readable `structuredContent` payload.
+/// Natural follow-up tools an agent should consider after a tool runs
+/// successfully, so a multi-step task chains without re-planning
+/// (oracle-da9j.7). Empty for terminal/standalone tools.
+fn next_actions_for(name: &str) -> Vec<&'static str> {
+    match name {
+        "oracle_capabilities" => vec![
+            "tools/list — read each tool's argument schema + readOnlyHint/destructiveHint",
+            "analyze_project — load a project to enable the graph + analysis tools",
+        ],
+        "analyze_project" => vec![
+            "plsql_analyze — routine/object inventory, lint findings, complexity",
+            "find_callers / find_callees / get_dependencies — traverse the dependency graph",
+        ],
+        "plsql_analyze" => vec![
+            "find_callers / get_dependencies — drill into a specific routine's edges",
+        ],
+        "parse_file" => vec![
+            "get_symbol — look up a declaration by name",
+            "compile_check — error/warning counts + every diagnostic",
+        ],
+        "find_callers" | "find_callees" => {
+            vec!["get_dependencies — the flat dependency id list for the same target"]
+        }
+        // A live-DB read naturally precedes a guarded write.
+        "describe_table" | "describe_view" => vec![
+            "patch_view / create_or_replace (dry_run) — preview a change to this object",
+        ],
+        _ => vec![],
+    }
+}
+
 fn tool_result(text: &str, is_error: bool, structured: Option<Value>) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert(
@@ -696,6 +735,49 @@ mod tests {
         assert_eq!(
             find("parse_file")["annotations"]["available"],
             Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn successful_results_carry_next_actions_workflow_hints() {
+        // oracle-da9j.7: a tool that runs attaches its natural follow-ups.
+        let r = crate::default_tool_registry();
+        let resp = handle_request(
+            &req(
+                15,
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "parse_file",
+                    "arguments": {"source": "BEGIN NULL; END;\n/\n"}
+                })),
+            ),
+            &r,
+        )
+        .unwrap();
+        let na = resp.result.expect("ok")["next_actions"]
+            .as_array()
+            .expect("next_actions present")
+            .clone();
+        assert!(
+            na.iter().any(|s| s.as_str().unwrap_or("").contains("get_symbol")),
+            "parse_file should chain to get_symbol/compile_check: {na:?}"
+        );
+        // The discovery tool chains to tools/list + analyze_project.
+        let cap = handle_request(
+            &req(
+                16,
+                "tools/call",
+                Some(serde_json::json!({"name": "oracle_capabilities", "arguments": {}})),
+            ),
+            &r,
+        )
+        .unwrap();
+        assert!(
+            cap.result.unwrap()["next_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s.as_str().unwrap_or("").contains("tools/list"))
         );
     }
 
