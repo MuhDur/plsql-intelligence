@@ -121,6 +121,8 @@ pub enum DispatchError {
 #[must_use]
 pub fn dispatch_table() -> &'static [&'static str] {
     &[
+        // ── zero-arg discovery (call first) ──
+        "oracle_capabilities",
         // ── self-contained static-analysis tools ──
         "parse_file",
         "get_symbol",
@@ -164,6 +166,37 @@ pub fn dispatch_table() -> &'static [&'static str] {
     ]
 }
 
+/// The zero-arg `oracle_capabilities` discovery report (oracle-da9j.3): a
+/// session-orientation document an agent calls FIRST. It reports the build
+/// feature flags, the surface size, and static-vs-live guidance, and points at
+/// `tools/list` for each tool's argument schema + read-only/destructive
+/// annotations (so this stays a lean orientation doc, not a duplicate of the
+/// per-tool detail). Honest about the runtime: the pure protocol layer holds no
+/// live connection between calls; live-DB tools require the `live-db` build
+/// feature + an active `connect`.
+fn capabilities_report() -> Value {
+    let live_db = cfg!(feature = "live-db");
+    serde_json::json!({
+        "server": "plsql-mcp",
+        "version": env!("CARGO_PKG_VERSION"),
+        "protocol_version": crate::mcp_protocol::PROTOCOL_VERSION,
+        "tool_count": dispatch_table().len(),
+        "features": { "live_db": live_db },
+        "runtime": {
+            "live_db_active": live_db,
+            "note": "Static-analysis tools (parse_file, analyze_project, plsql_analyze, the graph \
+                     tools, …) run with no database. Live-DB tools (query, connect, deploy_ddl, …) \
+                     require the `live-db` build feature AND an active connection; without it they \
+                     return a runtime-state-required result naming the recovery tool."
+        },
+        "next_actions": [
+            "Call tools/list to read each tool's argument inputSchema and readOnlyHint/destructiveHint.",
+            "Static analysis needs no connection — start with analyze_project, then the graph tools (find_callers / find_callees / get_dependencies).",
+            "For any live-DB tool, call `connect` first."
+        ]
+    })
+}
+
 /// Deserialize the `arguments` object into a tool Request type,
 /// turning a serde failure into a typed [`DispatchError`].
 fn parse_args<T: DeserializeOwned>(tool: &str, arguments: &Value) -> Result<T, DispatchError> {
@@ -188,6 +221,8 @@ fn parse_args<T: DeserializeOwned>(tool: &str, arguments: &Value) -> Result<T, D
 /// deserialize into the tool's Request type.
 pub fn dispatch_tool(name: &str, arguments: &Value) -> Result<DispatchOutcome, DispatchError> {
     match name {
+        // ── zero-arg discovery: a session-orientation report ──────
+        "oracle_capabilities" => Ok(DispatchOutcome::Ran(capabilities_report())),
         // ── self-contained static tools: run end to end ──────────
         "parse_file" => {
             let req: ParseFileRequest = parse_args(name, arguments)?;

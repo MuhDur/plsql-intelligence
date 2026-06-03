@@ -259,6 +259,22 @@ pub use tools::{ToolDescriptor, ToolRegistry, ToolTier};
 #[must_use]
 pub fn default_tool_registry() -> ToolRegistry {
     let mut r = ToolRegistry::new();
+    // Zero-arg discovery — the session-orientation entry point an agent calls
+    // FIRST to learn feature flags + static-vs-live guidance (oracle-da9j.3).
+    r.register(
+        ToolDescriptor::new(
+            "oracle_capabilities",
+            ToolTier::FoundationStatic,
+            "Zero-arg session-orientation report: build feature flags (live-db on/off), the \
+             tool-surface size, static-vs-live guidance, and next_actions. Call this (and \
+             tools/list) FIRST to plan a session.",
+        )
+        .with_input_schema(serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {}
+        })),
+    );
     // Static-analysis tools (no project, no DB) — always safe to call.
     register_parse_tools(&mut r);
     register_analyze_project_tool(&mut r);

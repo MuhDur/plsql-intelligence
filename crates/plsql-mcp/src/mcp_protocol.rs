@@ -193,7 +193,15 @@ fn handle_initialize(id: Value, params: Option<&Value>) -> JsonRpcResponse {
         },
         "capabilities": {
             "tools": { "listChanged": false }
-        }
+        },
+        // Orient the agent before its first tool call (oracle-da9j.3): the
+        // zero-arg discovery tool + tools/list together report the feature
+        // flags, the tool surface, and each tool's argument schema.
+        "instructions": "Call the zero-arg `oracle_capabilities` tool and `tools/list` FIRST: \
+                         they report the build feature flags (live-db on/off), the tool surface, \
+                         and each tool's argument inputSchema + readOnlyHint/destructiveHint. \
+                         Static-analysis tools run with no database; live-DB tools require an \
+                         active `connect`."
     });
     JsonRpcResponse::ok(id, result)
 }
@@ -534,6 +542,57 @@ mod tests {
         let env = &result["structuredContent"];
         assert_eq!(env["error_class"], "RUNTIME_STATE_REQUIRED");
         assert_eq!(env["suggested_tool"], "analyze_project");
+    }
+
+    #[test]
+    fn oracle_capabilities_is_a_zero_arg_discovery_tool() {
+        // oracle-da9j.3: the shipping registry advertises a zero-arg discovery
+        // tool that runs over the wire and reports feature flags + next_actions.
+        let r = crate::default_tool_registry();
+        assert!(r.tools.iter().any(|t| t.name == "oracle_capabilities"));
+        let resp = handle_request(
+            &req(
+                11,
+                "tools/call",
+                Some(serde_json::json!({"name": "oracle_capabilities", "arguments": {}})),
+            ),
+            &r,
+        )
+        .unwrap();
+        let result = resp.result.expect("ok result");
+        assert_eq!(result["isError"], Value::Bool(false));
+        let doc = &result["structuredContent"];
+        assert_eq!(doc["server"], "plsql-mcp");
+        assert!(doc["features"]["live_db"].is_boolean());
+        assert!(
+            doc["next_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s.as_str().unwrap_or("").contains("tools/list")),
+            "capabilities should point at tools/list: {doc}"
+        );
+    }
+
+    #[test]
+    fn initialize_emits_orientation_instructions() {
+        let resp = handle_request(
+            &req(
+                12,
+                "initialize",
+                Some(serde_json::json!({"protocolVersion": PROTOCOL_VERSION})),
+            ),
+            &crate::default_tool_registry(),
+        )
+        .unwrap();
+        let instr = resp.result.expect("ok")["instructions"]
+            .as_str()
+            .expect("instructions string present")
+            .to_string();
+        assert!(
+            instr.contains("oracle_capabilities") && instr.contains("tools/list"),
+            "initialize must orient the agent: {instr}"
+        );
     }
 
     #[test]
