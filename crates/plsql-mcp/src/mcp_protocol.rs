@@ -34,7 +34,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::tools::{ToolDescriptor, ToolRegistry};
+use crate::safety::SafetyProfile;
+use crate::tools::{ToolDescriptor, ToolRegistry, ToolTier};
 
 /// MCP protocol version this implementation negotiates. Clients
 /// that advertise a higher version receive a `version_mismatch`
@@ -216,6 +217,49 @@ fn handle_tools_list(id: Value, registry: &ToolRegistry) -> JsonRpcResponse {
     )
 }
 
+/// Whether a tool should be advertised as CALLABLE on the current wire — given
+/// the build's `live-db` feature and the active safety profile — plus a human
+/// reason when it is not (oracle-da9j.4). Foundation-static tools are always
+/// callable; a FoundationLiveDb tool needs the live-db feature AND a profile
+/// permitting its operation, so a static-only build / inspect-only session no
+/// longer advertises ~37% of the surface as plainly callable when every such
+/// call would return RuntimeStateRequired or a profile refusal. The tool stays
+/// LISTED (discoverable, so an agent can still plan) but flagged `available:false`.
+fn tool_availability(t: &ToolDescriptor, live_db: bool, profile: SafetyProfile) -> (bool, Option<String>) {
+    if matches!(t.tier, ToolTier::FoundationStatic) {
+        return (true, None);
+    }
+    if !live_db {
+        return (
+            false,
+            Some("requires the `live-db` build feature (this build is static-only)".to_string()),
+        );
+    }
+    if t.destructive {
+        if profile.allows_ddl_preview() {
+            (true, None)
+        } else {
+            (
+                false,
+                Some(format!(
+                    "requires a write-capable safety profile (current: {}); call set_safety_profile / enable_writes first",
+                    profile.as_str()
+                )),
+            )
+        }
+    } else if profile.allows_read_only_live_tools() {
+        (true, None)
+    } else {
+        (
+            false,
+            Some(format!(
+                "requires a live safety profile (current: {})",
+                profile.as_str()
+            )),
+        )
+    }
+}
+
 fn tool_to_mcp_value(t: &ToolDescriptor) -> Value {
     // Advertise the tool's real argument schema when it has one, so an agent can
     // construct a valid call first-try instead of probing -32602 InvalidArguments
@@ -227,14 +271,26 @@ fn tool_to_mcp_value(t: &ToolDescriptor) -> Value {
         .input_schema
         .clone()
         .unwrap_or_else(|| serde_json::json!({ "type": "object", "additionalProperties": true }));
+    // Gate the advertised callability by the build feature + the default
+    // (inspect-only) safety posture of the pure protocol wire, so a static-only
+    // build does not present the live/write surface as plainly callable
+    // (oracle-da9j.4). The tool stays listed; `available:false` + a reason tell
+    // the agent why a call would be refused here.
+    let (available, reason) =
+        tool_availability(t, cfg!(feature = "live-db"), SafetyProfile::default());
+    let mut annotations = serde_json::json!({
+        "readOnlyHint": !t.destructive,
+        "destructiveHint": t.destructive,
+        "available": available,
+    });
+    if let Some(why) = reason {
+        annotations["unavailableReason"] = Value::String(why);
+    }
     serde_json::json!({
         "name": t.name,
         "description": t.summary,
         "inputSchema": input_schema,
-        "annotations": {
-            "readOnlyHint": !t.destructive,
-            "destructiveHint": t.destructive,
-        },
+        "annotations": annotations,
     })
 }
 
@@ -592,6 +648,54 @@ mod tests {
         assert!(
             instr.contains("oracle_capabilities") && instr.contains("tools/list"),
             "initialize must orient the agent: {instr}"
+        );
+    }
+
+    #[test]
+    fn tool_availability_gates_by_feature_and_profile() {
+        // oracle-da9j.4: feature + profile projection (tested with live_db=true
+        // so the profile dimension is exercised regardless of the build feature).
+        let static_tool = ToolDescriptor::new("parse_file", ToolTier::FoundationStatic, "s");
+        let read_live = ToolDescriptor::new("query", ToolTier::FoundationLiveDb, "r");
+        let write_live =
+            ToolDescriptor::new("deploy_ddl", ToolTier::FoundationLiveDb, "w").destructive();
+        // Static tools are always available.
+        assert!(tool_availability(&static_tool, false, SafetyProfile::StaticOnly).0);
+        // No live-db feature → every live tool unavailable (with a reason).
+        let (avail, reason) = tool_availability(&read_live, false, SafetyProfile::SessionWriteEnabled);
+        assert!(!avail && reason.is_some());
+        // live-db on + StaticOnly profile → even read-only live tools off.
+        assert!(!tool_availability(&read_live, true, SafetyProfile::StaticOnly).0);
+        // live-db on + InspectOnly → read-only live available, writes not.
+        assert!(tool_availability(&read_live, true, SafetyProfile::InspectOnly).0);
+        assert!(!tool_availability(&write_live, true, SafetyProfile::InspectOnly).0);
+        // live-db on + DdlGuarded → write (preview) tools available.
+        assert!(tool_availability(&write_live, true, SafetyProfile::DdlGuarded).0);
+    }
+
+    #[test]
+    fn tools_list_flags_live_tools_unavailable_in_static_build() {
+        // oracle-da9j.4: a FoundationLiveDb tool is listed (discoverable) but
+        // flagged available:false + a reason in a build without the live-db
+        // feature; static tools stay available:true.
+        let r = crate::default_tool_registry();
+        let resp = handle_request(&req(14, "tools/list", None), &r).unwrap();
+        let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+        let find = |n: &str| {
+            tools
+                .iter()
+                .find(|t| t["name"] == n)
+                .unwrap_or_else(|| panic!("{n} listed"))
+                .clone()
+        };
+        if !cfg!(feature = "live-db") {
+            let q = find("query");
+            assert_eq!(q["annotations"]["available"], Value::Bool(false));
+            assert!(q["annotations"]["unavailableReason"].is_string());
+        }
+        assert_eq!(
+            find("parse_file")["annotations"]["available"],
+            Value::Bool(true)
         );
     }
 
