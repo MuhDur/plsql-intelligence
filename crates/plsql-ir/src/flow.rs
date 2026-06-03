@@ -77,6 +77,15 @@ pub enum TaintKind {
     /// Value came from an Oracle scheduler argument
     /// (`DBMS_SCHEDULER.SET_JOB_ARGUMENT_VALUE`).
     SchedulerArgument,
+    /// Value flowed through a sub-expression the recognizer could not lower
+    /// (`Expr::Raw` — an unrecognized shape such as a SQL `CASE` expression, an
+    /// unbalanced/unterminated fragment, or a depth-limit-collapsed concat
+    /// tail). The analyzer cannot prove the value safe, so it fails CLOSED:
+    /// the value is treated as potentially-injectable rather than silently
+    /// dropped (R13 — never swallow a blind spot). Carrying this as a live
+    /// taint kind makes a downstream dynamic-SQL sink flag it instead of
+    /// reading the un-lowered value as clean (oracle-qo1v.2).
+    Unanalyzable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

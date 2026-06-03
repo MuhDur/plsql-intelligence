@@ -121,7 +121,10 @@ pub fn recognise_dynamic_sql(call_text: &str, site: &str) -> Option<DynamicSqlEv
     let upper = call_text.to_ascii_uppercase();
     let trimmed = upper.trim_start();
     let (fragments, candidate_objects, uses_binds, expr_interpolations) =
-        if trimmed.starts_with("EXECUTE IMMEDIATE") {
+        if find_execute_immediate(call_text).is_some_and(|(s, _)| call_text[..s].trim().is_empty())
+        {
+            // Leads with `EXECUTE IMMEDIATE` (case-insensitive, any inter-keyword
+            // whitespace) — see [`find_execute_immediate`] (oracle-qo1v.4).
             extract_execute_immediate(call_text)
         } else if trimmed.contains("DBMS_SQL.") {
             return Some(DynamicSqlEvidence {
@@ -167,6 +170,44 @@ pub fn recognise_dynamic_sql(call_text: &str, site: &str) -> Option<DynamicSqlEv
     })
 }
 
+/// Find the `EXECUTE IMMEDIATE` keyword pair in `text`, case-insensitively and
+/// tolerant of any run of inter-keyword whitespace, with both keywords
+/// word-boundaried. Returns `(start, end)` byte offsets — `start` indexes
+/// `EXECUTE`, `end` is just past `IMMEDIATE`.
+///
+/// Oracle is whitespace-insensitive between keywords, so `EXECUTE  IMMEDIATE`
+/// (multiple spaces), `EXECUTE\tIMMEDIATE`, and `EXECUTE\nIMMEDIATE` must be
+/// recognised exactly as the canonical single space — the previous
+/// `starts_with("EXECUTE IMMEDIATE")` / `find("EXECUTE IMMEDIATE")` + hardcoded
+/// 17-byte slice matched only the single-space form, an asymmetry vs the runtime
+/// guard's canonicalized scan (oracle-qo1v.4). Byte-level comparison so a
+/// multi-byte char preceding the match can never trigger a char-boundary panic.
+fn find_execute_immediate(text: &str) -> Option<(usize, usize)> {
+    let b = text.as_bytes();
+    let is_kw_byte = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c == b'#';
+    let mut i = 0usize;
+    while i + 7 <= b.len() {
+        let exec_bounded = b[i..i + 7].eq_ignore_ascii_case(b"EXECUTE")
+            && (i == 0 || !is_kw_byte(b[i - 1]))
+            && (i + 7 >= b.len() || !is_kw_byte(b[i + 7]));
+        if exec_bounded {
+            let mut j = i + 7;
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j > i + 7
+                && j + 9 <= b.len()
+                && b[j..j + 9].eq_ignore_ascii_case(b"IMMEDIATE")
+                && (j + 9 >= b.len() || !is_kw_byte(b[j + 9]))
+            {
+                return Some((i, j + 9));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Walk an `EXECUTE IMMEDIATE 'frag1' || expr || 'frag2'` body
 /// and pull out the literal fragments + the candidate objects
 /// any of those fragments mention. `<expr>` is the placeholder
@@ -175,11 +216,10 @@ pub fn recognise_dynamic_sql(call_text: &str, site: &str) -> Option<DynamicSqlEv
 fn extract_execute_immediate(
     text: &str,
 ) -> (Vec<String>, Vec<CandidateObject>, bool, Vec<ExprInterpolation>) {
-    let upper = text.to_ascii_uppercase();
-    let Some(after_kw) = upper.find("EXECUTE IMMEDIATE") else {
+    let Some((_, kw_end)) = find_execute_immediate(text) else {
         return (vec![], vec![], false, vec![]);
     };
-    let rest = &text[after_kw + "EXECUTE IMMEDIATE".len()..];
+    let rest = &text[kw_end..];
     // The native dynamic-SQL `USING` bind clause always appears *after*
     // the dynamic-SQL text expression is fully closed, so the split must
     // ignore any ` USING ` keyword that lies *inside* a `'...'` string
@@ -998,6 +1038,25 @@ mod tests {
     #[test]
     fn non_dynamic_input_returns_none() {
         assert!(recognise_dynamic_sql("v_x := 0;", "pkg.proc:1").is_none());
+    }
+
+    #[test]
+    fn recognises_execute_immediate_with_non_canonical_whitespace() {
+        // oracle-qo1v.4: the MCP dynamic_sql_evidence recogniser must be
+        // whitespace-insensitive between EXECUTE and IMMEDIATE, matching Oracle
+        // and the runtime guard — not only the canonical single space.
+        for body in [
+            "EXECUTE  IMMEDIATE 'SELECT 1 FROM dual'",   // two spaces
+            "EXECUTE\tIMMEDIATE 'SELECT 1 FROM dual'",   // tab
+            "EXECUTE\nIMMEDIATE 'SELECT 1 FROM dual'",   // newline
+        ] {
+            assert!(
+                recognise_dynamic_sql(body, "pkg.proc:1").is_some(),
+                "non-canonical EXECUTE IMMEDIATE must be recognised: {body:?}"
+            );
+        }
+        // Control: an identifier merely starting with EXECUTE is not dynamic SQL.
+        assert!(recognise_dynamic_sql("executable := 1;", "pkg.proc:1").is_none());
     }
 
     #[test]

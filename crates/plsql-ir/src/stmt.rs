@@ -432,7 +432,12 @@ fn strip_comments(s: &str) -> String {
             }
             continue;
         }
-        // Block comment `/* … */`: drop it entirely.
+        // Block comment `/* … */`: replace it with a single space. A comment is
+        // a token SEPARATOR, so dropping it outright fused the tokens on either
+        // side — `EXECUTE/**/IMMEDIATE` collapsed to `EXECUTEIMMEDIATE` and
+        // evaded the keyword classifier (oracle-qo1v.3). Substituting a space
+        // keeps the two tokens distinct (and is harmless mid-token: `a/**/b`
+        // becomes `a b`, which never re-fuses).
         if c == '/' && chars.get(i + 1) == Some(&'*') {
             i += 2;
             while i < chars.len() {
@@ -442,6 +447,7 @@ fn strip_comments(s: &str) -> String {
                 }
                 i += 1;
             }
+            out.push(' ');
             continue;
         }
         out.push(c);
@@ -470,6 +476,47 @@ fn starts_with_keyword(trimmed: &str, keyword: &str) -> bool {
         None => true,
         Some(c) => !(c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '#'),
     }
+}
+
+/// Match the `EXECUTE IMMEDIATE` keyword pair at the start of `text` (after
+/// optional leading whitespace), case-insensitively, tolerant of ANY run of
+/// inter-keyword whitespace, with both keywords word-boundaried. Returns the
+/// byte offset in `text` immediately past `IMMEDIATE`, or `None`.
+///
+/// Oracle is whitespace-insensitive between keywords, so `EXECUTE  IMMEDIATE`
+/// (multiple spaces), `EXECUTE\tIMMEDIATE`, `EXECUTE\nIMMEDIATE`, and — once
+/// `strip_comments` substitutes a space for a removed block comment —
+/// `EXECUTE/**/IMMEDIATE` must all classify as dynamic SQL exactly as the
+/// canonical single-space form does. The previous
+/// `starts_with_keyword(trimmed, "EXECUTE IMMEDIATE")` + hardcoded `text[17..]`
+/// matched only the single-space form and sliced a fixed 17 bytes, an asymmetry
+/// vs the runtime guard's canonicalized Stage A scan (oracle-qo1v.3). Returning
+/// the computed offset (rather than a hardcoded 17) keeps the body slice correct
+/// once inter-keyword spacing can vary.
+fn execute_immediate_body_offset(text: &str) -> Option<usize> {
+    let b = text.as_bytes();
+    let is_kw_byte = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c == b'#';
+    let skip_ws = |mut i: usize| {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    let match_kw = |start: usize, kw: &[u8]| -> Option<usize> {
+        let end = start + kw.len();
+        if end > b.len() || !b[start..end].eq_ignore_ascii_case(kw) {
+            return None;
+        }
+        // Word boundary after the keyword (byte-level, never slices a codepoint).
+        (end >= b.len() || !is_kw_byte(b[end])).then_some(end)
+    };
+    let start = skip_ws(0);
+    let after_exec = match_kw(start, b"EXECUTE")?;
+    let after_ws = skip_ws(after_exec);
+    if after_ws == after_exec {
+        return None; // require at least one whitespace between the two keywords
+    }
+    match_kw(after_ws, b"IMMEDIATE")
 }
 
 /// Byte offset of the first top-level `:=` in `text` — one that is NOT inside
@@ -510,8 +557,8 @@ fn classify(text: &str) -> Statement {
     // word-boundary `starts_with_keyword`, `if_count := 1` / `for_idx := 0`
     // etc. do NOT match these — they fall through to the assignment test.
     // (oracle-rwjl.3)
-    if starts_with_keyword(trimmed, "EXECUTE IMMEDIATE") {
-        let after = &text[17..];
+    if let Some(body_off) = execute_immediate_body_offset(text) {
+        let after = &text[body_off..];
         let sql_literal = extract_quoted(after).unwrap_or_default();
         let has_bind_variables = after.to_ascii_uppercase().contains("USING ");
         return Statement::ExecuteImmediate {
@@ -978,6 +1025,35 @@ mod tests {
         } else {
             panic!("{r:?}");
         }
+    }
+
+    #[test]
+    fn execute_immediate_recognised_with_non_canonical_whitespace() {
+        // oracle-qo1v.3: Oracle is whitespace-insensitive between keywords, so
+        // every inter-keyword spacing must classify as dynamic SQL exactly as the
+        // canonical single space does — not fall through to Unrecognized and so
+        // never become a dynamic-SQL sink. The block-comment form relies on
+        // strip_comments now substituting a space for `/* */`.
+        for src in [
+            "EXECUTE  IMMEDIATE 'DROP TABLE t';",   // two spaces
+            "EXECUTE\tIMMEDIATE 'DROP TABLE t';",   // tab
+            "EXECUTE\nIMMEDIATE 'DROP TABLE t';",   // newline
+            "EXECUTE/**/IMMEDIATE 'DROP TABLE t';", // block comment between
+        ] {
+            let r = lower_statement_body(src);
+            assert!(
+                matches!(r.first(), Some(Statement::ExecuteImmediate { sql_literal, .. }) if sql_literal == "DROP TABLE t"),
+                "non-canonical EXECUTE IMMEDIATE must classify as dynamic SQL: {src:?} -> {r:?}"
+            );
+        }
+        // Control: a local whose name merely starts with EXECUTE is not a sink.
+        assert!(
+            !matches!(
+                lower_statement_body("executable_flag := 1;").first(),
+                Some(Statement::ExecuteImmediate { .. })
+            ),
+            "an identifier starting with EXECUTE must not match"
+        );
     }
 
     #[test]

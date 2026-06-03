@@ -704,6 +704,30 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'#'
 }
 
+/// Byte offset in `u` immediately past a leading `EXECUTE IMMEDIATE` keyword
+/// pair — case-insensitive (via [`keyword_at`]), tolerant of ANY run of
+/// inter-keyword whitespace, both keywords word-boundaried — or `None`.
+/// Oracle is whitespace-insensitive between keywords, so `EXECUTE  IMMEDIATE`
+/// (multiple spaces), `EXECUTE\tIMMEDIATE`, and `EXECUTE\nIMMEDIATE` must be
+/// recognised exactly as the canonical single space; the previous
+/// `keyword_at(u, 0, "EXECUTE IMMEDIATE")` + hardcoded `text[17..]` matched only
+/// the single-space form (oracle-qo1v.4). Returning the computed offset keeps
+/// the body slice correct once inter-keyword spacing can vary.
+fn execute_immediate_body_start(u: &str) -> Option<usize> {
+    if !keyword_at(u, 0, "EXECUTE") {
+        return None;
+    }
+    let b = u.as_bytes();
+    let mut j = 7; // past "EXECUTE"
+    while j < b.len() && b[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if j == 7 {
+        return None; // require at least one whitespace between the two keywords
+    }
+    keyword_at(u, j, "IMMEDIATE").then_some(j + 9)
+}
+
 fn classify_statement(raw: &str, file_id: FileId, start: usize, end: usize) -> AstStatement {
     let span = make_span(file_id, start as u32, end as u32);
     // Strip a leading line comment run.
@@ -737,8 +761,8 @@ fn classify_statement(raw: &str, file_id: FileId, start: usize, end: usize) -> A
             span,
         };
     }
-    if keyword_at(u, 0, "EXECUTE IMMEDIATE") {
-        let after = &text[17..];
+    if let Some(body_start) = execute_immediate_body_start(u) {
+        let after = &text[body_start..];
         let sql_text = extract_first_quoted(after).unwrap_or_default();
         let has_using = after.to_ascii_uppercase().contains(" USING ");
         return AstStatement::ExecuteImmediate {

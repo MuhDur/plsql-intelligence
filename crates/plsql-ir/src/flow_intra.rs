@@ -389,6 +389,22 @@ fn collect_expr_flow(expr: &Expr, sources: &TaintSources, env: &FlowEnv, flow: &
             collect_expr_flow(rhs, sources, env, flow);
         }
         Expr::Unary { operand, .. } => collect_expr_flow(operand, sources, env, flow),
+        Expr::Raw { .. } => {
+            // The recognizer could not lower this sub-expression (an
+            // unrecognized shape like a SQL `CASE` expression, an
+            // unbalanced/unterminated fragment, or a depth-limit-collapsed
+            // concat tail). Any user-tainted operand inside it is invisible to
+            // this collector, so treating the value as clean would be a silent
+            // taint fail-open (R13). Fail CLOSED: mark the value Unanalyzable so
+            // a downstream dynamic-SQL sink flags it, and force the string shape
+            // opaque so it can never be mistaken for a provably-constant literal.
+            if !flow.taint.kinds.contains(&TaintKind::Unanalyzable) {
+                flow.taint.kinds.push(TaintKind::Unanalyzable);
+            }
+            if flow.string_shape.is_none() {
+                flow.string_shape = Some(StringShape::FullyOpaque);
+            }
+        }
         _ => {}
     }
 }
@@ -419,6 +435,31 @@ mod tests {
         let f = env.get("v_sql").unwrap();
         assert!(f.taint.kinds.contains(&TaintKind::UserInput));
         assert!(f.taint.flags_alarm());
+    }
+
+    #[test]
+    fn unlowerable_case_expression_rhs_fails_closed_as_unanalyzable() {
+        // oracle-qo1v.2: a SQL CASE expression on an assignment RHS is not a
+        // recognized Expr shape, so it lowers to Expr::Raw and the user-tainted
+        // operand (p_user) inside it is invisible to the taint collector. The
+        // old catch-all dropped it silently (taint fail-open). The collector now
+        // fails CLOSED: the value is marked Unanalyzable (raises the alarm so a
+        // downstream EXECUTE IMMEDIATE is flagged) and forced to an opaque string
+        // shape so it can never be read as a provably-constant literal.
+        let s = lower_statement_body("v_sql := CASE WHEN cond THEN p_user ELSE 'x' END;");
+        let env = analyze_flow(&s, &src(&["p_user"]));
+        let f = env.get("v_sql").expect("v_sql flow recorded");
+        assert!(
+            f.taint.kinds.contains(&TaintKind::Unanalyzable),
+            "un-lowerable CASE RHS must be marked Unanalyzable: {:?}",
+            f.taint
+        );
+        assert!(f.taint.flags_alarm(), "fail closed: must raise the alarm");
+        assert!(
+            matches!(f.string_shape, Some(StringShape::FullyOpaque)),
+            "un-lowerable value must not be mistaken for a constant literal: {:?}",
+            f.string_shape
+        );
     }
 
     #[test]
