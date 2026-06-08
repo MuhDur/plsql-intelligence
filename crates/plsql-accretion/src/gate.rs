@@ -881,6 +881,17 @@ pub fn pins_check(repo_root: &Path, candidate_text: &str) -> Result<String, Gate
     // ⇒ the legacy direct cmd-on-current-tree path (the adversarial
     // self-test uses that, unchanged — additive, fail-closed).
 
+    // Guarantee the `.usr/` scratch directory exists in the gate's working dir
+    // BEFORE running any G9 hook. The proposer's content-addressed pin marker
+    // lives at `.usr/usr_pin_<sig16>` and its `setup`/`restore` hooks are single
+    // allowlisted commands (`touch .usr/usr_pin_…`), so they cannot create the
+    // parent themselves. `.usr/` is gitignored runtime state, so a clean checkout
+    // (CI, a fresh clone) lacks it and the `touch` failed with "No such file or
+    // directory" — making G9 report a vacuous-pass FAIL and wrongly quarantine an
+    // honest candidate. The code already assumed "the gate's working dir
+    // guarantees `.usr/`"; make that true here (mirrors `usr-loop scan`).
+    let _ = std::fs::create_dir_all(repo_root.join(".usr"));
+
     let run = |sh: &str| -> i32 {
         Command::new("bash")
             .arg("-c")
@@ -1174,6 +1185,36 @@ mod tests {
         let e = pins_check(Path::new("."), "no pins directives here\n").unwrap_err();
         assert!(matches!(e, GateError::PinMismatch(_)), "{e:?}");
     }
+
+    #[test]
+    fn pins_check_creates_the_usr_scratch_dir_in_a_clean_working_dir() {
+        // CI/clean-checkout regression: `.usr/` is gitignored runtime state, so a
+        // fresh checkout (GitHub CI, a new clone) has no repo-root `.usr/`. The G9
+        // pin hooks `touch .usr/usr_pin_<sig>` then failed with "No such file or
+        // directory", making G9 vacuously fail and wrongly quarantine an honest
+        // candidate (the long-standing nightly + cargo-test-all-targets red).
+        // pins_check must guarantee `.usr/` exists in its working dir before
+        // running any hook (mirroring `usr-loop scan`).
+        let tmp = std::env::temp_dir().join(format!(
+            "usr_pins_clean_{}_{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&tmp).expect("temp working dir");
+        assert!(
+            !tmp.join(".usr").exists(),
+            "precondition: the clean working dir has no .usr/"
+        );
+        // No pins directives ⇒ a typed PinMismatch, but the unconditional
+        // `.usr/` creation at the top of pins_check has already run.
+        let _ = pins_check(&tmp, "no pins directives\n");
+        assert!(
+            tmp.join(".usr").is_dir(),
+            "pins_check must create the .usr/ scratch dir in its working dir"
+        );
+    }
+
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     /// **G9 shell-injection security regression** — without explicit
     /// operator opt-in ([`PINS_TRUST_ENV`] = `1`), an adversarial
