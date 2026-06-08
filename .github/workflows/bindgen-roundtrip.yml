@@ -41,8 +41,13 @@ jobs:
           ORACLE_PWD: ${{ secrets.ORACLE_XE_PWD }}
           ORACLE_CHARACTERSET: AL32UTF8
           ENABLE_ARCHIVELOG: "false"
+        # The health-cmd runs INSIDE the service container, which already has
+        # ORACLE_PWD set from the secret via the `env:` block above. The
+        # `${{ secrets.* }}` context is NOT permitted inside `services.*.options`
+        # and made GitHub reject the whole workflow file (a 0s "workflow file
+        # issue" failure on every push); use the in-container shell var instead.
         options: >-
-          --health-cmd "echo 'select 1 from dual;' | sqlplus -s system/${{ secrets.ORACLE_XE_PWD }}@//localhost:1521/FREEPDB1 | grep -q 1"
+          --health-cmd "echo 'select 1 from dual;' | sqlplus -s system/$ORACLE_PWD@//localhost:1521/FREEPDB1 | grep -q 1"
           --health-interval 30s
           --health-timeout 10s
           --health-retries 20

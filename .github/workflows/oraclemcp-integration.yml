@@ -105,8 +105,12 @@ jobs:
         env:
           ORACLE_PWD: ${{ secrets.ORACLE_XE_PWD }}
           ORACLE_CHARACTERSET: AL32UTF8
+        # `${{ secrets.* }}` is not permitted inside `services.*.options`; it made
+        # GitHub reject the workflow file (0s "workflow file issue" on every push).
+        # The health-cmd runs in-container where ORACLE_PWD is already set via the
+        # `env:` block above — use the shell var.
         options: >-
-          --health-cmd "echo 'select 1 from dual;' | sqlplus -s system/${{ secrets.ORACLE_XE_PWD }}@//localhost:1521/FREEPDB1 | grep -q 1"
+          --health-cmd "echo 'select 1 from dual;' | sqlplus -s system/$ORACLE_PWD@//localhost:1521/FREEPDB1 | grep -q 1"
           --health-interval 30s
           --health-timeout 10s
           --health-retries 20
