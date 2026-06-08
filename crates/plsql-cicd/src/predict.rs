@@ -55,6 +55,27 @@ pub fn predict(changeset: &ChangeSet, mode: PredictMode) -> InvalidationPredicti
         }
     }
 
+    // Derive the completeness posture from the changeset's actual understanding
+    // and FINALIZE it (oracle-687a.2). Previously the profile shipped with the
+    // `#[default]` posture (`Degraded`), so an empty / fully-understood changeset
+    // serialized a false-pessimistic `Degraded` over the wire — the exact inverse
+    // of the false-clean failure the design forbids. We tally objects as
+    // understood (no opacity) vs unrecognized (carries an `UnknownReason`), count
+    // the opacity records as diagnostics, then let `finalize_posture` apply the
+    // anti-spin rules: 0 objects / 0 diagnostics ⇒ `Clean`; any opacity ⇒ never
+    // `Clean`.
+    let unrecognized = changeset
+        .objects
+        .iter()
+        .filter(|o| !o.uncertainties.is_empty())
+        .count();
+    prediction.completeness.objects_total = changeset.objects.len();
+    prediction.completeness.objects_unrecognized = unrecognized;
+    prediction.completeness.objects_with_extracted_semantics =
+        changeset.objects.len().saturating_sub(unrecognized);
+    prediction.completeness.diagnostics_total = prediction.uncertainties.len();
+    prediction.completeness.finalize_posture();
+
     // Sort by `(distance, owner, name)` so reports diff cleanly across runs.
     prediction
         .predicted_invalidations
@@ -363,6 +384,49 @@ mod tests {
         let prediction = predict(&ChangeSet::empty(), PredictMode::CatalogAware);
         assert!(prediction.predicted_invalidations.is_empty());
         assert!(prediction.uncertainties.is_empty());
+    }
+
+    #[test]
+    fn completeness_posture_is_finalized_not_default_degraded() {
+        use plsql_core::CompletenessPosture;
+        // oracle-687a.2: an empty changeset (0 objects, 0 diagnostics) must
+        // serialize posture=Clean, NOT the false-pessimistic #[default] Degraded.
+        for mode in [
+            PredictMode::SourceOnly,
+            PredictMode::CatalogAware,
+            PredictMode::LiveSnapshot,
+        ] {
+            let p = predict(&ChangeSet::empty(), mode);
+            assert_eq!(
+                p.completeness.posture,
+                CompletenessPosture::Clean,
+                "empty changeset must be Clean in {mode:?}, not default-Degraded"
+            );
+        }
+        // A fully-understood changeset (objects, zero opacity) is also Clean.
+        let clean = ChangeSet {
+            objects: vec![changed(ChangedObjectKind::PackageSpec, 100)],
+            ..ChangeSet::empty()
+        };
+        assert_eq!(
+            predict(&clean, PredictMode::CatalogAware).completeness.posture,
+            CompletenessPosture::Clean
+        );
+        // A changeset carrying opacity (an UnknownReason) must NEVER be Clean.
+        let mut opaque_obj = changed(ChangedObjectKind::PackageSpec, 101);
+        opaque_obj.uncertainties = vec![UnknownReason::DynamicSqlOpaque];
+        let opaque = ChangeSet {
+            objects: vec![opaque_obj],
+            ..ChangeSet::empty()
+        };
+        let pp = predict(&opaque, PredictMode::CatalogAware);
+        assert_ne!(
+            pp.completeness.posture,
+            CompletenessPosture::Clean,
+            "a changeset with opacity must not be Clean: {:?}",
+            pp.completeness
+        );
+        assert_eq!(pp.completeness.objects_unrecognized, 1);
     }
 
     #[test]

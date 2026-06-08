@@ -863,7 +863,7 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
     }
 
     // --- Stage 2: parse + Stage 4: IR lowering + Stage 5: symbols
-    use plsql_core::{Confidence, ConfidenceLevel};
+    use plsql_core::{Confidence, ConfidenceLevel, Evidence};
     use plsql_depgraph::{
         Edge, EdgeId, EdgeKind, LogicalObjectId, Node, NodeId, NodeIdentityKind, ObjectRevisionId,
         Provenance, QualifiedName, ResolutionStrategy,
@@ -1068,31 +1068,57 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
                 // then falls back to the leading package name ("PKG_A") so that
                 // package-qualified calls resolve to the package node when the
                 // individual member isn't registered separately.
-                let resolved_callee_node = nodes_by_logical_id
+                // Capture HOW the callee resolved so the edge provenance records
+                // the real resolution strategy instead of a constant, and the
+                // depgraph's queryable provenance is honestly fed (oracle-687a.3):
+                //   - exact dotted-name match with >1 part  → PackageMemberLookup
+                //     (a qualified `PKG.MEMBER` resolved to the exact member)
+                //   - exact match with a single bare part   → LocalLexical
+                //     (a bare name resolved in local/same scope)
+                //   - fell back to the leading package node → PackageMemberLookup
+                //     (qualified call resolved to its package)
+                let resolved = nodes_by_logical_id
                     .get(&callee_logical)
                     .copied()
+                    .map(|nid| {
+                        let strat = if cs.callee_parts.len() > 1 {
+                            ResolutionStrategy::PackageMemberLookup
+                        } else {
+                            ResolutionStrategy::LocalLexical
+                        };
+                        (nid, strat)
+                    })
                     .or_else(|| {
                         cs.callee_parts
                             .first()
                             .map(|p| p.to_ascii_uppercase())
                             .and_then(|pkg| nodes_by_logical_id.get(&pkg).copied())
+                            .map(|nid| (nid, ResolutionStrategy::PackageMemberLookup))
                     });
-                if let Some(callee_node_id) = resolved_callee_node {
+                if let Some((callee_node_id, strategy)) = resolved {
+                    let confidence = Confidence::new(ConfidenceLevel::Medium, None);
                     let edge = Edge::new(
                         EdgeId::new(next_edge_id),
                         caller_node_id,
                         callee_node_id,
                         EdgeKind::Calls,
-                        Confidence::new(ConfidenceLevel::Medium, None),
+                        confidence.clone(),
                     );
                     next_edge_id += 1;
-                    let prov3 = Provenance::new(
-                        file_id,
-                        decl.common().span,
-                        ResolutionStrategy::LocalLexical,
+                    let prov3 = Provenance::new(file_id, decl.common().span, strategy)
+                        .with_note(format!("call to {}", cs.callee_display));
+                    // Mint Evidence for this sub-High-confidence edge so the
+                    // justification payload (explain_edge / explain_path) is fed
+                    // exactly where confidence is uncertain (oracle-687a.4).
+                    let evidence = Evidence::new(
+                        "PLSQL-DEP-002",
+                        format!(
+                            "call `{}` resolved via {strategy:?} from {}",
+                            cs.callee_display, caller_id_str
+                        ),
                     )
-                    .with_note(format!("call to {}", cs.callee_display));
-                    dep_graph.insert_edge(edge, prov3, None);
+                    .with_confidence(confidence);
+                    dep_graph.insert_edge(edge, prov3, Some(evidence));
                 }
             }
 
@@ -1140,44 +1166,54 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
                     },
                 ));
 
-                // Resolve (or synthesise) the table node.
-                let table_node_id = match nodes_by_logical_id.get(&table_logical).copied() {
-                    Some(id) => id,
-                    None => {
-                        let schema_name = unknown_schema(&mut interner);
-                        let tbl_sym = interner
-                            .intern(table_logical.clone())
-                            .unwrap_or_else(|| plsql_core::SymbolId::new(0));
-                        let obj_name = plsql_core::ObjectName::from(tbl_sym);
-                        let nid = NodeId::new(next_node_id);
-                        next_node_id += 1;
-                        dep_graph.insert_node(Node::new(
-                            nid,
-                            LogicalObjectId::new(table_logical.clone()),
-                            ObjectRevisionId::new("source"),
-                            QualifiedName::new(Some(schema_name), obj_name),
-                            NodeIdentityKind::Unknown,
-                        ));
-                        nodes_by_logical_id.insert(table_logical.clone(), nid);
-                        nid
-                    }
-                };
+                // Resolve (or synthesise) the table node. A hit on a registered
+                // object means the table is a known same-schema object
+                // (SameSchemaLookup); a miss synthesises an Unknown node — we only
+                // have the lexical reference, so the strategy stays LocalLexical
+                // (honest provenance, oracle-687a.3).
+                let (table_node_id, table_strategy) =
+                    match nodes_by_logical_id.get(&table_logical).copied() {
+                        Some(id) => (id, ResolutionStrategy::SameSchemaLookup),
+                        None => {
+                            let schema_name = unknown_schema(&mut interner);
+                            let tbl_sym = interner
+                                .intern(table_logical.clone())
+                                .unwrap_or_else(|| plsql_core::SymbolId::new(0));
+                            let obj_name = plsql_core::ObjectName::from(tbl_sym);
+                            let nid = NodeId::new(next_node_id);
+                            next_node_id += 1;
+                            dep_graph.insert_node(Node::new(
+                                nid,
+                                LogicalObjectId::new(table_logical.clone()),
+                                ObjectRevisionId::new("source"),
+                                QualifiedName::new(Some(schema_name), obj_name),
+                                NodeIdentityKind::Unknown,
+                            ));
+                            nodes_by_logical_id.insert(table_logical.clone(), nid);
+                            (nid, ResolutionStrategy::LocalLexical)
+                        }
+                    };
 
+                let confidence = Confidence::new(ConfidenceLevel::Medium, None);
                 let edge = Edge::new(
                     EdgeId::new(next_edge_id),
                     caller_node_id,
                     table_node_id,
                     edge_kind,
-                    Confidence::new(ConfidenceLevel::Medium, None),
+                    confidence.clone(),
                 );
                 next_edge_id += 1;
-                let provp = Provenance::new(
-                    file_id,
-                    decl.common().span,
-                    ResolutionStrategy::LocalLexical,
+                let provp = Provenance::new(file_id, decl.common().span, table_strategy)
+                    .with_note(format!("{edge_kind_str} {table_logical}"));
+                // Feed Evidence on this sub-High-confidence edge (oracle-687a.4).
+                let evidence = Evidence::new(
+                    "PLSQL-DEP-003",
+                    format!(
+                        "{edge_kind_str} of `{table_logical}` extracted from embedded SQL in {caller_id_str} (resolved via {table_strategy:?})"
+                    ),
                 )
-                .with_note(format!("{edge_kind_str} {table_logical}"));
-                dep_graph.insert_edge(edge, provp, None);
+                .with_confidence(confidence);
+                dep_graph.insert_edge(edge, provp, Some(evidence));
             }
         }
 
@@ -1976,6 +2012,96 @@ mod tests {
                 .map(|e| e.kind)
                 .collect::<Vec<_>>()
         );
+
+        // oracle-687a.3/.4: every engine-built Reads/Writes edge must carry a
+        // populated Evidence (justification payload) and an honest resolution
+        // strategy in its provenance — not evidence=None + a hardcoded constant.
+        for edge in &run.dep_graph.edges {
+            if matches!(edge.kind, EdgeKind::Reads | EdgeKind::Writes) {
+                let ev = run
+                    .dep_graph
+                    .evidence
+                    .get(&edge.id)
+                    .expect("R/W edge must carry Evidence");
+                assert!(
+                    !ev.summary.is_empty() && ev.code == "PLSQL-DEP-003",
+                    "R/W edge Evidence must be populated: {ev:?}"
+                );
+                let strat = run
+                    .dep_graph
+                    .provenance
+                    .get(&edge.id)
+                    .expect("R/W edge must carry Provenance")
+                    .resolution_strategy;
+                // raw_orders / orders_summary are not declared objects here, so
+                // the lexical reference resolves LocalLexical (honest: unknown).
+                assert_eq!(strat, plsql_depgraph::ResolutionStrategy::LocalLexical);
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn qualified_call_edge_provenance_carries_package_member_lookup_and_evidence() {
+        // oracle-687a.3/.4: a qualified `PKG.MEMBER` call must stamp the Calls
+        // edge provenance with PackageMemberLookup (not the old hardcoded
+        // LocalLexical) and carry a populated Evidence payload.
+        use plsql_depgraph::{EdgeKind, ResolutionStrategy};
+        let base = std::env::temp_dir().join(format!(
+            "plsql-687a-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let proj = base.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("pkg_a.pkb"),
+            "CREATE OR REPLACE PACKAGE BODY pkg_a IS\n\
+             \x20 PROCEDURE do_work IS BEGIN NULL; END do_work;\n\
+             END pkg_a;\n/\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join("pkg_b.pkb"),
+            "CREATE OR REPLACE PACKAGE BODY pkg_b IS\n\
+             \x20 PROCEDURE run IS BEGIN pkg_a.do_work(); END run;\n\
+             END pkg_b;\n/\n",
+        )
+        .unwrap();
+
+        let run = analyze_project(AnalysisRequest {
+            project_root: proj.clone(),
+            ..AnalysisRequest::default()
+        })
+        .expect("analyze ok");
+
+        let call_edge = run
+            .dep_graph
+            .edges
+            .iter()
+            .find(|e| e.kind == EdgeKind::Calls)
+            .expect("a Calls edge for pkg_a.do_work");
+        let strat = run
+            .dep_graph
+            .provenance
+            .get(&call_edge.id)
+            .expect("Calls edge provenance")
+            .resolution_strategy;
+        assert_eq!(
+            strat,
+            ResolutionStrategy::PackageMemberLookup,
+            "a qualified PKG.MEMBER call must record PackageMemberLookup, not LocalLexical"
+        );
+        let ev = run
+            .dep_graph
+            .evidence
+            .get(&call_edge.id)
+            .expect("Calls edge must carry Evidence");
+        assert_eq!(ev.code, "PLSQL-DEP-002");
+        assert!(!ev.summary.is_empty());
 
         let _ = std::fs::remove_dir_all(&base);
     }

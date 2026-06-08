@@ -100,6 +100,18 @@ fn repair_class_mapping() {
 
     let other = Diagnostic::new("SOME-OTHER-CODE", Severity::Info, "x");
     assert_eq!(RepairClass::classify(&other), RepairClass::Unrepairable);
+
+    // oracle-687a.1: a parser-recovery diagnostic carries the typed
+    // ParserRecoveryRegion reason, so it must classify as TypedDegradation —
+    // NOT be mistaken for a Grammar repair candidate. Before the recover.rs fix
+    // the reason was absent and this fell through to Unrepairable (PARSE-RECOVERY-001
+    // is not a Grammar/Lowering code), silently dropping the honest-uncertainty signal.
+    let recovery = Diagnostic::new("PARSE-RECOVERY-001", Severity::Warn, "recovered")
+        .with_unknown_reason(UnknownReason::ParserRecoveryRegion);
+    assert_eq!(
+        RepairClass::classify(&recovery),
+        RepairClass::TypedDegradation
+    );
 }
 
 #[test]

@@ -10,7 +10,7 @@
 //! the next block in the same file", and "Surface a `Diagnostic` per
 //! error with source span."
 
-use plsql_core::{Diagnostic, FileId, Position, Severity, Span};
+use plsql_core::{Diagnostic, FileId, Position, Severity, Span, UnknownReason};
 
 /// Result of a recovery attempt.
 #[derive(Debug)]
@@ -346,6 +346,12 @@ fn make_recovery_diagnostic(bytes: &[u8], start: usize, end: usize, file_id: Fil
         ),
     )
     .with_primary_span(span)
+    // Tag the recovered region as a typed degradation so the honest-uncertainty
+    // pillar holds end-to-end: without this the accretion gap classifier
+    // (plsql-accretion gap.rs keys off `unknown_reasons.is_empty()`) misclassifies
+    // a parser-recovery diagnostic as a Grammar/Lowering repair candidate instead
+    // of the TypedDegradation it actually is (oracle-687a.1).
+    .with_unknown_reason(UnknownReason::ParserRecoveryRegion)
 }
 
 // ---------------------------------------------------------------------------
@@ -355,7 +361,7 @@ fn make_recovery_diagnostic(bytes: &[u8], start: usize, end: usize, file_id: Fil
 #[cfg(test)]
 mod tests {
     use super::recover_to_statement_boundary;
-    use plsql_core::{FileId, Severity};
+    use plsql_core::{FileId, Severity, UnknownReason};
 
     fn fid() -> FileId {
         FileId::new(0)
@@ -370,6 +376,14 @@ mod tests {
         let diag = result.diagnostic.expect("recovery produced a diagnostic");
         assert_eq!(diag.code, "PARSE-RECOVERY-001");
         assert_eq!(diag.severity, Severity::Warn);
+        // oracle-687a.1: a recovery diagnostic MUST carry the typed degradation
+        // reason so downstream (the accretion gap classifier) sees it as
+        // TypedDegradation, not a Grammar/Lowering repair candidate.
+        assert_eq!(
+            diag.unknown_reasons,
+            vec![UnknownReason::ParserRecoveryRegion],
+            "PARSE-RECOVERY-001 must be tagged ParserRecoveryRegion"
+        );
     }
 
     #[test]
