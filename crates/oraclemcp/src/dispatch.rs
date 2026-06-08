@@ -164,7 +164,10 @@ fn ensure_read_only(sql: &str) -> Result<(), ErrorEnvelope> {
     };
     Err(ErrorEnvelope::new(
         class,
-        format!("read-only server refused this statement: {}", decision.reason),
+        format!(
+            "read-only server refused this statement: {}",
+            decision.reason
+        ),
     )
     .with_next_step(decision.safe_alternative.unwrap_or_else(|| {
         "this server accepts only read-only statements — SELECT/WITH plus the \
@@ -474,7 +477,10 @@ mod tests {
     fn explain_plan_refuses_a_non_read_only_statement() {
         let dispatcher = OracleDispatcher::new(Box::new(NoExecMock));
         let err = dispatcher
-            .dispatch("oracle_explain_plan", json!({ "sql": "DELETE FROM hr.employees" }))
+            .dispatch(
+                "oracle_explain_plan",
+                json!({ "sql": "DELETE FROM hr.employees" }),
+            )
             .expect_err("explain of a write is refused fail-closed");
         assert!(matches!(
             err.error_class,
