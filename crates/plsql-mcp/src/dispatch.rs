@@ -423,6 +423,53 @@ mod tests {
     }
 
     #[test]
+    fn every_self_contained_static_tool_actually_runs() {
+        // oracle-687a.6: the lockstep + "dispatches" tests only prove each name
+        // resolves to an arm; they do NOT prove the arm does real work. Here every
+        // genuinely self-contained static tool (no ambient graph / connection /
+        // preview state) is called with MINIMAL VALID args and MUST return
+        // DispatchOutcome::Ran with a structured result — a stub arm that returned
+        // RuntimeStateRequired or panicked would fail this.
+        let dir = std::env::temp_dir().join(format!(
+            "plsql-687a6-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.to_string_lossy().to_string();
+        let src = "CREATE PROCEDURE p IS BEGIN NULL; END;\n/\n";
+        let cases: &[(&str, serde_json::Value)] = &[
+            ("oracle_capabilities", json!({})),
+            ("parse_file", json!({ "source": src })),
+            ("get_symbol", json!({ "source": src, "symbol": "P" })),
+            ("compile_check", json!({ "source": src })),
+            ("inspect_profile", json!({})),
+            (
+                "dynamic_sql_evidence",
+                json!({ "call_text": "EXECUTE IMMEDIATE 'SELECT 1 FROM dual'", "site": "p:1" }),
+            ),
+            ("doc_lookup", json!({ "source": src, "query": "" })),
+            ("completeness_report", json!({ "project_root": root })),
+            ("analyze_project", json!({ "project_root": root })),
+            ("plsql_analyze", json!({ "project_root": root })),
+        ];
+        for (name, args) in cases {
+            let outcome = dispatch_tool(name, args)
+                .unwrap_or_else(|e| panic!("self-contained tool `{name}` errored: {e:?}"));
+            let DispatchOutcome::Ran(v) = outcome else {
+                panic!("self-contained tool `{name}` must return Ran, got a gated outcome");
+            };
+            assert!(
+                v.is_object() || v.is_array(),
+                "tool `{name}` must return a structured result, got {v}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn parse_file_runs_and_returns_real_response() {
         let out = dispatch_tool(
             "parse_file",

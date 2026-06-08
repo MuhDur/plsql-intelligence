@@ -28,6 +28,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::is_ident_byte;
 use crate::stmt::{SqlVerb, Statement};
 
 /// One table-level access pulled from an embedded SQL statement.
@@ -360,10 +361,6 @@ fn tables_after(upper: &str, raw: &str, keyword: &str) -> Vec<String> {
         }
     }
     out
-}
-
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'#'
 }
 
 fn push(out: &mut Vec<TableAccess>, raw_name: String, access: AccessKind) {

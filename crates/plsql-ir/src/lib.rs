@@ -34,6 +34,14 @@ pub mod sql_sem;
 pub mod stmt;
 pub mod table_stub;
 
+/// Whether `b` is a PL/SQL identifier byte (`[A-Za-z0-9_$#]`). Shared by the
+/// lexical extractors (`dml_edges`, `sql_resolve`) which tokenize embedded SQL
+/// at the byte level; previously copied byte-for-byte in each (oracle-687a.7).
+#[must_use]
+pub(crate) fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'#'
+}
+
 pub use calls::{CallContext, CallSite, extract_call_sites, extract_call_sites_bounded};
 pub use canonical::{
     CanonicalisationContext, CanonicalisationStats, canonicalize_expr, canonicalize_statements,

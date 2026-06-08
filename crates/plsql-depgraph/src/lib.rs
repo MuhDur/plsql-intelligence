@@ -838,6 +838,21 @@ impl DepGraph {
         let start = self.resolve_node(from)?;
         let target = self.resolve_node(to)?;
 
+        // Build a from-adjacency index and an edge-by-id index ONCE, hoisted out
+        // of the per-node BFS walk — re-sorting the whole edge vector at every
+        // popped node made the search O(V·E log E) (oracle-687a.5). The adjacency
+        // vectors are filled from `sorted_edges` so each node's outgoing edges
+        // keep EdgeId order, making BFS visitation byte-identical to the old
+        // per-pop `sorted_edges(...).filter(from == current)` (I-DETERMINISM).
+        // Mirrors the same local-index pattern `detect_cycles` already uses.
+        let ordered = sorted_edges(&self.edges);
+        let mut adjacency: HashMap<NodeId, Vec<&Edge>> = HashMap::new();
+        let mut by_id: HashMap<EdgeId, &Edge> = HashMap::with_capacity(ordered.len());
+        for edge in &ordered {
+            adjacency.entry(edge.from).or_default().push(edge);
+            by_id.insert(edge.id, edge);
+        }
+
         let mut queue = VecDeque::from([start.id]);
         let mut visited = HashSet::from([start.id]);
         let mut predecessors = HashMap::<NodeId, EdgeId>::new();
@@ -847,10 +862,7 @@ impl DepGraph {
                 break;
             }
 
-            for edge in sorted_edges(&self.edges)
-                .into_iter()
-                .filter(|edge| edge.from == current)
-            {
+            for edge in adjacency.get(&current).into_iter().flatten() {
                 if visited.insert(edge.to) {
                     predecessors.insert(edge.to, edge.id);
                     queue.push_back(edge.to);
@@ -878,8 +890,9 @@ impl DepGraph {
                 break;
             };
             path_edge_ids.push(edge_id);
-            let edge = self
-                .edge_by_id(edge_id)
+            let edge = by_id
+                .get(&edge_id)
+                .copied()
                 .ok_or(GraphQueryError::MissingEdgeEndpoint {
                     edge_id,
                     missing_node_id: cursor,
@@ -891,8 +904,9 @@ impl DepGraph {
         let mut nodes = Vec::from([NodeSummary::from_node(start)]);
         let mut edges = Vec::new();
         for edge_id in path_edge_ids {
-            let edge = self
-                .edge_by_id(edge_id)
+            let edge = by_id
+                .get(&edge_id)
+                .copied()
                 .ok_or(GraphQueryError::MissingEdgeEndpoint {
                     edge_id,
                     missing_node_id: target.id,
@@ -1016,6 +1030,10 @@ impl DepGraph {
         self.nodes.get(&node_id)
     }
 
+    // Test-only since query_path stopped using it (it now builds a local
+    // EdgeId index once; oracle-687a.5). A single O(E) scan is acceptable in a
+    // one-shot test assertion.
+    #[cfg(test)]
     fn edge_by_id(&self, edge_id: EdgeId) -> Option<&Edge> {
         self.edges.iter().find(|edge| edge.id == edge_id)
     }

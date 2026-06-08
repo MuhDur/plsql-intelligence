@@ -30,6 +30,7 @@
 //!   pass cross-checks the resolved `(schema, table)` pairs
 //!   against.
 
+use crate::is_ident_byte;
 use crate::sql_sem::{SqlSemanticVerb, SqlStatementModel, TableUsageKind, TableUse};
 
 /// Resolve table + alias structure from a single embedded SQL
@@ -367,10 +368,6 @@ fn delete_target(upper: &str, raw: &str) -> Option<(Option<String>, String, Stri
         _ => (None, token_upper),
     };
     Some((schema, table, alias))
-}
-
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'#'
 }
 
 impl SqlStatementModel {
