@@ -9,6 +9,46 @@ work.
 
 ## [Unreleased]
 
+### Hardening, MCP agent-UX, and reality-check (2026-06)
+
+A multi-pass remediation sweep across the whole workspace. The suite stayed
+green throughout (2603 tests, zero failures; `clippy -D warnings` clean;
+`cargo-deny` clean; the `oraclemcp-*` one-way boundary lint clean).
+
+- **Correctness and security hunt (converged).** Thirteen rounds of
+  adversarial multi-agent bug-hunting with per-finding ground-truth
+  calibration fixed 122 distinct correctness/security defects plus one
+  production performance bug, then converged (the last rounds found no new
+  reachable high-severity defect). Whole defect classes were closed: SQL-guard
+  fail-closed invariants (buried `;`, trailing SQL after `END`, buried verbs,
+  whitespace/comment-insensitive `EXECUTE IMMEDIATE`), code-generation
+  injection in `plsql-bindgen`, unbounded recursion in expression/statement
+  lowering (typed depth caps), UTF-8 char-boundary slicing, taint
+  fail-closed-on-unanalyzable, dependency-extraction completeness (legacy comma
+  joins, string-literal masking), and an inverted edge-direction in
+  `plsql-lineage::dependencies`/`impact`.
+- **MCP server agent-ergonomics.** The shipping `plsql-mcp` wire now advertises
+  a real argument JSON-Schema and read-only / destructive annotations per tool;
+  returns structured error envelopes with a machine class and a fuzzy
+  "did you mean" suggestion on an unknown tool; ships a zero-argument
+  `oracle_capabilities` discovery tool plus `initialize` orientation
+  instructions; gates the advertised surface by build feature and safety
+  profile so a static-only build does not present unrunnable live tools as
+  callable; normalizes Oracle identifier case on `describe_*` / `list_objects`
+  so natural lowercase input resolves; and attaches `next_actions` workflow
+  hints to successful results.
+- **Honest-uncertainty fidelity.** Parser-recovery diagnostics are now tagged
+  with `UnknownReason::ParserRecoveryRegion`, so the accretion gap classifier
+  sees them as typed degradation rather than a grammar/lowering repair
+  candidate. The CI-cascade `predict` path finalizes its completeness posture
+  instead of serializing a default-pessimistic `Degraded`. Engine-built
+  dependency edges now carry the real resolution strategy and a populated
+  evidence payload rather than a hardcoded constant and `None`.
+- **Performance.** `DepGraph::query_path` builds a from-adjacency and edge-id
+  index once instead of re-sorting every edge at each BFS node
+  (`O(V·E·log E)` → `O(E·log E)`), with byte-identical visitation order
+  preserved.
+
 ### Open-source readiness (2026-05-22)
 
 - **MCP consolidation.** The MCP server is now a single `plsql-mcp`

@@ -79,11 +79,16 @@ This is pre-1.0 software under active development. `plan.md` is the
 authoritative specification; `docs/ARCHITECTURE.md` is the technical
 architecture snapshot.
 
-- The Cargo workspace ships 24 crates and 5 tool binaries (`crates/`,
-  `tools/`). The foundation and product layers are implemented; live
-  Oracle catalog extraction, the `verify`/CI-cascade path, and the
-  live-DB MCP tool surface are feature-gated and exercised against a
-  containerized Oracle 23ai (`live-xe` suites, `make demo-oracle-xe-ci`).
+- The Cargo workspace ships 30 crates and 5 tool binaries (`crates/`,
+  `tools/`): 22 `plsql-*` engine and analysis crates plus 8 engine-free
+  `oraclemcp-*` crates that hold the MCP server core (protocol, tool
+  registry, the fail-closed SQL guard, audit sink, auth, telemetry,
+  config). The one-way boundary — `oraclemcp-*` never imports a `plsql-*`
+  engine crate — is enforced by a CI dependency lint. The foundation and
+  product layers are implemented; live Oracle catalog extraction, the
+  `verify`/CI-cascade path, and the live-DB MCP tool surface are
+  feature-gated and exercised against a containerized Oracle 23ai
+  (`live-xe` suites, `make demo-oracle-xe-ci`).
 - The **USR Loop** (Layer 5) is implemented end to end: the
   `plsql-accretion` library, the `usr-loop` tool, the sha-pinned
   conformance gate, the monotone tripwire, and the re-runnable acceptance
@@ -241,6 +246,7 @@ types.
 | 3   | `plsql-engine` | Orchestration: per-run `AnalysisRun`, `CompletenessReport` |
 | 4   | `plsql-lineage`, `plsql-doc`, `plsql-bindgen`, `plsql-cicd`, `plsql-sast` | Lineage, docs, Rust bindings, change-set planning, static analysis |
 | 5   | `plsql-mcp`, `plsql-accretion` | The unified MCP server plus the USR Loop library (no reverse deps) |
+| MCP core | `oraclemcp-core`, `oraclemcp-guard`, `oraclemcp-db`, `oraclemcp-audit`, `oraclemcp-auth`, `oraclemcp-telemetry`, `oraclemcp-config`, `oraclemcp-error` | Engine-free MCP server core: protocol/registry, the fail-closed SQL guard and operating-level state, the connection layer, the out-of-band audit sink, transport auth, telemetry, config, and the structured error envelope. `#![forbid(unsafe_code)]`; never imports a `plsql-*` engine crate (one-way boundary, CI-enforced) |
 
 ```
   PL/SQL source + Oracle catalog snapshot
@@ -266,13 +272,19 @@ Tool binaries: `tools/usr-loop` (the USR Loop orchestrator),
 `tools/plan-lint` (structural lint of `plan.md`),
 `tools/corpus-license-check`, `tools/corpus-bench`, `tools/corpus-grow`.
 
-The MCP server (`plsql-mcp`) is a single crate. It completes the MCP
-handshake, advertises the full tool surface over `tools/list`, and
-dispatches `tools/call` end-to-end: static-analysis and change-impact
-tools execute in-process; live-DB tools dispatch and degrade with a
-typed `RuntimeStateRequired` response when no active Oracle connection
-is configured. A lockstep test enforces that every tool the registry
-advertises has a dispatch arm.
+The MCP server (`plsql-mcp`) is a single binary built on the engine-free
+`oraclemcp-*` core. It completes the MCP handshake, advertises the full
+tool surface over `tools/list` — each tool carries a real argument
+JSON-Schema and read-only / destructive annotations — and dispatches
+`tools/call` end-to-end: static-analysis and change-impact tools execute
+in-process; live-DB tools dispatch and degrade with a typed
+`RuntimeStateRequired` response (naming the tool to call next) when no
+active Oracle connection is configured. A zero-argument
+`oracle_capabilities` tool reports the feature flags and surface so an
+agent can orient before its first call, and failed calls return a
+structured error envelope with a machine-readable class and a fuzzy
+"did you mean" suggestion. A lockstep test enforces that every tool the
+registry advertises has a dispatch arm.
 
 ---
 
