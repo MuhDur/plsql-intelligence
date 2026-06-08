@@ -4,7 +4,7 @@
 //! the generated string literal. This is the compile-level proof behind the
 //! string assertions in `emit.rs`'s unit tests.
 
-use plsql_bindgen::executor::{BindValue, ExecutionError, OracleExecutor, Row, RoutineArg};
+use plsql_bindgen::executor::{BindValue, ExecutionError, OracleExecutor, RoutineArg, Row};
 
 /// VERBATIM shape of what `emit_routine` now emits for a routine whose name
 /// carries a quote + SQL fragment + brace (`f", DROP TABLE t; -- {`). The
@@ -12,9 +12,7 @@ use plsql_bindgen::executor::{BindValue, ExecutionError, OracleExecutor, Row, Ro
 /// escaped inside the Rust string literal — the body compiles and the hostile
 /// text never breaks out. Keep this in lockstep with the emitter's gate body.
 #[allow(dead_code)]
-pub fn binding_invalid_stub_0(
-    executor: &mut impl OracleExecutor,
-) -> Result<(), ExecutionError> {
+pub fn binding_invalid_stub_0(executor: &mut impl OracleExecutor) -> Result<(), ExecutionError> {
     let _ = executor;
     // bindgen: routine name `f", DROP TABLE t; -- {`: identifier contains a
     // character outside [A-Za-z0-9_]; the BindingPlan carries an identifier

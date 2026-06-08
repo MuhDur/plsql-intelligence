@@ -127,9 +127,7 @@ fn print_usage() {
     println!("Optional local artifact-cache daemon.");
     println!();
     println!("Positional:");
-    println!(
-        "  <cache-dir>      directory holding cache.db (SQLite) and plsqld.sock (UDS);"
-    );
+    println!("  <cache-dir>      directory holding cache.db (SQLite) and plsqld.sock (UDS);");
     println!("                   must exist (R17 — never auto-created)");
     println!();
     println!("Info flags:");
@@ -288,7 +286,10 @@ mod tests {
     fn capabilities_contract_is_pinned() {
         let c = capabilities_json();
         assert_eq!(c["binary"], "plsqld");
-        assert_eq!(c["contract_version"], u64::from(CAPABILITIES_CONTRACT_VERSION));
+        assert_eq!(
+            c["contract_version"],
+            u64::from(CAPABILITIES_CONTRACT_VERSION)
+        );
         assert_eq!(c["version"], env!("CARGO_PKG_VERSION"));
         for key in [
             "mode",

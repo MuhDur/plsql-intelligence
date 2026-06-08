@@ -11,7 +11,10 @@ fn bin_path() -> &'static str {
 
 #[test]
 fn help_long_exits_zero_and_prints_usage() {
-    let out = Command::new(bin_path()).arg("--help").output().expect("spawn");
+    let out = Command::new(bin_path())
+        .arg("--help")
+        .output()
+        .expect("spawn");
     assert!(
         out.status.success(),
         "`plsqld --help` must exit 0 (Axiom 0); got {:?}; stderr={}",
@@ -19,7 +22,10 @@ fn help_long_exits_zero_and_prints_usage() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("plsqld"), "--help stdout must name the binary");
+    assert!(
+        stdout.contains("plsqld"),
+        "--help stdout must name the binary"
+    );
     assert!(
         stdout.contains("<cache-dir>"),
         "--help must document the positional <cache-dir>"
@@ -38,7 +44,10 @@ fn help_short_exits_zero() {
 
 #[test]
 fn version_long_exits_zero_and_prints_version() {
-    let out = Command::new(bin_path()).arg("--version").output().expect("spawn");
+    let out = Command::new(bin_path())
+        .arg("--version")
+        .output()
+        .expect("spawn");
     assert!(out.status.success(), "`plsqld --version` must exit 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("plsqld"));
@@ -69,7 +78,10 @@ fn capabilities_emits_parseable_json_with_required_keys() {
 
 #[test]
 fn robot_docs_exits_zero() {
-    let out = Command::new(bin_path()).arg("--robot-docs").output().expect("spawn");
+    let out = Command::new(bin_path())
+        .arg("--robot-docs")
+        .output()
+        .expect("spawn");
     assert!(out.status.success(), "`plsqld --robot-docs` must exit 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Unix-domain"));
@@ -80,7 +92,10 @@ fn robot_docs_exits_zero() {
 /// happen again.
 #[test]
 fn help_does_not_attempt_to_create_a_help_directory() {
-    let out = Command::new(bin_path()).arg("--help").output().expect("spawn");
+    let out = Command::new(bin_path())
+        .arg("--help")
+        .output()
+        .expect("spawn");
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -94,7 +109,10 @@ fn help_does_not_attempt_to_create_a_help_directory() {
 
 #[test]
 fn unknown_flag_is_reported_with_pointer_to_help() {
-    let out = Command::new(bin_path()).arg("--no-such-flag").output().expect("spawn");
+    let out = Command::new(bin_path())
+        .arg("--no-such-flag")
+        .output()
+        .expect("spawn");
     assert!(!out.status.success(), "unknown flag must not exit 0");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(

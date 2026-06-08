@@ -535,7 +535,10 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
             IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)),
         ] {
-            assert!(!is_safe_bind(ip), "RFC1918 {ip} must NOT be safe by default");
+            assert!(
+                !is_safe_bind(ip),
+                "RFC1918 {ip} must NOT be safe by default"
+            );
         }
     }
 
@@ -575,7 +578,11 @@ mod tests {
 
     #[test]
     fn guard_bind_refuses_rfc1918_without_override() {
-        for raw in [("10.0.1.5", 9000u16), ("172.16.0.1", 9000), ("192.168.1.10", 9000)] {
+        for raw in [
+            ("10.0.1.5", 9000u16),
+            ("172.16.0.1", 9000),
+            ("192.168.1.10", 9000),
+        ] {
             let err = guard_bind(raw, false)
                 .unwrap_err_or_else_msg(|| format!("{raw:?} must be refused without override"));
             assert!(
@@ -659,11 +666,8 @@ mod tests {
 
     #[test]
     fn bind_guard_error_converts_to_permission_denied_io_error() {
-        let io: std::io::Error = BindGuardError::PublicBindRefused(SocketAddr::from((
-            [0, 0, 0, 0],
-            8080,
-        )))
-        .into();
+        let io: std::io::Error =
+            BindGuardError::PublicBindRefused(SocketAddr::from(([0, 0, 0, 0], 8080))).into();
         assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
@@ -672,8 +676,8 @@ mod tests {
         // The behavioural contract: a public bind through the real
         // entry point fails with a PermissionDenied error *before*
         // any socket is opened — never silently exposed.
-        let err = serve_preview_blocking(("0.0.0.0", 0u16), fixture_set(), "billing", false)
-            .unwrap_err();
+        let err =
+            serve_preview_blocking(("0.0.0.0", 0u16), fixture_set(), "billing", false).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(
             err.to_string().contains("public-internet"),

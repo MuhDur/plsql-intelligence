@@ -524,11 +524,7 @@ connect_string = "//localhost/DEV"
         // `bill` is a prefix of the real alias `billing-dev`. A raw
         // substring match would mark `bill` as present; a structural
         // lookup must not.
-        fs::write(
-            &path,
-            r#"{ "connections": [{ "name": "billing-dev" }] }"#,
-        )
-        .unwrap();
+        fs::write(&path, r#"{ "connections": [{ "name": "billing-dev" }] }"#).unwrap();
         let probe = DbToolsAlias::probe("bill", &tmp);
         assert!(
             !probe.available,

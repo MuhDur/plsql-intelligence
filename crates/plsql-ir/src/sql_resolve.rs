@@ -480,7 +480,9 @@ mod tests {
             m.tables
         );
         assert!(
-            m.tables.iter().any(|t| t.table == "LOG" && t.usage == TableUsageKind::Write),
+            m.tables
+                .iter()
+                .any(|t| t.table == "LOG" && t.usage == TableUsageKind::Write),
             "the real INSERT target LOG must still be a Write: {:?}",
             m.tables
         );

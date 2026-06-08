@@ -492,9 +492,7 @@ fn parse_honesty(candidate_text: &str) -> Result<HonestyManifest, GateError> {
                 }
                 "extracted-semantics-delta" => {
                     m.extracted_semantics_delta = v.parse().map_err(|_| {
-                        GateError::Parse(format!(
-                            "extracted-semantics-delta not an integer: {v:?}"
-                        ))
+                        GateError::Parse(format!("extracted-semantics-delta not an integer: {v:?}"))
                     })?;
                 }
                 "posture" => m.posture = v.to_string(),
@@ -678,8 +676,8 @@ pub fn measure_estate_metrics(estate: &Path) -> Result<String, GateError> {
         ..AnalysisRequest::default()
     };
     req.cache.enabled = false;
-    let run = analyze_project(req)
-        .map_err(|e| GateError::Io(format!("engine analyze failed: {e}")))?;
+    let run =
+        analyze_project(req).map_err(|e| GateError::Io(format!("engine analyze failed: {e}")))?;
     let edges = run.dep_graph.edge_count();
     let facts = run.fact_store.fact_count;
     let ratio = run.completeness.extracted_semantics_ratio;
@@ -800,7 +798,10 @@ pub(crate) fn validate_trusted_pin_shell(line: &str) -> Result<&str, GateError> 
             "trusted pin hook is empty (cannot pin a real behavior)".into(),
         ));
     }
-    if let Some(bad) = trimmed.chars().find(|c| PINS_FORBIDDEN_METACHARS.contains(c)) {
+    if let Some(bad) = trimmed
+        .chars()
+        .find(|c| PINS_FORBIDDEN_METACHARS.contains(c))
+    {
         return Err(GateError::PinMismatch(format!(
             "trusted pin hook contains forbidden shell metacharacter {bad:?} — only a single \
              simple command is permitted (no pipelines, sub-shells, or redirections)"
@@ -912,10 +913,7 @@ pub fn pins_check(repo_root: &Path, candidate_text: &str) -> Result<String, Gate
         // leading-token allowlist. Fail-closed (no shell payload runs
         // on the typed-error path; the canary in the security
         // regression test proves it).
-        let trusted = std::env::var(PINS_TRUST_ENV)
-            .ok()
-            .as_deref()
-            == Some("1");
+        let trusted = std::env::var(PINS_TRUST_ENV).ok().as_deref() == Some("1");
         if !trusted {
             return Err(GateError::PinMismatch(format!(
                 "G9 refuses to execute candidate-supplied shell pin hooks by default — set \
@@ -935,9 +933,7 @@ pub fn pins_check(repo_root: &Path, candidate_text: &str) -> Result<String, Gate
         ] {
             if let Some(h) = hook {
                 validate_trusted_pin_shell(h).map_err(|e| match e {
-                    GateError::PinMismatch(m) => {
-                        GateError::PinMismatch(format!("{label}: {m}"))
-                    }
+                    GateError::PinMismatch(m) => GateError::PinMismatch(format!("{label}: {m}")),
                     other => other,
                 })?;
             }
@@ -1056,7 +1052,10 @@ mod tests {
         // A missing metric is a fail-closed regression (never assumed
         // ≥ baseline).
         assert!(
-            matches!(baseline_cmp(base, missing), Err(GateError::BaselineRegression(_))),
+            matches!(
+                baseline_cmp(base, missing),
+                Err(GateError::BaselineRegression(_))
+            ),
             "missing metric must be a typed BaselineRegression"
         );
         let bad_json = baseline_cmp("{not json", ok).unwrap_err();

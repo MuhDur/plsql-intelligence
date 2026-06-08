@@ -857,8 +857,7 @@ mod tests {
     #[test]
     fn clap_typo_suggests_robot_json() {
         use clap::Parser;
-        let err =
-            Cli::try_parse_from(["plsql-depgraph", "--robotjson", "doctor"]).unwrap_err();
+        let err = Cli::try_parse_from(["plsql-depgraph", "--robotjson", "doctor"]).unwrap_err();
         let s = err.to_string();
         assert!(
             s.contains("--robot-json") || s.contains("similar"),

@@ -288,8 +288,13 @@ pub fn dispatch_tool(name: &str, arguments: &Value) -> Result<DispatchOutcome, D
                 RuntimeKind::DependencyGraph,
             ))
         }
-        "what_breaks" | "recompile_plan" | "classify_change" | "compare_oracle_deps"
-        | "release_gate" | "sarif_scan" | "orphan_candidates" => {
+        "what_breaks"
+        | "recompile_plan"
+        | "classify_change"
+        | "compare_oracle_deps"
+        | "release_gate"
+        | "sarif_scan"
+        | "orphan_candidates" => {
             // These take graphs / reports / catalog snapshots that
             // are analysis state, not part of a JSON request.
             Ok(DispatchOutcome::RuntimeStateRequired(
@@ -298,12 +303,17 @@ pub fn dispatch_tool(name: &str, arguments: &Value) -> Result<DispatchOutcome, D
         }
 
         // ── connection / safety tools: need session state ────────
-        "list_connections" | "connect" | "disconnect" | "current_database" | "switch_database"
-        | "current_safety_profile" | "set_safety_profile" | "enable_writes" | "disable_writes" => {
-            Ok(DispatchOutcome::RuntimeStateRequired(
-                RuntimeKind::SessionState,
-            ))
-        }
+        "list_connections"
+        | "connect"
+        | "disconnect"
+        | "current_database"
+        | "switch_database"
+        | "current_safety_profile"
+        | "set_safety_profile"
+        | "enable_writes"
+        | "disable_writes" => Ok(DispatchOutcome::RuntimeStateRequired(
+            RuntimeKind::SessionState,
+        )),
 
         // ── live-DB tools: arguments validated, then gated ───────
         "query" => {
@@ -355,7 +365,9 @@ pub fn dispatch_tool(name: &str, arguments: &Value) -> Result<DispatchOutcome, D
 /// object rather than a panic (the protocol layer keeps the wire
 /// alive).
 fn ran<T: serde::Serialize>(response: &T) -> DispatchOutcome {
-    DispatchOutcome::Ran(serde_json::to_value(response).unwrap_or(Value::Object(Default::default())))
+    DispatchOutcome::Ran(
+        serde_json::to_value(response).unwrap_or(Value::Object(Default::default())),
+    )
 }
 
 /// Argument shape for the `query` tool — mirrors the `run_query`
@@ -397,8 +409,7 @@ mod tests {
         // server actually advertises must be the same set — no
         // registered-but-undispatched tool, no phantom dispatch arm.
         let registry = crate::default_tool_registry();
-        let mut registered: Vec<&str> =
-            registry.tools.iter().map(|t| t.name.as_str()).collect();
+        let mut registered: Vec<&str> = registry.tools.iter().map(|t| t.name.as_str()).collect();
         registered.sort_unstable();
         let mut dispatched: Vec<&str> = dispatch_table().to_vec();
         dispatched.sort_unstable();

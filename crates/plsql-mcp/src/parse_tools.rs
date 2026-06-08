@@ -186,7 +186,9 @@ fn parse_tool_schema(name: &str) -> Option<serde_json::Value> {
             },
         })),
         // inspect_profile takes no arguments.
-        "inspect_profile" => Some(json!({"type": "object", "additionalProperties": false, "properties": {}})),
+        "inspect_profile" => {
+            Some(json!({"type": "object", "additionalProperties": false, "properties": {}}))
+        }
         _ => None,
     }
 }

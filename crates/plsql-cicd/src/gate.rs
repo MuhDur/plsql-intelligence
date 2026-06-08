@@ -346,8 +346,7 @@ pub fn run_gate(prediction: &InvalidationPrediction, policy: &GatePolicy) -> Gat
         // still fires (the policy's `Option<u32>` cap is preserved
         // for backward compatibility; widening it would change the
         // serialized shape downstream callers depend on).
-        let observed = u32::try_from(prediction.predicted_invalidations.len())
-            .unwrap_or(u32::MAX);
+        let observed = u32::try_from(prediction.predicted_invalidations.len()).unwrap_or(u32::MAX);
         if observed > cap {
             failures.push(GateFailure::InvalidationsExceeded { cap, observed });
         }
@@ -758,8 +757,10 @@ mod tests {
         }
 
         // Every emitted name is in the allow-list…
-        let emitted: Vec<&'static str> =
-            all_variants.iter().map(|v| unknown_reason_name(v)).collect();
+        let emitted: Vec<&'static str> = all_variants
+            .iter()
+            .map(|v| unknown_reason_name(v))
+            .collect();
         for name in &emitted {
             assert!(
                 is_known_reason_name(name),

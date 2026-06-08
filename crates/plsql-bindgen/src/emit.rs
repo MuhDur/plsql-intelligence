@@ -431,10 +431,7 @@ fn emit_routine(out: &mut String, package_id: &str, r: &RoutineBinding, rust_nam
         return;
     }
 
-    let _ = write!(
-        out,
-        "pub fn {rust_name}(executor: &mut impl OracleExecutor"
-    );
+    let _ = write!(out, "pub fn {rust_name}(executor: &mut impl OracleExecutor");
     for p in &r.parameters {
         if matches!(p.mode, ParameterMode::In | ParameterMode::InOut) {
             let _ = write!(out, ", {}: {}", p.name, rust_type_sig(p));
@@ -725,9 +722,8 @@ fn emit_routine_body_dynamic(
             // read back: omitting an IN OUT means there is no actual
             // argument for the server to write into. Surface that as a
             // typed error rather than mis-aligning the output cursor.
-            let omittable_inout = owner.is_some_and(|p| {
-                matches!(p.mode, ParameterMode::InOut) && should_use_defaulted(p)
-            });
+            let omittable_inout = owner
+                .is_some_and(|p| matches!(p.mode, ParameterMode::InOut) && should_use_defaulted(p));
             let core = scalar_out_extract(&rt.path, &bind).expect("checked by unsupported_type");
             let value_expr = if rt.nullable {
                 format!("if matches!({bind}, BindValue::Null) {{ None }} else {{ Some({core}) }}")
@@ -802,7 +798,10 @@ fn emit_dynamic_param_bind(out: &mut String, p: &ParameterBinding) {
                 let _ = writeln!(out, "        Defaulted::Omit => {{}}");
                 let _ = writeln!(out, "        Defaulted::Null => {{");
                 let _ = writeln!(out, "            let __n = __slot; __slot += 1;");
-                let _ = writeln!(out, "            __call.push(format!(\"{name} => :{{__n}}\"));");
+                let _ = writeln!(
+                    out,
+                    "            __call.push(format!(\"{name} => :{{__n}}\"));"
+                );
                 let _ = writeln!(
                     out,
                     "            __args.push(RoutineArg::{variant}(BindValue::Null));"
@@ -810,7 +809,10 @@ fn emit_dynamic_param_bind(out: &mut String, p: &ParameterBinding) {
                 let _ = writeln!(out, "        }}");
                 let _ = writeln!(out, "        Defaulted::Value(__v) => {{");
                 let _ = writeln!(out, "            let __n = __slot; __slot += 1;");
-                let _ = writeln!(out, "            __call.push(format!(\"{name} => :{{__n}}\"));");
+                let _ = writeln!(
+                    out,
+                    "            __call.push(format!(\"{name} => :{{__n}}\"));"
+                );
                 let _ = writeln!(
                     out,
                     "            __args.push(RoutineArg::{variant}({value_ctor}));"
@@ -839,7 +841,9 @@ fn dynamic_value_ctor(p: &ParameterBinding, src: &str) -> String {
     let path = &p.rust_type.path;
     if p.rust_type.nullable {
         let inner = scalar_in_marshal(path, "__iv").expect("checked by unsupported_type");
-        format!("match {src} {{ Some(__iv) => {{ let __iv = (*__iv).clone(); {inner} }}, None => BindValue::Null }}")
+        format!(
+            "match {src} {{ Some(__iv) => {{ let __iv = (*__iv).clone(); {inner} }}, None => BindValue::Null }}"
+        )
     } else {
         // `src` is always a reference expression (`&name` or a `&T` match
         // binding); parenthesise before `.clone()` so the cloned value is
@@ -1452,11 +1456,16 @@ mod tests {
             src.contains("BINDING_DEGENERATE_FUNCTION"),
             "degenerate function must emit a typed error body: {src}"
         );
-        assert!(!src.contains("unimplemented!"), "must not panic-body: {src}");
+        assert!(
+            !src.contains("unimplemented!"),
+            "must not panic-body: {src}"
+        );
         // The signature still type-checks: a function with no return is
         // forced to `Result<(), _>` so the emitted error body is valid Rust.
         assert!(
-            src.contains("pub fn f(executor: &mut impl OracleExecutor) -> Result<(), ExecutionError>"),
+            src.contains(
+                "pub fn f(executor: &mut impl OracleExecutor) -> Result<(), ExecutionError>"
+            ),
             "degenerate function signature must be well-formed: {src}"
         );
         // No executor call is composed — there is nothing to invoke.
@@ -1682,7 +1691,11 @@ mod tests {
             .collect();
         assert_eq!(fn_names.len(), 2, "{fn_names:?}");
         let unique: std::collections::BTreeSet<_> = fn_names.iter().collect();
-        assert_eq!(unique.len(), 2, "duplicate pub fn names emitted: {fn_names:?}");
+        assert_eq!(
+            unique.len(),
+            2,
+            "duplicate pub fn names emitted: {fn_names:?}"
+        );
     }
 
     #[test]
@@ -1776,7 +1789,12 @@ mod tests {
         let r = RoutineBinding {
             name: "ok_proc".into(),
             kind: RoutineKind::Procedure,
-            parameters: vec![param("p_a => :99 -- broken", "i64", ParameterMode::In, false)],
+            parameters: vec![param(
+                "p_a => :99 -- broken",
+                "i64",
+                ParameterMode::In,
+                false,
+            )],
             return_type: None,
             autonomous_transaction: false,
         };
@@ -2135,7 +2153,10 @@ mod tests {
         assert!(type_path_problem("i64\nfn x(){}").is_some());
         assert!(type_path_problem("Vec<u8").is_some(), "unbalanced `<`");
         assert!(type_path_problem("u8>").is_some(), "unbalanced `>`");
-        assert!(type_path_problem("Foo>Bar<Baz").is_some(), "interleaved brackets");
+        assert!(
+            type_path_problem("Foo>Bar<Baz").is_some(),
+            "interleaved brackets"
+        );
         assert!(type_path_problem("(i64)").is_some());
         assert!(type_path_problem("Foo=Bar").is_some());
     }
@@ -2218,8 +2239,8 @@ mod tests {
     // executor proves the three Defaulted states bind correctly. This is
     // the behavioral teeth behind the string assertions above.
     mod generated_shape {
-        use crate::executor::{BindValue, ExecutionError, OracleExecutor, Row, RoutineArg};
         use crate::Defaulted;
+        use crate::executor::{BindValue, ExecutionError, OracleExecutor, RoutineArg, Row};
 
         /// Records the block + args the wrapper handed the executor.
         #[derive(Default)]
@@ -2274,8 +2295,10 @@ mod tests {
                 }
             }
             let _ = __slot;
-            let __block =
-                format!("BEGIN hr.demo_pkg.proc_with_default({}); END;", __call.join(", "));
+            let __block = format!(
+                "BEGIN hr.demo_pkg.proc_with_default({}); END;",
+                __call.join(", ")
+            );
             let __out = executor.call_routine(&__block, &__args)?;
             let _ = __out;
             Ok(())

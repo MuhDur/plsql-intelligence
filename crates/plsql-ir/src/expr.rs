@@ -942,8 +942,12 @@ mod tests {
     fn unaffected_comparison_ops_still_split_correctly() {
         // The relational-tier merge must not regress the operators that
         // already worked: `=`, `<`, `>`, `<>`.
-        for (src, expected_op) in [("a = b", "="), ("a < b", "<"), ("a > b", ">"), ("a <> b", "<>")]
-        {
+        for (src, expected_op) in [
+            ("a = b", "="),
+            ("a < b", "<"),
+            ("a > b", ">"),
+            ("a <> b", "<>"),
+        ] {
             match lower_expression(src) {
                 Expr::Binary { op, lhs, rhs } => {
                     assert_eq!(op, expected_op, "op for {src:?}");

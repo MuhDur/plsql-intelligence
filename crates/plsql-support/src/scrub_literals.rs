@@ -510,11 +510,11 @@ mod tests {
         // Each input puts a non-ASCII char in a token-separator or
         // unquoted-identifier position (outside any string/comment).
         for src in [
-            "x\u{00A0}:= 1;",     // NBSP between tokens
-            "café := 1;",         // accented leading identifier
-            "v_é := 5",           // accented char inside identifier
-            "é",                  // trailing accent only
-            "a — b",              // em-dash separator
+            "x\u{00A0}:= 1;", // NBSP between tokens
+            "café := 1;",     // accented leading identifier
+            "v_é := 5",       // accented char inside identifier
+            "é",              // trailing accent only
+            "a — b",          // em-dash separator
         ] {
             let (out, _) = scrub_literals(src, ScrubThresholds::default_thresholds());
             // No panic reached here; non-literal text must be copied

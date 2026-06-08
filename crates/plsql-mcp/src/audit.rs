@@ -210,9 +210,7 @@ fn is_valid_audit_table_name(name: &str) -> bool {
     match parts.next() {
         // `OWNER.NAME` — exactly one dot, both halves valid, no third part.
         Some(second) => {
-            parts.next().is_none()
-                && is_simple_sql_name(first)
-                && is_simple_sql_name(second)
+            parts.next().is_none() && is_simple_sql_name(first) && is_simple_sql_name(second)
         }
         // Bare `NAME` — no dot at all.
         None => is_simple_sql_name(first),
@@ -312,8 +310,8 @@ mod tests {
     fn with_audit_table_accepts_valid_identifiers() {
         // oracle-c1e2: a strict OWNER.NAME / NAME shape is accepted.
         for name in ["MCP_CALLS", "OPS_AUDIT.MCP_CALLS", "PKG$WITH#SIGILS"] {
-            let plan = AuditPlan::for_tool(fixture_client(), "describe_table")
-                .with_audit_table(name);
+            let plan =
+                AuditPlan::for_tool(fixture_client(), "describe_table").with_audit_table(name);
             assert!(
                 plan.is_some(),
                 "valid table name {name:?} should be accepted"
@@ -345,8 +343,8 @@ mod tests {
             "   ",
         ];
         for attack in attacks {
-            let plan = AuditPlan::for_tool(fixture_client(), "describe_table")
-                .with_audit_table(attack);
+            let plan =
+                AuditPlan::for_tool(fixture_client(), "describe_table").with_audit_table(attack);
             assert!(
                 plan.is_none(),
                 "malicious table name {attack:?} must be rejected"

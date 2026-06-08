@@ -412,7 +412,13 @@ mod tests {
         assert_eq!(response.errors.len(), 1);
         let row = &response.errors[0];
         // No surviving ASCII angle brackets anywhere in the free-text fields.
-        for field in [&row.text, &row.attribute, &row.owner, &row.object_name, &row.object_type] {
+        for field in [
+            &row.text,
+            &row.attribute,
+            &row.owner,
+            &row.object_name,
+            &row.object_type,
+        ] {
             assert!(
                 !field.contains('<') && !field.contains('>'),
                 "free-text field retained a raw angle bracket: {field:?}"

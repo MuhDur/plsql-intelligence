@@ -482,7 +482,10 @@ mod tests {
         // copy was a Latin-1 reinterpretation that mangled `café`
         // into `cafÃ©`, corrupting the redacted bundle's source.
         let (out, _) = rename_identifiers("x := 'café';", "salt");
-        assert!(out.contains("'café'"), "accented string body mangled: {out}");
+        assert!(
+            out.contains("'café'"),
+            "accented string body mangled: {out}"
+        );
         // q-quote and longer multi-byte bodies likewise survive.
         let (out2, _) = rename_identifiers("y := 'naïve façade — déjà vu';", "salt");
         assert!(

@@ -194,7 +194,12 @@ pub fn classify_kind(ddl: &str) -> Result<String, CreateOrReplaceError> {
         }
     }
 
-    let kind = kind_tokens.iter().take(2).copied().collect::<Vec<_>>().join(" ");
+    let kind = kind_tokens
+        .iter()
+        .take(2)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ");
     Err(CreateOrReplaceError::UnsupportedKind { kind })
 }
 
@@ -553,7 +558,9 @@ mod tests {
         // the whitespace-run tokenization, a tab or double space dropped the BODY
         // suffix and (via parse_target_schema) the owner — a cross-schema bypass.
         for sep in ["  ", "\t", "\n", " \t ", "\u{0c}"] {
-            let ddl = format!("CREATE OR REPLACE PACKAGE{sep}BODY billing.invoice_pkg AS BEGIN NULL; END;");
+            let ddl = format!(
+                "CREATE OR REPLACE PACKAGE{sep}BODY billing.invoice_pkg AS BEGIN NULL; END;"
+            );
             assert_eq!(
                 classify_kind(&ddl).unwrap(),
                 "PACKAGE BODY",
@@ -602,8 +609,7 @@ mod tests {
             Some("ANALYTICS".to_string())
         );
         assert_eq!(
-            parse_target_schema("create or replace view billing.v AS SELECT 1 FROM dual;")
-                .unwrap(),
+            parse_target_schema("create or replace view billing.v AS SELECT 1 FROM dual;").unwrap(),
             Some("BILLING".to_string())
         );
         assert_eq!(
@@ -618,15 +624,15 @@ mod tests {
     #[test]
     fn parse_target_schema_returns_none_for_unqualified() {
         assert_eq!(
-            parse_target_schema(
-                "CREATE OR REPLACE PACKAGE BODY INVOICE_PKG AS\nBEGIN\nEND;"
-            )
-            .unwrap(),
+            parse_target_schema("CREATE OR REPLACE PACKAGE BODY INVOICE_PKG AS\nBEGIN\nEND;")
+                .unwrap(),
             None
         );
         assert_eq!(
-            parse_target_schema("create or replace function f RETURN NUMBER AS BEGIN RETURN 1; END;")
-                .unwrap(),
+            parse_target_schema(
+                "create or replace function f RETURN NUMBER AS BEGIN RETURN 1; END;"
+            )
+            .unwrap(),
             None
         );
     }
@@ -722,10 +728,7 @@ mod tests {
         // Embedded dot inside the quoted owner is literal name content, not a
         // qualifier — still a single owner segment, not a three-part name.
         assert_eq!(
-            parse_target_schema(
-                "CREATE OR REPLACE VIEW \"A.B\".V AS SELECT 1 FROM dual;"
-            )
-            .unwrap(),
+            parse_target_schema("CREATE OR REPLACE VIEW \"A.B\".V AS SELECT 1 FROM dual;").unwrap(),
             Some("A.B".to_string())
         );
     }
@@ -750,8 +753,7 @@ mod tests {
         );
         // An unquoted owner stays upper-cased (dictionary normalisation).
         assert_eq!(
-            parse_target_schema("CREATE OR REPLACE VIEW billing.v AS SELECT 1 FROM dual;")
-                .unwrap(),
+            parse_target_schema("CREATE OR REPLACE VIEW billing.v AS SELECT 1 FROM dual;").unwrap(),
             Some("BILLING".to_string())
         );
     }
@@ -774,9 +776,7 @@ mod tests {
         // single (quoted) owner and route past the cross-schema gate.
         assert!(
             matches!(
-                parse_target_schema(
-                    "CREATE OR REPLACE VIEW \"My Schema.V AS SELECT 1 FROM dual;"
-                ),
+                parse_target_schema("CREATE OR REPLACE VIEW \"My Schema.V AS SELECT 1 FROM dual;"),
                 Err(CreateOrReplaceError::MalformedQualifiedName { .. })
             ),
             "unterminated quote must fail closed, got {:?}",

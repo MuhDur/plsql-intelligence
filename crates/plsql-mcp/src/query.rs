@@ -810,9 +810,7 @@ mod tests {
         assert!(!is_read_only_sql(
             "SELECT id FROM (SELECT id FROM t)FOR UPDATE"
         ));
-        assert!(!is_read_only_sql(
-            "SELECT id FROM invoices\r\nFOR\tUPDATE"
-        ));
+        assert!(!is_read_only_sql("SELECT id FROM invoices\r\nFOR\tUPDATE"));
         assert!(!is_read_only_sql(
             "SELECT id FROM invoices\nFOR  UPDATE  OF id"
         ));
@@ -827,8 +825,12 @@ mod tests {
         // route through enable_writes. A naive adjacency scan would see the
         // comment's word token as intervening and miss the lock.
         assert!(!is_read_only_sql("SELECT dummy FROM dual FOR/* x */UPDATE"));
-        assert!(!is_read_only_sql("SELECT id FROM invoices FOR /* x */ UPDATE"));
-        assert!(!is_read_only_sql("SELECT id FROM invoices FOR -- c\nUPDATE"));
+        assert!(!is_read_only_sql(
+            "SELECT id FROM invoices FOR /* x */ UPDATE"
+        ));
+        assert!(!is_read_only_sql(
+            "SELECT id FROM invoices FOR -- c\nUPDATE"
+        ));
         // Empty / word-less comment forms remain caught.
         assert!(!is_read_only_sql("SELECT id FROM invoices FOR/**/UPDATE"));
         // Comment before the keyword pair also separates correctly.
@@ -858,8 +860,14 @@ mod tests {
         // Unterminated block comment is consumed to end-of-input.
         assert_eq!(strip_sql_comments("a/* unterminated"), "a ");
         // A comment-introducer inside a literal is preserved verbatim.
-        assert_eq!(strip_sql_comments("'/* not a comment */'"), "'/* not a comment */'");
-        assert_eq!(strip_sql_comments("'-- not a comment'"), "'-- not a comment'");
+        assert_eq!(
+            strip_sql_comments("'/* not a comment */'"),
+            "'/* not a comment */'"
+        );
+        assert_eq!(
+            strip_sql_comments("'-- not a comment'"),
+            "'-- not a comment'"
+        );
         // Non-ASCII content is copied without splitting code points.
         assert_eq!(strip_sql_comments("café/* x */ over"), "café  over");
     }
@@ -902,7 +910,9 @@ mod tests {
 
         // Fail-closed guarantee preserved: genuine multi-statement strings
         // (the `;` is a real terminator outside any literal) stay rejected.
-        assert!(!is_read_only_sql("SELECT 'a;b' FROM dual; DELETE FROM logs"));
+        assert!(!is_read_only_sql(
+            "SELECT 'a;b' FROM dual; DELETE FROM logs"
+        ));
         assert!(!is_read_only_sql("SELECT 'a' FROM dual; DROP TABLE x"));
         // A leading line comment that hides a write statement is still rejected.
         assert!(!is_read_only_sql("-- note\nDELETE FROM logs"));
@@ -974,12 +984,7 @@ mod tests {
         // A zero-width space spliced into the tag (`<tool\u{200B}_call>`)
         // defeats a literal blocklist; normalization strips the zero-width
         // char and the structural pass neutralizes the markup.
-        let payload = format!(
-            "{lt}tool{zw}_call{gt}",
-            lt = '<',
-            gt = '>',
-            zw = '\u{200B}'
-        );
+        let payload = format!("{lt}tool{zw}_call{gt}", lt = '<', gt = '>', zw = '\u{200B}');
         let (out, changed) = sanitize(&payload);
         assert!(changed, "zero-width-obfuscated tag must be neutralized");
         assert!(
@@ -1034,7 +1039,10 @@ mod tests {
             "response must carry the untrusted-data envelope notice"
         );
         assert!(
-            response.untrusted_data_notice.to_lowercase().contains("data"),
+            response
+                .untrusted_data_notice
+                .to_lowercase()
+                .contains("data"),
             "notice must tell the agent the cells are data: {:?}",
             response.untrusted_data_notice
         );
@@ -1092,7 +1100,8 @@ mod tests {
             );
             // The surviving non-marker codepoints must remain intact.
             assert!(
-                out.chars().any(|c| c == ohm || c == dotted_i || c == eszett),
+                out.chars()
+                    .any(|c| c == ohm || c == dotted_i || c == eszett),
                 "boundary-shifting chars must survive intact: {out:?}"
             );
         }

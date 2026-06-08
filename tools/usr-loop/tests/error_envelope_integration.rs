@@ -31,8 +31,8 @@ fn scan_nonexistent_estate_emits_error_envelope_in_robot_json() {
         !stdout.trim().is_empty(),
         "stdout must carry the error envelope in --robot-json mode"
     );
-    let v: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("stdout not JSON ({e}): {stdout}"));
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("stdout not JSON ({e}): {stdout}"));
     assert_eq!(v["format"], "plsql-robot-json");
     assert_eq!(v["schema_id"], "plsql.usr.error_envelope");
     assert_eq!(v["schema_version"]["major"], 1);
@@ -116,7 +116,10 @@ fn robot_triage_emits_mega_object() {
         .expect("spawn usr-loop");
 
     // Healthy posture → exit 0.
-    assert!(out.status.success(), "--robot-triage must exit 0 on healthy");
+    assert!(
+        out.status.success(),
+        "--robot-triage must exit 0 on healthy"
+    );
     let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
     let v: serde_json::Value =
         serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("stdout not JSON ({e})"));

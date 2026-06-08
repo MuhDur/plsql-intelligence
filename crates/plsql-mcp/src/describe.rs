@@ -283,10 +283,15 @@ pub fn run_describe_trigger<C: OracleConnection>(
     // K18 scrubber. TRIGGER_TYPE / STATUS are dictionary enumerations and
     // TABLE_OWNER / TABLE_NAME are identifiers, so they are left as-is.
     let mut sanitized_fields = 0usize;
-    let triggering_event =
-        scrub(row.text("TRIGGERING_EVENT").map(String::from), &mut sanitized_fields)
-            .unwrap_or_default();
-    let when_clause = scrub(row.text("WHEN_CLAUSE").map(String::from), &mut sanitized_fields);
+    let triggering_event = scrub(
+        row.text("TRIGGERING_EVENT").map(String::from),
+        &mut sanitized_fields,
+    )
+    .unwrap_or_default();
+    let when_clause = scrub(
+        row.text("WHEN_CLAUSE").map(String::from),
+        &mut sanitized_fields,
+    );
     let mut unknown_reasons = Vec::new();
     if sanitized_fields > 0 {
         unknown_reasons.push(UnknownReason::ResponseSanitized);
@@ -804,11 +809,16 @@ mod tests {
         // tool-call marker spliced into a trigger body. A benign `>=` is
         // still rewritten — that is the fail-closed contract — and the
         // rewrite is accounted for in `sanitized_fields`.
-        assert_eq!(response.when_clause.as_deref(), Some(":new.amount \u{FF1E}= 0"));
+        assert_eq!(
+            response.when_clause.as_deref(),
+            Some(":new.amount \u{FF1E}= 0")
+        );
         assert_eq!(response.sanitized_fields, 1);
-        assert!(response
-            .unknown_reasons
-            .contains(&UnknownReason::ResponseSanitized));
+        assert!(
+            response
+                .unknown_reasons
+                .contains(&UnknownReason::ResponseSanitized)
+        );
     }
 
     #[test]
@@ -887,9 +897,11 @@ mod tests {
         // Four DB-controlled free-text fields carried markup: column
         // default, column comment, table comment, CHECK condition.
         assert_eq!(response.sanitized_fields, 4);
-        assert!(response
-            .unknown_reasons
-            .contains(&UnknownReason::ResponseSanitized));
+        assert!(
+            response
+                .unknown_reasons
+                .contains(&UnknownReason::ResponseSanitized)
+        );
 
         // No surviving parseable `<…>` markup in any returned field.
         let col = &response.columns[0];
@@ -923,10 +935,7 @@ mod tests {
         );
         conn.add(
             "from all_views",
-            vec![row(&[
-                ("TEXT_VC", TOOL_CALL),
-                ("READ_ONLY", "N"),
-            ])],
+            vec![row(&[("TEXT_VC", TOOL_CALL), ("READ_ONLY", "N")])],
         );
         conn.add(
             "from all_tab_comments",
@@ -937,9 +946,11 @@ mod tests {
         let response = run_describe_view(&conn, "BILLING", "BAD_VIEW", Some(4000)).unwrap();
         // View body, view comment, and column comment all carried markup.
         assert_eq!(response.sanitized_fields, 3);
-        assert!(response
-            .unknown_reasons
-            .contains(&UnknownReason::ResponseSanitized));
+        assert!(
+            response
+                .unknown_reasons
+                .contains(&UnknownReason::ResponseSanitized)
+        );
         assert!(!response.query_preview.as_deref().unwrap().contains('<'));
         assert!(!response.query_preview.as_deref().unwrap().contains('>'));
         assert!(!response.view_comment.as_deref().unwrap().contains('<'));

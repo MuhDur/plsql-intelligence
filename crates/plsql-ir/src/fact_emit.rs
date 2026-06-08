@@ -2020,7 +2020,8 @@ mod tests {
     // FROM-less cross-schema delete silently escaped the scan.
     #[test]
     fn scan_cross_schema_write_flags_from_less_delete() {
-        let s = scan_cross_schema_write("hr.proc1", "begin delete fin.audit_log where id = 5; end;");
+        let s =
+            scan_cross_schema_write("hr.proc1", "begin delete fin.audit_log where id = 5; end;");
         assert_eq!(s.len(), 1, "FROM-less cross-schema delete must flag: {s:?}");
         assert_eq!(s[0].detail, "fin.audit_log");
     }

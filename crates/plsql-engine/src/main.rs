@@ -648,7 +648,11 @@ mod tests {
             matches!(err, CliError::ProjectRootMissing { .. }),
             "expected ProjectRootMissing, got {err:?}"
         );
-        assert_eq!(err.exit_code(), 2, "nonexistent path is an invocation failure");
+        assert_eq!(
+            err.exit_code(),
+            2,
+            "nonexistent path is an invocation failure"
+        );
         let msg = format!("{err}");
         assert!(
             msg.contains("does not exist"),
@@ -665,13 +669,11 @@ mod tests {
     /// files under a non-directory.
     #[test]
     fn validate_project_root_rejects_non_directory_with_exit_two() {
-        let tmp = std::env::temp_dir().join(format!(
-            "plsql-engine-validate-{}.tmp",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("plsql-engine-validate-{}.tmp", std::process::id()));
         std::fs::write(&tmp, b"i am a file, not a directory").unwrap();
-        let err = validate_project_root(&tmp)
-            .expect_err("validation must reject a non-directory path");
+        let err =
+            validate_project_root(&tmp).expect_err("validation must reject a non-directory path");
         let _ = std::fs::remove_file(&tmp);
         assert!(
             matches!(err, CliError::ProjectRootNotDirectory { .. }),
@@ -711,8 +713,8 @@ mod tests {
     #[test]
     fn clap_accepts_robot_triage_without_subcommand() {
         use clap::Parser;
-        let cli =
-            Cli::try_parse_from(["plsql-engine", "--robot-triage"]).expect("--robot-triage must parse");
+        let cli = Cli::try_parse_from(["plsql-engine", "--robot-triage"])
+            .expect("--robot-triage must parse");
         assert!(cli.robot_triage);
         assert!(cli.command.is_none());
     }
@@ -766,9 +768,8 @@ mod tests {
         // additive-minor tolerance. This is the case that was wrongly
         // rejected before the fix.
         let higher_minor = SchemaVersion::new(canonical.major, canonical.minor + 1, 0);
-        check_artifact_schema(ANALYSIS_RUN_SCHEMA.id, higher_minor).expect(
-            "a same-major higher-minor artifact is ForwardCompatible and must be accepted",
-        );
+        check_artifact_schema(ANALYSIS_RUN_SCHEMA.id, higher_minor)
+            .expect("a same-major higher-minor artifact is ForwardCompatible and must be accepted");
 
         // Same-major, lower-or-equal minor — Compatible.
         let lower_minor = SchemaVersion::new(canonical.major, 0, 0);
@@ -801,7 +802,11 @@ mod tests {
             matches!(err, CliError::IncompatibleSchema { .. }),
             "expected IncompatibleSchema, got {err:?}"
         );
-        assert_eq!(err.exit_code(), 2, "incompatible artifact is an invocation failure");
+        assert_eq!(
+            err.exit_code(),
+            2,
+            "incompatible artifact is an invocation failure"
+        );
 
         // Right version, wrong schema_id — wrong payload shape (e.g. a
         // doctor report masquerading as a run artifact).

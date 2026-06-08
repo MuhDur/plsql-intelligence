@@ -221,7 +221,10 @@ fn main() -> ExitCode {
     }
 
     if args.capabilities {
-        println!("{}", serde_json::to_string_pretty(&capabilities_json()).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&capabilities_json()).unwrap()
+        );
         return ExitCode::SUCCESS;
     }
 
@@ -237,9 +240,7 @@ fn main() -> ExitCode {
         // line on stdout), and append the default-path hint so the
         // agent learns the canonical invocation in one round-trip.
         let hint = if args.corpus_root.as_path() != Path::new(DEFAULT_CORPUS_ROOT) {
-            format!(
-                "\n  try: corpus-bench --corpus-root ./{DEFAULT_CORPUS_ROOT} (the default)"
-            )
+            format!("\n  try: corpus-bench --corpus-root ./{DEFAULT_CORPUS_ROOT} (the default)")
         } else {
             String::new()
         };
@@ -404,7 +405,10 @@ fn print_usage_to<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
         "usage: corpus-bench [--corpus-root <path>] [--warm-iters <N>] [--robot-json]"
     )?;
     writeln!(w)?;
-    writeln!(w, "Benchmarks cold + warm parse time for every PL/SQL file under")?;
+    writeln!(
+        w,
+        "Benchmarks cold + warm parse time for every PL/SQL file under"
+    )?;
     writeln!(
         w,
         "the corpus root. Defaults: corpus-root=./{DEFAULT_CORPUS_ROOT}, warm-iters=5."
@@ -415,15 +419,27 @@ fn print_usage_to<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
         w,
         "  --robot-json       Stable-schema JSON report (schema_id={SCHEMA_ID} v{SCHEMA_VERSION})"
     )?;
-    writeln!(w, "  --warm-iters <N>   Iterations to collect warm-timing median")?;
+    writeln!(
+        w,
+        "  --warm-iters <N>   Iterations to collect warm-timing median"
+    )?;
     writeln!(
         w,
         "  --capabilities     Print the machine-readable agent contract as JSON and exit"
     )?;
-    writeln!(w, "  --robot-docs       Print a paste-ready agent handbook and exit")?;
-    writeln!(w, "  -V, --version      Print corpus-bench <version> and exit")?;
+    writeln!(
+        w,
+        "  --robot-docs       Print a paste-ready agent handbook and exit"
+    )?;
+    writeln!(
+        w,
+        "  -V, --version      Print corpus-bench <version> and exit"
+    )?;
     writeln!(w)?;
-    writeln!(w, "Exit codes: 0 ok, 2 invocation error (bad args, empty corpus).")?;
+    writeln!(
+        w,
+        "Exit codes: 0 ok, 2 invocation error (bad args, empty corpus)."
+    )?;
     Ok(())
 }
 
@@ -558,7 +574,10 @@ mod tests {
     #[test]
     fn unknown_flag_suggests_near_miss() {
         let err = parse_args(vec!["--robotjson".into()]).unwrap_err();
-        assert!(err.contains("--robot-json"), "expected DYM hint; got: {err}");
+        assert!(
+            err.contains("--robot-json"),
+            "expected DYM hint; got: {err}"
+        );
         assert!(err.contains("did you mean"));
     }
 

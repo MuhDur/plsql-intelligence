@@ -409,7 +409,9 @@ mod tests {
             ..ChangeSet::empty()
         };
         assert_eq!(
-            predict(&clean, PredictMode::CatalogAware).completeness.posture,
+            predict(&clean, PredictMode::CatalogAware)
+                .completeness
+                .posture,
             CompletenessPosture::Clean
         );
         // A changeset carrying opacity (an UnknownReason) must NEVER be Clean.

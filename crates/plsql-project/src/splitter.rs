@@ -544,7 +544,11 @@ mod tests {
         // spurious zero-width Statement.
         let src = "CREATE TABLE t (id NUMBER);\n/\n";
         let s = split_script(src);
-        assert_eq!(s.len(), 1, "lone `/` after `;` must not add a phantom: {s:?}");
+        assert_eq!(
+            s.len(),
+            1,
+            "lone `/` after `;` must not add a phantom: {s:?}"
+        );
         assert!(matches!(s[0].kind, StatementKind::Sql));
         assert_eq!(s[0].raw, "CREATE TABLE t (id NUMBER);");
         assert_eq!(s[0].line_start, 1);

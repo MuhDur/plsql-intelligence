@@ -215,7 +215,12 @@ fn find_execute_immediate(text: &str) -> Option<(usize, usize)> {
 /// comparable across runs.
 fn extract_execute_immediate(
     text: &str,
-) -> (Vec<String>, Vec<CandidateObject>, bool, Vec<ExprInterpolation>) {
+) -> (
+    Vec<String>,
+    Vec<CandidateObject>,
+    bool,
+    Vec<ExprInterpolation>,
+) {
     let Some((_, kw_end)) = find_execute_immediate(text) else {
         return (vec![], vec![], false, vec![]);
     };
@@ -307,7 +312,12 @@ fn extract_execute_immediate(
 
     let candidate_objects = candidate_objects_from_fragments(&fragments);
     let uses_binds = using_pos.is_some();
-    (fragments, candidate_objects, uses_binds, expr_interpolations)
+    (
+        fragments,
+        candidate_objects,
+        uses_binds,
+        expr_interpolations,
+    )
 }
 
 /// Find the byte offset of the native dynamic-SQL ` USING ` bind
@@ -348,10 +358,7 @@ fn top_level_using(rest: &str) -> Option<usize> {
             // the historical ` USING ` token exactly, so a bare
             // `USINGTON`-style identifier is never a false positive.
             let tail = &bytes[i + 1..];
-            if tail.len() >= 6
-                && tail[..5].eq_ignore_ascii_case(b"USING")
-                && tail[5] == b' '
-            {
+            if tail.len() >= 6 && tail[..5].eq_ignore_ascii_case(b"USING") && tail[5] == b' ' {
                 return Some(i);
             }
         }
@@ -685,7 +692,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ev.opacity_reason, OpacityReason::LiteralOnly);
-        assert!(!ev.uses_binds, "JOIN-USING falsely reported as a bind clause");
+        assert!(
+            !ev.uses_binds,
+            "JOIN-USING falsely reported as a bind clause"
+        );
         let names: Vec<&str> = ev
             .candidate_objects
             .iter()
@@ -759,7 +769,10 @@ mod tests {
             "pkg.proc:105",
         )
         .unwrap();
-        assert!(ev.uses_binds, "trailing bind clause missed after multibyte literal");
+        assert!(
+            ev.uses_binds,
+            "trailing bind clause missed after multibyte literal"
+        );
         assert_eq!(
             ev.fragments,
             vec!["UPDATE t SET note = 'naïve café résumé' WHERE id = :1"],
@@ -1046,9 +1059,9 @@ mod tests {
         // whitespace-insensitive between EXECUTE and IMMEDIATE, matching Oracle
         // and the runtime guard — not only the canonical single space.
         for body in [
-            "EXECUTE  IMMEDIATE 'SELECT 1 FROM dual'",   // two spaces
-            "EXECUTE\tIMMEDIATE 'SELECT 1 FROM dual'",   // tab
-            "EXECUTE\nIMMEDIATE 'SELECT 1 FROM dual'",   // newline
+            "EXECUTE  IMMEDIATE 'SELECT 1 FROM dual'", // two spaces
+            "EXECUTE\tIMMEDIATE 'SELECT 1 FROM dual'", // tab
+            "EXECUTE\nIMMEDIATE 'SELECT 1 FROM dual'", // newline
         ] {
             assert!(
                 recognise_dynamic_sql(body, "pkg.proc:1").is_some(),

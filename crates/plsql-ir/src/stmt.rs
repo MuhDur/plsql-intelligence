@@ -227,7 +227,8 @@ fn split_statements(source: &str) -> Vec<StatementChunk> {
             continue;
         }
         // Track block depth by matching whole opener keywords.
-        if let Some(consumed) = consume_any_keyword(&upper_chars, i, &["BEGIN", "IF", "LOOP", "CASE"])
+        if let Some(consumed) =
+            consume_any_keyword(&upper_chars, i, &["BEGIN", "IF", "LOOP", "CASE"])
         {
             depth += 1;
             for &ch in chars.iter().skip(i).take(consumed) {
@@ -1274,8 +1275,7 @@ mod tests {
                 arms,
                 else_body_text,
             } => {
-                let conds: Vec<&str> =
-                    arms.iter().map(|a| a.cond_text.as_str()).collect();
+                let conds: Vec<&str> = arms.iter().map(|a| a.cond_text.as_str()).collect();
                 assert_eq!(
                     conds,
                     vec!["a", "b", "c"],

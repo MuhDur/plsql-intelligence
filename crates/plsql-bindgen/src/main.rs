@@ -480,9 +480,6 @@ mod tests {
             VALID_FLAGS.contains(&"--version"),
             "VALID_FLAGS must include --version"
         );
-        assert!(
-            VALID_FLAGS.contains(&"-V"),
-            "VALID_FLAGS must include -V"
-        );
+        assert!(VALID_FLAGS.contains(&"-V"), "VALID_FLAGS must include -V");
     }
 }

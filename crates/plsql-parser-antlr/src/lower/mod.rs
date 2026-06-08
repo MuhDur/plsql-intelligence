@@ -1786,7 +1786,8 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
 
     #[test]
     fn function_with_decl_section_does_not_swallow_next_create() {
-        let first = "CREATE FUNCTION f RETURN NUMBER IS\n  v_x NUMBER;\nBEGIN\n  RETURN v_x;\nEND;\n";
+        let first =
+            "CREATE FUNCTION f RETURN NUMBER IS\n  v_x NUMBER;\nBEGIN\n  RETURN v_x;\nEND;\n";
         let second = "CREATE PROCEDURE q IS BEGIN NULL; END;\n";
         let src = format!("{first}{second}");
         let decls = lower_and_collect(&src);
@@ -2047,7 +2048,12 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
         );
         // And there is exactly one declaration: the in-string text was not
         // mis-promoted into a spurious second decl.
-        assert_eq!(ast.root.declarations.len(), 1, "{:?}", ast.root.declarations);
+        assert_eq!(
+            ast.root.declarations.len(),
+            1,
+            "{:?}",
+            ast.root.declarations
+        );
     }
 
     #[test]
@@ -2080,7 +2086,12 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
         );
         // Exactly one declaration: the post-`END IF;` text was not mis-promoted
         // into a spurious second decl.
-        assert_eq!(ast.root.declarations.len(), 1, "{:?}", ast.root.declarations);
+        assert_eq!(
+            ast.root.declarations.len(),
+            1,
+            "{:?}",
+            ast.root.declarations
+        );
     }
 
     #[test]
@@ -2108,7 +2119,12 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
                 src.len() as u32,
                 "span must run to the trailing END; not the inner END LOOP/CASE; src={src:?}"
             );
-            assert_eq!(ast.root.declarations.len(), 1, "{:?}", ast.root.declarations);
+            assert_eq!(
+                ast.root.declarations.len(),
+                1,
+                "{:?}",
+                ast.root.declarations
+            );
         }
     }
 
@@ -2142,7 +2158,12 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
         );
         // Exactly one declaration: the second routine was not mis-promoted into
         // a spurious top-level decl.
-        assert_eq!(ast.root.declarations.len(), 1, "{:?}", ast.root.declarations);
+        assert_eq!(
+            ast.root.declarations.len(),
+            1,
+            "{:?}",
+            ast.root.declarations
+        );
     }
 
     #[test]
@@ -2175,15 +2196,19 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
         let end_name_terminator = src.rfind("END p;").map(|i| (i + "END p;".len()) as u32);
         assert_eq!(end_name_terminator, Some(111), "fixture sanity");
         assert_eq!(
-            spec_span.end.offset,
-            111,
+            spec_span.end.offset, 111,
             "package spec span must run to the trailing END p; (offset 111), not the \
              first member's `;` (offset 83) — got {}",
             spec_span.end.offset
         );
         // Exactly one declaration: the following PROCEDURE member was not
         // mis-promoted into a spurious top-level decl.
-        assert_eq!(ast.root.declarations.len(), 1, "{:?}", ast.root.declarations);
+        assert_eq!(
+            ast.root.declarations.len(),
+            1,
+            "{:?}",
+            ast.root.declarations
+        );
     }
 
     #[test]
@@ -2253,7 +2278,12 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
             body_span.end.offset,
             src.len()
         );
-        assert_eq!(ast.root.declarations.len(), 1, "{:?}", ast.root.declarations);
+        assert_eq!(
+            ast.root.declarations.len(),
+            1,
+            "{:?}",
+            ast.root.declarations
+        );
     }
 
     /// Find the single matching decl span for a given name, asserting the
@@ -2303,7 +2333,12 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
             slice.contains("inner;"),
             "enclosing body's inner call must be inside the span slice: {slice:?}"
         );
-        assert_eq!(ast.root.declarations.len(), 1, "{:?}", ast.root.declarations);
+        assert_eq!(
+            ast.root.declarations.len(),
+            1,
+            "{:?}",
+            ast.root.declarations
+        );
     }
 
     #[test]
@@ -2329,7 +2364,12 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
             slice.contains("INSERT INTO audit"),
             "enclosing body's INSERT must be inside the span slice: {slice:?}"
         );
-        assert_eq!(ast.root.declarations.len(), 1, "{:?}", ast.root.declarations);
+        assert_eq!(
+            ast.root.declarations.len(),
+            1,
+            "{:?}",
+            ast.root.declarations
+        );
     }
 
     #[test]
@@ -2355,7 +2395,12 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
             slice.contains("INSERT INTO audit"),
             "enclosing body's INSERT must be inside the span slice: {slice:?}"
         );
-        assert_eq!(ast.root.declarations.len(), 1, "{:?}", ast.root.declarations);
+        assert_eq!(
+            ast.root.declarations.len(),
+            1,
+            "{:?}",
+            ast.root.declarations
+        );
     }
 
     #[test]
@@ -2383,7 +2428,12 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
             slice.contains("INSERT INTO audit"),
             "enclosing body's INSERT must be inside the span slice: {slice:?}"
         );
-        assert_eq!(ast.root.declarations.len(), 1, "{:?}", ast.root.declarations);
+        assert_eq!(
+            ast.root.declarations.len(),
+            1,
+            "{:?}",
+            ast.root.declarations
+        );
     }
 
     #[test]
@@ -2392,7 +2442,8 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
         // forward (`PROCEDURE inner;`, no IS|AS body) is terminated by the first
         // `;`; the skip must consume only that `;` and resume so the enclosing
         // routine's own BEGIN is still found.
-        let src = "CREATE PROCEDURE p IS PROCEDURE inner; BEGIN inner; INSERT INTO audit VALUES(1); END;";
+        let src =
+            "CREATE PROCEDURE p IS PROCEDURE inner; BEGIN inner; INSERT INTO audit VALUES(1); END;";
         let ast = lower_source(src, fid());
         let span = only_span(&ast, |d| match d {
             AstDecl::Procedure { name, span } if name == "p" => Some(*span),
@@ -2411,7 +2462,12 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
             slice.contains("INSERT INTO audit"),
             "enclosing body's INSERT must be inside the span slice: {slice:?}"
         );
-        assert_eq!(ast.root.declarations.len(), 1, "{:?}", ast.root.declarations);
+        assert_eq!(
+            ast.root.declarations.len(),
+            1,
+            "{:?}",
+            ast.root.declarations
+        );
     }
 
     #[test]
@@ -2453,7 +2509,10 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
         let s = stmts("dbms_output.put_line('a ; b'); v := 1;");
         assert_eq!(s.len(), 2, "got {s:?}");
         assert!(
-            matches!(&s[0], AstStatement::Call { .. } | AstStatement::Unknown { .. }),
+            matches!(
+                &s[0],
+                AstStatement::Call { .. } | AstStatement::Unknown { .. }
+            ),
             "first statement should be the whole put_line call, got {:?}",
             s[0]
         );
@@ -2714,8 +2773,14 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
     #[test]
     fn parse005_genuine_keywords_still_classified() {
         assert!(matches!(stmts("NULL;")[0], AstStatement::Null { .. }));
-        assert!(matches!(stmts("UPDATE t SET a = 1;")[0], AstStatement::Sql { .. }));
-        assert!(matches!(stmts("DELETE FROM t;")[0], AstStatement::Sql { .. }));
+        assert!(matches!(
+            stmts("UPDATE t SET a = 1;")[0],
+            AstStatement::Sql { .. }
+        ));
+        assert!(matches!(
+            stmts("DELETE FROM t;")[0],
+            AstStatement::Sql { .. }
+        ));
         assert!(matches!(
             stmts("IF v_x > 0 THEN NULL; END IF;")[0],
             AstStatement::If { .. }
@@ -2806,9 +2871,11 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
         // `<=`/`>=`/`!=` before the relational tier, yielding op:"=" with a
         // corrupted LHS slice (`a <`). Merging `=` into the relational tier
         // (2-char ops first) makes the whole 2-char op match.
-        for (src, expected_op, lhs) in
-            [("a <= b", "<=", "a"), ("a >= b", ">=", "a"), ("a != b", "!=", "a")]
-        {
+        for (src, expected_op, lhs) in [
+            ("a <= b", "<=", "a"),
+            ("a >= b", ">=", "a"),
+            ("a != b", "!=", "a"),
+        ] {
             match ex(src) {
                 AstExpr::Binary {
                     op,
@@ -2963,4 +3030,3 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
         assert!(t.span().start.offset >= 50);
     }
 }
-

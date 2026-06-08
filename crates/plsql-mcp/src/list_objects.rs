@@ -433,9 +433,18 @@ mod tests {
             &None,
             6,
         );
-        assert!(params.contains(&OracleBind::String("BILLING".into())), "{params:?}");
-        assert!(params.contains(&OracleBind::String("TABLE".into())), "{params:?}");
-        assert!(params.contains(&OracleBind::String("INV_%".into())), "{params:?}");
+        assert!(
+            params.contains(&OracleBind::String("BILLING".into())),
+            "{params:?}"
+        );
+        assert!(
+            params.contains(&OracleBind::String("TABLE".into())),
+            "{params:?}"
+        );
+        assert!(
+            params.contains(&OracleBind::String("INV_%".into())),
+            "{params:?}"
+        );
         assert!(sql.contains("upper(object_name) like"));
         // A double-quoted schema keeps its exact case (Oracle case-sensitive).
         let (_, quoted) = build_query(
@@ -446,7 +455,10 @@ mod tests {
             &None,
             6,
         );
-        assert!(quoted.contains(&OracleBind::String("MixedCase".into())), "{quoted:?}");
+        assert!(
+            quoted.contains(&OracleBind::String("MixedCase".into())),
+            "{quoted:?}"
+        );
     }
 
     #[test]

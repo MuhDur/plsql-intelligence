@@ -225,7 +225,11 @@ fn handle_tools_list(id: Value, registry: &ToolRegistry) -> JsonRpcResponse {
 /// longer advertises ~37% of the surface as plainly callable when every such
 /// call would return RuntimeStateRequired or a profile refusal. The tool stays
 /// LISTED (discoverable, so an agent can still plan) but flagged `available:false`.
-fn tool_availability(t: &ToolDescriptor, live_db: bool, profile: SafetyProfile) -> (bool, Option<String>) {
+fn tool_availability(
+    t: &ToolDescriptor,
+    live_db: bool,
+    profile: SafetyProfile,
+) -> (bool, Option<String>) {
     if matches!(t.tier, ToolTier::FoundationStatic) {
         return (true, None);
     }
@@ -318,7 +322,9 @@ fn handle_tools_call(
             format!("tool not found: {name}"),
         )
         .with_fuzzy_matches(oraclemcp_error::fuzzy_suggest(name, &names, 5))
-        .with_next_step("Call tools/list to see the exact tool names, then retry with one of them.");
+        .with_next_step(
+            "Call tools/list to see the exact tool names, then retry with one of them.",
+        );
         return JsonRpcResponse::err_with_data(
             id,
             -32601,
@@ -341,13 +347,16 @@ fn handle_tools_call(
     // connection / loaded graph / preview session.
     match dispatch_tool(name, arguments) {
         Ok(DispatchOutcome::Ran(structured)) => {
-            let mut result = tool_result(&structured_text(name, &structured), false, Some(structured));
+            let mut result =
+                tool_result(&structured_text(name, &structured), false, Some(structured));
             // Workflow-first: attach the natural follow-up tools so an agent can
             // chain a multi-step task without re-planning (oracle-da9j.7).
             let next = next_actions_for(name);
             if !next.is_empty() {
                 result["next_actions"] = Value::Array(
-                    next.into_iter().map(|s| Value::String(s.to_string())).collect(),
+                    next.into_iter()
+                        .map(|s| Value::String(s.to_string()))
+                        .collect(),
                 );
             }
             JsonRpcResponse::ok(id, result)
@@ -413,9 +422,9 @@ fn runtime_kind_recovery_tool(kind: crate::dispatch::RuntimeKind) -> &'static st
         RuntimeKind::DependencyGraph => "analyze_project",
         // Live connection / preview / session state all require an active
         // connected live-db session, entered via `connect`.
-        RuntimeKind::LiveConnection
-        | RuntimeKind::PreviewSession
-        | RuntimeKind::SessionState => "connect",
+        RuntimeKind::LiveConnection | RuntimeKind::PreviewSession | RuntimeKind::SessionState => {
+            "connect"
+        }
     }
 }
 
@@ -435,9 +444,9 @@ fn next_actions_for(name: &str) -> Vec<&'static str> {
             "plsql_analyze — routine/object inventory, lint findings, complexity",
             "find_callers / find_callees / get_dependencies — traverse the dependency graph",
         ],
-        "plsql_analyze" => vec![
-            "find_callers / get_dependencies — drill into a specific routine's edges",
-        ],
+        "plsql_analyze" => {
+            vec!["find_callers / get_dependencies — drill into a specific routine's edges"]
+        }
         "parse_file" => vec![
             "get_symbol — look up a declaration by name",
             "compile_check — error/warning counts + every diagnostic",
@@ -446,9 +455,9 @@ fn next_actions_for(name: &str) -> Vec<&'static str> {
             vec!["get_dependencies — the flat dependency id list for the same target"]
         }
         // A live-DB read naturally precedes a guarded write.
-        "describe_table" | "describe_view" => vec![
-            "patch_view / create_or_replace (dry_run) — preview a change to this object",
-        ],
+        "describe_table" | "describe_view" => {
+            vec!["patch_view / create_or_replace (dry_run) — preview a change to this object"]
+        }
         _ => vec![],
     }
 }
@@ -581,7 +590,12 @@ mod tests {
             );
         }
         // Destructive write tools carry destructiveHint (.9).
-        for name in ["deploy_ddl", "create_or_replace", "execute_approved", "patch_package"] {
+        for name in [
+            "deploy_ddl",
+            "create_or_replace",
+            "execute_approved",
+            "patch_package",
+        ] {
             let t = by(name);
             assert_eq!(
                 t["annotations"]["destructiveHint"],
@@ -610,7 +624,9 @@ mod tests {
         let err = resp.error.expect("protocol error");
         assert_eq!(err.code, -32601);
         let data = err.data.expect("structured envelope in error.data");
-        let fuzzy = data["fuzzy_matches"].as_array().expect("fuzzy_matches present");
+        let fuzzy = data["fuzzy_matches"]
+            .as_array()
+            .expect("fuzzy_matches present");
         assert!(
             fuzzy.iter().any(|v| v == "parse_file"),
             "fuzzy_matches should suggest parse_file: {data}"
@@ -701,7 +717,8 @@ mod tests {
         // Static tools are always available.
         assert!(tool_availability(&static_tool, false, SafetyProfile::StaticOnly).0);
         // No live-db feature → every live tool unavailable (with a reason).
-        let (avail, reason) = tool_availability(&read_live, false, SafetyProfile::SessionWriteEnabled);
+        let (avail, reason) =
+            tool_availability(&read_live, false, SafetyProfile::SessionWriteEnabled);
         assert!(!avail && reason.is_some());
         // live-db on + StaticOnly profile → even read-only live tools off.
         assert!(!tool_availability(&read_live, true, SafetyProfile::StaticOnly).0);
@@ -759,7 +776,8 @@ mod tests {
             .expect("next_actions present")
             .clone();
         assert!(
-            na.iter().any(|s| s.as_str().unwrap_or("").contains("get_symbol")),
+            na.iter()
+                .any(|s| s.as_str().unwrap_or("").contains("get_symbol")),
             "parse_file should chain to get_symbol/compile_check: {na:?}"
         );
         // The discovery tool chains to tools/list + analyze_project.
@@ -880,7 +898,10 @@ mod tests {
         .unwrap();
         let result = resp.result.expect("ok result");
         assert_eq!(result["isError"], Value::Bool(false));
-        assert_eq!(result["structuredContent"]["file_count"].as_u64().unwrap(), 0);
+        assert_eq!(
+            result["structuredContent"]["file_count"].as_u64().unwrap(),
+            0
+        );
     }
 
     #[test]

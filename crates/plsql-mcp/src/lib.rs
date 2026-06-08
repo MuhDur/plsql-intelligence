@@ -73,10 +73,6 @@ pub use analyze_project::{
     AnalyzeProjectError, AnalyzeProjectRequest, AnalyzeProjectResponse,
     register_analyze_project_tool, run_analyze_project,
 };
-pub use plsql_analyze::{
-    CallRef, ComplexityInfo, LintFinding, PlsqlAnalyzeError, PlsqlAnalyzeRequest,
-    PlsqlAnalyzeResponse, RoutineInfo, register_plsql_analyze_tool, run_plsql_analyze,
-};
 pub use change_tools::{
     ChangeToolError, register_change_tools, run_classify_change, run_compare_oracle_deps,
     run_explain_lifecycle, run_orphan_candidates, run_recompile_plan, run_release_gate,
@@ -107,6 +103,10 @@ pub use parse_tools::{
     CompileCheckRequest, CompileCheckResponse, GetSymbolRequest, GetSymbolResponse,
     InspectProfileResponse, ParseFileRequest, ParseFileResponse, register_parse_tools,
     run_compile_check, run_get_symbol, run_inspect_profile, run_parse_file,
+};
+pub use plsql_analyze::{
+    CallRef, ComplexityInfo, LintFinding, PlsqlAnalyzeError, PlsqlAnalyzeRequest,
+    PlsqlAnalyzeResponse, RoutineInfo, register_plsql_analyze_tool, run_plsql_analyze,
 };
 pub use trust::{TrustBlock, attach_trust_block, trust_block_value};
 
@@ -182,9 +182,7 @@ pub use describe::{
     run_describe_table, run_describe_trigger, run_describe_view,
 };
 
-pub use dispatch::{
-    DispatchError, DispatchOutcome, RuntimeKind, dispatch_table, dispatch_tool,
-};
+pub use dispatch::{DispatchError, DispatchOutcome, RuntimeKind, dispatch_table, dispatch_tool};
 
 pub use compile::{
     CompileToolError, CompileWithWarningsResponse, WarningCategory, categorize_error,

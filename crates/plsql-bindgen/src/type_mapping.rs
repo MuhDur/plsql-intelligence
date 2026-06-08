@@ -4,7 +4,6 @@
 //! never invents a mapping locally. Unsupported types are surfaced as
 //! `BindingDiagnostic`s using the codes catalog from this crate.
 
-
 use crate::{BindingDiagnostic, BindingDiagnosticCode, DiagnosticSpan, RustTypeRef};
 
 /// Parsed view of an Oracle column / parameter type — the input shape the

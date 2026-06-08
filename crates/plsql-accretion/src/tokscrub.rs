@@ -216,10 +216,7 @@ pub fn is_synthetic_alias(text: &str) -> bool {
     // synthetic `synthesise(Class::Str, _)` can emit is `'sx_<hex8>'`.
     // Nothing else (`'7'`, `'7.0'`, `'id_<hex12>'`, …) is a synthetic;
     // those are un-scrubbed original string bodies and fail closed.
-    if let Some(body) = text
-        .strip_prefix('\'')
-        .and_then(|b| b.strip_suffix('\''))
-    {
+    if let Some(body) = text.strip_prefix('\'').and_then(|b| b.strip_suffix('\'')) {
         return body.strip_prefix("sx_").is_some_and(|hex| is_hex(hex, 8));
     }
 
@@ -521,10 +518,19 @@ mod tests {
         assert!(is_synthetic_alias("7"));
         assert!(is_synthetic_alias("7.0"));
         // Cross-check against the actual synthesiser output.
-        assert!(is_synthetic_alias(&synthesise(Class::Ident, "customers_pii")));
-        assert!(is_synthetic_alias(&synthesise(Class::QuotedIdent, "My Col")));
+        assert!(is_synthetic_alias(&synthesise(
+            Class::Ident,
+            "customers_pii"
+        )));
+        assert!(is_synthetic_alias(&synthesise(
+            Class::QuotedIdent,
+            "My Col"
+        )));
         assert!(is_synthetic_alias(&synthesise(Class::Str, "ZZSECRET")));
-        assert!(is_synthetic_alias(&synthesise(Class::Num, "4111111111111111")));
+        assert!(is_synthetic_alias(&synthesise(
+            Class::Num,
+            "4111111111111111"
+        )));
         assert!(is_synthetic_alias(&synthesise(Class::Num, "98765.43")));
 
         // Rejects un-scrubbed originals and spoofed/loose shapes.
@@ -605,7 +611,9 @@ mod tests {
             "single-quoted '7' must be flagged as un-scrubbed residue"
         );
         assert!(!quoted_verdict("SELECT 1 FROM dual WHERE x = '7.0'"));
-        assert!(!quoted_verdict("SELECT 1 FROM dual WHERE x = 'id_0123456789ab'"));
+        assert!(!quoted_verdict(
+            "SELECT 1 FROM dual WHERE x = 'id_0123456789ab'"
+        ));
         // A genuinely-scrubbed string literal ('sx_<hex8>') still
         // validates as the synthetic `synthesise(Class::Str, _)` emits.
         assert!(

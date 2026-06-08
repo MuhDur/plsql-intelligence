@@ -138,7 +138,8 @@ pub fn register_graph_tools(registry: &mut ToolRegistry) {
             },
         });
         registry.register(
-            ToolDescriptor::new(name, ToolTier::FoundationStatic, summary).with_input_schema(schema),
+            ToolDescriptor::new(name, ToolTier::FoundationStatic, summary)
+                .with_input_schema(schema),
         );
     }
 }

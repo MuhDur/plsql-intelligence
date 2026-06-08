@@ -95,10 +95,14 @@ pub enum PlsqlAnalyzeError {
 }
 
 /// PL/SQL source file extensions the complexity walker considers.
-const PLSQL_EXTS: &[&str] = &["sql", "pks", "pkb", "plb", "prc", "fnc", "trg", "tps", "tpb"];
+const PLSQL_EXTS: &[&str] = &[
+    "sql", "pks", "pkb", "plb", "prc", "fnc", "trg", "tps", "tpb",
+];
 
 /// Run the engine analysis and assemble the structured analysis document.
-pub fn run_plsql_analyze(req: PlsqlAnalyzeRequest) -> Result<PlsqlAnalyzeResponse, PlsqlAnalyzeError> {
+pub fn run_plsql_analyze(
+    req: PlsqlAnalyzeRequest,
+) -> Result<PlsqlAnalyzeResponse, PlsqlAnalyzeError> {
     let root = PathBuf::from(&req.project_root);
     let run = engine_analyze(AnalysisRequest {
         project_root: root.clone(),
@@ -126,7 +130,11 @@ pub fn run_plsql_analyze(req: PlsqlAnalyzeRequest) -> Result<PlsqlAnalyzeRespons
         .filter_map(|e| {
             let from = run.dep_graph.nodes.get(&e.from)?.logical_id.to_string();
             let to = run.dep_graph.nodes.get(&e.to)?.logical_id.to_string();
-            Some(CallRef { from, to, kind: format!("{:?}", e.kind) })
+            Some(CallRef {
+                from,
+                to,
+                kind: format!("{:?}", e.kind),
+            })
         })
         .collect();
     call_refs.sort_by(|a, b| (&a.from, &a.to, &a.kind).cmp(&(&b.from, &b.to, &b.kind)));
@@ -352,7 +360,10 @@ mod tests {
             "block-comment keywords must not count"
         );
         // Control: real decisions outside literals still count (IF + AND => 3).
-        assert_eq!(cyclomatic("IF a AND b THEN c := 'OR not counted'; END IF;"), 3);
+        assert_eq!(
+            cyclomatic("IF a AND b THEN c := 'OR not counted'; END IF;"),
+            3
+        );
     }
 
     #[test]
@@ -366,13 +377,30 @@ mod tests {
     fn request_response_serde_roundtrips() {
         let resp = PlsqlAnalyzeResponse {
             project_root: "/p".to_owned(),
-            routines: vec![RoutineInfo { logical_id: "pkg.proc/1".to_owned(), kind: "Routine".to_owned() }],
-            call_refs: vec![CallRef { from: "a".to_owned(), to: "b".to_owned(), kind: "Calls".to_owned() }],
-            lint: vec![LintFinding { code: "X1".to_owned(), severity: "Warn".to_owned(), message: "m".to_owned() }],
-            complexity: vec![ComplexityInfo { file: "/p/a.pkb".to_owned(), cyclomatic: 3 }],
+            routines: vec![RoutineInfo {
+                logical_id: "pkg.proc/1".to_owned(),
+                kind: "Routine".to_owned(),
+            }],
+            call_refs: vec![CallRef {
+                from: "a".to_owned(),
+                to: "b".to_owned(),
+                kind: "Calls".to_owned(),
+            }],
+            lint: vec![LintFinding {
+                code: "X1".to_owned(),
+                severity: "Warn".to_owned(),
+                message: "m".to_owned(),
+            }],
+            complexity: vec![ComplexityInfo {
+                file: "/p/a.pkb".to_owned(),
+                cyclomatic: 3,
+            }],
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["routines"][0]["logical_id"], serde_json::json!("pkg.proc/1"));
+        assert_eq!(
+            json["routines"][0]["logical_id"],
+            serde_json::json!("pkg.proc/1")
+        );
         assert_eq!(json["complexity"][0]["cyclomatic"], serde_json::json!(3));
         let back: PlsqlAnalyzeResponse = serde_json::from_value(json).unwrap();
         assert_eq!(back, resp);

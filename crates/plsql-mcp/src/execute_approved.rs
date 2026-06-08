@@ -481,8 +481,7 @@ mod tests {
         use crate::create_or_replace::{
             CreateOrReplaceMode, CreateOrReplaceRequest, run_create_or_replace,
         };
-        let spaced_ddl =
-            "CREATE OR REPLACE PACKAGE BODY ANALYTICS . PKG AS BEGIN NULL; END;";
+        let spaced_ddl = "CREATE OR REPLACE PACKAGE BODY ANALYTICS . PKG AS BEGIN NULL; END;";
         let mut registry = PreviewRegistry::new();
         run_create_or_replace(
             &mut registry,

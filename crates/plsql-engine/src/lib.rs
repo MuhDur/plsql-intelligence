@@ -1004,13 +1004,16 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
         // recorded on its AstDecl (lower_top_level threads it through
         // make_common), so a span-keyed map recovers the correct body
         // regardless of how many decls were filtered out ahead of it.
-        let body_by_span: std::collections::HashMap<plsql_core::Span, &Vec<plsql_parser::ast::AstStatement>> =
-            ast.root
-                .declarations
-                .iter()
-                .map(plsql_parser::ast::Spanned::span)
-                .zip(ast.body_statements.iter())
-                .collect();
+        let body_by_span: std::collections::HashMap<
+            plsql_core::Span,
+            &Vec<plsql_parser::ast::AstStatement>,
+        > = ast
+            .root
+            .declarations
+            .iter()
+            .map(plsql_parser::ast::Spanned::span)
+            .zip(ast.body_statements.iter())
+            .collect();
 
         for decl in &lowered.declarations {
             let caller_id_str = interner
@@ -1386,7 +1389,13 @@ mod tests {
 
         let ir = ast_stmts_to_ir(&[sql_sentinel("SELECT col FROM t")]);
         assert!(
-            matches!(ir[0], Statement::Sql { verb: SqlVerb::Select, .. }),
+            matches!(
+                ir[0],
+                Statement::Sql {
+                    verb: SqlVerb::Select,
+                    ..
+                }
+            ),
             "leading SELECT recovers SqlVerb::Select, got {:?}",
             ir[0]
         );
@@ -1401,9 +1410,15 @@ mod tests {
     #[test]
     fn leading_dml_verb_is_word_boundaried() {
         use plsql_ir::SqlVerb;
-        assert_eq!(leading_dml_verb("SELECT 1 FROM dual"), Some(SqlVerb::Select));
+        assert_eq!(
+            leading_dml_verb("SELECT 1 FROM dual"),
+            Some(SqlVerb::Select)
+        );
         assert_eq!(leading_dml_verb("  delete from t"), Some(SqlVerb::Delete));
-        assert_eq!(leading_dml_verb("MERGE INTO t USING s ON (..)"), Some(SqlVerb::Merge));
+        assert_eq!(
+            leading_dml_verb("MERGE INTO t USING s ON (..)"),
+            Some(SqlVerb::Merge)
+        );
         // Identifier continuations must not be read as verbs.
         assert_eq!(leading_dml_verb("DELETED_FLAG := 1"), None);
         assert_eq!(leading_dml_verb("UPDATES_LOG.write(x)"), None);
@@ -1934,8 +1949,7 @@ mod tests {
         use crate::ANALYSIS_RUN_SCHEMA;
         let run = analyze_project(AnalysisRequest::default()).expect("empty run ok");
         assert_eq!(
-            run.artifacts.schema_version,
-            ANALYSIS_RUN_SCHEMA.version,
+            run.artifacts.schema_version, ANALYSIS_RUN_SCHEMA.version,
             "embedded manifest schema_version must equal ANALYSIS_RUN_SCHEMA.version, \
              not a hardcoded literal"
         );

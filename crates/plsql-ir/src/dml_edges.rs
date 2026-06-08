@@ -422,7 +422,8 @@ mod tests {
         let acc = extract_table_accesses(&s);
         for t in ["EMP", "DEPT"] {
             assert!(
-                acc.iter().any(|x| x.table == t && x.access == AccessKind::Read),
+                acc.iter()
+                    .any(|x| x.table == t && x.access == AccessKind::Read),
                 "comma-join must read {t}: {acc:?}"
             );
         }
@@ -431,7 +432,8 @@ mod tests {
         let acc3 = extract_table_accesses(&s3);
         for t in ["A", "B", "C"] {
             assert!(
-                acc3.iter().any(|x| x.table == t && x.access == AccessKind::Read),
+                acc3.iter()
+                    .any(|x| x.table == t && x.access == AccessKind::Read),
                 "comma-join must read {t}: {acc3:?}"
             );
         }
@@ -448,7 +450,8 @@ mod tests {
             "INTO inside a literal must not mint a phantom ORDERS access: {acc:?}"
         );
         assert!(
-            acc.iter().any(|x| x.table == "LOG" && x.access == AccessKind::Write),
+            acc.iter()
+                .any(|x| x.table == "LOG" && x.access == AccessKind::Write),
             "the real UPDATE target LOG must still be a Write: {acc:?}"
         );
     }

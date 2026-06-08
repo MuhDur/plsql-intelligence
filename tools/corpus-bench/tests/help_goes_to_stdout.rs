@@ -42,12 +42,18 @@ fn help_flag_writes_to_stdout_not_stderr() {
 #[test]
 fn short_help_flag_writes_to_stdout_not_stderr() {
     let bin = env!("CARGO_BIN_EXE_corpus-bench");
-    let out = Command::new(bin).arg("-h").output().expect("spawn corpus-bench -h");
+    let out = Command::new(bin)
+        .arg("-h")
+        .output()
+        .expect("spawn corpus-bench -h");
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!stdout.trim().is_empty(), "-h must write to stdout");
-    assert!(stderr.is_empty(), "-h must NOT write to stderr; got: {stderr:?}");
+    assert!(
+        stderr.is_empty(),
+        "-h must NOT write to stderr; got: {stderr:?}"
+    );
 }
 
 #[test]
@@ -57,7 +63,10 @@ fn unknown_flag_keeps_usage_block_on_stderr() {
     // refactor cannot accidentally move the usage block off
     // stderr in the error branch.
     let bin = env!("CARGO_BIN_EXE_corpus-bench");
-    let out = Command::new(bin).arg("--definitely-not-a-flag").output().unwrap();
+    let out = Command::new(bin)
+        .arg("--definitely-not-a-flag")
+        .output()
+        .unwrap();
     assert!(!out.status.success(), "unknown flag must fail");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(

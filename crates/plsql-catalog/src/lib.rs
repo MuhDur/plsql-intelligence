@@ -1350,8 +1350,7 @@ pub fn load_from_dbms_metadata_dir(dir: &std::path::Path) -> Result<CatalogSnaps
             Err(_) => continue,
         };
 
-        if let Some((schema, obj_name, obj)) =
-            classify_dbms_metadata_ddl(&ddl_text, &mut interner)
+        if let Some((schema, obj_name, obj)) = classify_dbms_metadata_ddl(&ddl_text, &mut interner)
         {
             let schema_catalog = schemas.entry(schema).or_default();
             schema_catalog.objects.insert(obj_name, obj);
@@ -1416,7 +1415,10 @@ fn classify_dbms_metadata_ddl(
 
     // `PACKAGE BODY` / `TYPE BODY` are bodies — the spec's catalog row
     // is the source of truth. Honest uncertainty: return None.
-    if matches!(header.kind, DdlKind::PackageBody | DdlKind::TypeBody | DdlKind::Unknown) {
+    if matches!(
+        header.kind,
+        DdlKind::PackageBody | DdlKind::TypeBody | DdlKind::Unknown
+    ) {
         return None;
     }
 
@@ -6483,7 +6485,8 @@ mod tests {
         ));
         // A grantee absent from ALL_USERS classifies as a role — the defect
         // this bead fixes (previously always `Grantee::User`).
-        let role = grantee_from_dictionary_value(&mut snapshot, "APP_READER_ROLE").expect("grantee");
+        let role =
+            grantee_from_dictionary_value(&mut snapshot, "APP_READER_ROLE").expect("grantee");
         let crate::Grantee::Role(role_name) = role else {
             panic!("APP_READER_ROLE must classify as a role, got {role:?}");
         };
@@ -8369,8 +8372,7 @@ mod tests {
     /// downstream consumer.
     #[test]
     fn classify_view_with_table_in_body_is_view_not_table() {
-        let ddl =
-            "CREATE OR REPLACE VIEW hr.v_emp AS SELECT * FROM hr.emp WHERE 'TABLE'='TABLE';";
+        let ddl = "CREATE OR REPLACE VIEW hr.v_emp AS SELECT * FROM hr.emp WHERE 'TABLE'='TABLE';";
         let (kind, obj) = classify_single(ddl);
         assert_eq!(
             kind,
@@ -8433,8 +8435,7 @@ mod tests {
     /// wrong thing).
     #[test]
     fn classify_materialized_view_is_materialized_view_not_view() {
-        let ddl =
-            "CREATE MATERIALIZED VIEW hr.mv_emp_summary AS SELECT dept, COUNT(*) FROM hr.emp GROUP BY dept;";
+        let ddl = "CREATE MATERIALIZED VIEW hr.mv_emp_summary AS SELECT dept, COUNT(*) FROM hr.emp GROUP BY dept;";
         let (kind, obj) = classify_single(ddl);
         assert_eq!(
             kind,
@@ -8473,8 +8474,7 @@ mod tests {
     /// not the object kind.
     #[test]
     fn classify_editionable_view_is_view() {
-        let ddl =
-            "CREATE OR REPLACE EDITIONABLE VIEW hr.v_emp AS SELECT * FROM hr.emp;";
+        let ddl = "CREATE OR REPLACE EDITIONABLE VIEW hr.v_emp AS SELECT * FROM hr.emp;";
         let (kind, _obj) = classify_single(ddl);
         assert_eq!(kind, ObjectType::View);
     }

@@ -423,7 +423,11 @@ mod tests {
             3,
             "ordinal must not collide with a unique sibling's literal suffix: {names:?}"
         );
-        assert_eq!(names, vec!["proc_x_1", "proc_x_2", "proc_x_2_2"], "{names:?}");
+        assert_eq!(
+            names,
+            vec!["proc_x_1", "proc_x_2", "proc_x_2_2"],
+            "{names:?}"
+        );
     }
 
     #[test]
@@ -475,7 +479,10 @@ mod tests {
         );
         // The real singleton keeps `touch_1`; the overload ordinal that
         // would have been `touch_1` escalates to `touch_1_2`.
-        assert_eq!(names[2], "touch_1", "singleton keeps its verbatim name: {names:?}");
+        assert_eq!(
+            names[2], "touch_1",
+            "singleton keeps its verbatim name: {names:?}"
+        );
         assert_eq!(names, vec!["touch_1_2", "touch_2", "touch_1"], "{names:?}");
     }
 

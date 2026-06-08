@@ -484,8 +484,7 @@ mod tests {
         // SEC001 fail-open regression: a DBMS_ASSERT cleanse on ONE operand must
         // NOT zero the injection alarm for tainted input concatenated ALONGSIDE it.
         // `DBMS_ASSERT.ENQUOTE_LITERAL('x') || p_user` interpolates raw p_user.
-        let s =
-            lower_statement_body("v_sql := DBMS_ASSERT.ENQUOTE_LITERAL('x') || p_user;");
+        let s = lower_statement_body("v_sql := DBMS_ASSERT.ENQUOTE_LITERAL('x') || p_user;");
         let env = analyze_flow(&s, &src(&["p_user"]));
         let f = env.get("v_sql").unwrap();
         assert!(
@@ -671,9 +670,8 @@ mod tests {
         // reusing it must NOT resurrect a live UserInput kind. The transitive
         // env-consult inherits cleansed_by (for reporting) but no live kind,
         // because the sanitiser already drained the kinds it consumed.
-        let s = lower_statement_body(
-            "v_tmp := DBMS_ASSERT.SIMPLE_SQL_NAME(p_user); v_sql := v_tmp;",
-        );
+        let s =
+            lower_statement_body("v_tmp := DBMS_ASSERT.SIMPLE_SQL_NAME(p_user); v_sql := v_tmp;");
         let env = analyze_flow(&s, &src(&["p_user"]));
         let sql = env.get("v_sql").unwrap();
         assert!(
@@ -694,9 +692,7 @@ mod tests {
     fn taint_laundered_through_local_into_concatenation_alarms() {
         // Combine transitivity with the sibling-cleanse guard: stage raw user
         // input in a local, then concatenate it into a dynamic-SQL string.
-        let s = lower_statement_body(
-            "v_t := p_user; v_sql := 'SELECT * FROM ' || v_t;",
-        );
+        let s = lower_statement_body("v_t := p_user; v_sql := 'SELECT * FROM ' || v_t;");
         let env = analyze_flow(&s, &src(&["p_user"]));
         let sql = env.get("v_sql").unwrap();
         assert!(

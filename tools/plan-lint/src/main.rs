@@ -85,9 +85,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
         curr[0] = i;
         for j in 1..=m {
             let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            curr[j] = (prev[j] + 1)
-                .min(curr[j - 1] + 1)
-                .min(prev[j - 1] + cost);
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -371,13 +369,22 @@ fn parse_args(mut args: Vec<String>) -> Result<Args, String> {
 }
 
 fn print_usage_to<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
-    writeln!(w, "usage: plan-lint [--plan <path>] [--robot-json] [--doctor]")?;
+    writeln!(
+        w,
+        "usage: plan-lint [--plan <path>] [--robot-json] [--doctor]"
+    )?;
     writeln!(w)?;
     writeln!(w, "Validates structural integrity of plan.md.")?;
     writeln!(w)?;
     writeln!(w, "Flags:")?;
-    writeln!(w, "  --plan <path>     Path to plan.md (default: ./plan.md)")?;
-    writeln!(w, "  --robot-json      Emit a stable-schema JSON report to stdout")?;
+    writeln!(
+        w,
+        "  --plan <path>     Path to plan.md (default: ./plan.md)"
+    )?;
+    writeln!(
+        w,
+        "  --robot-json      Emit a stable-schema JSON report to stdout"
+    )?;
     writeln!(
         w,
         "                    (schema_id={SCHEMA_ID}, schema_version={SCHEMA_VERSION})"
@@ -390,15 +397,33 @@ fn print_usage_to<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
         w,
         "  --capabilities    Print the machine-readable agent contract as JSON and exit"
     )?;
-    writeln!(w, "  --robot-docs      Print a paste-ready agent handbook and exit")?;
+    writeln!(
+        w,
+        "  --robot-docs      Print a paste-ready agent handbook and exit"
+    )?;
     writeln!(w, "  -V, --version     Print plan-lint <version> and exit")?;
     writeln!(w)?;
     writeln!(w, "Examples:")?;
-    writeln!(w, "  plan-lint                       # check ./plan.md, human output")?;
-    writeln!(w, "  plan-lint --doctor              # add a rule-by-rule summary table")?;
-    writeln!(w, "  plan-lint --plan docs/plan.md   # check a different file")?;
-    writeln!(w, "  plan-lint --robot-json | jq .   # consume the JSON report")?;
-    writeln!(w, "  plan-lint --capabilities | jq . # versioned machine-readable contract")?;
+    writeln!(
+        w,
+        "  plan-lint                       # check ./plan.md, human output"
+    )?;
+    writeln!(
+        w,
+        "  plan-lint --doctor              # add a rule-by-rule summary table"
+    )?;
+    writeln!(
+        w,
+        "  plan-lint --plan docs/plan.md   # check a different file"
+    )?;
+    writeln!(
+        w,
+        "  plan-lint --robot-json | jq .   # consume the JSON report"
+    )?;
+    writeln!(
+        w,
+        "  plan-lint --capabilities | jq . # versioned machine-readable contract"
+    )?;
     writeln!(w)?;
     writeln!(w, "Exit codes:")?;
     writeln!(w, "  0  clean (no errors; warnings still printed)")?;
@@ -1332,8 +1357,14 @@ mod tests {
     #[test]
     fn unknown_flag_suggests_near_miss() {
         let err = parse_args(vec!["--robotjson".into()]).unwrap_err();
-        assert!(err.contains("--robot-json"), "expected DYM hint; got: {err}");
-        assert!(err.contains("did you mean"), "expected DYM phrase; got: {err}");
+        assert!(
+            err.contains("--robot-json"),
+            "expected DYM hint; got: {err}"
+        );
+        assert!(
+            err.contains("did you mean"),
+            "expected DYM phrase; got: {err}"
+        );
     }
 
     #[test]
@@ -1349,11 +1380,17 @@ mod tests {
     #[test]
     fn suggest_flag_finds_obvious_typos() {
         // 1-char drop: missing hyphen.
-        assert_eq!(suggest_flag("--robotjson", VALID_FLAGS), Some("--robot-json"));
+        assert_eq!(
+            suggest_flag("--robotjson", VALID_FLAGS),
+            Some("--robot-json")
+        );
         // 2-char transpose / swap inside the suffix.
         assert_eq!(suggest_flag("--versoin", VALID_FLAGS), Some("--version"));
         // 1-char delta — `--robot-json` → `--robot-jso` (drop trailing n).
-        assert_eq!(suggest_flag("--robot-jso", VALID_FLAGS), Some("--robot-json"));
+        assert_eq!(
+            suggest_flag("--robot-jso", VALID_FLAGS),
+            Some("--robot-json")
+        );
         // Far-from-anything: no suggestion.
         assert_eq!(suggest_flag("--xyz-totally-unknown", VALID_FLAGS), None);
     }

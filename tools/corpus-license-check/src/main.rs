@@ -287,7 +287,10 @@ fn main() -> ExitCode {
     }
 
     if args.capabilities {
-        println!("{}", serde_json::to_string_pretty(&capabilities_json()).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&capabilities_json()).unwrap()
+        );
         return ExitCode::SUCCESS;
     }
 
@@ -413,7 +416,10 @@ fn print_usage_to<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
     )?;
     writeln!(w)?;
     writeln!(w, "Enforces that every committed file under enforced roots")?;
-    writeln!(w, "(currently: {ENFORCED_ROOTS:?}) has a `[[file]]` entry in")?;
+    writeln!(
+        w,
+        "(currently: {ENFORCED_ROOTS:?}) has a `[[file]]` entry in"
+    )?;
     writeln!(w, "manifest.toml.")?;
     writeln!(w)?;
     writeln!(w, "Flags:")?;
@@ -421,7 +427,10 @@ fn print_usage_to<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
         w,
         "  --corpus-root <path>  Path to the corpus directory (default: ./{DEFAULT_CORPUS_ROOT})"
     )?;
-    writeln!(w, "  --robot-json          Emit a stable-schema JSON report to stdout")?;
+    writeln!(
+        w,
+        "  --robot-json          Emit a stable-schema JSON report to stdout"
+    )?;
     writeln!(
         w,
         "                        (schema_id={SCHEMA_ID}, schema_version={SCHEMA_VERSION})"
@@ -434,13 +443,22 @@ fn print_usage_to<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
         w,
         "  --capabilities        Print the machine-readable agent contract as JSON and exit"
     )?;
-    writeln!(w, "  --robot-docs          Print a paste-ready agent handbook and exit")?;
-    writeln!(w, "  -V, --version         Print corpus-license-check <version> and exit")?;
+    writeln!(
+        w,
+        "  --robot-docs          Print a paste-ready agent handbook and exit"
+    )?;
+    writeln!(
+        w,
+        "  -V, --version         Print corpus-license-check <version> and exit"
+    )?;
     writeln!(w)?;
     writeln!(w, "Exit codes:")?;
     writeln!(w, "  0  clean")?;
     writeln!(w, "  1  one or more violations")?;
-    writeln!(w, "  2  invocation error (bad args, unreadable manifest, etc.)")?;
+    writeln!(
+        w,
+        "  2  invocation error (bad args, unreadable manifest, etc.)"
+    )?;
     Ok(())
 }
 
@@ -991,7 +1009,10 @@ redistribution_allowed = false
     #[test]
     fn unknown_flag_suggests_near_miss() {
         let err = parse_args(vec!["--robotjson".to_string()]).unwrap_err();
-        assert!(err.contains("--robot-json"), "expected DYM hint; got: {err}");
+        assert!(
+            err.contains("--robot-json"),
+            "expected DYM hint; got: {err}"
+        );
         assert!(err.contains("did you mean"));
     }
 

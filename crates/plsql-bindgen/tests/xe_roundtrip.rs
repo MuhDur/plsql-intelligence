@@ -66,12 +66,13 @@ mod live {
     use std::path::PathBuf;
 
     use plsql_bindgen::{
-        BindingPlan, BindingsPosture, ParameterBinding, ParameterMode, RoutineBinding,
-        RoutineKind, RustTypeRef, coverage_report,
+        BindingPlan, BindingsPosture, ParameterBinding, ParameterMode, RoutineBinding, RoutineKind,
+        RustTypeRef, coverage_report,
     };
 
     fn require_env(name: &str) -> String {
-        env::var(name).unwrap_or_else(|_| panic!("live-roundtrip needs env var {name}; see workflow yml"))
+        env::var(name)
+            .unwrap_or_else(|_| panic!("live-roundtrip needs env var {name}; see workflow yml"))
     }
 
     /// Build the synthetic `pkg_employee_mgmt` BindingPlan used by the
@@ -83,25 +84,37 @@ mod live {
         let p_emp_id = ParameterBinding {
             name: "p_emp_id".into(),
             mode: ParameterMode::In,
-            rust_type: RustTypeRef { path: "i64".into(), nullable: false },
+            rust_type: RustTypeRef {
+                path: "i64".into(),
+                nullable: false,
+            },
             has_default: false,
         };
         let p_name = ParameterBinding {
             name: "p_name".into(),
             mode: ParameterMode::In,
-            rust_type: RustTypeRef { path: "String".into(), nullable: false },
+            rust_type: RustTypeRef {
+                path: "String".into(),
+                nullable: false,
+            },
             has_default: false,
         };
         let p_salary = ParameterBinding {
             name: "p_salary".into(),
             mode: ParameterMode::In,
-            rust_type: RustTypeRef { path: "f64".into(), nullable: false },
+            rust_type: RustTypeRef {
+                path: "f64".into(),
+                nullable: false,
+            },
             has_default: false,
         };
         let p_dept_id = ParameterBinding {
             name: "p_dept_id".into(),
             mode: ParameterMode::In,
-            rust_type: RustTypeRef { path: "i64".into(), nullable: false },
+            rust_type: RustTypeRef {
+                path: "i64".into(),
+                nullable: false,
+            },
             has_default: false,
         };
 
@@ -127,7 +140,10 @@ mod live {
                     name: "get_salary".into(),
                     kind: RoutineKind::Function,
                     parameters: vec![p_emp_id.clone()],
-                    return_type: Some(RustTypeRef { path: "f64".into(), nullable: true }),
+                    return_type: Some(RustTypeRef {
+                        path: "f64".into(),
+                        nullable: true,
+                    }),
                     autonomous_transaction: false,
                 },
                 RoutineBinding {
@@ -136,10 +152,16 @@ mod live {
                     parameters: vec![ParameterBinding {
                         name: "p_dept_id".into(),
                         mode: ParameterMode::In,
-                        rust_type: RustTypeRef { path: "i64".into(), nullable: false },
+                        rust_type: RustTypeRef {
+                            path: "i64".into(),
+                            nullable: false,
+                        },
                         has_default: false,
                     }],
-                    return_type: Some(RustTypeRef { path: "i32".into(), nullable: true }),
+                    return_type: Some(RustTypeRef {
+                        path: "i32".into(),
+                        nullable: true,
+                    }),
                     autonomous_transaction: false,
                 },
             ],

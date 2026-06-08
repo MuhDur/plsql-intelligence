@@ -890,13 +890,14 @@ impl DepGraph {
                 break;
             };
             path_edge_ids.push(edge_id);
-            let edge = by_id
-                .get(&edge_id)
-                .copied()
-                .ok_or(GraphQueryError::MissingEdgeEndpoint {
-                    edge_id,
-                    missing_node_id: cursor,
-                })?;
+            let edge =
+                by_id
+                    .get(&edge_id)
+                    .copied()
+                    .ok_or(GraphQueryError::MissingEdgeEndpoint {
+                        edge_id,
+                        missing_node_id: cursor,
+                    })?;
             cursor = edge.from;
         }
         path_edge_ids.reverse();
@@ -904,13 +905,14 @@ impl DepGraph {
         let mut nodes = Vec::from([NodeSummary::from_node(start)]);
         let mut edges = Vec::new();
         for edge_id in path_edge_ids {
-            let edge = by_id
-                .get(&edge_id)
-                .copied()
-                .ok_or(GraphQueryError::MissingEdgeEndpoint {
-                    edge_id,
-                    missing_node_id: target.id,
-                })?;
+            let edge =
+                by_id
+                    .get(&edge_id)
+                    .copied()
+                    .ok_or(GraphQueryError::MissingEdgeEndpoint {
+                        edge_id,
+                        missing_node_id: target.id,
+                    })?;
             edges.push(self.edge_summary(edge)?);
             let next_node =
                 self.node_by_id(edge.to)
@@ -950,7 +952,10 @@ impl DepGraph {
         let mut cycles = state
             .components
             .into_iter()
-            .filter_map(|component| self.component_cycle_summary(component, &adjacency).transpose())
+            .filter_map(|component| {
+                self.component_cycle_summary(component, &adjacency)
+                    .transpose()
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         cycles.sort_by_key(|cycle| cycle.nodes.first().map(|node| node.id).unwrap_or_default());

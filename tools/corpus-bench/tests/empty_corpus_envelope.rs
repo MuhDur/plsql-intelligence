@@ -31,8 +31,8 @@ fn empty_corpus_under_robot_json_emits_valid_envelope_on_stdout() {
         !stdout.trim().is_empty(),
         "--robot-json mode must emit an envelope even on the empty-corpus path"
     );
-    let v: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("stdout not JSON ({e}): {stdout}"));
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("stdout not JSON ({e}): {stdout}"));
     assert_eq!(v["schema_id"], "corpus-bench.report");
     assert_eq!(v["schema_version"], 1);
     assert_eq!(v["file_count"], 0);

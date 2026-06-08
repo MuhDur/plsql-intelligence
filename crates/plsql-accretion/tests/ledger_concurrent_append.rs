@@ -16,9 +16,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use plsql_accretion::{
-    AccretionIndex, AccretionLedger, Ledger, LedgerBody, RepairClass,
-};
+use plsql_accretion::{AccretionIndex, AccretionLedger, Ledger, LedgerBody, RepairClass};
 
 fn unique_dir(label: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()

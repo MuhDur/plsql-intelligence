@@ -63,8 +63,7 @@ pub fn run_explain_lifecycle(
     graph: &DepGraph,
     selector: &NodeSelector,
 ) -> Result<LineageExplanation, ChangeToolError> {
-    plsql_lineage::explain_node(graph, selector)
-        .map_err(|e| ChangeToolError::Query(e.to_string()))
+    plsql_lineage::explain_node(graph, selector).map_err(|e| ChangeToolError::Query(e.to_string()))
 }
 
 // --- release_gate / recompile_plan ------------------------------
@@ -75,10 +74,7 @@ use plsql_lineage::RecompilePlan;
 /// `release_gate` — evaluate an invalidation prediction against a
 /// gate policy.
 #[must_use]
-pub fn run_release_gate(
-    prediction: &InvalidationPrediction,
-    policy: &GatePolicy,
-) -> GateDecision {
+pub fn run_release_gate(prediction: &InvalidationPrediction, policy: &GatePolicy) -> GateDecision {
     run_gate(prediction, policy)
 }
 
@@ -197,8 +193,8 @@ mod tests {
         let g = DepGraph::new();
         // The node is absent -> typed Query error, never a panic /
         // empty success.
-        let err = run_explain_lifecycle(&g, &NodeSelector::LogicalObjectId("nope".into()))
-            .unwrap_err();
+        let err =
+            run_explain_lifecycle(&g, &NodeSelector::LogicalObjectId("nope".into())).unwrap_err();
         assert!(matches!(err, ChangeToolError::Query(_)));
     }
 
@@ -272,7 +268,9 @@ mod tests {
         register_change_tools(&mut reg);
         assert_eq!(reg.len(), 8, "registration is idempotent");
         assert!(
-            reg.tools.iter().all(|t| t.tier == ToolTier::FoundationStatic),
+            reg.tools
+                .iter()
+                .all(|t| t.tier == ToolTier::FoundationStatic),
             "change-analysis tools are pure static analysis"
         );
         let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();

@@ -273,7 +273,10 @@ fn main() -> ExitCode {
     }
 
     if args.capabilities {
-        println!("{}", serde_json::to_string_pretty(&capabilities_json()).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&capabilities_json()).unwrap()
+        );
         return ExitCode::SUCCESS;
     }
 
@@ -441,16 +444,25 @@ fn print_usage_to<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
         "usage: corpus-grow [--output <dir>] [--seed <u64>] [--count <N>] [--pattern <name>]... [--robot-json] [--quiet]"
     )?;
     writeln!(w)?;
-    writeln!(w, "Generates synthetic PL/SQL samples from a fixed pattern library.")?;
+    writeln!(
+        w,
+        "Generates synthetic PL/SQL samples from a fixed pattern library."
+    )?;
     writeln!(w)?;
-    writeln!(w, "Defaults: --output {DEFAULT_OUTPUT_ROOT}, --seed 1, --count 1.")?;
+    writeln!(
+        w,
+        "Defaults: --output {DEFAULT_OUTPUT_ROOT}, --seed 1, --count 1."
+    )?;
     writeln!(w)?;
     writeln!(w, "Patterns available:")?;
     for name in templates().keys() {
         writeln!(w, "  {name}")?;
     }
     writeln!(w)?;
-    writeln!(w, "Pass `--pattern <name>` one or more times to filter; omit to emit")?;
+    writeln!(
+        w,
+        "Pass `--pattern <name>` one or more times to filter; omit to emit"
+    )?;
     writeln!(w, "every pattern.")?;
     writeln!(w)?;
     writeln!(w, "Discovery flags:")?;
@@ -458,10 +470,19 @@ fn print_usage_to<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
         w,
         "  --capabilities    Print the machine-readable agent contract as JSON and exit"
     )?;
-    writeln!(w, "  --robot-docs      Print a paste-ready agent handbook and exit")?;
-    writeln!(w, "  -V, --version     Print corpus-grow <version> and exit")?;
+    writeln!(
+        w,
+        "  --robot-docs      Print a paste-ready agent handbook and exit"
+    )?;
+    writeln!(
+        w,
+        "  -V, --version     Print corpus-grow <version> and exit"
+    )?;
     writeln!(w)?;
-    writeln!(w, "Stable schema for the JSON manifest: {SCHEMA_ID} v{SCHEMA_VERSION}.")?;
+    writeln!(
+        w,
+        "Stable schema for the JSON manifest: {SCHEMA_ID} v{SCHEMA_VERSION}."
+    )?;
     Ok(())
 }
 
@@ -530,7 +551,13 @@ mod tests {
         assert_eq!(c["binary"], "corpus-grow");
         assert_eq!(c["contract_version"], CAPABILITIES_CONTRACT_VERSION);
         assert_eq!(c["version"], env!("CARGO_PKG_VERSION"));
-        for key in ["flags", "exit_codes", "stdout_contract", "manifest_schema", "patterns"] {
+        for key in [
+            "flags",
+            "exit_codes",
+            "stdout_contract",
+            "manifest_schema",
+            "patterns",
+        ] {
             assert!(c.get(key).is_some(), "capabilities missing key `{key}`");
         }
         let flags = c["flags"].as_object().unwrap();
@@ -575,7 +602,10 @@ mod tests {
     #[test]
     fn unknown_flag_suggests_near_miss() {
         let err = parse_args(vec!["--robotjson".into()]).unwrap_err();
-        assert!(err.contains("--robot-json"), "expected DYM hint; got: {err}");
+        assert!(
+            err.contains("--robot-json"),
+            "expected DYM hint; got: {err}"
+        );
         assert!(err.contains("did you mean"));
     }
 

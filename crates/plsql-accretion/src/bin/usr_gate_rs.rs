@@ -316,7 +316,10 @@ mod tests {
     fn capabilities_contract_is_pinned() {
         let c = capabilities_json();
         assert_eq!(c["binary"], "usr-gate-rs");
-        assert_eq!(c["contract_version"], u64::from(CAPABILITIES_CONTRACT_VERSION));
+        assert_eq!(
+            c["contract_version"],
+            u64::from(CAPABILITIES_CONTRACT_VERSION)
+        );
         assert_eq!(c["version"], env!("CARGO_PKG_VERSION"));
         for key in [
             "mode",

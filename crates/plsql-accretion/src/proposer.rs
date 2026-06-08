@@ -845,8 +845,12 @@ impl CompletionBackend for SubprocessBackend {
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
-        String::from_utf8(out.stdout)
-            .map_err(|e| format!("model CLI {:?} produced non-UTF-8 output: {e}", self.program))
+        String::from_utf8(out.stdout).map_err(|e| {
+            format!(
+                "model CLI {:?} produced non-UTF-8 output: {e}",
+                self.program
+            )
+        })
     }
 
     fn tag(&self) -> String {
@@ -1281,7 +1285,9 @@ mod tests {
             ProposerError::R20Violation { path } => {
                 assert_eq!(path, "crates/plsql-core/src/lib.rs");
             }
-            other => panic!("expected R20Violation for the /dev/null deletion target, got {other:?}"),
+            other => {
+                panic!("expected R20Violation for the /dev/null deletion target, got {other:?}")
+            }
         }
     }
 

@@ -174,9 +174,7 @@ pub fn is_scratch_schema(name: &str) -> bool {
     // upper-cased copy of the whole string.
     let prefix = b"VERIFY_T_";
     let bytes = name.as_bytes();
-    if bytes.len() < prefix.len()
-        || !bytes[..prefix.len()].eq_ignore_ascii_case(prefix)
-    {
+    if bytes.len() < prefix.len() || !bytes[..prefix.len()].eq_ignore_ascii_case(prefix) {
         return false;
     }
     // Every remaining byte must be a safe Oracle-identifier character. This
@@ -598,10 +596,9 @@ pub fn validate_scratch_password(password: &str) -> Result<(), VerifyError> {
             ),
         });
     }
-    if let Some(bad) = password
-        .chars()
-        .find(|c| !matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '#' | '_' | '$' | '.' | '+' | '-'))
-    {
+    if let Some(bad) = password.chars().find(
+        |c| !matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '#' | '_' | '$' | '.' | '+' | '-'),
+    ) {
         return Err(VerifyError::InvalidScratchPassword {
             reason: format!(
                 "password contains disallowed character `{bad}` — only [A-Za-z0-9#_$.+-] are permitted"
@@ -1222,7 +1219,10 @@ mod tests {
         let err = validate_scratch_password("").expect_err("empty password must be rejected");
         match err {
             VerifyError::InvalidScratchPassword { reason } => {
-                assert!(reason.contains("empty"), "reason should mention empty: {reason}");
+                assert!(
+                    reason.contains("empty"),
+                    "reason should mention empty: {reason}"
+                );
             }
             other => panic!("expected InvalidScratchPassword, got {other:?}"),
         }
@@ -1231,8 +1231,8 @@ mod tests {
     #[test]
     fn validate_scratch_password_rejects_over_length() {
         let too_long = "A".repeat(MAX_SCRATCH_PASSWORD_LEN + 1);
-        let err =
-            validate_scratch_password(&too_long).expect_err("over-length password must be rejected");
+        let err = validate_scratch_password(&too_long)
+            .expect_err("over-length password must be rejected");
         assert!(matches!(err, VerifyError::InvalidScratchPassword { .. }));
         // The boundary itself is accepted.
         validate_scratch_password(&"A".repeat(MAX_SCRATCH_PASSWORD_LEN))

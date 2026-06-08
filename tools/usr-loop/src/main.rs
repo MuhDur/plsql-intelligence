@@ -763,7 +763,9 @@ fn run_propose(
                 cluster_id
             ),
             Some(estate_path),
-            Some("omit --cluster-id to propose for the highest-occurrence cluster, or rescan and pick a frozen signature prefix from `usr-loop cluster <estate>`"),
+            Some(
+                "omit --cluster-id to propose for the highest-occurrence cluster, or rescan and pick a frozen signature prefix from `usr-loop cluster <estate>`",
+            ),
         );
         return ExitCode::from(1);
     };

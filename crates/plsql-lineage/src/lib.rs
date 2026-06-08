@@ -740,16 +740,13 @@ pub fn parse_unified_diff(diff: &str) -> Result<SemanticChangeSet, ClassifyError
         // `++ b` run (which surfaces as `--- a` / `+++ b` followed by
         // more hunk content, NOT a `@@` header) is never mistaken for
         // a new file pair.
-        let starts_fresh_pair_in_hunk = lines
-            .get(idx + 1)
-            .is_some_and(|n| n.starts_with("+++ "))
+        let starts_fresh_pair_in_hunk = lines.get(idx + 1).is_some_and(|n| n.starts_with("+++ "))
             && lines.get(idx + 2).is_some_and(|n| n.starts_with("@@"));
         // `--- ` is a file header when we are outside any hunk, or —
         // for header-less diffs — when it opens the canonical fresh
         // pair shape above. Inside a hunk a `--- comment` line is
         // otherwise a deleted comment, not a header.
-        let minus_is_header =
-            line.starts_with("--- ") && (!in_hunk || starts_fresh_pair_in_hunk);
+        let minus_is_header = line.starts_with("--- ") && (!in_hunk || starts_fresh_pair_in_hunk);
 
         if minus_is_header {
             let rest = &line["--- ".len()..];
@@ -3904,7 +3901,8 @@ mod impact_tests {
     // for header detection inside a hunk.
     #[test]
     fn parse_unified_diff_dashdash_plusplus_content_in_hunk_not_header() {
-        let diff = "--- a/pkg/d.pkb\n+++ b/pkg/d.pkb\n@@ -1,3 +1,3 @@\n begin\n--- a\n+++ b\n null;\n";
+        let diff =
+            "--- a/pkg/d.pkb\n+++ b/pkg/d.pkb\n@@ -1,3 +1,3 @@\n begin\n--- a\n+++ b\n null;\n";
         let cs = parse_unified_diff(diff).expect("-- / ++ content must parse");
         assert_eq!(cs.changes.len(), 1, "{:?}", cs.changes);
         match &cs.changes[0] {
@@ -3930,7 +3928,11 @@ mod impact_tests {
         match &cs.changes[0] {
             ChangeRecord::Body(bc) => {
                 assert_eq!(bc.object_id, "proc");
-                assert_eq!(bc.hash_before.as_deref(), Some("diff:-1"), "deletion must be tallied");
+                assert_eq!(
+                    bc.hash_before.as_deref(),
+                    Some("diff:-1"),
+                    "deletion must be tallied"
+                );
                 assert_eq!(bc.hash_after.as_deref(), Some("diff:+0"));
             }
             other => panic!("expected Body for proc, got {other:?}"),
@@ -5185,7 +5187,8 @@ mod impact_tests {
             "no rename candidate without a full pair"
         );
         assert!(
-            out.unmatched_deletes.contains(&"billing.old_pkg".to_string()),
+            out.unmatched_deletes
+                .contains(&"billing.old_pkg".to_string()),
             "dropped object must survive in unmatched_deletes, got {:?}",
             out.unmatched_deletes
         );
@@ -5204,7 +5207,8 @@ mod impact_tests {
         let out = classify_rename(&cs, &hints);
         assert!(out.candidates.is_empty());
         assert!(
-            out.unmatched_deletes.contains(&"billing.old_pkg".to_string()),
+            out.unmatched_deletes
+                .contains(&"billing.old_pkg".to_string()),
             "dropped object must survive in unmatched_deletes, got {:?}",
             out.unmatched_deletes
         );
@@ -5226,7 +5230,8 @@ mod impact_tests {
         let out = classify_rename(&cs, &hints);
         assert!(out.candidates.is_empty());
         assert!(
-            out.unmatched_deletes.contains(&"billing.old_pkg".to_string()),
+            out.unmatched_deletes
+                .contains(&"billing.old_pkg".to_string()),
             "dropped object must survive in unmatched_deletes, got {:?}",
             out.unmatched_deletes
         );

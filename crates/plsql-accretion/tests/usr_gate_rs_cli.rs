@@ -10,7 +10,10 @@ fn bin_path() -> &'static str {
 
 #[test]
 fn help_long_exits_zero_and_prints_usage() {
-    let out = Command::new(bin_path()).arg("--help").output().expect("spawn");
+    let out = Command::new(bin_path())
+        .arg("--help")
+        .output()
+        .expect("spawn");
     assert!(
         out.status.success(),
         "`usr-gate-rs --help` must exit 0; got {:?}; stderr={}",
@@ -22,7 +25,14 @@ fn help_long_exits_zero_and_prints_usage() {
         stdout.contains("usr-gate-rs"),
         "--help stdout must name the binary, got {stdout}"
     );
-    for sub in ["roundtrip", "honesty", "residue", "baseline-cmp", "metrics", "pins"] {
+    for sub in [
+        "roundtrip",
+        "honesty",
+        "residue",
+        "baseline-cmp",
+        "metrics",
+        "pins",
+    ] {
         assert!(
             stdout.contains(sub),
             "--help must list subcommand `{sub}`, got {stdout}"
@@ -42,7 +52,10 @@ fn help_short_exits_zero() {
 
 #[test]
 fn version_long_exits_zero_and_prints_version() {
-    let out = Command::new(bin_path()).arg("--version").output().expect("spawn");
+    let out = Command::new(bin_path())
+        .arg("--version")
+        .output()
+        .expect("spawn");
     assert!(
         out.status.success(),
         "`usr-gate-rs --version` must exit 0; got {:?}",
@@ -84,10 +97,20 @@ fn capabilities_emits_parseable_json_with_required_keys() {
 
 #[test]
 fn robot_docs_exits_zero_and_mentions_subcommands() {
-    let out = Command::new(bin_path()).arg("--robot-docs").output().expect("spawn");
+    let out = Command::new(bin_path())
+        .arg("--robot-docs")
+        .output()
+        .expect("spawn");
     assert!(out.status.success(), "--robot-docs must exit 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for sub in ["roundtrip", "honesty", "residue", "baseline-cmp", "metrics", "pins"] {
+    for sub in [
+        "roundtrip",
+        "honesty",
+        "residue",
+        "baseline-cmp",
+        "metrics",
+        "pins",
+    ] {
         assert!(stdout.contains(sub), "robot-docs must mention `{sub}`");
     }
     assert!(stdout.contains("USR_GATE_TRUST_PINS"));
@@ -109,7 +132,10 @@ fn bare_invocation_is_not_zero_but_points_at_help() {
 
 #[test]
 fn unknown_subcommand_points_at_help() {
-    let out = Command::new(bin_path()).arg("bogus-xyzzy").output().expect("spawn");
+    let out = Command::new(bin_path())
+        .arg("bogus-xyzzy")
+        .output()
+        .expect("spawn");
     assert!(
         !out.status.success(),
         "unknown subcommand must not exit 0; got {:?}",

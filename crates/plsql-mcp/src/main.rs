@@ -480,9 +480,7 @@ fn print_doctor_human(report: &DoctorReport) {
     // Structured one-line summary on stdout. Reports every severity tier so
     // a caller can grep for `blockers=0` without conflating a
     // warning-but-no-blocker state with perfect health.
-    println!(
-        "doctor: blockers={blocker_count} warnings={warning_count} info={info_count}"
-    );
+    println!("doctor: blockers={blocker_count} warnings={warning_count} info={info_count}");
 }
 
 fn run_info(robot_json: bool) -> ExitCode {
@@ -1005,8 +1003,7 @@ mod tests {
         // The version banner ("plsql-mcp <version>") must not be on stdout
         // either — it is a diagnostic header.
         assert!(
-            !stdout.contains("plsql-mcp 0.")
-                && !stdout.contains("registered tools:"),
+            !stdout.contains("plsql-mcp 0.") && !stdout.contains("registered tools:"),
             "doctor human mode must not write the version banner / tool-count line to stdout; got: {stdout:?}"
         );
         // Findings that DO exist on this host (e.g. missing connections.toml)

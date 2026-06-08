@@ -77,17 +77,11 @@ impl LedgerLockGuard {
             .truncate(false)
             .open(&lock_path)
             .map_err(|e| {
-                LedgerError::Io(format!(
-                    "open ledger lock {}: {e}",
-                    lock_path.display()
-                ))
+                LedgerError::Io(format!("open ledger lock {}: {e}", lock_path.display()))
             })?;
         // Blocking exclusive lock. Released on Drop (file close).
         FileExt::lock_exclusive(&file).map_err(|e| {
-            LedgerError::Io(format!(
-                "lock ledger sidecar {}: {e}",
-                lock_path.display()
-            ))
+            LedgerError::Io(format!("lock ledger sidecar {}: {e}", lock_path.display()))
         })?;
         Ok(Self { _file: file })
     }
