@@ -27,9 +27,12 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-oraclemcp-core = { path = "../oraclemcp-core" }
-oraclemcp-error = { path = "../oraclemcp-error" }
-oraclemcp-guard = { path = "../oraclemcp-guard" }
+# Depend on the published engine-free oraclemcp core (extracted to the standalone
+# MuhDur/oraclemcp repo + crates.io). plsql-mcp is the full superset that adds the
+# PL/SQL intelligence layer on top of this shared MCP spine.
+oraclemcp-core = "0.1.0"
+oraclemcp-error = "0.1.0"
+oraclemcp-guard = "0.1.0"
 plsql-catalog = { path = "../plsql-catalog" }
 plsql-cicd = { path = "../plsql-cicd" }
 plsql-core = { path = "../plsql-core" }

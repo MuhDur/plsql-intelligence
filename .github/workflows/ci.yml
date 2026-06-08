@@ -45,29 +45,9 @@ jobs:
       - run: cargo test --workspace --all-targets
       - run: cargo test --workspace --doc
 
-  # `oracle-qmwz.1.1` (P0-0) — the one-way dependency boundary: the engine-free
-  # oraclemcp-* core crates must never import a plsql-* engine crate, so the
-  # eventual Phase-E extraction is a mechanical git-filter-repo, not a rewrite.
-  oraclemcp-boundary:
-    name: oraclemcp boundary lint (one-way dependency)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: bash scripts/oraclemcp_boundary_lint.sh
-
-  # `oracle-qmwz.6.2` (T-CORPUS) — keep the classifier cargo-fuzz target building
-  # (the differential adversarial corpus itself runs in the `test` job via the
-  # oraclemcp-guard integration test).
-  classifier-fuzz-smoke:
-    name: classifier fuzz target builds (nightly)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo install --locked cargo-fuzz || true
-      - run: cargo +nightly fuzz build classify_fuzz
-        working-directory: crates/oraclemcp-guard
+  # NOTE: the engine-free oraclemcp-* MCP spine (and its boundary lint + classifier
+  # cargo-fuzz smoke) moved to the standalone MuhDur/oraclemcp repo in Phase-E.
+  # Those CI jobs now live there; plsql-mcp consumes the published crates.
 
   # `oracle-qmwz.1.2` (P0-1) — supply-chain gates for the oraclemcp build.
   supply-chain:

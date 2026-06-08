@@ -22,20 +22,11 @@ members = [
     "crates/plsql-mcp",
     "crates/plsql-support",
     "crates/plsql-accretion",
-    # oraclemcp-* core crates (plan §14): engine-free MCP spine, extracted in
-    # place from plsql-mcp/plsql-catalog. The CI dependency-lint enforces that
-    # none of these import a plsql-* engine crate (one-way boundary, §0).
-    "crates/oraclemcp-error",
-    "crates/oraclemcp-config",
-    "crates/oraclemcp-audit",
-    "crates/oraclemcp-telemetry",
-    "crates/oraclemcp-db",
-    "crates/oraclemcp-guard",
-    "crates/oraclemcp-auth",
-    "crates/oraclemcp-core",
-    # The engine-free oraclemcp server binary (Phase-E E-2b): a thin consumer of
-    # oraclemcp-core (server) + oraclemcp-db (ops). Additive; imports no plsql-*.
-    "crates/oraclemcp",
+    # The engine-free oraclemcp-* MCP spine (8 crates) + the lean `oraclemcp`
+    # binary were extracted to the standalone MuhDur/oraclemcp repo and published
+    # to crates.io (Phase-E depend-back). plsql-mcp now consumes the published
+    # `oraclemcp-core`/`-error`/`-guard` crates; the in-workspace copies were
+    # removed. plsql-mcp remains the full superset (DB tools + PL/SQL intelligence).
     "tools/corpus-bench",
     "tools/corpus-grow",
     "tools/corpus-license-check",
