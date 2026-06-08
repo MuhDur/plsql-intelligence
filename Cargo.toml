@@ -33,6 +33,9 @@ members = [
     "crates/oraclemcp-guard",
     "crates/oraclemcp-auth",
     "crates/oraclemcp-core",
+    # The engine-free oraclemcp server binary (Phase-E E-2b): a thin consumer of
+    # oraclemcp-core (server) + oraclemcp-db (ops). Additive; imports no plsql-*.
+    "crates/oraclemcp",
     "tools/corpus-bench",
     "tools/corpus-grow",
     "tools/corpus-license-check",
