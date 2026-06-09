@@ -49,6 +49,29 @@ result. That honest-uncertainty exhaust feeds the **USR Loop**, which
 turns recorded gaps into proven, privacy-clean parser and lowering
 repairs so coverage compounds with use.
 
+### Two MCP servers: `oraclemcp` and `plsql-mcp`
+
+This repo ships the **full** PL/SQL Intelligence MCP server, **`plsql-mcp`** — live
+Oracle DB tools **plus** offline PL/SQL intelligence (parse/analyze, dependency
+graph, lineage, SAST) and guarded writes. Its engine-free core was extracted to a
+standalone, published sibling, [**`oraclemcp`**](https://github.com/MuhDur/oraclemcp):
+
+| | [`oraclemcp`](https://github.com/MuhDur/oraclemcp) | `plsql-mcp` (this repo) |
+|---|---|---|
+| Scope | Safe, read-only live **Oracle DB** access | The superset: DB access **+** PL/SQL **intelligence** + guarded writes |
+| Build | Engine-free, lean, fast | Full pure-Rust ANTLR engine |
+| Install | `cargo install oraclemcp` · `docker run -i ghcr.io/muhdur/oraclemcp` | `cargo install --path crates/plsql-mcp` · `docker run -i ghcr.io/muhdur/plsql-mcp` |
+| MCP registry | `io.github.MuhDur/oraclemcp` | `io.github.MuhDur/plsql-mcp` |
+
+Reach for `oraclemcp` when an agent just needs safe database access; use
+`plsql-mcp` when you want deep PL/SQL code understanding (it includes everything
+`oraclemcp` does).
+
+> **Unofficial** — not affiliated with, endorsed by, or sponsored by Oracle
+> Corporation. "Oracle" is used only descriptively to indicate compatibility; for
+> Oracle's official MCP servers see [github.com/oracle/mcp](https://github.com/oracle/mcp).
+> The Docker images bundle Oracle Instant Client under Oracle's Free Use Terms.
+
 ### Why use it?
 
 | Capability | What it does |
@@ -79,12 +102,14 @@ This is pre-1.0 software under active development. `plan.md` is the
 authoritative specification; `docs/ARCHITECTURE.md` is the technical
 architecture snapshot.
 
-- The Cargo workspace ships 30 crates and 5 tool binaries (`crates/`,
-  `tools/`): 22 `plsql-*` engine and analysis crates plus 8 engine-free
-  `oraclemcp-*` crates that hold the MCP server core (protocol, tool
-  registry, the fail-closed SQL guard, audit sink, auth, telemetry,
-  config). The one-way boundary — `oraclemcp-*` never imports a `plsql-*`
-  engine crate — is enforced by a CI dependency lint. The foundation and
+- The Cargo workspace ships 22 `plsql-*` engine and analysis crates plus 5
+  tool binaries (`crates/`, `tools/`). The engine-free MCP server core — 8
+  `oraclemcp-*` crates (protocol, tool registry, the fail-closed SQL guard,
+  audit sink, auth, telemetry, config, error envelope) — was extracted to the
+  standalone, published [`oraclemcp`](https://github.com/MuhDur/oraclemcp) repo;
+  `plsql-mcp` now consumes them from crates.io. The one-way boundary
+  (`oraclemcp-*` never imports a `plsql-*` engine crate) holds by construction
+  and is enforced in the oraclemcp repo's CI. The foundation and
   product layers are implemented; live Oracle catalog extraction, the
   `verify`/CI-cascade path, and the live-DB MCP tool surface are
   feature-gated and exercised against a containerized Oracle 23ai
@@ -246,7 +271,7 @@ types.
 | 3   | `plsql-engine` | Orchestration: per-run `AnalysisRun`, `CompletenessReport` |
 | 4   | `plsql-lineage`, `plsql-doc`, `plsql-bindgen`, `plsql-cicd`, `plsql-sast` | Lineage, docs, Rust bindings, change-set planning, static analysis |
 | 5   | `plsql-mcp`, `plsql-accretion` | The unified MCP server plus the USR Loop library (no reverse deps) |
-| MCP core | `oraclemcp-core`, `oraclemcp-guard`, `oraclemcp-db`, `oraclemcp-audit`, `oraclemcp-auth`, `oraclemcp-telemetry`, `oraclemcp-config`, `oraclemcp-error` | Engine-free MCP server core: protocol/registry, the fail-closed SQL guard and operating-level state, the connection layer, the out-of-band audit sink, transport auth, telemetry, config, and the structured error envelope. `#![forbid(unsafe_code)]`; never imports a `plsql-*` engine crate (one-way boundary, CI-enforced) |
+| MCP core (external) | `oraclemcp-core`, `oraclemcp-guard`, `oraclemcp-db`, `oraclemcp-audit`, `oraclemcp-auth`, `oraclemcp-telemetry`, `oraclemcp-config`, `oraclemcp-error` | Engine-free MCP server core: protocol/registry, the fail-closed SQL guard and operating-level state, the connection layer, the out-of-band audit sink, transport auth, telemetry, config, and the structured error envelope. `#![forbid(unsafe_code)]`; never imports a `plsql-*` engine crate (one-way boundary). **Extracted to the standalone [`oraclemcp`](https://github.com/MuhDur/oraclemcp) repo and consumed from crates.io** — `plsql-mcp` depends on the published `oraclemcp-core`/`-guard`/`-error` rather than in-workspace copies |
 
 ```
   PL/SQL source + Oracle catalog snapshot
