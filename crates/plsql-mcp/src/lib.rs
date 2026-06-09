@@ -8,7 +8,7 @@
 //! agent can call. The canonical surface — built by
 //! [`default_tool_registry`] — is fully populated: foundation
 //! static-analysis tools (parsing, project analysis, dependency graph
-//! queries, change analysis, SAST scans, doc lookup) plus, when the
+//! queries, change analysis, SARIF rendering, doc lookup) plus, when the
 //! `live-db` Cargo feature is enabled, the read-only-by-default live
 //! Oracle tool surface (connection / safety management, schema
 //! describe, query, audit-emitting DDL with previewed approval tokens).

@@ -134,3 +134,120 @@ fn bare_invocation_points_at_help() {
         "bare-invocation stderr must point at --help and name <cache-dir>, got {stderr}"
     );
 }
+
+/// Regression (oracle-qbqf.5): the serial accept loop applies a per-connection
+/// read timeout, so an idle client that never sends a line is dropped instead
+/// of stalling the daemon forever. We verify this end-to-end: launch plsqld
+/// with a short `PLSQLD_READ_TIMEOUT_MS`, open a connection and send nothing,
+/// then open a *second* connection that gets a framed response — proving the
+/// accept loop kept running after timing out the idle connection.
+#[cfg(unix)]
+#[test]
+fn idle_connection_is_dropped_and_loop_keeps_serving() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    // RAII short-path tempdir. Unix-domain socket paths are bounded by SUN_LEN
+    // (~108 bytes), so the long worktree-scoped TMPDIR that the disk-discipline
+    // harness sets is unusable for the socket. We mint a short base dir under
+    // `/tmp` (an ephemeral socket dir, not a cargo build artifact) and remove
+    // it on drop.
+    struct ShortTempDir(std::path::PathBuf);
+    impl Drop for ShortTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // RAII guard for the daemon: the accept loop runs forever, so it must be
+    // killed when the test ends. Doing so on Drop (not just at the tail of the
+    // function) means a panicking assertion below still reaps the child rather
+    // than leaking a parked daemon that would keep the test harness pipe open.
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let base =
+        std::path::PathBuf::from(format!("/tmp/plsqld-qbqf5-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&base).expect("create short tempdir");
+    let dir = ShortTempDir(base);
+    let sock_path = dir.0.join("plsqld.sock");
+
+    let child = ChildGuard(
+        Command::new(bin_path())
+            .arg(&dir.0)
+            // Short read timeout so the idle connection is reaped quickly and
+            // the test does not have to wait the 30s production default.
+            .env("PLSQLD_READ_TIMEOUT_MS", "300")
+            .spawn()
+            .expect("spawn plsqld daemon"),
+    );
+
+    // Wait for the daemon to bind the socket (it is created lazily after the
+    // store opens). Poll rather than sleep a fixed interval.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !sock_path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "plsqld did not bind {} within 10s",
+            sock_path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Connection #1: connect and send NOTHING, and crucially KEEP IT OPEN
+    // (no EOF). Because the accept loop is serial, the daemon is now parked in
+    // `reader.lines()` on this connection. Without the read timeout it would
+    // block here forever (silent peer, socket never closed), starving every
+    // later client. With the 300ms read timeout, `reader.lines()` errors out
+    // and the `else { break }` arm ends this connection so the loop advances.
+    let _idle = UnixStream::connect(&sock_path).expect("connect idle client");
+
+    // Connection #2: connect() succeeds via the listen backlog, but it is only
+    // *serviced* once the daemon finishes (i.e. reaps) connection #1. We bound
+    // the client read with a 5s timeout: if the daemon never reaped the idle
+    // connection (no fix), no response arrives and `read_line` errors below —
+    // the regression fails loudly instead of hanging the suite.
+    let mut active = UnixStream::connect(&sock_path).expect("connect active client");
+    active
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set client read timeout");
+    // An unframed line yields a framed error response; we only need to prove a
+    // response comes back, i.e. the loop is alive and dispatching.
+    active
+        .write_all(b"not-a-valid-frame\n")
+        .expect("write request");
+    active.flush().expect("flush request");
+
+    let mut reader = BufReader::new(active);
+    let mut response = String::new();
+    let n = reader
+        .read_line(&mut response)
+        .expect("daemon must answer the second client after reaping the idle one (read timed out)");
+    assert!(
+        n > 0 && !response.trim().is_empty(),
+        "daemon must answer the second client after reaping the idle one; got empty response"
+    );
+    // The framed response is JSON; confirm it parses, proving the wire is intact.
+    let v: serde_json::Value =
+        serde_json::from_str(response.trim()).expect("daemon response must be framed JSON");
+    assert!(
+        v.get("payload").is_some(),
+        "framed daemon response must carry a payload, got {response}"
+    );
+
+    // `child` (ChildGuard) and `dir` (ShortTempDir) reap the daemon and remove
+    // the socket dir on drop; keep them alive until here so the daemon stays up
+    // for the assertions above.
+    drop(child);
+    drop(dir);
+}

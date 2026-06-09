@@ -6,6 +6,7 @@
 //! programmatically. All four tools share an `OracleConnection` shim and
 //! issue parameterized queries against `ALL_*` dictionary views.
 
+use oraclemcp_error::{ErrorClass, ErrorEnvelope, enrich_oracle_error, fuzzy_suggest};
 use plsql_catalog::{CatalogError, OracleBind, OracleConnection};
 use plsql_core::UnknownReason;
 use serde::{Deserialize, Serialize};
@@ -134,6 +135,59 @@ pub enum DescribeError {
         name: String,
         object_type: String,
     },
+}
+
+impl DescribeError {
+    /// Render this failure as an actionable [`ErrorEnvelope`] (oracle-da9j.11).
+    ///
+    /// * [`DescribeError::Backend`] carries a raw Oracle backend string and is
+    ///   routed through [`enrich_oracle_error`] (parsed `ora_code` +
+    ///   [`ErrorClass`] + fuzzy candidates from `known_objects`).
+    /// * [`DescribeError::NotFound`] becomes an [`ErrorClass::ObjectNotFound`]
+    ///   envelope whose `fuzzy_matches` are the near-misses for the requested
+    ///   `name` drawn from `known_objects`, with `suggested_tool` overridden to
+    ///   `list_objects` (the tool that enumerates valid object ids in this
+    ///   schema) so the dead-end becomes a one-shot correction.
+    ///
+    /// `known_objects` is the list of object names available in the relevant
+    /// schema (e.g. from `list_objects` / the cached snapshot). When it is empty
+    /// the envelope still classifies correctly but carries no candidates.
+    #[must_use]
+    pub fn to_envelope(&self, known_objects: &[&str]) -> ErrorEnvelope {
+        match self {
+            DescribeError::Backend(err) => {
+                // `name` is unknown at the Backend arm; pass the candidate list
+                // through so an ORA-00942 still classifies as ObjectNotFound.
+                enrich_oracle_error(&err.to_string(), None, known_objects)
+            }
+            DescribeError::NotFound {
+                owner,
+                name,
+                object_type,
+            } => {
+                let matches = fuzzy_suggest(name, known_objects, 5);
+                let mut env = ErrorEnvelope::new(
+                    ErrorClass::ObjectNotFound,
+                    format!("object `{owner}.{name}` not found in ALL_OBJECTS as `{object_type}`"),
+                )
+                // The describe tools are local-schema introspection; steer the
+                // agent to list_objects (enumerates valid ids) rather than the
+                // crate default (oracle_schema_inspect, which is not a tool here).
+                .with_suggested_tool("list_objects");
+                if matches.is_empty() {
+                    env = env.with_next_step(format!(
+                        "`{owner}.{name}` not found and no near match is known — call \
+                         list_objects to enumerate valid object ids in `{owner}`"
+                    ));
+                } else {
+                    env = env
+                        .with_next_step(format!("`{name}` not found — did you mean one of these?"))
+                        .with_fuzzy_matches(matches);
+                }
+                env
+            }
+        }
+    }
 }
 
 /// Normalize a user-supplied Oracle identifier to the form the data dictionary
@@ -749,6 +803,37 @@ mod tests {
         let conn = RouterStub::default();
         let err = run_describe_table(&conn, "BILLING", "MISSING").unwrap_err();
         assert!(matches!(err, DescribeError::NotFound { .. }));
+    }
+
+    // ── oracle-da9j.11: NotFound -> ObjectNotFound envelope w/ fuzzy + tool ──
+
+    #[test]
+    fn not_found_maps_to_object_not_found_with_fuzzy_and_list_objects_tool() {
+        let conn = RouterStub::default();
+        let err = run_describe_table(&conn, "BILLING", "INVOICE").unwrap_err();
+        let env = err.to_envelope(&["INVOICES", "CUSTOMERS", "PAYMENTS"]);
+        assert_eq!(env.error_class, oraclemcp_error::ErrorClass::ObjectNotFound);
+        // The near-miss `INVOICES` (one char from `INVOICE`) must surface.
+        assert!(
+            env.fuzzy_matches.contains(&"INVOICES".to_owned()),
+            "expected INVOICES near-miss, got {:?}",
+            env.fuzzy_matches
+        );
+        // The describe tools steer to list_objects, not the crate default.
+        assert_eq!(env.suggested_tool.as_deref(), Some("list_objects"));
+    }
+
+    #[test]
+    fn describe_backend_ora_00942_enriches_to_object_not_found() {
+        // A backend ORA-00942 reaching a describe tool enriches identically to
+        // the query path.
+        let err = DescribeError::Backend(CatalogError::OracleBackendError {
+            backend: OracleBackend::RustOracle,
+            message: String::from("ORA-00942: table or view does not exist"),
+        });
+        let env = err.to_envelope(&["INVOICES"]);
+        assert_eq!(env.error_class, oraclemcp_error::ErrorClass::ObjectNotFound);
+        assert_eq!(env.ora_code, Some(942));
     }
 
     #[test]

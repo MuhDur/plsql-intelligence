@@ -9,6 +9,7 @@
 //! SQL using its own `is_read_only_sql` predicate (mirrors the CICD
 //! inspector's so the MCP crate doesn't take a dep on plsql-cicd).
 
+use oraclemcp_error::{ErrorClass, ErrorEnvelope, enrich_oracle_error};
 use plsql_catalog::{CatalogError, OracleBind, OracleConnection, OracleRow};
 use plsql_core::UnknownReason;
 use serde::{Deserialize, Serialize};
@@ -68,6 +69,46 @@ pub enum QueryError {
     NotReadOnly { preview: String },
     #[error("oracle backend error: {0}")]
     Backend(#[from] CatalogError),
+}
+
+impl QueryError {
+    /// Render this failure as an actionable [`ErrorEnvelope`] (oracle-da9j.11).
+    ///
+    /// * [`QueryError::Backend`] carries a raw Oracle backend string; it is
+    ///   routed through [`enrich_oracle_error`] so the envelope carries the
+    ///   parsed `ora_code`, a machine-stable [`ErrorClass`] (e.g. an ORA-00942
+    ///   becomes [`ErrorClass::ObjectNotFound`]), and — when the agent named an
+    ///   object and a cached schema snapshot is available — fuzzy "did you mean"
+    ///   candidates. A non-Oracle backend error (I/O, JSON, decode) carries no
+    ///   `ORA-` code and degrades to an honest [`ErrorClass::Internal`] envelope.
+    /// * [`QueryError::NotReadOnly`] is the fail-closed write gate refusing a
+    ///   non-SELECT statement; it maps to [`ErrorClass::ForbiddenStatement`]
+    ///   with a `next_step` naming the write path (`enable_writes` →
+    ///   `create_or_replace` / `patch_*` / `execute_approved`) so the agent is
+    ///   steered to the guarded-write workflow instead of retrying verbatim.
+    ///
+    /// `referenced` is the object name the agent referenced (for ORA-00942
+    /// fuzzy matching); `known_objects` is the cached schema snapshot the
+    /// candidate list is drawn from (empty ⇒ the envelope suggests re-capturing
+    /// the snapshot). Both are supplied by the caller because `run_query` itself
+    /// holds no schema cache.
+    #[must_use]
+    pub fn to_envelope(&self, referenced: Option<&str>, known_objects: &[&str]) -> ErrorEnvelope {
+        match self {
+            QueryError::Backend(err) => {
+                enrich_oracle_error(&err.to_string(), referenced, known_objects)
+            }
+            QueryError::NotReadOnly { preview } => ErrorEnvelope::new(
+                ErrorClass::ForbiddenStatement,
+                format!("query tool refuses non-SELECT SQL (preview: `{preview}`)"),
+            )
+            .with_next_step(
+                "the query tool is read-only by construction; to run a write/DDL, use the \
+                 guarded-write path: enable_writes, then create_or_replace / patch_package / \
+                 patch_view (dry_run → apply) or execute_approved",
+            ),
+        }
+    }
 }
 
 /// Run a read-only query and return a structured response.
@@ -704,6 +745,60 @@ mod tests {
         let conn = StubConn::default();
         let err = run_query(&conn, "DELETE FROM CUSTOMERS", &[], None).unwrap_err();
         assert!(matches!(err, QueryError::NotReadOnly { .. }));
+    }
+
+    // ── oracle-da9j.11: route DB error paths through enrich/fuzzy machinery ──
+
+    #[test]
+    fn backend_ora_00942_maps_to_object_not_found_with_candidates() {
+        // An ORA-00942 from the backend must enrich to OBJECT_NOT_FOUND, carry
+        // the parsed ora_code, and surface near-miss candidates drawn from the
+        // caller-supplied schema snapshot.
+        let err = QueryError::Backend(CatalogError::OracleBackendError {
+            backend: OracleBackend::RustOracle,
+            message: String::from("ORA-00942: table or view does not exist"),
+        });
+        let env = err.to_envelope(Some("EMPLOYES"), &["EMPLOYEES", "DEPARTMENTS"]);
+        assert_eq!(env.error_class, oraclemcp_error::ErrorClass::ObjectNotFound);
+        assert_eq!(env.ora_code, Some(942));
+        assert!(
+            env.fuzzy_matches.contains(&"EMPLOYEES".to_owned()),
+            "expected EMPLOYEES near-miss, got {:?}",
+            env.fuzzy_matches
+        );
+        // The crate default suggested_tool for ObjectNotFound is non-empty.
+        assert!(env.suggested_tool.is_some());
+    }
+
+    #[test]
+    fn not_read_only_maps_to_forbidden_statement_with_write_path_step() {
+        // The read-only gate refusal must classify as ForbiddenStatement and
+        // steer the agent to the guarded-write path, not a bare string.
+        let err = run_query(&StubConn::default(), "DELETE FROM CUSTOMERS", &[], None).unwrap_err();
+        let env = err.to_envelope(None, &[]);
+        assert_eq!(
+            env.error_class,
+            oraclemcp_error::ErrorClass::ForbiddenStatement
+        );
+        assert!(
+            env.next_steps
+                .iter()
+                .any(|s| s.contains("enable_writes") && s.contains("create_or_replace")),
+            "next_step must name the write path: {:?}",
+            env.next_steps
+        );
+    }
+
+    #[test]
+    fn non_oracle_backend_error_degrades_to_internal() {
+        // A backend error with no ORA- code (e.g. a decode failure) must not be
+        // mis-classified; it degrades to an honest Internal envelope.
+        let err = QueryError::Backend(CatalogError::MissingColumn {
+            column: String::from("AMOUNT"),
+        });
+        let env = err.to_envelope(None, &[]);
+        assert_eq!(env.error_class, oraclemcp_error::ErrorClass::Internal);
+        assert!(env.ora_code.is_none());
     }
 
     #[test]

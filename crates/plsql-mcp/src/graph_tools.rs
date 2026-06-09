@@ -17,6 +17,7 @@
 //! * `get_dependencies` — *forward*, reduced to the sorted unique
 //!   set of target logical ids (the "what does this need" list).
 
+use oraclemcp_error::{ErrorClass, ErrorEnvelope, fuzzy_suggest};
 use plsql_depgraph::{DepGraph, NeighborhoodQueryResult, NodeSelector};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -49,6 +50,45 @@ pub enum GraphToolError {
     /// "absent" is reported, never an empty success).
     #[error("graph query failed: {0}")]
     Query(String),
+}
+
+impl GraphToolError {
+    /// Render this failure as an actionable [`ErrorEnvelope`] (oracle-da9j.11).
+    ///
+    /// An unknown graph target is an [`ErrorClass::ObjectNotFound`]: the agent
+    /// supplied a logical object id the analysed [`DepGraph`] does not hold. The
+    /// envelope carries near-miss `fuzzy_matches` drawn from the graph's own
+    /// node ids (the graph holds every valid id, so a wrong-arity or misspelled
+    /// target — `pkg.proc/2` for `pkg.proc/1` — surfaces as a one-character
+    /// near miss) and a `suggested_tool` of `analyze_project` (the tool that
+    /// (re)loads the graph and emits the canonical id set).
+    #[must_use]
+    pub fn to_envelope(&self, graph: &DepGraph, target: &str) -> ErrorEnvelope {
+        let GraphToolError::Query(message) = self;
+        let ids: Vec<String> = graph
+            .nodes
+            .values()
+            .map(|n| n.logical_id.as_str().to_owned())
+            .collect();
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let matches = fuzzy_suggest(target, &id_refs, 5);
+        let mut env = ErrorEnvelope::new(ErrorClass::ObjectNotFound, message.clone())
+            .with_suggested_tool("analyze_project");
+        if matches.is_empty() {
+            env = env.with_next_step(format!(
+                "`{target}` is not a node in the analysed graph and no near match exists — \
+                 run analyze_project (or plsql_analyze) to (re)load the graph and obtain the \
+                 valid logical object ids"
+            ));
+        } else {
+            env = env
+                .with_next_step(format!(
+                    "`{target}` is not in the analysed graph — did you mean one of these?"
+                ))
+                .with_fuzzy_matches(matches);
+        }
+        env
+    }
 }
 
 fn selector(target: &str) -> NodeSelector {
@@ -256,6 +296,43 @@ mod tests {
         let e = run_find_callers(&g, &req("does.not.exist")).unwrap_err();
         let GraphToolError::Query(msg) = e;
         assert!(msg.contains("does.not.exist"), "selector echoed: {msg}");
+    }
+
+    // ── oracle-da9j.11: unknown graph target -> ObjectNotFound w/ fuzzy ──
+
+    #[test]
+    fn wrong_arity_target_yields_fuzzy_near_miss() {
+        // A wrong-arity target (`pkg.proc/2` for the graph's `pkg.proc/1`) is a
+        // one-character near miss: the envelope must classify as ObjectNotFound,
+        // suggest analyze_project, and surface the real id as a fuzzy candidate.
+        let g = fixture();
+        let target = "pkg.proc/2";
+        let e = run_find_callees(&g, &req(target)).unwrap_err();
+        let env = e.to_envelope(&g, target);
+        assert_eq!(env.error_class, oraclemcp_error::ErrorClass::ObjectNotFound);
+        assert_eq!(env.suggested_tool.as_deref(), Some("analyze_project"));
+        assert!(
+            env.fuzzy_matches.contains(&"pkg.proc/1".to_owned()),
+            "expected pkg.proc/1 near-miss, got {:?}",
+            env.fuzzy_matches
+        );
+    }
+
+    #[test]
+    fn far_target_has_no_fuzzy_match_but_still_classifies() {
+        // A target with no near miss still classifies as ObjectNotFound and
+        // points the agent at analyze_project to (re)load the id set.
+        let g = fixture();
+        let target = "totally.unrelated.zzzzzzzz";
+        let e = run_find_callers(&g, &req(target)).unwrap_err();
+        let env = e.to_envelope(&g, target);
+        assert_eq!(env.error_class, oraclemcp_error::ErrorClass::ObjectNotFound);
+        assert!(env.fuzzy_matches.is_empty(), "no near miss expected");
+        assert!(
+            env.next_steps.iter().any(|s| s.contains("analyze_project")),
+            "next_step must steer to analyze_project: {:?}",
+            env.next_steps
+        );
     }
 
     #[test]

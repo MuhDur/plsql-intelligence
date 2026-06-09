@@ -247,6 +247,26 @@ fn run_unix(cache_dir_arg: &str) -> ExitCode {
     };
     eprintln!("plsqld: listening on {}", sock_path.display());
 
+    // Connections are served sequentially (single-stream by design). Like
+    // the sibling local transports — `plsql_doc::serve` (serve.rs:164) and
+    // `plsql_mcp::tcp` (tcp.rs:13) — this is a dev/local daemon that mirrors
+    // the "one agent per process" posture, so the per-store state machine
+    // never sees concurrent requests. Concurrent connection fan-out
+    // (thread-per-connection + `Arc<Store>`) is intentionally out of scope
+    // until a real multi-client UDS consumer exists (none does today).
+    //
+    // Defensive read timeout: a stalled or idle client would otherwise hold
+    // the serial loop open indefinitely. A 30s read timeout turns a stalled
+    // `reader.lines()` into a `WouldBlock`/`TimedOut` error, which falls into
+    // the `else { break }` arm below and ends that connection so the next one
+    // can be accepted. `PLSQLD_READ_TIMEOUT_MS` is a test-only knob (the
+    // regression test sets a short timeout so it need not wait the full 30s);
+    // operators never set it.
+    let read_timeout = std::env::var("PLSQLD_READ_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_else(|| std::time::Duration::from_secs(30));
     for conn in listener.incoming() {
         let stream = match conn {
             Ok(s) => s,
@@ -255,6 +275,10 @@ fn run_unix(cache_dir_arg: &str) -> ExitCode {
                 continue;
             }
         };
+        if let Err(e) = stream.set_read_timeout(Some(read_timeout)) {
+            eprintln!("plsqld: cannot set read timeout: {e}");
+            continue;
+        }
         let reader = BufReader::new(match stream.try_clone() {
             Ok(s) => s,
             Err(e) => {
