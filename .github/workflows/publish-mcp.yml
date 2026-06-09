@@ -1,0 +1,27 @@
+name: Publish to MCP Registry (plsql-mcp)
+
+# Lists plsql-mcp ("PL/SQL Intelligence") in the official MCP registry
+# (registry.modelcontextprotocol.io) under io.github.MuhDur, authenticated via
+# GitHub OIDC (no token/secret). server.json references the OCI image
+# ghcr.io/muhdur/plsql-mcp built by docker.yml — run this AFTER that image is
+# pushed and its GHCR package is public. Dispatch-only so it never races the
+# image build on a tag.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  publish:
+    name: publish server.json
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # GitHub OIDC
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+      - name: Authenticate (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+      - name: Publish server.json
+        run: ./mcp-publisher publish
