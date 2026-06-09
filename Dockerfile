@@ -12,10 +12,11 @@
 
 # ---- builder: compile plsql-mcp (default features incl. live-db) ----
 # ODPI-C is vendored + compiled by the `oracle` crate (needs gcc, not the client
-# at build time). The ANTLR codegen is feature-gated OFF by default, so no Java
-# is needed — the default build compiles the committed parser.
+# at build time). plsql-parser-antlr's build.rs regenerates the Rust lexer/parser
+# from the vendored antlr4-rust.jar, so it needs a JDK (Java 11+) on PATH — the
+# GitHub ubuntu runners ship Java preinstalled, but oraclelinux:9 does not.
 FROM oraclelinux:9 AS builder
-RUN dnf -y install gcc && dnf clean all && \
+RUN dnf -y install gcc java-17-openjdk-headless && dnf clean all && \
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
       | sh -s -- -y --profile minimal --default-toolchain stable
 ENV PATH="/root/.cargo/bin:${PATH}"
