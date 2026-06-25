@@ -2,7 +2,6 @@
 name = "plsql-parser-java"
 version = "0.1.0"
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 # Inert historical spike — the parser-backend tournament loser. It builds
 # and its tests pass, but by design it produces no real parse (worker

@@ -4,7 +4,6 @@ version = "0.1.0"
 description = "Canonical analysis orchestration for plsql-intelligence"
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 
 [dependencies]
 plsql-catalog = { path = "../plsql-catalog" }

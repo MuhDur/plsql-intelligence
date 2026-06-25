@@ -1,4 +1,14 @@
+# This workspace is pinned to NIGHTLY Rust.
+#
+# The convergence depends on asupersync/oracledb, and asupersync uses
+# nightly-only language features (try_trait_v2 + try_trait_v2_residual).
+# There is no stable MSRV; bump this date deliberately with asupersync/oracledb
+# upgrades and CI workflow pins.
+#
+# Upstream pins (verified 2026-06-25):
+# - oraclemcp: nightly-2026-05-11
+# - rust-oracledb: nightly-2026-05-11
 [toolchain]
-channel = "stable"
+channel = "nightly-2026-05-11"
 components = ["clippy", "rustfmt"]
 profile = "minimal"

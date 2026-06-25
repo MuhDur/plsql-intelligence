@@ -4,7 +4,6 @@ version = "0.1.0"
 description = "USR loop library (Layer 5): GapRecord capture from honest-uncertainty exhaust (PLSQL-USR-001)"
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 
 [dependencies]
 fs2 = { workspace = true }

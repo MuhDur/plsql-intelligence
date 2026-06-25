@@ -4,7 +4,6 @@ version = "0.1.0"
 description = "ANTLR4-based PL/SQL parser backend (grammar + codegen)"
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 
 # The .g4 grammar files are included as data for the build.rs codegen step.
 # They are NOT compiled directly — ANTLR generates Rust source from them.

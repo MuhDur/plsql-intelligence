@@ -4,7 +4,6 @@ version = "0.1.0"
 description = "CI/CD recompilation cascade types and operations for plsql-intelligence"
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 
 [features]
 default = []

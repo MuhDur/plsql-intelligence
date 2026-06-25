@@ -54,7 +54,7 @@ jobs:
           --health-start-period 5m
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly-2026-05-11
       - uses: Swatinem/rust-cache@v2
 
       - name: Install Oracle Instant Client
