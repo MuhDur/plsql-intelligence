@@ -89,12 +89,42 @@ impl PlsqlMcpServer {
 
     #[must_use]
     pub fn handle_request(&self, req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
+        // block-on-boundary: this is the one synchronous serve-entry bridge.
+        // Blocking transports enter the server-owned Asupersync runtime here;
+        // DB round trips and downstream dispatch code must not add their own
+        // block_on shims.
+        self.dispatch_runtime.block_on(async {
+            let Some(cx) = asupersync::Cx::current() else {
+                return req.id.clone().map(|id| {
+                    JsonRpcResponse::err(
+                        id,
+                        -32603,
+                        "Asupersync context was not installed for MCP dispatch",
+                    )
+                });
+            };
+            self.handle_request_with_cx(&cx, req).await
+        })
+    }
+
+    pub async fn handle_request_with_cx(
+        &self,
+        _cx: &asupersync::Cx,
+        req: &JsonRpcRequest,
+    ) -> Option<JsonRpcResponse> {
         handle_request(req, &self.registry)
     }
 
     #[must_use]
     pub fn handle_request_line(&self, line: &str) -> Option<JsonRpcResponse> {
-        handle_request_line(line, &self.registry)
+        match serde_json::from_str::<JsonRpcRequest>(line) {
+            Ok(req) => self.handle_request(&req),
+            Err(err) => Some(JsonRpcResponse::err(
+                Value::Null,
+                -32700,
+                format!("parse error: {err}"),
+            )),
+        }
     }
 }
 
@@ -619,6 +649,17 @@ mod tests {
             cx_is_installed,
             "server-owned runtime must install an Asupersync Cx during block_on"
         );
+    }
+
+    #[test]
+    fn server_runtime_boundary_preserves_protocol_behavior() {
+        let server = PlsqlMcpServer::new(registry_with_query()).expect("server runtime builds");
+        let request = req(15, "tools/list", None);
+
+        let direct = handle_request(&request, server.registry()).expect("direct response");
+        let through_server = server.handle_request(&request).expect("server response");
+
+        assert_eq!(through_server, direct);
     }
 
     #[test]
