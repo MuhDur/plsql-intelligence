@@ -54,5 +54,8 @@ thiserror.workspace = true
 toml = "1.1"
 tracing.workspace = true
 
+[dev-dependencies]
+async-trait = "0.1"
+
 [lints]
 workspace = true

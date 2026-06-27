@@ -58,6 +58,7 @@ pub mod foundation_tools;
 pub mod graph_tools;
 pub mod list_objects;
 pub mod mcp_protocol;
+pub mod oraclemcp_catalog;
 pub mod parse_tools;
 pub mod patch;
 pub mod plsql_analyze;
@@ -69,6 +70,7 @@ pub mod tcp;
 pub mod tools;
 pub mod trust;
 
+pub use oraclemcp_catalog::OraclemcpCatalogConnection;
 pub use oraclemcp_core::{
     PrivilegedEffect, ReadPathCaps, RequestBudget, narrow_to_read_path, requires_privileged_effect,
 };

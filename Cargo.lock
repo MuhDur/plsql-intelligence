@@ -2114,6 +2114,7 @@ name = "plsql-mcp"
 version = "0.1.0"
 dependencies = [
  "asupersync",
+ "async-trait",
  "clap",
  "oraclemcp-audit",
  "oraclemcp-core",
