@@ -58,17 +58,17 @@ standalone, published sibling, [**`oraclemcp`**](https://github.com/MuhDur/oracl
 
 | | [`oraclemcp`](https://github.com/MuhDur/oraclemcp) | `plsql-mcp` (this repo) |
 |---|---|---|
-| Scope | Safe, read-only live **Oracle DB** access | The superset: DB access **+** PL/SQL **intelligence** + guarded writes |
+| Scope | Guarded live **Oracle DB** access | The superset: DB access **+** PL/SQL **intelligence** + guarded writes |
 | Build | Engine-free, lean, fast | Full pure-Rust ANTLR engine |
 | Install | `cargo install oraclemcp` · `docker run -i ghcr.io/muhdur/oraclemcp` | `cargo install --path crates/plsql-mcp` · `docker run -i ghcr.io/muhdur/plsql-mcp` |
 | MCP registry | `io.github.MuhDur/oraclemcp` | `io.github.MuhDur/plsql-mcp` |
 
-Reach for `oraclemcp` when an agent just needs safe database access; use
+Reach for `oraclemcp` when an agent just needs governed database access; use
 `plsql-mcp` when you want deep PL/SQL code understanding (it includes everything
 `oraclemcp` does).
 
 > _Independent open-source project; not affiliated with Oracle. The Docker images
-> bundle Oracle Instant Client under Oracle's Free Use Terms._
+> ship the project binaries only; they do not bundle Oracle Instant Client._
 
 ### Why use it?
 
@@ -342,9 +342,11 @@ cargo build -p plsql-catalog
 cargo test  -p plsql-accretion
 ```
 
-The MCP `live-db` feature pulls in the optional Oracle driver and requires
-Instant Client at runtime; see `docs/integrations/live-db/` for
-per-platform setup.
+The MCP `live-db` feature uses the pure-Rust thin stack shared with
+`oraclemcp` (`oraclemcp-db` -> `oracledb`). The normal `plsql-mcp`
+container and live-DB tool path do not require Oracle Instant Client at
+runtime. See `docs/integrations/live-db/` for connection setup and
+safety posture.
 
 ---
 

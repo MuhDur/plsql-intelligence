@@ -2,19 +2,17 @@
 #
 # plsql-mcp container image — the FULL PL/SQL Intelligence MCP server: live Oracle
 # DB tools + guarded writes + offline PL/SQL intelligence (parse/analyze/depgraph/
-# lineage/SAST). Oracle Instant Client is bundled so the live-DB tools work out of
-# the box (plsql-mcp defaults to the `live-db` feature → ODPI-C via the `oracle`
-# crate, which dlopen()s the client at runtime).
+# lineage/SAST). Live DB access routes through the pure-Rust thin stack
+# (`oraclemcp-db` -> `oracledb`), so the image does not bundle Oracle Instant
+# Client or native Oracle client libraries.
 #
-# Licensing: the binary + crates are Apache-2.0 OR MIT; the runtime layers come
-# from Oracle's official Instant Client image (Oracle Free Use Terms), so this is
-# a mixed-license artifact. Unofficial — not affiliated with Oracle Corporation.
+# Licensing: the binary + crates are Apache-2.0 OR MIT. Unofficial — not
+# affiliated with Oracle Corporation.
 
 # ---- builder: compile plsql-mcp (default features incl. live-db) ----
-# ODPI-C is vendored + compiled by the `oracle` crate (needs gcc, not the client
-# at build time). plsql-parser-antlr's build.rs regenerates the Rust lexer/parser
-# from the vendored antlr4-rust.jar, so it needs a JDK (Java 11+) on PATH — the
-# GitHub ubuntu runners ship Java preinstalled, but oraclelinux:9 does not.
+# plsql-parser-antlr's build.rs regenerates the Rust lexer/parser from the
+# vendored antlr4-rust.jar, so it needs a JDK (Java 11+) on PATH — the GitHub
+# ubuntu runners ship Java preinstalled, but oraclelinux:9 does not.
 FROM oraclelinux:9 AS builder
 RUN dnf -y install gcc java-17-openjdk-headless && dnf clean all && \
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -24,8 +22,8 @@ WORKDIR /src
 COPY . .
 RUN cargo build --release -p plsql-mcp
 
-# ---- runtime: Oracle's official Instant Client image (public, FUTC) ----
-FROM ghcr.io/oracle/oraclelinux9-instantclient:23
+# ---- runtime: plain Oracle Linux, no Instant Client layer ----
+FROM oraclelinux:9
 COPY --from=builder /src/target/release/plsql-mcp /usr/local/bin/plsql-mcp
 
 # Required by the MCP registry to verify image ownership against server.json.

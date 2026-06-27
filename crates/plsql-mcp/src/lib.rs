@@ -31,7 +31,7 @@
 //! - `tcp` — TCP accept loop and the shared `process_stream` pump the
 //!   stdio path reuses; loopback-only by default, wider binds require
 //!   `--allow-public-bind`.
-//! - `doctor` — diagnostic report (transport, Instant Client posture,
+//! - `doctor` — diagnostic report (transport, live-DB backend posture,
 //!   connection write-posture, profile sanity) consumed by both the
 //!   `doctor` subcommand and the `--robot-triage` mega-object.
 //! - `connections` — named connection profiles loaded from

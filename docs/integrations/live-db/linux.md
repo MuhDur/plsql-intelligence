@@ -2,50 +2,30 @@
 
 This walkthrough sets up the live-DB feature of `plsql-mcp` on a typical
 Linux developer machine (Ubuntu / Fedora / Debian / Arch). It covers the
-Oracle Instant Client install, wallet-based connection setup, the
+thin-driver connection setup, optional wallet/TNS aliases, the
 `permanently_read_only` hard guard, and editor / agent integration snippets.
 
-## 1. Oracle Instant Client install
+## 1. Binary setup
 
-`plsql-mcp` depends on the `rust-oracle` driver, which in turn calls into
-the libclntsh.so shipped by Oracle Instant Client. Oracle does not allow
-us to bundle Instant Client, so it has to be installed on the host first.
+`plsql-mcp` live DB access uses the pure-Rust thin stack shared with
+`oraclemcp` (`oraclemcp-db` -> `oracledb`). No Oracle Instant Client,
+`libclntsh.so`, `LD_LIBRARY_PATH`, or OCI SDK install is required for the
+normal live-DB path.
 
-1. Pick a 23ai client matching the database's major release if the choice
-   is yours; the 21c / 23ai clients work fine against 19c databases too.
-2. Download from Oracle's Instant Client page (Basic + SDK packages):
-   <https://www.oracle.com/database/technologies/instant-client/linux-x86-64-downloads.html>.
-3. Unzip into a stable directory:
+Build from source with the pinned nightly:
 
-   ```sh
-   sudo mkdir -p /opt/oracle
-   sudo unzip instantclient-basic-linux.x64-23.x.0.0.0dbru.zip -d /opt/oracle/
-   sudo unzip instantclient-sdk-linux.x64-23.x.0.0.0dbru.zip -d /opt/oracle/
-   ```
+```sh
+cargo build -p plsql-mcp --release
+```
 
-4. Export the directory so the dynamic loader finds it. Pick one:
+Then verify the surface:
 
-   - **Per-shell (recommended for development):**
-     ```sh
-     export LD_LIBRARY_PATH="/opt/oracle/instantclient_23_8:$LD_LIBRARY_PATH"
-     ```
-     Persist in `~/.bashrc` / `~/.zshrc`.
+```sh
+plsql-mcp doctor
+plsql-mcp --robot-json capabilities
+```
 
-   - **System-wide:** `echo /opt/oracle/instantclient_23_8 | sudo tee /etc/ld.so.conf.d/oracle.conf && sudo ldconfig`.
-
-5. Verify with `plsql-mcp doctor`:
-
-   ```text
-   $ plsql-mcp doctor
-   plsql-mcp 0.1.0 (live-db: true, transport: stdio, safety: InspectOnly)
-   ...
-   [OK] MCP_DOCTOR_OK — plsql-mcp doctor: no blockers detected.
-   ```
-
-   Doctor reports the detected Instant Client path + version hint. If you
-   see `MCP_INSTANT_CLIENT_NOT_DETECTED`, recheck step 4.
-
-## 2. Wallet setup
+## 2. Wallet / TNS setup
 
 For Autonomous Database (and any other Oracle service that ships a wallet
 zip), prefer wallet-based auth. No password lives on the developer's
@@ -59,8 +39,10 @@ filesystem outside the wallet.
    export TNS_ADMIN="$HOME/oracle/wallets/prod"
    ```
 
-3. `tnsnames.ora` will already contain the connect aliases (`billing_high`,
-   `billing_low`, ...). Reference those by name in `connections.toml`.
+3. `tnsnames.ora` will already contain the connect aliases
+   (`billing_high`, `billing_low`, ...). Reference those by name in
+   `connections.toml` when your driver build supports TNS aliases; use
+   Easy Connect strings (`//host:port/service`) otherwise.
 
 ## 3. `~/.plsql-mcp/connections.toml`
 

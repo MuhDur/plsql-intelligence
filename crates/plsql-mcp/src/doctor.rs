@@ -1,14 +1,9 @@
 //! `plsql-mcp doctor` data shape.
 //!
-//! Wires the subcommand and report struct, plus Instant Client
-//! detection (path + version heuristic from `LD_LIBRARY_PATH`,
-//! `DYLD_LIBRARY_PATH`, and `ORACLE_HOME`), `OracleConnection`
-//! backend reporting (`rust-oracle` Apache-2.0 today, plus a
-//! placeholder for the future `oracle-rs` opt-in), and the `live-db`
-//! build-status row. Connection profile validation + audit-posture
-//! verification land in the live-DB layers.
+//! Wires the subcommand and report struct, `oraclemcp-db` backend reporting,
+//! and the `live-db` build-status row. Connection profile validation plus
+//! audit-posture verification land in the live-DB layers.
 
-use std::env;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -27,7 +22,7 @@ pub struct DoctorReport {
     pub active_safety_profile: SafetyProfile,
     pub registered_tool_count: usize,
     pub transport: String,
-    /// Detected Oracle Instant Client posture.
+    /// Legacy thick-driver compatibility posture.
     pub instant_client: InstantClientPosture,
     /// Selected `OracleConnection` backend.
     pub oracle_connection_backend: OracleConnectionBackendInfo,
@@ -116,7 +111,11 @@ pub struct AuditPosture {
     pub comment_marker_template: String,
 }
 
-/// What the doctor learned about the host's Oracle Instant Client install.
+/// Legacy thick-driver compatibility posture.
+///
+/// The normal `plsql-mcp` live-DB path routes through `oraclemcp-db`, which
+/// does not need Oracle Instant Client. These fields remain in the JSON report
+/// so older consumers do not break while C.6 retires the thick catalog driver.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InstantClientPosture {
     /// Whether the binary was built with the `live-db` Cargo feature.
@@ -130,20 +129,18 @@ pub struct InstantClientPosture {
     /// `instantclient_23_4` / `instantclient_19_25`).
     pub version_hint: Option<String>,
     /// Environment variables the binary inspected to find Instant Client.
-    /// Empty when the `live-db` feature is off.
+    /// Empty for the normal `oraclemcp-db` thin backend.
     pub inspected_env_vars: Vec<String>,
 }
 
 /// Which Oracle connection backend the binary will use.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OracleConnectionBackendInfo {
-    /// `rust-oracle` (Apache-2.0; depends on Instant Client) is the only
-    /// backend wired today. `oracle-rs` (BSD-3, mature later) is reserved
-    /// for D16's opt-in switch.
+    /// Backend crate boundary used by the live-DB runtime.
     pub name: String,
     /// Whether the backend is compiled into this binary.
     pub compiled_in: bool,
-    /// Free-form notes (e.g. "requires Oracle Instant Client at runtime").
+    /// Free-form notes for agent-facing remediation and inventory.
     pub notes: String,
 }
 
@@ -205,17 +202,6 @@ pub fn doctor_report_with_connections(
             ),
             remediation: Some(String::from(
                 "Rebuild with `cargo install plsql-mcp` (default features) or `cargo build --features live-db` to enable live-DB tools.",
-            )),
-        });
-    } else if instant_client.probable_path.is_none() {
-        findings.push(DoctorFinding {
-            code: String::from("MCP_INSTANT_CLIENT_NOT_DETECTED"),
-            severity: DoctorSeverity::Warning,
-            summary: String::from(
-                "live-DB feature is enabled but no Oracle Instant Client directory was detected on the library search path.",
-            ),
-            remediation: Some(String::from(
-                "Install Oracle Instant Client and set LD_LIBRARY_PATH (Linux) / DYLD_LIBRARY_PATH (macOS) to its lib directory; see docs/integrations/live-db/{linux,macos,windows}.md.",
             )),
         });
     }
@@ -389,67 +375,15 @@ fn derive_write_posture(registry: &ConnectionRegistry) -> Vec<ConnectionWritePos
         .collect()
 }
 
-/// Heuristically detect an Instant Client install from the host environment.
+/// Report the legacy Instant Client posture.
 ///
-/// Looks at, in order: `LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH`, then
-/// `ORACLE_HOME` (with the `lib` suffix appended). Picks the first
-/// directory whose final path component starts with `instantclient`,
-/// `instant_client`, or `instantclient_`. Returns a best-effort version
-/// hint extracted from the directory name (e.g. `instantclient_23_4` →
-/// `23_4`).
+/// The normal live-DB path uses `oraclemcp-db` and does not inspect client
+/// library paths. C.6 removes the remaining thick-driver compatibility path.
 #[must_use]
 fn detect_instant_client(live_db_feature_enabled: bool) -> InstantClientPosture {
-    if !live_db_feature_enabled {
-        return InstantClientPosture {
-            live_db_feature: false,
-            ..InstantClientPosture::default()
-        };
-    }
-
-    let inspected_env_vars = vec![
-        String::from("LD_LIBRARY_PATH"),
-        String::from("DYLD_LIBRARY_PATH"),
-        String::from("ORACLE_HOME"),
-    ];
-
-    let mut candidate_paths: Vec<PathBuf> = Vec::new();
-    for var in ["LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"] {
-        if let Ok(value) = env::var(var) {
-            for entry in value.split(':') {
-                if !entry.is_empty() {
-                    candidate_paths.push(PathBuf::from(entry));
-                }
-            }
-        }
-    }
-    if let Ok(home) = env::var("ORACLE_HOME") {
-        candidate_paths.push(PathBuf::from(home).join("lib"));
-    }
-
-    let mut probable_path = None;
-    let mut version_hint = None;
-    for path in candidate_paths {
-        if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-            let lower = name.to_ascii_lowercase();
-            if lower.starts_with("instantclient") || lower == "lib" {
-                if lower.starts_with("instantclient") {
-                    if let Some(version) = lower.strip_prefix("instantclient_") {
-                        if !version.is_empty() {
-                            version_hint = Some(version.to_string());
-                        }
-                    }
-                }
-                probable_path = Some(path);
-                break;
-            }
-        }
-    }
-
     InstantClientPosture {
-        live_db_feature: true,
-        probable_path,
-        version_hint,
-        inspected_env_vars,
+        live_db_feature: live_db_feature_enabled,
+        ..InstantClientPosture::default()
     }
 }
 
@@ -462,10 +396,10 @@ fn describe_oracle_backend(live_db_feature_enabled: bool) -> OracleConnectionBac
         };
     }
     OracleConnectionBackendInfo {
-        name: String::from("rust-oracle"),
+        name: String::from("oraclemcp-db"),
         compiled_in: true,
         notes: String::from(
-            "rust-oracle (Apache-2.0) — requires Oracle Instant Client at runtime. Future opt-in: oracle-rs (BSD-3) once it matures (D16).",
+            "oraclemcp-db 0.4.0 thin backend over oracledb; no Oracle Instant Client required for the normal live-DB path.",
         ),
     }
 }
@@ -670,35 +604,28 @@ mod tests {
     }
 
     #[test]
-    fn doctor_report_includes_instant_client_posture() {
+    fn doctor_report_keeps_legacy_instant_client_fields_quiet() {
         let report = doctor_report(&McpConfig::default(), &ToolRegistry::new());
-        // With the default-on `live-db` feature, the posture's
-        // `live_db_feature` bit should be true.
         assert_eq!(
             report.instant_client.live_db_feature,
             report.live_db_feature_enabled
         );
-        // Either we detected an Instant Client (path is Some) or we emitted
-        // the MCP_INSTANT_CLIENT_NOT_DETECTED warning. Exactly one of the two
-        // is consistent with this bead's acceptance.
-        let warning_present = report
-            .findings
-            .iter()
-            .any(|f| f.code == "MCP_INSTANT_CLIENT_NOT_DETECTED");
-        let path_present = report.instant_client.probable_path.is_some();
-        if report.live_db_feature_enabled {
-            assert!(
-                warning_present || path_present,
-                "live-db build must either detect Instant Client or warn that none was found"
-            );
-        }
+        assert!(report.instant_client.probable_path.is_none());
+        assert!(report.instant_client.version_hint.is_none());
+        assert!(report.instant_client.inspected_env_vars.is_empty());
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.code == "MCP_INSTANT_CLIENT_NOT_DETECTED")
+        );
     }
 
     #[test]
     fn doctor_report_names_oracle_connection_backend() {
         let report = doctor_report(&McpConfig::default(), &ToolRegistry::new());
         if report.live_db_feature_enabled {
-            assert_eq!(report.oracle_connection_backend.name, "rust-oracle");
+            assert_eq!(report.oracle_connection_backend.name, "oraclemcp-db");
             assert!(report.oracle_connection_backend.compiled_in);
         } else {
             assert_eq!(report.oracle_connection_backend.name, "none");

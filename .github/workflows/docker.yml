@@ -1,8 +1,8 @@
 name: Docker image (plsql-mcp)
 
 # Build the full PL/SQL Intelligence server image (live Oracle DB tools +
-# intelligence) with Oracle Instant Client bundled, and push it to GHCR
-# (ghcr.io/muhdur/plsql-mcp). The image carries the
+# intelligence) and push it to GHCR (ghcr.io/muhdur/plsql-mcp). The image
+# does not bundle Oracle Instant Client. It carries the
 # io.modelcontextprotocol.server.name label the MCP registry needs.
 on:
   push:

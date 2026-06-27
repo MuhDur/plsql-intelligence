@@ -2,22 +2,18 @@
 
 Sister of [`linux.md`](linux.md). Windows-specific notes only.
 
-## 1. Oracle Instant Client install (Windows)
+## 1. Binary setup
 
-1. Download the Basic + SDK packages for Windows x64 from
-   <https://www.oracle.com/database/technologies/instant-client/winx64-64-downloads.html>.
-2. Unzip into a stable directory, e.g. `C:\oracle\instantclient_23_8`.
-3. Add it to the system `PATH` (the dynamic loader on Windows uses `PATH`
-   rather than `LD_LIBRARY_PATH`):
+`plsql-mcp` uses the pure-Rust thin live-DB stack on Windows. No Oracle
+Instant Client directory, `OCI.dll`, SDK zip, or `PATH` loader entry is
+required for the normal live-DB path.
 
-   - Win+R → `sysdm.cpl` → Advanced → Environment Variables.
-   - Edit `Path` (User or System), add the Instant Client directory.
+Build from source with the pinned nightly:
 
-4. Re-open your terminal so the new `PATH` is picked up.
-5. Verify with `plsql-mcp doctor`. The `instant_client.probable_path` will
-   show the path *if* you also set `ORACLE_HOME` to the Instant Client
-   directory — the detection heuristic on Windows looks at `ORACLE_HOME\lib`
-   in addition to `PATH` entries. Setting `ORACLE_HOME` is recommended.
+```powershell
+cargo build -p plsql-mcp --release
+plsql-mcp.exe doctor
+```
 
 ## 2. Wallet setup
 
@@ -64,12 +60,8 @@ except `plsql-mcp.exe`.
 
 ## 5. Troubleshooting
 
-- "The code execution cannot proceed because OCI.dll was not found":
-  `PATH` does not include the Instant Client directory. Re-open the
-  terminal after editing `PATH`.
 - "ORA-12154 TNS:could not resolve the connect identifier":
   `TNS_ADMIN` is not set, or the alias is not in the `tnsnames.ora` in
   that directory.
-- For 32-bit Office / SQL Developer interop, install the 32-bit Instant
-  Client alongside the 64-bit one in a separate directory — `plsql-mcp`
-  (64-bit) ignores it.
+- Prefer an Easy Connect string (`//host:port/service`) while validating a
+  new setup; add wallet/TNS aliases once the server starts cleanly.

@@ -511,7 +511,7 @@ plsql-intelligence/
 │   ├── plsql-scan/             # Layer 3 product surface (SAST)
 │   ├── plsql-doc/              # Layer 3 product surface
 │   ├── plsql-bindgen/          # Layer 3 product surface
-│   ├── plsql-mcp/              # Layer 3 product surface — Apache-2.0 OR MIT MCP adapter; static-analysis tools always-on, live-DB tools behind `live-db` Cargo feature (default-on for binary, optional for library), change-impact tools in module `change_tools`; requires Oracle Instant Client at runtime when `live-db` enabled (§13A)
+│   ├── plsql-mcp/              # Layer 3 product surface — Apache-2.0 OR MIT MCP adapter; static-analysis tools always-on, live-DB tools behind `live-db` Cargo feature (default-on for binary, optional for library), change-impact tools in module `change_tools`; normal live path uses `oraclemcp-db` -> `oracledb` with no Instant Client requirement (§13A)
 │   ├── plsql-cicd/             # Layer 5 product surface
 │   └── plsql-subset/           # Future product — placeholder only
 ├── corpus/
@@ -2124,7 +2124,7 @@ The MCP server uses the standard Model Context Protocol: stdio transport by defa
 | `doc_lookup` | object id | rendered markdown documentation for the object (signatures, doc comments, examples) | `plsql-doc` |
 | `inspect_profile` | none | current `AnalysisProfile` (Oracle version, current schema, current edition, `PLSQL_CCFLAGS`, enabled roles, DB-link policy) | `plsql-engine` |
 
-**Live-DB connectivity tools** (`plsql-mcp`, Apache-2.0 OR MIT; available when `live-db` Cargo feature is enabled and Oracle Instant Client is present at runtime):
+**Live-DB connectivity tools** (`plsql-mcp`, Apache-2.0 OR MIT; available when the `live-db` Cargo feature is enabled; normal runtime connections use `oraclemcp-db` -> `oracledb` and do not require Oracle Instant Client):
 
 | Tool | Safety class | Input | Output / behavior |
 |------|--------------|-------|-------------------|
@@ -2208,9 +2208,9 @@ This means daemon mode (D17) is the natural backend for the MCP server. The MCP 
 
 **Trust Block in every response.** Every MCP tool response includes a `meta.trust_block` field carrying the same Trust Block payload as CLI / HTML / SARIF reports. Agents (or the human developer reading the agent's output) can see at a glance: parsed 94% clean, 7 opaque dynamic-SQL sites, catalog snapshot age, exact column lineage 72%. The brand promise that "every customer-visible report" includes the Trust Block (§1.5) applies to MCP responses identically.
 
-**Live-DB connectivity (foundation, Apache-2.0).** v0.10 absorbed the basic live-Oracle surface that the workspace's existing `oracle-mcp/server.py` had been providing. `plsql-mcp` ships a `live-db` Cargo feature (default-on for the binary, optional for the library — so static-analysis-only embedding remains possible). When `live-db` is enabled and Oracle Instant Client is present at runtime, the live-DB tool surface from §13A.2 becomes available. When `live-db` is disabled or Instant Client is missing, the binary still works (static-analysis tools always function) and the doctor subcommand reports the gap with a remediation hint.
+**Live-DB connectivity (foundation, Apache-2.0).** v0.10 absorbed the basic live-Oracle surface that the workspace's existing `oracle-mcp/server.py` had been providing. `plsql-mcp` ships a `live-db` Cargo feature (default-on for the binary, optional for the library — so static-analysis-only embedding remains possible). When `live-db` is enabled, the live-DB tool surface from §13A.2 becomes available through the published `oraclemcp-db` thin backend. When `live-db` is disabled, the binary still works (static-analysis tools always function) and the doctor subcommand reports the disabled feature explicitly.
 
-**Connection management.** Delegated to `plsql-catalog`'s existing `OracleConnection` abstraction (D16). Same connection backend `plsql-catalog extract` already uses for catalog snapshots. Supports TNS aliases, EZConnect, Oracle Wallet, `~/.dbtools` saved profiles, OCI IAM tokens, and mTLS — whatever the underlying Oracle crate supports. First-class interop target: reuse SQLcl / SQL Developer `~/.dbtools` connections verbatim so switching costs stay low. No `plsql-mcp`-specific credential store; no novel auth surface.
+**Connection management.** Runtime sessions are opened through `oraclemcp-db`; the `plsql-mcp` adapter maps that connection into the `plsql-catalog` `OracleConnection` trait for catalog-shaped loaders. Supports TNS aliases, EZConnect, Oracle Wallet, `~/.dbtools` saved profiles, OCI IAM tokens, and mTLS to the extent the `oraclemcp-db` / `oracledb` backend supports them. First-class interop target: reuse SQLcl / SQL Developer `~/.dbtools` connections verbatim so switching costs stay low. No `plsql-mcp`-specific credential store; no novel auth surface.
 
 **Credential storage.** `plsql-mcp` never persists credentials itself. Credentials live where they always live: in TNS / wallet / dbtools / OCI IAM. The MCP server reads what's already on the developer's machine. Matches the existing `oracle-mcp/server.py` pattern; keeps the security posture compatible with regulated shops (the credential surface is the developer's existing SQL Developer / SQL*Plus install, not a new attack surface).
 
@@ -2245,7 +2245,7 @@ Token is single-use, time-limited, and tied to the *exact* previewed DDL byte-fo
 
 **Permanently read-only connections.** A connection can be flagged `permanently_read_only = true` in `~/.plsql-mcp/connections.toml`. The hard guard refuses `enable_writes` and every write tool regardless of session state — operator confirmation cannot override it. Recommended for production database connections. Doctor subcommand prominently reports any connection without this flag set on a production-looking DSN (heuristic: hostname matches `*prod*`, `*production*`, or matches a configurable production allowlist).
 
-**Driver dependency.** `plsql-mcp`'s `live-db` feature pulls in the Oracle connection crate selected by D16 (`oracle` crate today, `oracle-rs` opt-in once mature, both behind the `OracleConnection` trait). The `oracle` crate requires Oracle Instant Client at runtime — `plsql-mcp doctor` reports Instant Client version + path and remediation hints if missing. No Instant Client bundling (Oracle's redistribution policy makes that impractical for permissive distribution); user installs Instant Client separately, documented per-platform in `docs/integrations/live-db/{linux,macos,windows}.md`.
+**Driver dependency.** `plsql-mcp`'s normal `live-db` feature pulls in the published `oraclemcp-db` connection layer, which uses the pure-Rust `oracledb` stack. The default `plsql-mcp` binary and Docker image do not require or bundle Oracle Instant Client. The legacy thick `oracle` / ODPI-C path remains only as a temporary catalog parity and live-XE compatibility path until C.6 retires it after the differential gate passes; doctor reports the active live backend as `oraclemcp-db`.
 
 **Boundary with the wider Track B Live-DB Oracle MCP.** v0.10 absorbs basic live-DB tools into `plsql-mcp`. What stays in Track B (separate project, out of scope here) is the *production-operations* surface: SIEM integration / external audit forwarders, OpenTelemetry distributed tracing, multi-tenant credential broker (federated SSO across many DBs), FedRAMP/HIPAA audit retention configuration, OCI IAM SSO federation, per-tenant rate limiting, fleet-visibility dashboard, compliance reporting. Those are operational features for fleet-wide deployment, not individual-developer agent use. §2.2 restates the boundary.
 
@@ -2270,7 +2270,7 @@ The crate / binary name is **`plsql-mcp`**, consistent with the rest of the `pls
 
 - Live-DB tools work against an Oracle XE 23ai container via the `make demo-oracle-xe` path (§6.2.8.1)
 - `cargo install plsql-mcp --no-default-features` produces a binary with live-DB tools disabled; static-analysis tools still function; doctor reports the `live-db` feature is off
-- With `live-db` enabled but Instant Client missing, doctor reports the gap with platform-specific install instructions; static-analysis tools still function
+- With `live-db` enabled, doctor reports the `oraclemcp-db` backend and does not require Instant Client; static-analysis tools still function independently of live connection configuration
 - If `~/.dbtools` contains saved SQLcl / SQL Developer connections, `list_connections` discovers them and `connect` can use them without copying credentials into a second store
 - `doctor` and `current_database` report the active safety profile; default live-DB profile is `inspect_only`
 - `enable_writes` refuses without an operator confirmation token; succeeds with one
@@ -2283,7 +2283,7 @@ The crate / binary name is **`plsql-mcp`**, consistent with the rest of the `pls
 
 **Cross-surface:**
 
-- Doctor subcommand (`plsql-mcp doctor`) passes a health check on a fresh install: protocol version negotiated, transport functional, engine cache reachable, `live-db` feature build-status, Instant Client version + path, `OracleConnection` backend (`oracle` crate / `oracle-rs`), active safety profile, default write-posture, `permanently_read_only` connections found in config
+- Doctor subcommand (`plsql-mcp doctor`) passes a health check on a fresh install: protocol version negotiated, transport functional, engine cache reachable, `live-db` feature build-status, live backend (`oraclemcp-db` over `oracledb`), active safety profile, default write-posture, `permanently_read_only` connections found in config
 - The `_meta.session.client_info` field is propagated from MCP client into `V$SESSION.ACTION` so DBAs auditing live-DB activity see *which* agent ran *which* tool
 - `docs/integrations/live-db/sqlcl-compatibility-matrix.md` ships with a dated feature matrix covering overlap, intentional divergence, and current capability gaps versus Oracle SQLcl MCP; refreshed before each release so market-facing copy does not drift
 
@@ -2310,7 +2310,7 @@ Layer-3 live-DB foundation work (depends on `plsql-catalog` OracleConnection, NO
 
 | Bead | Title | Depends | Effort |
 |------|-------|---------|--------|
-| `PLSQL-MCP-LIVE-001` | Author `plsql-mcp` `live-db` Cargo feature flag; default-on for binary, optional for library; doctor reports `live-db` build-status, Instant Client version + path, `OracleConnection` backend | MCP-001 + CAT-003 | S |
+| `PLSQL-MCP-LIVE-001` | Author `plsql-mcp` `live-db` Cargo feature flag; default-on for binary, optional for library; doctor reports `live-db` build-status and the `oraclemcp-db` live backend | MCP-001 + CAT-003 | S |
 | `PLSQL-MCP-LIVE-002` | Implement connection management tools (`list_connections`, `connect`, `disconnect`, `current_database`, `switch_database`) reusing `plsql-catalog`'s `OracleConnection` trait and first-class `~/.dbtools` interop | MCP-LIVE-001 + CAT-003 | M |
 | `PLSQL-MCP-LIVE-003` | Implement audit baseline: `DBMS_APPLICATION_INFO.SET_MODULE`, `V$SESSION.ACTION` from MCP client_info, `/* plsql-mcp $tool $session-id $agent-model */` statement marker, optional audit-table append | MCP-LIVE-002 | M |
 | `PLSQL-MCP-LIVE-004` | Implement `query` tool with structured row output, column metadata, LOB handling, and K18 prompt-injection sanitization (scrub MCP / tool-call markers in row values, emit `UnknownReason::ResponseSanitized` note) | MCP-LIVE-003 | M |
@@ -2326,10 +2326,10 @@ Layer-3 live-DB foundation work (depends on `plsql-catalog` OracleConnection, NO
 | `PLSQL-MCP-LIVE-014` | Implement `create_or_replace` (full DDL deployment under per-operation approval) | MCP-LIVE-011 | M |
 | `PLSQL-MCP-LIVE-015` | Implement `execute_approved` (run previously-previewed statement under token) and `deploy_ddl` (lock-free via `DBMS_SCHEDULER`, a one-shot `PLSQL_BLOCK` scheduler job) | MCP-LIVE-014 | M |
 | `PLSQL-MCP-LIVE-016` | Implement interactive schema-name confirmation for cross-schema write operations (operator must type the schema name verbatim) | MCP-LIVE-014 | S |
-| `PLSQL-MCP-LIVE-017` | Doctor subcommand: `live-db` feature build-status, Instant Client version + path, `OracleConnection` backend, write-posture per connection, `permanently_read_only` audit, production-DSN heuristic warnings | MCP-LIVE-008 + MCP-LIVE-009 | M |
+| `PLSQL-MCP-LIVE-017` | Doctor subcommand: `live-db` feature build-status, `oraclemcp-db` backend, write-posture per connection, `permanently_read_only` audit, production-DSN heuristic warnings | MCP-LIVE-008 + MCP-LIVE-009 | M |
 | `PLSQL-MCP-LIVE-018` | Integration test: every live-DB tool E2E against Oracle XE 23ai container; chained-flow test (preview → execute_approved); refusal tests (read-only-default, expired token, mismatched token, `permanently_read_only` block) | MCP-LIVE-007 + MCP-LIVE-016 + CAT-008 + LAB-007 | L |
 | `PLSQL-MCP-LIVE-019` | Hero demo (§1.4 DROP COLUMN) end-to-end via live-DB tools against the synthetic-lab Oracle XE deployment; golden-snapshot the full agent transcript | MCP-LIVE-018 + LAB-006 | M |
-| `PLSQL-MCP-LIVE-020` | Per-platform live-DB integration walkthroughs in `docs/integrations/live-db/{linux,macos,windows}.md` including Instant Client install steps, wallet setup, `permanently_read_only` examples, Claude Code / Cursor / Codex CLI config snippets | MCP-LIVE-017 | M |
+| `PLSQL-MCP-LIVE-020` | Per-platform live-DB integration walkthroughs in `docs/integrations/live-db/{linux,macos,windows}.md` covering thin-driver setup, wallet / connect-string setup, `permanently_read_only` examples, Claude Code / Cursor / Codex CLI config snippets | MCP-LIVE-017 | M |
 | `PLSQL-MCP-LIVE-021` | Author and maintain `docs/integrations/live-db/sqlcl-compatibility-matrix.md`: dated overlap / divergence / capability-gap matrix versus Oracle SQLcl MCP so README, docs, and sales copy stay source-backed | MCP-LIVE-020 | S |
 
 Change-impact tools (depends on Layer 4 lineage + Layer 5 CICD completion). These ship in `plsql-mcp` itself, in module `change_tools`; the `PLSQL-MCP-PRO-*` bead IDs are retained as immutable historical references:
@@ -2351,7 +2351,7 @@ Change-impact tools (depends on Layer 4 lineage + Layer 5 CICD completion). Thes
 - **MCP-D2: model-context-protocol library choice.** rust-mcp-sdk if mature enough, else hand-rolled minimal MCP impl in `plsql-mcp` itself. **Recommendation:** evaluate at MCP-002 spike; if the ecosystem library is solid, take it; otherwise hand-roll (the protocol is small).
 - **MCP-D3: how to expose the lab schema as a built-in MCP resource.** The MCP `resources/list` mechanism could let an agent enumerate the synthetic lab's source files for demos. **Recommendation:** ship as an opt-in `--enable-lab-resources` flag in `plsql-mcp`, not enabled by default (avoids surprising users who don't know they have lab content available).
 - **MCP-D4: per-tool rate limiting / cost annotation.** Some tools (`what_breaks` on a large changeset, `compare_oracle_deps` on a 500k-LOC estate) are expensive. Should the MCP response include estimated cost / latency hints so agents can plan? **Recommendation:** yes — add `meta.cost_estimate` per tool response from the start; cheap to ship, prevents bad agent behavior later.
-- **MCP-D5: live-DB driver backend.** `plsql-mcp`'s `live-db` feature needs an Oracle connection crate. Options: (a) `oracle` (kubo/rust-oracle, ODPI-C-based, sync, mature, requires Instant Client at runtime); (b) `oracle-rs` (stiang, pure-Rust TNS, async, single maintainer, immature as of v0.9); (c) both behind the `OracleConnection` trait selected at runtime. **Recommendation:** same shape as D16 — ship with `oracle` (Instant Client) as the default; abstract behind `OracleConnection`; light up `oracle-rs` as `--features oracle-rs` once it ships a stable release. Doctor reports which backend is in use. Note: this decision is downstream of D16; v0.10 makes `plsql-mcp` the highest-volume consumer of the connection layer, which may accelerate D16 closure.
+- **MCP-D5: live-DB driver backend.** Resolved for `plsql-mcp` by the 0.5.0 convergence: the normal `live-db` feature uses the published `oraclemcp-db` layer over the pure-Rust `oracledb` stack. The legacy `oracle` / ODPI-C path remains only for catalog parity and live-XE compatibility until C.6 removes it. Doctor reports which backend is in use.
 
 ---
 
@@ -3240,15 +3240,15 @@ Static lineage at first close. AWR/ASH correlation is a separate product layer.
 
 Project key `plsql-intelligence` is internal. Marketing name TBD. **Candidates:** `PLINQ` (PL/SQL Intelligence), `Atlas`, `Mantis`, `Lookout`. **Rejected:** `Codex` (taken by OpenAI), `PLOracle` (sounds Oracle-owned or Oracle-endorsed; invites trademark confusion). Founder decision; not blocking technical work.
 
-### D16 — Oracle connection crate `[OPEN, leaning `oracle` then migrate to `oracle-rs`; v0.10 elevates urgency]`
+### D16 — Oracle connection crate `[OPEN for catalog/bindgen; plsql-mcp live path resolved via oraclemcp-db]`
 
-For components that need a live Oracle connection (CI/CD cascade verify, subsetter, integration tests, **and after v0.10 the `plsql-mcp` `live-db` feature which is the highest-volume consumer**):
+For components that need a live Oracle connection (CI/CD cascade verify, subsetter, integration tests, and catalog extraction compatibility paths):
 
-1. **Use `oracle` crate** (kubo/rust-oracle, ODPI-C-based, sync) — mature, requires Oracle Instant Client at runtime
-2. **Use `oracle-rs`** (stiang, pure-Rust TNS, async, single maintainer) — strategic alignment with Rust async-Oracle thesis, but still early
-3. **Both behind an `OracleConnection` trait** — abstract over both; pick at compile time via Cargo features; runtime backend reported by `doctor`
+1. **Use `oraclemcp-db` / `oracledb` for `plsql-mcp` live sessions** — chosen by the 0.5.0 convergence; async `&Cx` boundary, no Instant Client requirement in the normal MCP path.
+2. **Keep the `oracle` crate temporarily for catalog parity** (kubo/rust-oracle, ODPI-C-based, sync) — mature, requires Oracle Instant Client at runtime, retired only after the C.6 parity gate.
+3. **Track `oracle-rs` / future thin alternatives for non-MCP consumers** — strategic alignment with Rust async-Oracle thesis, but not the default for this workspace until a passing capability matrix exists.
 
-**Recommendation:** start with `oracle` crate for stability behind the `OracleConnection` trait so `oracle-rs` becomes opt-in (`--features oracle-rs`) once it ships a stable release. Contribute upstream PRs to `oracle-rs` from real workloads.
+**Recommendation:** keep `plsql-mcp` on `oraclemcp-db`; keep the old `oracle` crate compiling only for parity until C.6; do not add new first-party direct driver dependencies outside an explicit adapter boundary.
 
 **Current signal (2026-05-12).** `cargo info` shows `oracle` at `0.6.3` and `oracle-rs` at `0.1.7`. That is strong enough to treat `oracle-rs` as real and worth tracking, but not strong enough to invert the default-backend recommendation.
 
@@ -3259,12 +3259,12 @@ For components that need a live Oracle connection (CI/CD cascade verify, subsett
 - working support for TNS / EZConnect / Wallet basics, LOBs, PL/SQL procedure calls, statement cancellation/timeouts, and the `compile_with_warnings` / `patch_package` flows
 - a passing compatibility matrix against the `OracleConnection` trait's required capability set
 
-**v0.10 amendment:** `plsql-mcp` (`live-db` feature) is now the primary external consumer of `OracleConnection` and is what drives this decision toward closure. Until D16 closes:
+**v0.5.0 convergence amendment:** `plsql-mcp` (`live-db` feature) is no longer a direct consumer of the old thick driver. Until D16/C.6 fully closes:
 
-- The `OracleConnection` trait MUST be implemented and stable in `plsql-catalog` from v0.10 onward, even if only one backend (`oracle` crate) is wired
-- `plsql-mcp` depends on `plsql-catalog`'s `OracleConnection` only — never on the underlying Oracle crate directly
-- Distribution implications (Oracle Instant Client runtime requirement) are documented in `docs/integrations/live-db/{linux,macos,windows}.md` (see MCP-LIVE-020)
-- The Instant Client redistribution question stays *not* solved by bundling — users install Instant Client separately. This preserves permissive licensing of the `plsql-mcp` binary (bundling Instant Client would create a licensing knot that contradicts §19's Apache-2.0 OR MIT row for `plsql-mcp`)
+- The `OracleConnection` trait remains stable in `plsql-catalog`; `plsql-mcp` adapts `oraclemcp-db` connections into that trait for catalog-shaped loaders.
+- `plsql-mcp` must not depend directly on the thick `oracle` crate in its default feature graph; live sessions route through `oraclemcp-db`.
+- Distribution docs state that the normal `plsql-mcp` binary and Docker image do not bundle or require Instant Client.
+- The remaining Instant Client requirement belongs only to the temporary `oracle-driver` / `live-xe` compatibility path until C.6 removes it.
 
 ### D17 — Cache and incremental analysis `[OPEN, foundation-level]`
 

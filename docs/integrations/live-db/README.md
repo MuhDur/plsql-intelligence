@@ -1,22 +1,24 @@
 # `plsql-mcp` live-DB integration
 
-Per-platform walkthroughs for the `live-db` feature of `plsql-mcp`. Pick
-the platform you're developing on:
+Per-platform walkthroughs for the `live-db` feature of `plsql-mcp`. The
+normal live-DB path uses the pure-Rust thin stack shared with `oraclemcp`
+(`oraclemcp-db` -> `oracledb`) and does not require Oracle Instant
+Client. Pick the platform you're developing on:
 
 - [Linux](linux.md)
 - [macOS](macos.md)
 - [Windows](windows.md)
 
-All three cover the same five steps:
+All three cover the same setup shape:
 
-1. Install Oracle Instant Client.
-2. Set up an Oracle wallet for credential-free auth.
+1. Build or install `plsql-mcp`.
+2. Configure Oracle connect strings / wallets where your estate uses them.
 3. Create `~/.plsql-mcp/connections.toml` with `permanently_read_only`
    for any production-looking connection.
 4. Wire `plsql-mcp serve` into Claude Code / Cursor / Codex CLI.
 5. Smoke-test through the agent.
 
-`plsql-mcp doctor` is the source of truth for build-status, Instant
-Client detection, audit posture, and per-connection write-posture. Run
-it after every install step; it returns a structured JSON report under
+`plsql-mcp doctor` is the source of truth for build status, live-DB
+feature posture, audit posture, and per-connection write posture. Run it
+after setup changes; it returns a structured JSON report under
 `--robot-json` so an agent can diagnose itself.

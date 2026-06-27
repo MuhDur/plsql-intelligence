@@ -1,41 +1,28 @@
 # `plsql-mcp` live-DB integration on macOS
 
-Sister of [`linux.md`](linux.md). macOS-specific notes only — refer to the
-Linux walkthrough for the shared conceptual setup (connections.toml,
-agent config, smoke test).
+Sister of [`linux.md`](linux.md). macOS-specific notes only — refer to
+the Linux walkthrough for the shared conceptual setup
+(`connections.toml`, agent config, smoke test).
 
-## 1. Oracle Instant Client install (macOS)
+## 1. Binary setup
 
-1. Apple Silicon (M-series) and Intel are both supported — pick the matching
-   ZIP from
-   <https://www.oracle.com/database/technologies/instant-client/macos-arm64-downloads.html>
-   (or `macos-intel64-downloads.html`).
-2. Quarantine: macOS Gatekeeper will refuse to load the `.dylib`s on first
-   use. After unzipping, run:
+`plsql-mcp` uses the same pure-Rust thin live-DB stack on Apple Silicon
+and Intel Macs. No Instant Client `.dylib`, `DYLD_LIBRARY_PATH`, or
+Gatekeeper quarantine step is required for the normal live-DB path.
 
-   ```sh
-   sudo xattr -dr com.apple.quarantine /opt/oracle/instantclient_23_8
-   ```
+Build from source with the pinned nightly:
 
-3. Set the runtime loader path:
-
-   ```sh
-   export DYLD_LIBRARY_PATH="/opt/oracle/instantclient_23_8:$DYLD_LIBRARY_PATH"
-   ```
-
-   System Integrity Protection scrubs `DYLD_LIBRARY_PATH` from subprocesses
-   under certain shells; if `plsql-mcp doctor` can't find the install, try
-   exporting both `DYLD_LIBRARY_PATH` and `DYLD_FALLBACK_LIBRARY_PATH`.
-
-4. Verify with `plsql-mcp doctor` — the `instant_client.probable_path`
-   field should be populated.
+```sh
+cargo build -p plsql-mcp --release
+plsql-mcp doctor
+```
 
 ## 2. Wallet setup
 
 Same as Linux: drop the wallet directory somewhere stable and point
 `TNS_ADMIN` at it. macOS-specific: tag with `xattr -dr` if the wallet zip
 came from a download you opened in Safari, otherwise Gatekeeper may
-refuse to read it during connection.
+refuse to read the wallet files during connection.
 
 ## 3. Editor / agent config
 
@@ -60,8 +47,7 @@ refuse to read it during connection.
 
 ## 4. Troubleshooting
 
-- `dlopen` errors typically mean DYLD path is scrubbed (SIP) or quarantine
-  was not cleared. `xattr` + `DYLD_FALLBACK_LIBRARY_PATH` resolves both.
-- For Apple Silicon, ensure the Instant Client zip you grabbed is the
-  `aarch64` build — Rosetta-translated x86_64 libs are unstable inside
-  long-running MCP servers.
+- If wallet files came from Safari and connections fail with file-access
+  errors, clear quarantine on the wallet directory with `xattr -dr`.
+- Prefer Easy Connect strings while validating a new setup; add wallet/TNS
+  aliases after `plsql-mcp doctor` is clean.

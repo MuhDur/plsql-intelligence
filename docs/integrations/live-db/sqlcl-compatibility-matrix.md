@@ -1,7 +1,7 @@
 # `plsql-mcp` vs Oracle SQLcl MCP — compatibility matrix
 
-> **Snapshot date:** 2026-05-15
-> **`plsql-mcp` version:** 0.1.0 (HEAD)
+> **Snapshot date:** 2026-06-27
+> **`plsql-mcp` version:** 0.5.0 convergence branch (HEAD)
 > **SQLcl MCP version:** Oracle SQLcl 24.4 / 25.x preview (Oracle's general
 > availability cadence — verify the exact build at oracle.com/sqlcl before
 > quoting public claims).
@@ -38,9 +38,9 @@ prefix across MCP servers.
 | `compile_with_warnings` + categorization | text-only                                   | ✅ — severe / performance / informational / other (`PLSQL-MCP-LIVE-010`) |
 | Connection management (`list_connections` / `connect` / `disconnect` / `current_database` / `switch_database`) | ✅ | ✅ (`PLSQL-MCP-LIVE-002`) |
 | `~/.dbtools` interop                    | ✅                                          | ✅ via `DbToolsAlias::probe` (`PLSQL-MCP-LIVE-002`) |
-| Oracle Wallet support                   | ✅                                          | ✅ via the underlying `rust-oracle` driver           |
-| Instant Client detection in doctor      | partial                                     | ✅ `instant_client.probable_path` + version hint (`PLSQL-MCP-LIVE-001`) |
-| `OracleConnection` backend choice        | SQLcl-internal                              | trait-isolated (`rust-oracle` Apache-2.0 today; `oracle-rs` reserved) |
+| Oracle Wallet support                   | ✅                                          | connection-string / wallet path support through the thin `oracledb` stack |
+| Instant Client requirement              | SQLcl ships its own runtime                 | ❌ no Instant Client in the normal `plsql-mcp` live-DB path |
+| `OracleConnection` backend choice        | SQLcl-internal                              | trait-isolated (`oraclemcp-db` -> `oracledb`; legacy thick path pending removal) |
 | Static-analysis tool surface             | ❌ (SQLcl is connectivity-first)            | ✅ — parser / catalog / depgraph / completeness + lineage / SAST / CICD / docs / bindings |
 | `what-breaks` / change classification    | ❌                                          | ✅ (`change_tools`)                                  |
 | `release_gate` / `recompile_plan`        | ❌                                          | ✅ (`change_tools`)                                  |
@@ -59,7 +59,7 @@ the matching bead lands.
 | Lineage `compare-oracle-deps` customer report        | `PLSQL-LIN-016`     | Implemented in commit `7c66451`; see lineage REPORT.md.         |
 | `patch_package` (targeted REPLACE-based edit)        | `PLSQL-MCP-LIVE-012`| Use `compile_with_warnings` after manual `CREATE OR REPLACE`.   |
 | TCP transport for remote sessions                     | `PLSQL-MCP-002`     | stdio works in every MCP client today; remote sessions deferred. |
-| Per-platform Instant Client install walkthroughs      | `PLSQL-MCP-LIVE-020`| Closed — `docs/integrations/live-db/{linux,macos,windows}.md`.  |
+| Per-platform thin-driver setup walkthroughs           | `oracle-plsql-converge-0lnu.10.5` | Updated — `docs/integrations/live-db/{linux,macos,windows}.md`. |
 
 ## Areas where `plsql-mcp` differs *intentionally*
 
