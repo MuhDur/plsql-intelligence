@@ -25,6 +25,7 @@ use thiserror::Error;
 use crate::create_or_replace::{CreateOrReplaceError, parse_target_schema};
 use crate::cross_schema::{
     CrossSchemaConfirmation, CrossSchemaError, require_cross_schema_confirmation,
+    schema_name_matches_target,
 };
 use crate::preview::{PreviewError, PreviewRegistry};
 
@@ -128,15 +129,15 @@ pub fn run_execute_approved(
     // operator-typed confirmation. An unqualified DDL header targets
     // the current schema, so the effective target is the principal.
     let parsed_schema = parse_target_schema(&verified.ddl_bytes)?;
-    let effective_target = parsed_schema
-        .map(|s| s.to_ascii_uppercase())
-        .unwrap_or_else(|| req.principal_schema.trim().to_ascii_uppercase());
+    // `parse_target_schema` returns Oracle dictionary identity: unquoted
+    // owners are upper-cased, quoted owners keep exact case.
+    let effective_target = parsed_schema.unwrap_or_else(|| req.principal_schema.trim().to_string());
 
     // The caller's `target_schema` is still validated: if it names a
     // schema, it must agree with the one the verified DDL actually
     // targets. An empty field means "caller did not specify".
     let caller_target = req.target_schema.trim();
-    if !caller_target.is_empty() && caller_target.to_ascii_uppercase() != effective_target {
+    if !caller_target.is_empty() && !schema_name_matches_target(caller_target, &effective_target) {
         return Err(ExecuteApprovedError::TargetSchemaMismatch {
             caller: caller_target.to_string(),
             ddl: effective_target,
@@ -250,6 +251,10 @@ mod tests {
         move || t.to_string()
     }
 
+    fn fixed_owned(t: String) -> impl FnOnce() -> String {
+        move || t
+    }
+
     fn approved_request(token: &str) -> ExecuteApprovedRequest {
         ExecuteApprovedRequest {
             connection: "billing-dev".into(),
@@ -354,6 +359,105 @@ mod tests {
         };
         let plan = run_execute_approved(&mut registry, req).unwrap();
         assert!(plan.cross_schema.confirmed);
+    }
+
+    #[test]
+    fn execute_approved_preserves_quoted_owner_case_for_cross_schema_guard() {
+        use crate::create_or_replace::{
+            CreateOrReplaceMode, CreateOrReplaceRequest, run_create_or_replace,
+        };
+
+        let quoted_owner_ddl = "CREATE OR REPLACE VIEW \"lower_owner\".V AS SELECT 1 FROM dual;";
+        let token = ["quoted", "owner", "approval"].join("-");
+        let mut registry = PreviewRegistry::new();
+        run_create_or_replace(
+            &mut registry,
+            CreateOrReplaceRequest {
+                connection: "quoted-dev".into(),
+                operation_summary: "replace quoted-owner view".into(),
+                ddl_bytes: quoted_owner_ddl.into(),
+                mode: CreateOrReplaceMode::DryRun,
+            },
+            fixed_owned(token.clone()),
+        )
+        .unwrap();
+
+        let err = run_execute_approved(
+            &mut registry,
+            ExecuteApprovedRequest {
+                connection: "quoted-dev".into(),
+                token: token.clone(),
+                ddl_bytes: quoted_owner_ddl.into(),
+                principal_schema: "BILLING".into(),
+                target_schema: "LOWER_OWNER".into(),
+                operator_typed_schema: Some("lower_owner".into()),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ExecuteApprovedError::TargetSchemaMismatch { .. }),
+            "uppercase caller target must not match quoted owner lower_owner: {err:?}"
+        );
+
+        let req = ExecuteApprovedRequest {
+            connection: "quoted-dev".into(),
+            token,
+            ddl_bytes: quoted_owner_ddl.into(),
+            principal_schema: "BILLING".into(),
+            target_schema: "lower_owner".into(),
+            operator_typed_schema: Some("lower_owner".into()),
+        };
+        let plan = run_execute_approved(&mut registry, req).unwrap();
+        assert!(matches!(
+            plan.cross_schema.decision,
+            crate::cross_schema::CrossSchemaDecision::CrossSchemaConfirmed {
+                target,
+                schema_typed,
+                ..
+            } if target == "lower_owner" && schema_typed == "lower_owner"
+        ));
+    }
+
+    #[test]
+    fn execute_approved_rejects_quoted_owner_confirmation_with_wrong_case() {
+        use crate::create_or_replace::{
+            CreateOrReplaceMode, CreateOrReplaceRequest, run_create_or_replace,
+        };
+
+        let quoted_owner_ddl = "CREATE OR REPLACE VIEW \"lower_owner\".V AS SELECT 1 FROM dual;";
+        let token = ["quoted", "owner", "case", "approval"].join("-");
+        let mut registry = PreviewRegistry::new();
+        run_create_or_replace(
+            &mut registry,
+            CreateOrReplaceRequest {
+                connection: "quoted-dev".into(),
+                operation_summary: "replace quoted-owner view".into(),
+                ddl_bytes: quoted_owner_ddl.into(),
+                mode: CreateOrReplaceMode::DryRun,
+            },
+            fixed_owned(token.clone()),
+        )
+        .unwrap();
+
+        let req = ExecuteApprovedRequest {
+            connection: "quoted-dev".into(),
+            token,
+            ddl_bytes: quoted_owner_ddl.into(),
+            principal_schema: "BILLING".into(),
+            target_schema: "lower_owner".into(),
+            operator_typed_schema: Some("LOWER_OWNER".into()),
+        };
+        let err = run_execute_approved(&mut registry, req).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ExecuteApprovedError::CrossSchema(CrossSchemaError::ConfirmationMismatch {
+                    ref typed,
+                    ref target,
+                }) if typed == "LOWER_OWNER" && target == "lower_owner"
+            ),
+            "quoted owner confirmation must be case-exact: {err:?}"
+        );
     }
 
     #[test]
