@@ -71,6 +71,15 @@ If that audit trail is missing, then you must act as if the operation never happ
 - **Errors:** `miette` for human diagnostics, `thiserror` for library errors. No `anyhow` except `main()`.
 - **Observability:** `tracing` with structured fields. Spans on every public API call.
 - **Async runtime:** Tokio for CLIs / daemon / I/O. Public library APIs stay sync-first unless explicitly documented async.
+- **asupersync/nightly bump runbook:** Treat the Rust nightly pin and
+  `asupersync` version as one coordinated bump. Before changing either,
+  re-check the current `oraclemcp`, `rust-oracledb`, `asupersync`, and
+  `oracledb` releases, then update `rust-toolchain.toml`, every CI/Docker
+  toolchain pin, and the future Phase-B `asupersync`/`oraclemcp-db`
+  dependency in one reviewed change. The current matched baseline is
+  `nightly-2026-05-11` with `asupersync 0.3.4`; Phase 0 documents this policy
+  only, and the exact direct/transitive dependency pin is verified when
+  `oraclemcp-db` lands in Phase B.
 
 ---
 
