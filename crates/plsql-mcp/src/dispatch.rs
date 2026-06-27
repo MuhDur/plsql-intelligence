@@ -49,7 +49,10 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use asupersync::Cx;
-use oraclemcp_core::{DispatchContext, DispatchFuture, ToolDispatch};
+use asupersync::cx::SubsetOf;
+use oraclemcp_core::{
+    DispatchContext, DispatchFuture, ReadPathCaps, RequestBudget, ToolDispatch, narrow_to_read_path,
+};
 use oraclemcp_error::{ErrorClass, ErrorEnvelope};
 
 use crate::{
@@ -155,8 +158,80 @@ impl ToolDispatch for PlsqlToolDispatch {
         name: &'a str,
         args: Value,
     ) -> DispatchFuture<'a> {
-        dispatch_tool(cx, context, name, args)
+        dispatch_tool(cx, PlsqlDispatchContext::from_cx(cx, context), name, args)
     }
+}
+
+/// `plsql-mcp`'s local dispatch context.
+///
+/// `oraclemcp-core` owns the public [`ToolDispatch`] trait and its transport
+/// [`DispatchContext`]. B.6 keeps that upstream contract intact while giving the
+/// PL/SQL dispatcher a local place to carry the adopted 0.4.0 request budget and
+/// read-path capability surface. Later Phase C/D work can consume this context
+/// without changing the MCP transport or forking the upstream trait.
+#[derive(Clone, Copy, Debug)]
+pub struct PlsqlDispatchContext<'a> {
+    core: DispatchContext<'a>,
+    request_budget: RequestBudget,
+}
+
+impl<'a> PlsqlDispatchContext<'a> {
+    /// Build a PL/SQL dispatch context from the upstream transport context plus
+    /// an explicit request budget.
+    #[must_use]
+    pub fn new(core: DispatchContext<'a>, request_budget: RequestBudget) -> Self {
+        Self {
+            core,
+            request_budget,
+        }
+    }
+
+    /// Adopt the currently installed Asupersync context budget at the
+    /// dispatch boundary. This only carries the budget; enforcement and query
+    /// timeout propagation stay with the later Phase D bead.
+    #[must_use]
+    pub fn from_cx(cx: &Cx, core: DispatchContext<'a>) -> Self {
+        Self::new(core, RequestBudget::from_budget(cx.budget()))
+    }
+
+    /// The upstream transport authorization context.
+    #[must_use]
+    pub fn core(self) -> DispatchContext<'a> {
+        self.core
+    }
+
+    /// Per-request budget captured from the Asupersync dispatch context.
+    #[must_use]
+    pub fn request_budget(self) -> RequestBudget {
+        self.request_budget
+    }
+
+    /// Narrow the supplied Asupersync context to the read-path capability row.
+    ///
+    /// The context value is passed in explicitly because the capability row is a
+    /// property of the runtime `Cx`, not of the transport metadata. Keeping the
+    /// helper here makes the Phase C read loaders consume the same dispatch
+    /// context that carries the request budget.
+    #[must_use]
+    pub fn narrow_to_read_path<Caps>(self, cx: &Cx<Caps>) -> Cx<ReadPathCaps>
+    where
+        ReadPathCaps: SubsetOf<Caps>,
+    {
+        narrow_dispatch_to_read_path(cx)
+    }
+}
+
+/// Narrow a dispatcher context to the read-path capability row.
+///
+/// This is intentionally a thin local wrapper around `oraclemcp-core`'s
+/// zero-cost type-level narrowing helper. It gives Phase C read loaders a
+/// `plsql-mcp` import point while preserving the upstream capability proof.
+#[must_use]
+pub fn narrow_dispatch_to_read_path<Caps>(cx: &Cx<Caps>) -> Cx<ReadPathCaps>
+where
+    ReadPathCaps: SubsetOf<Caps>,
+{
+    narrow_to_read_path(cx)
 }
 
 /// Every tool name with a dispatch arm. The single source of truth
@@ -266,7 +341,7 @@ fn parse_args<T: DeserializeOwned>(tool: &str, arguments: &Value) -> Result<T, D
 #[must_use]
 pub fn dispatch_tool<'a>(
     _cx: &'a Cx,
-    _context: DispatchContext<'a>,
+    _context: PlsqlDispatchContext<'a>,
     name: &'a str,
     arguments: Value,
 ) -> DispatchFuture<'a> {
@@ -492,10 +567,44 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let cx = Cx::current().expect("block_on installs a request Cx");
-            dispatch_tool(&cx, DispatchContext::default(), name, args)
+            let context = PlsqlDispatchContext::from_cx(&cx, DispatchContext::default());
+            dispatch_tool(&cx, context, name, args)
                 .await
                 .map_err(Box::new)
         })
+    }
+
+    #[test]
+    fn plsql_dispatch_context_carries_request_budget() {
+        let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().expect("block_on installs a request Cx");
+            let context = PlsqlDispatchContext::from_cx(&cx, DispatchContext::default());
+            let request_budget: crate::RequestBudget = context.request_budget();
+
+            assert_eq!(request_budget.budget(), cx.budget());
+        });
+    }
+
+    #[test]
+    fn read_path_caps_are_reachable_from_dispatch_context() {
+        let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().expect("block_on installs a request Cx");
+            let context = PlsqlDispatchContext::from_cx(&cx, DispatchContext::default());
+            let read_cx: Cx<crate::ReadPathCaps> = context.narrow_to_read_path(&cx);
+
+            fn assert_read_path(_: &Cx<crate::ReadPathCaps>) {}
+            assert_read_path(&read_cx);
+        });
     }
 
     #[test]

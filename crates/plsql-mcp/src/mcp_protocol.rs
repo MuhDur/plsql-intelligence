@@ -435,7 +435,7 @@ async fn handle_tools_call(
     cx: &Cx,
     context: DispatchContext<'_>,
 ) -> JsonRpcResponse {
-    use crate::dispatch::dispatch_tool;
+    use crate::dispatch::{PlsqlDispatchContext, dispatch_tool};
 
     let Some(params) = params else {
         return JsonRpcResponse::err(id, -32602, "tools/call requires params");
@@ -478,7 +478,8 @@ async fn handle_tools_call(
     // arguments into the tool's Request type and either runs the tool
     // (self-contained static analysis) or returns an honest ErrorEnvelope for
     // tools that need a live connection / loaded graph / preview session.
-    match dispatch_tool(cx, context, name, arguments).await {
+    let dispatch_context = PlsqlDispatchContext::from_cx(cx, context);
+    match dispatch_tool(cx, dispatch_context, name, arguments).await {
         Ok(structured) => {
             let mut result =
                 tool_result(&structured_text(name, &structured), false, Some(structured));

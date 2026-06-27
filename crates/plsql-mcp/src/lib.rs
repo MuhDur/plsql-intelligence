@@ -69,6 +69,10 @@ pub mod tcp;
 pub mod tools;
 pub mod trust;
 
+pub use oraclemcp_core::{
+    PrivilegedEffect, ReadPathCaps, RequestBudget, narrow_to_read_path, requires_privileged_effect,
+};
+
 pub use analyze_project::{
     AnalyzeProjectError, AnalyzeProjectRequest, AnalyzeProjectResponse,
     register_analyze_project_tool, run_analyze_project,
