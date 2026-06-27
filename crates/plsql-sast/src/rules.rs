@@ -1234,7 +1234,10 @@ impl Rule for Perf003IsNullOnIndexedColumn {
 mod tests {
     use super::*;
     use crate::{CompletenessSnapshot, ScanUnit, run_scan};
-    use plsql_ir::{FactProvenance, FactStore, FlowEnv, emit_flow_env_facts, mint_fact};
+    use plsql_ir::{
+        FactProvenance, FactStore, FlowEnv, FlowQuery, TaintSources, emit_flow_env_facts, mint_fact,
+    };
+    use serde::Serialize;
 
     fn prov() -> FactProvenance {
         FactProvenance {
@@ -1377,6 +1380,346 @@ mod tests {
                 shape,
             },
         )
+    }
+
+    #[derive(Debug, Serialize, PartialEq, Eq)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum SastEquivalenceRow {
+        Finding {
+            rule_id: String,
+            severity: Severity,
+            message: String,
+            file: String,
+            line: u32,
+            byte_span: (u32, u32),
+            confidence: String,
+            remediation: Option<String>,
+        },
+        Skip {
+            rule_id: String,
+            unit: String,
+            reason: crate::SkipReason,
+            detail: String,
+        },
+    }
+
+    #[derive(Debug, Serialize, PartialEq, Eq)]
+    struct SastReportProjection {
+        rules_run: usize,
+        rules_gated: usize,
+        rows: Vec<SastEquivalenceRow>,
+    }
+
+    fn project_report(report: &crate::ScanReport) -> SastReportProjection {
+        let mut rows = Vec::new();
+        rows.extend(
+            report
+                .findings
+                .iter()
+                .map(|finding| SastEquivalenceRow::Finding {
+                    rule_id: finding.rule_id.clone(),
+                    severity: finding.severity,
+                    message: finding.message.clone(),
+                    file: finding.location.file.clone(),
+                    line: finding.location.line,
+                    byte_span: finding.location.byte_span,
+                    confidence: format!("{:?}", finding.confidence.level),
+                    remediation: finding.remediation.clone(),
+                }),
+        );
+        rows.extend(report.skipped.iter().map(|skip| SastEquivalenceRow::Skip {
+            rule_id: skip.rule_id.clone(),
+            unit: skip.unit.clone(),
+            reason: skip.reason,
+            detail: skip.detail.clone(),
+        }));
+        SastReportProjection {
+            rules_run: report.rules_run,
+            rules_gated: report.rules_gated,
+            rows,
+        }
+    }
+
+    fn dynamic_sql_sites(facts: &FactStore) -> Vec<&str> {
+        facts
+            .by_kind(FactKind::DynamicSqlEvidence)
+            .filter_map(|fact| match &fact.payload {
+                FactPayload::DynamicSqlEvidence { site } => Some(site.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn opaque_sites(facts: &FactStore) -> std::collections::BTreeSet<&str> {
+        facts
+            .by_kind(FactKind::Opacity)
+            .filter_map(|fact| match &fact.payload {
+                FactPayload::Opacity {
+                    target_logical_id, ..
+                } => Some(target_logical_id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn legacy_sec001_output(ctx: &ScanContext<'_>) -> RuleOutput {
+        let rule = Sec001ExecuteImmediateInjection;
+        let mut out = RuleOutput::default();
+        let opaque = opaque_sites(ctx.facts);
+
+        for site in dynamic_sql_sites(ctx.facts) {
+            if opaque.contains(site) {
+                out = out.skip(ctx.skip(
+                    rule.id(),
+                    crate::SkipReason::OpaqueConstruct,
+                    &format!("dynamic-SQL site `{site}` is opaque; cannot prove safety"),
+                ));
+                continue;
+            }
+
+            let taint = ctx.flow.taint_of(site);
+            if taint.is_tainted {
+                let Some((taint_fact_id, _)) = taint_fact_for(ctx, site) else {
+                    out = out.skip(ctx.skip(
+                        rule.id(),
+                        crate::SkipReason::MissingFlowFacts,
+                        &format!("no TaintFact for dynamic-SQL site `{site}`"),
+                    ));
+                    continue;
+                };
+                let kinds = taint
+                    .kinds
+                    .iter()
+                    .map(|k| format!("{k:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let f = finding(
+                    rule.id(),
+                    rule.default_severity(),
+                    &format!(
+                        "Uncleansed tainted value ({kinds}) reaches EXECUTE IMMEDIATE at `{site}` \
+                         (TaintFact {})",
+                        taint_fact_id.0
+                    ),
+                    ctx.source_file,
+                    0,
+                    (0, 0),
+                );
+                out = out.finding(Finding {
+                    remediation: Some(
+                        "Bind user input with USING placeholders, or validate via \
+                         DBMS_ASSERT before concatenation."
+                            .to_string(),
+                    ),
+                    ..f
+                });
+                continue;
+            }
+
+            match ctx.flow.string_shape_of(site) {
+                Some(StringShape::Literal { .. }) | Some(StringShape::Empty) => {}
+                Some(StringShape::InterpolatedWithFix { .. }) | Some(StringShape::FullyOpaque) => {}
+                None => {
+                    out = out.skip(ctx.skip(
+                        rule.id(),
+                        crate::SkipReason::MissingFlowFacts,
+                        &format!("no StringShape/Taint facts for dynamic-SQL site `{site}`"),
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    fn legacy_sec002_output(ctx: &ScanContext<'_>) -> RuleOutput {
+        let rule = Sec002DbmsSqlParse;
+        let mut out = RuleOutput::default();
+        for fact in ctx.facts.by_kind(FactKind::Opacity) {
+            let FactPayload::Opacity {
+                target_logical_id,
+                reason,
+            } = &fact.payload
+            else {
+                continue;
+            };
+            if !reason.to_ascii_uppercase().contains("DBMS_SQL") {
+                continue;
+            }
+            let evidence = ctx
+                .flow
+                .string_shape_of(target_logical_id)
+                .and_then(|shape| {
+                    string_shape_fact_for(ctx, target_logical_id)
+                        .map(|(id, _)| format!("StringShapeFact {} ({shape:?})", id.0))
+                })
+                .unwrap_or_else(|| format!("OpacityFact {}", fact.id.0));
+            let f = finding(
+                rule.id(),
+                rule.default_severity(),
+                &format!(
+                    "DBMS_SQL dynamic SQL at `{target_logical_id}` is opaque to taint \
+                     analysis ({reason}); injection cannot be ruled out automatically \
+                     ({evidence})"
+                ),
+                ctx.source_file,
+                0,
+                (0, 0),
+            );
+            let mut downgraded = f;
+            downgraded.confidence = plsql_core::Confidence {
+                level: plsql_core::ConfidenceLevel::Medium,
+                explanation: Some(
+                    "opaque DBMS_SQL surface; injection unproven but unanalysable".to_string(),
+                ),
+            };
+            downgraded.remediation = Some(
+                "Prefer EXECUTE IMMEDIATE with USING binds, or bind every DBMS_SQL value \
+                 via DBMS_SQL.BIND_VARIABLE; manually review this site."
+                    .to_string(),
+            );
+            out = out.finding(downgraded);
+        }
+        out
+    }
+
+    fn legacy_scan(unit: &ScanUnit<'_>, facts: &FactStore) -> crate::ScanReport {
+        let ctx = ScanContext::new(
+            unit.unit_logical_id,
+            unit.source_file,
+            FlowQuery::new(unit.flow),
+            facts,
+        );
+        let mut report = crate::ScanReport::default();
+        for (rule_id, required_kind, output) in [
+            (
+                "SEC001",
+                FactKind::DynamicSqlEvidence,
+                legacy_sec001_output(&ctx),
+            ),
+            ("SEC002", FactKind::Opacity, legacy_sec002_output(&ctx)),
+        ] {
+            if facts.by_kind(required_kind).next().is_none() {
+                report.skipped.push(crate::RuleSkippedDiagnostic {
+                    rule_id: rule_id.to_string(),
+                    unit: "<analysis-run>".to_string(),
+                    reason: crate::SkipReason::MissingFlowFacts,
+                    detail: format!("no facts of required kind {required_kind:?}"),
+                });
+                report.rules_gated += 1;
+            } else {
+                report.rules_run += 1;
+                report.findings.extend(output.findings);
+                report.skipped.extend(output.skipped);
+            }
+        }
+        report
+    }
+
+    struct SastEquivalenceCase {
+        name: &'static str,
+        unit: &'static str,
+        source: &'static str,
+        user_input_names: &'static [&'static str],
+        dynamic_site: Option<&'static str>,
+        opacity: Option<(&'static str, &'static str)>,
+    }
+
+    fn build_sast_case(case: &SastEquivalenceCase) -> (FlowEnv, FactStore) {
+        let stmts = plsql_ir::lower_statement_body(case.source);
+        let env = plsql_ir::analyze_flow(
+            &stmts,
+            &TaintSources {
+                user_input_names: case
+                    .user_input_names
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
+                bind_names: vec![],
+            },
+        );
+        let mut facts = FactStore::default();
+        if let Some(site) = case.dynamic_site {
+            facts.push(dynsql_fact(site));
+        }
+        if let Some((target, reason)) = case.opacity {
+            facts.push(opacity_reason(target, reason));
+        }
+        emit_flow_env_facts(&mut facts, &prov(), case.unit, &env);
+        (env, facts)
+    }
+
+    #[test]
+    fn public_synthetic_sast_outputs_match_legacy_flow_oracle() -> Result<(), serde_json::Error> {
+        // Coverage mirrors corpus/synthetic/l2: no-bind EXECUTE IMMEDIATE,
+        // static EXECUTE IMMEDIATE, DBMS_ASSERT-sanitized EXECUTE IMMEDIATE,
+        // and DBMS_SQL opacity. Keep this floor monotone until the release-wide
+        // coverage_index seed lands.
+        const EXPECTED_EQUIVALENCE_CASES: usize = 4;
+        let cases = [
+            SastEquivalenceCase {
+                name: "pkg_execute_immediate.update_no_binds",
+                unit: "pkg_execute_immediate_demo.update_no_binds",
+                source: "v_sql := 'UPDATE invoices SET amount = ' || p_amount || ' WHERE id = ' || p_id;",
+                user_input_names: &["p_amount", "p_id"],
+                dynamic_site: Some("V_SQL"),
+                opacity: None,
+            },
+            SastEquivalenceCase {
+                name: "pkg_execute_immediate.truncate_static_string",
+                unit: "pkg_execute_immediate_demo.truncate_static_string",
+                source: "v_sql := 'TRUNCATE TABLE staging_invoices';",
+                user_input_names: &[],
+                dynamic_site: Some("V_SQL"),
+                opacity: None,
+            },
+            SastEquivalenceCase {
+                name: "pkg_dbms_assert.delete_from_table",
+                unit: "pkg_dbms_assert_demo.delete_from_table",
+                source: "v_sql := 'DELETE FROM ' || dbms_assert.sql_object_name(p_table);",
+                user_input_names: &["p_table"],
+                dynamic_site: Some("V_SQL"),
+                opacity: None,
+            },
+            SastEquivalenceCase {
+                name: "dbms_sql.parse_opaque_surface",
+                unit: "pkg_execute_immediate_demo.dbms_sql_surface",
+                source: "sql_text := 'SELECT * FROM ' || p_table;",
+                user_input_names: &["p_table"],
+                dynamic_site: None,
+                opacity: Some(("SQL_TEXT", "dynamic SQL via DBMS_SQL.PARSE")),
+            },
+        ];
+        assert_eq!(cases.len(), EXPECTED_EQUIVALENCE_CASES);
+
+        for case in cases {
+            let (env, facts) = build_sast_case(&case);
+            let units = [ScanUnit {
+                unit_logical_id: case.unit,
+                source_file: "corpus/synthetic/l2/equivalence.sql",
+                flow: &env,
+            }];
+            let legacy_unit = ScanUnit {
+                unit_logical_id: case.unit,
+                source_file: "corpus/synthetic/l2/equivalence.sql",
+                flow: &env,
+            };
+            let fact_rules: Vec<Box<dyn Rule>> = vec![
+                Box::new(Sec001ExecuteImmediateInjection),
+                Box::new(Sec002DbmsSqlParse),
+            ];
+            let fact_report = run_scan(
+                &fact_rules,
+                &units,
+                &facts,
+                &CompletenessSnapshot::default(),
+            );
+            let legacy_report = legacy_scan(&legacy_unit, &facts);
+
+            let fact_bytes = serde_json::to_string(&project_report(&fact_report))?;
+            let legacy_bytes = serde_json::to_string(&project_report(&legacy_report))?;
+            assert_eq!(fact_bytes, legacy_bytes, "case {}", case.name);
+        }
+        Ok(())
     }
 
     #[test]

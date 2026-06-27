@@ -3634,6 +3634,135 @@ mod tests {
         g
     }
 
+    fn equivalence_chain() -> (Dg, FactStore) {
+        let mut graph = Dg::new();
+        let make_node = |id: u64, lid: &str| -> DgNode {
+            DgNode::new(
+                DgNodeId::new(id),
+                LogicalObjectId::new(lid),
+                ObjectRevisionId::new(format!("rev:eq:{id}")),
+                QualifiedName::new(None, ObjectName::from(SymbolId::new(id + 200))),
+                NodeIdentityKind::Table,
+            )
+        };
+
+        graph.insert_node(make_node(1, "billing.customers"));
+        graph.insert_node(make_node(2, "billing.report_pkg"));
+        graph.insert_node(make_node(3, "billing.report_view"));
+        graph.insert_node(make_node(4, "billing.summary_job"));
+
+        let prov = || -> DgProvenance {
+            DgProvenance::new(
+                FileId::new(1),
+                Span::new(
+                    FileId::new(1),
+                    Position::new(1, 1, 0),
+                    Position::new(1, 5, 4),
+                ),
+                ResolutionStrategy::CatalogLookup,
+            )
+        };
+        let high = || DgConfidence::new(DgConfidenceLevel::High, None);
+
+        graph.insert_edge(
+            DgEdge::new(
+                DgEdgeId::new(11),
+                DgNodeId::new(2),
+                DgNodeId::new(1),
+                DgEdgeKind::Reads,
+                high(),
+            ),
+            prov(),
+            None,
+        );
+        graph.insert_edge(
+            DgEdge::new(
+                DgEdgeId::new(12),
+                DgNodeId::new(3),
+                DgNodeId::new(2),
+                DgEdgeKind::Reads,
+                high(),
+            ),
+            prov(),
+            None,
+        );
+        graph.insert_edge(
+            DgEdge::new(
+                DgEdgeId::new(13),
+                DgNodeId::new(4),
+                DgNodeId::new(3),
+                DgEdgeKind::Calls,
+                high(),
+            ),
+            prov(),
+            None,
+        );
+
+        let mut facts = FactStore::default();
+        facts.push(dependency_fact(
+            "billing.report_pkg",
+            "billing.customers",
+            "Reads",
+        ));
+        facts.push(dependency_fact(
+            "billing.report_view",
+            "billing.report_pkg",
+            "Reads",
+        ));
+        facts.push(dependency_fact(
+            "billing.summary_job",
+            "billing.report_view",
+            "Calls",
+        ));
+
+        (graph, facts)
+    }
+
+    fn lineage_result_bytes(result: &LineageResult) -> Result<String, serde_json::Error> {
+        serde_json::to_string(result)
+    }
+
+    #[test]
+    fn fact_backed_lineage_matches_depgraph_output_gate() -> Result<(), serde_json::Error> {
+        const EXPECTED_EQUIVALENCE_CASES: usize = 4;
+        let (graph, facts) = equivalence_chain();
+        let cases = [
+            (
+                "dependencies-unbounded",
+                lineage_result_bytes(&dependencies(&graph, &DgNodeId::new(4), None))?,
+                lineage_result_bytes(&dependencies_from_facts(
+                    &facts,
+                    "billing.summary_job",
+                    None,
+                ))?,
+            ),
+            (
+                "dependencies-max-depth",
+                lineage_result_bytes(&dependencies(&graph, &DgNodeId::new(4), Some(1)))?,
+                lineage_result_bytes(&dependencies_from_facts(
+                    &facts,
+                    "billing.summary_job",
+                    Some(1),
+                ))?,
+            ),
+            (
+                "impact-unbounded",
+                lineage_result_bytes(&impact(&graph, &DgNodeId::new(1), None))?,
+                lineage_result_bytes(&impact_from_facts(&facts, "billing.customers", None))?,
+            ),
+            (
+                "impact-max-depth",
+                lineage_result_bytes(&impact(&graph, &DgNodeId::new(1), Some(1)))?,
+                lineage_result_bytes(&impact_from_facts(&facts, "billing.customers", Some(1)))?,
+            ),
+        ];
+        assert_eq!(cases.len(), EXPECTED_EQUIVALENCE_CASES);
+        for (name, depgraph_bytes, fact_bytes) in cases {
+            assert_eq!(depgraph_bytes, fact_bytes, "case {name}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn dependencies_returns_direct_upstream() {
         let graph = dependency_fixture();
