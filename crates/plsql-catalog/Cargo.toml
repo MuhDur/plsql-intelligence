@@ -4,7 +4,6 @@ version = "0.1.0"
 description = "Offline-first Oracle catalog snapshot model for plsql-intelligence"
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 
 [features]
 default = []

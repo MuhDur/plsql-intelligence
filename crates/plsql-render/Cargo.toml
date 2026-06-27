@@ -4,7 +4,6 @@ version = "0.1.0"
 description = "Low-level HTML, Markdown, and SVG render helpers for plsql-intelligence"
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 
 [dependencies]
 tracing.workspace = true

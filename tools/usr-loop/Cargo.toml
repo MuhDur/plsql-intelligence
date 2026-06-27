@@ -2,7 +2,6 @@
 name = "usr-loop"
 version = "0.1.0"
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 description = "USR loop orchestrator: capture honest-uncertainty gaps from an Oracle estate (PLSQL-USR-001)"
 
