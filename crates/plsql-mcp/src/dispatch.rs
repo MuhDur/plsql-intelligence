@@ -57,12 +57,12 @@ use oraclemcp_error::{ErrorClass, ErrorEnvelope};
 
 use crate::{
     AnalyzeProjectRequest, CompileCheckRequest, CompletenessReportRequest, DocLookupRequest,
-    DynamicSqlEvidenceRequest, GetSymbolRequest, ParseFileRequest, PlsqlAnalyzeRequest,
+    DynamicSqlEvidenceRequest, GetSymbolRequest, ParseFileRequest, PlsqlAnalyzeRequest, QueryError,
     run_analyze_project, run_compile_check, run_completeness_report, run_doc_lookup,
     run_dynamic_sql_evidence, run_get_symbol, run_inspect_profile, run_parse_file,
     run_plsql_analyze,
 };
-use crate::{LiveDbRuntime, LiveRuntimeError, OraclemcpCatalogConnection};
+use crate::{ConnectionProfile, LiveDbRuntime, LiveRuntimeError, OraclemcpCatalogConnection};
 
 /// Why a dispatched tool could not run to completion in the pure
 /// protocol layer. Distinct from [`DispatchError`]: the tool *is*
@@ -374,8 +374,14 @@ pub fn dispatch_tool_with_runtime<'a>(
     Box::pin(async move {
         checkpoint(cx, name).map_err(|err| *err)?;
         match name {
+            "connect" => run_connect(cx, live_runtime, &arguments)
+                .await
+                .map_err(|err| *err),
             "list_connections" => run_list_connections(cx, live_runtime).map_err(|err| *err),
             "current_database" => run_current_database(cx, live_runtime)
+                .await
+                .map_err(|err| *err),
+            "query" => run_query_live(cx, live_runtime, &arguments)
                 .await
                 .map_err(|err| *err),
             _ => match dispatch_tool_outcome(name, &arguments) {
@@ -387,6 +393,89 @@ pub fn dispatch_tool_with_runtime<'a>(
             },
         }
     })
+}
+
+async fn run_connect(
+    cx: &Cx,
+    live_runtime: &mut LiveDbRuntime,
+    arguments: &Value,
+) -> Result<Value, Box<ErrorEnvelope>> {
+    let args: ConnectArgs =
+        parse_args("connect", arguments).map_err(|err| Box::new(err.into_envelope()))?;
+    let name = args.name.trim();
+    if name.is_empty() {
+        return Err(Box::new(invalid_arguments_envelope(
+            "connect",
+            "`name` must not be empty",
+        )));
+    }
+
+    if args.connect_string.is_none() {
+        let lease = live_runtime.activate(name).map_err(|err| {
+            if matches!(err, LiveRuntimeError::UnknownConnection { .. }) {
+                Box::new(invalid_arguments_envelope(
+                    "connect",
+                    "no existing live session has that name, and no `connect_string` was supplied",
+                ))
+            } else {
+                Box::new(live_runtime_error_envelope(err, "connect"))
+            }
+        })?;
+        return Ok(serde_json::json!({
+            "connected": true,
+            "reused_existing_session": true,
+            "active": name,
+            "lease": lease,
+            "connected_count": live_runtime.len(),
+        }));
+    }
+
+    let connect_string = args
+        .connect_string
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            Box::new(invalid_arguments_envelope(
+                "connect",
+                "`connect_string` must not be empty when supplied",
+            ))
+        })?;
+
+    let profile = ConnectionProfile {
+        name: String::from(name),
+        description: args.description.clone(),
+        connect_string: connect_string.clone(),
+        username: args.username.clone(),
+        permanently_read_only: args.permanently_read_only,
+        dbtools_alias: None,
+    };
+    let options = oraclemcp_db::OracleConnectOptions {
+        connect_string,
+        username: args.username,
+        password: args.password,
+        external_auth: args.external_auth,
+        ..oraclemcp_db::OracleConnectOptions::default()
+    };
+
+    checkpoint(cx, "connect")?;
+    let connection = oraclemcp_db::RustOracleConnection::connect(cx, options)
+        .await
+        .map_err(|err| Box::new(db_connection_error_envelope(err, "connect")))?;
+    checkpoint(cx, "connect")?;
+
+    let lease = live_runtime
+        .insert_and_activate(profile, Box::new(connection))
+        .map_err(|err| Box::new(live_runtime_error_envelope(err, "connect")))?;
+
+    Ok(serde_json::json!({
+        "connected": true,
+        "reused_existing_session": false,
+        "active": name,
+        "lease": lease,
+        "connected_count": live_runtime.len(),
+    }))
 }
 
 fn dispatch_tool_outcome(name: &str, arguments: &Value) -> Result<DispatchOutcome, DispatchError> {
@@ -591,6 +680,46 @@ async fn run_current_database(
     }))
 }
 
+async fn run_query_live(
+    cx: &Cx,
+    live_runtime: &LiveDbRuntime,
+    arguments: &Value,
+) -> Result<Value, Box<ErrorEnvelope>> {
+    let args: QueryArgs =
+        parse_args("query", arguments).map_err(|err| Box::new(err.into_envelope()))?;
+    crate::query::ensure_read_only_query(&args.sql)
+        .map_err(|err| Box::new(query_error_envelope(&err)))?;
+
+    let session = match args.connection.as_deref().map(str::trim) {
+        Some("") => {
+            return Err(Box::new(invalid_arguments_envelope(
+                "query",
+                "`connection`, when supplied, must not be empty",
+            )));
+        }
+        Some(connection) => live_runtime
+            .session(connection)
+            .map_err(|err| Box::new(live_runtime_error_envelope(err, "query")))?,
+        None => live_runtime
+            .active_session()
+            .map_err(|err| Box::new(live_runtime_error_envelope(err, "query")))?,
+    };
+
+    let adapter =
+        OraclemcpCatalogConnection::new(BorrowedOracleConnection::new(session.connection()));
+    checkpoint(cx, "query")?;
+    let rows = adapter
+        .query_rows(cx, &args.sql, &[])
+        .await
+        .map_err(|err| Box::new(query_error_envelope(&QueryError::Backend(err))))?;
+    checkpoint(cx, "query")?;
+    Ok(serde_json::to_value(crate::query::query_response_from_rows(
+        rows,
+        args.lob_truncation_chars,
+    ))
+    .unwrap_or(Value::Object(Default::default())))
+}
+
 struct BorrowedOracleConnection<'a> {
     inner: &'a dyn oraclemcp_db::OracleConnection,
 }
@@ -669,7 +798,12 @@ fn checkpoint(cx: &Cx, tool: &str) -> Result<(), Box<ErrorEnvelope>> {
 fn live_runtime_error_envelope(err: LiveRuntimeError, tool: &str) -> ErrorEnvelope {
     match err {
         LiveRuntimeError::NoActiveConnection | LiveRuntimeError::UnknownConnection { .. } => {
-            runtime_state_envelope(RuntimeKind::SessionState, tool)
+            let kind = if matches!(tool, "query") {
+                RuntimeKind::LiveConnection
+            } else {
+                RuntimeKind::SessionState
+            };
+            runtime_state_envelope(kind, tool)
         }
         LiveRuntimeError::StaleLease { .. } => {
             ErrorEnvelope::new(ErrorClass::LeaseRequired, format!("{err}"))
@@ -677,6 +811,31 @@ fn live_runtime_error_envelope(err: LiveRuntimeError, tool: &str) -> ErrorEnvelo
         }
         other => ErrorEnvelope::new(ErrorClass::Internal, other.to_string()),
     }
+}
+
+fn invalid_arguments_envelope(tool: &str, detail: &str) -> ErrorEnvelope {
+    ErrorEnvelope::new(
+        ErrorClass::InvalidArguments,
+        format!("invalid arguments for tool `{tool}`: {detail}"),
+    )
+    .with_next_step(format!(
+        "Inspect `{tool}`'s inputSchema in tools/list and supply the required fields."
+    ))
+}
+
+fn db_connection_error_envelope(err: oraclemcp_db::DbError, tool: &str) -> ErrorEnvelope {
+    ErrorEnvelope::new(
+        ErrorClass::ConnectionFailed,
+        format!("{tool} could not open an Oracle session: {err}"),
+    )
+    .with_suggested_tool("connect")
+    .with_next_step(
+        "Verify the connect_string, username/password or external-auth settings, then retry connect.",
+    )
+}
+
+fn query_error_envelope(err: &QueryError) -> ErrorEnvelope {
+    err.to_envelope(None, &[])
 }
 
 fn runtime_state_envelope(kind: RuntimeKind, tool: &str) -> ErrorEnvelope {
@@ -716,14 +875,35 @@ fn ran<T: serde::Serialize>(response: &T) -> DispatchOutcome {
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct QueryArgs {
-    #[allow(dead_code)]
     sql: String,
     #[serde(default)]
-    #[allow(dead_code)]
     connection: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
     lob_truncation_chars: Option<usize>,
+}
+
+/// Argument shape for `connect`.
+///
+/// D.3 keeps this intentionally explicit: a name-only call re-activates an
+/// existing in-process session, while opening a new session requires the
+/// connect material in this request. Profile-file secret resolution lands in a
+/// later loader bead; this path must not invent an implicit credential source.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectArgs {
+    name: String,
+    #[serde(default)]
+    connect_string: Option<String>,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    permanently_read_only: bool,
+    #[serde(default)]
+    external_auth: bool,
 }
 
 /// Argument shape for `deploy_ddl` — validates the two fields the
@@ -741,6 +921,7 @@ struct DeployDdlArgs {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
 
     fn dispatch_for_test(name: &str, args: Value) -> Result<Value, Box<ErrorEnvelope>> {
         let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
@@ -755,6 +936,114 @@ mod tests {
                 .await
                 .map_err(Box::new)
         })
+    }
+
+    fn dispatch_with_runtime_for_test(
+        name: &str,
+        args: Value,
+        live_runtime: &mut LiveDbRuntime,
+    ) -> Result<Value, Box<ErrorEnvelope>> {
+        let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().expect("block_on installs a request Cx");
+            let context = PlsqlDispatchContext::from_cx(&cx, DispatchContext::default());
+            dispatch_tool_with_runtime(&cx, context, live_runtime, name, args)
+                .await
+                .map_err(Box::new)
+        })
+    }
+
+    fn live_profile(name: &str) -> ConnectionProfile {
+        ConnectionProfile {
+            name: String::from(name),
+            description: Some(String::from("test profile")),
+            connect_string: String::from("//localhost/FREEPDB1"),
+            username: Some(String::from("system")),
+            permanently_read_only: false,
+            dbtools_alias: None,
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct RecordingOracleConnection {
+        queries: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingOracleConnection {
+        fn new() -> Self {
+            Self {
+                queries: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn observed_queries(&self) -> Vec<String> {
+            self.queries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl oraclemcp_db::OracleConnection for RecordingOracleConnection {
+        fn backend(&self) -> oraclemcp_db::OracleBackend {
+            oraclemcp_db::OracleBackend::RustOracle
+        }
+
+        async fn ping(&self, _cx: &Cx) -> Result<(), oraclemcp_db::DbError> {
+            Ok(())
+        }
+
+        async fn describe(
+            &self,
+            _cx: &Cx,
+        ) -> Result<oraclemcp_db::OracleConnectionInfo, oraclemcp_db::DbError> {
+            Ok(oraclemcp_db::OracleConnectionInfo {
+                backend: Some(oraclemcp_db::OracleBackend::RustOracle),
+                current_schema: Some(String::from("SYSTEM")),
+                server_version: Some(String::from("23ai")),
+                ..oraclemcp_db::OracleConnectionInfo::default()
+            })
+        }
+
+        async fn query_rows(
+            &self,
+            _cx: &Cx,
+            sql: &str,
+            _binds: &[oraclemcp_db::OracleBind],
+        ) -> Result<Vec<oraclemcp_db::OracleRow>, oraclemcp_db::DbError> {
+            self.queries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(String::from(sql));
+            Ok(vec![oraclemcp_db::OracleRow {
+                columns: vec![(
+                    String::from("VAL"),
+                    oraclemcp_db::OracleCell::new("NUMBER", Some(String::from("1"))),
+                )],
+            }])
+        }
+
+        async fn execute(
+            &self,
+            _cx: &Cx,
+            _sql: &str,
+            _binds: &[oraclemcp_db::OracleBind],
+        ) -> Result<u64, oraclemcp_db::DbError> {
+            Ok(0)
+        }
+
+        async fn commit(&self, _cx: &Cx) -> Result<(), oraclemcp_db::DbError> {
+            Ok(())
+        }
+
+        async fn rollback(&self, _cx: &Cx) -> Result<(), oraclemcp_db::DbError> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -921,6 +1210,48 @@ mod tests {
         let err = dispatch_for_test("query", json!({"sql": "SELECT 1 FROM dual"})).unwrap_err();
         assert_eq!(err.error_class, ErrorClass::RuntimeStateRequired);
         assert_eq!(err.suggested_tool.as_deref(), Some("connect"));
+    }
+
+    #[test]
+    fn connect_without_existing_session_is_invalid_arguments_not_runtime_state_required() {
+        let mut live_runtime = LiveDbRuntime::new();
+        let err =
+            dispatch_with_runtime_for_test("connect", json!({"name": "dev"}), &mut live_runtime)
+                .unwrap_err();
+        assert_eq!(err.error_class, ErrorClass::InvalidArguments);
+        assert!(
+            err.message.contains("connect_string"),
+            "connect must explain the missing connect material: {err:?}"
+        );
+    }
+
+    #[test]
+    fn query_after_connect_uses_active_upstream_session() {
+        let mut live_runtime = LiveDbRuntime::new();
+        let connection = RecordingOracleConnection::new();
+        let observed = connection.clone();
+        live_runtime
+            .insert_connected(live_profile("dev"), Box::new(connection))
+            .expect("stub session inserts");
+
+        let connected =
+            dispatch_with_runtime_for_test("connect", json!({"name": "dev"}), &mut live_runtime)
+                .expect("connect activates existing live session");
+        assert_eq!(connected["connected"], true);
+        assert_eq!(connected["active"], "dev");
+
+        let result = dispatch_with_runtime_for_test(
+            "query",
+            json!({"sql": "SELECT 1 AS val FROM dual"}),
+            &mut live_runtime,
+        )
+        .expect("query runs through live runtime");
+        assert_eq!(result["columns"][0]["name"], "VAL");
+        assert_eq!(result["rows"][0]["cells"][0]["value"], "1");
+        assert_eq!(
+            observed.observed_queries(),
+            vec!["SELECT 1 AS val FROM dual"]
+        );
     }
 
     #[test]

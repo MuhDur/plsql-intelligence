@@ -329,11 +329,25 @@ pub fn register_safety_tools(registry: &mut ToolRegistry) {
         ),
     ];
     for (name, summary) in descriptors {
-        registry.register(ToolDescriptor::new(
-            name,
-            ToolTier::FoundationLiveDb,
-            summary,
-        ));
+        let descriptor = ToolDescriptor::new(name, ToolTier::FoundationLiveDb, summary);
+        let descriptor = match name {
+            "connect" => descriptor.with_input_schema(serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["name"],
+                    "properties": {
+                        "name": {"type": "string", "description": "Stable in-process connection name to activate."},
+                        "connect_string": {"type": ["string", "null"], "description": "Oracle Net connect identifier. Required when opening a new session; omitted when re-activating an existing live session."},
+                        "username": {"type": ["string", "null"], "description": "Oracle username, or null for wallet/external authentication."},
+                        "password": {"type": ["string", "null"], "description": "Oracle password for this request. Never returned in responses."},
+                        "description": {"type": ["string", "null"], "description": "Optional operator-facing profile description."},
+                        "permanently_read_only": {"type": "boolean", "default": false, "description": "When true, this session refuses enable_writes for its lifetime."},
+                        "external_auth": {"type": "boolean", "default": false, "description": "Use external/wallet authentication instead of password auth."}
+                    }
+                })),
+            _ => descriptor,
+        };
+        registry.register(descriptor);
     }
 }
 

@@ -48,6 +48,13 @@ fn call(server: &mut PlsqlMcpServer, line: &str) -> serde_json::Value {
     serde_json::to_value(&resp).expect("response serializes")
 }
 
+fn call_json(server: &mut PlsqlMcpServer, request: serde_json::Value) -> serde_json::Value {
+    call(
+        server,
+        &serde_json::to_string(&request).expect("request serializes"),
+    )
+}
+
 #[test]
 fn scripted_session_golden_invariants() {
     let mut server = server(foundation_registry());
@@ -184,6 +191,68 @@ fn tools_call_live_db_tool_returns_an_honest_gated_result_over_the_wire() {
     assert!(
         text.contains("connection") || text.contains("live-db"),
         "gated message names the missing runtime: {text}"
+    );
+}
+
+#[test]
+#[ignore = "requires local plsql-intelligence-xe at localhost:1521/FREEPDB1"]
+fn live_xe_connect_then_query_hits_oracle_over_the_wire() {
+    let mut server = server(default_tool_registry());
+
+    let connected = call_json(
+        &mut server,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 70,
+            "method": "tools/call",
+            "params": {
+                "name": "connect",
+                "arguments": {
+                    "name": "xe-system",
+                    "connect_string": "//localhost:1521/FREEPDB1",
+                    "username": "SYSTEM",
+                    "password": "DemoPlsqlIntel#2026",
+                    "description": "local XE smoke test",
+                    "permanently_read_only": true
+                }
+            }
+        }),
+    );
+    assert!(
+        connected["error"].is_null(),
+        "connect must open a real oraclemcp-db session: {connected}"
+    );
+    assert_eq!(connected["result"]["structuredContent"]["connected"], true);
+    assert_eq!(
+        connected["result"]["structuredContent"]["active"],
+        "xe-system"
+    );
+
+    let queried = call_json(
+        &mut server,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 71,
+            "method": "tools/call",
+            "params": {
+                "name": "query",
+                "arguments": {
+                    "sql": "SELECT 1 AS val FROM dual"
+                }
+            }
+        }),
+    );
+    assert!(
+        queried["error"].is_null(),
+        "query must run through the active live session: {queried}"
+    );
+    assert_eq!(
+        queried["result"]["structuredContent"]["columns"][0]["name"],
+        "VAL"
+    );
+    assert_eq!(
+        queried["result"]["structuredContent"]["rows"][0]["cells"][0]["value"],
+        "1"
     );
 }
 

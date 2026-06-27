@@ -123,12 +123,24 @@ pub fn run_query<C: OracleConnection>(
     params: &[OracleBind],
     lob_truncation_chars: Option<usize>,
 ) -> Result<QueryResponse, QueryError> {
-    if !is_read_only_sql(sql) {
-        return Err(QueryError::NotReadOnly {
-            preview: preview_sql(sql),
-        });
-    }
+    ensure_read_only_query(sql)?;
     let raw_rows = conn.query_rows(sql, params)?;
+    Ok(query_response_from_rows(raw_rows, lob_truncation_chars))
+}
+
+pub(crate) fn ensure_read_only_query(sql: &str) -> Result<(), QueryError> {
+    if is_read_only_sql(sql) {
+        return Ok(());
+    }
+    Err(QueryError::NotReadOnly {
+        preview: preview_sql(sql),
+    })
+}
+
+pub(crate) fn query_response_from_rows(
+    raw_rows: Vec<OracleRow>,
+    lob_truncation_chars: Option<usize>,
+) -> QueryResponse {
     let columns = extract_column_metadata(&raw_rows);
     let mut response = QueryResponse {
         columns: columns.clone(),
@@ -170,7 +182,7 @@ pub fn run_query<C: OracleConnection>(
             .unknown_reasons
             .push(UnknownReason::ResponseSanitized);
     }
-    Ok(response)
+    response
 }
 
 fn extract_column_metadata(rows: &[OracleRow]) -> Vec<QueryColumnMeta> {
