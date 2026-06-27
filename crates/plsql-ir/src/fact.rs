@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::DeclId;
+use crate::flow::{ConstantValue, StringShape, TaintCleanser, TaintKind, ValueSet};
 
 /// Stable identity for a fact — `fact:<hex>` form.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
@@ -41,7 +42,7 @@ pub struct FactId(pub String);
 
 /// What family a fact belongs to. Drives consumer dispatch
 /// without having to match the payload.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FactKind {
     Declaration,
@@ -52,6 +53,11 @@ pub enum FactKind {
     Opacity,
     ResolutionReport,
     Privilege,
+    ConstantValue,
+    ValueSet,
+    StringShape,
+    Taint,
+    Sanitizer,
     ExceptionHandler,
     CursorForLoop,
     MissingInstrumentation,
@@ -130,6 +136,44 @@ pub enum FactPayload {
         grantee: String,
         privilege: String,
         on: String,
+    },
+    /// A variable/expression with a compile-time constant value in the
+    /// flow lattice. `name` is normalized to the analyzer's semantic
+    /// identifier for that value inside `unit_logical_id`.
+    ConstantValue {
+        unit_logical_id: String,
+        name: String,
+        value: ConstantValue,
+    },
+    /// A variable/expression whose possible values are bounded by
+    /// the flow lattice. `ValueSet::Top` is intentionally not
+    /// emitted: absence of this fact means "unbounded/unmeasured",
+    /// not safety.
+    ValueSet {
+        unit_logical_id: String,
+        name: String,
+        value_set: ValueSet,
+    },
+    /// The string-shape abstraction for a variable/expression.
+    /// SAST and lineage can consume this without re-walking the raw
+    /// expression tree.
+    StringShape {
+        unit_logical_id: String,
+        name: String,
+        shape: StringShape,
+    },
+    /// Live taint kinds flowing into a variable/expression.
+    Taint {
+        unit_logical_id: String,
+        name: String,
+        kinds: Vec<TaintKind>,
+    },
+    /// Sanitizers observed in a value's derivation. This is evidence
+    /// for reports; it is never proof of safety by itself.
+    Sanitizer {
+        unit_logical_id: String,
+        name: String,
+        cleansed_by: Vec<TaintCleanser>,
     },
     /// An `EXCEPTION WHEN ... THEN ...` handler. `scope` is the
     /// caught condition (`others` or a named exception); `body_class`
@@ -266,6 +310,11 @@ impl FactPayload {
             FactPayload::Opacity { .. } => FactKind::Opacity,
             FactPayload::ResolutionReport { .. } => FactKind::ResolutionReport,
             FactPayload::Privilege { .. } => FactKind::Privilege,
+            FactPayload::ConstantValue { .. } => FactKind::ConstantValue,
+            FactPayload::ValueSet { .. } => FactKind::ValueSet,
+            FactPayload::StringShape { .. } => FactKind::StringShape,
+            FactPayload::Taint { .. } => FactKind::Taint,
+            FactPayload::Sanitizer { .. } => FactKind::Sanitizer,
             FactPayload::ExceptionHandler { .. } => FactKind::ExceptionHandler,
             FactPayload::CursorForLoop { .. } => FactKind::CursorForLoop,
             FactPayload::MissingInstrumentation { .. } => FactKind::MissingInstrumentation,
@@ -333,7 +382,7 @@ pub struct FactStore {
 impl FactStore {
     pub fn push(&mut self, fact: Fact) -> FactId {
         let id = fact.id.clone();
-        if !self.facts.iter().any(|f| f.id == id) {
+        if !self.facts.iter().any(|f| f.id.cmp(&id).is_eq()) {
             self.facts.push(fact);
         }
         id
@@ -341,7 +390,7 @@ impl FactStore {
 
     /// Filter by family.
     pub fn by_kind(&self, kind: FactKind) -> impl Iterator<Item = &Fact> {
-        self.facts.iter().filter(move |f| f.kind == kind)
+        self.facts.iter().filter(move |f| f.kind.cmp(&kind).is_eq())
     }
 
     #[must_use]

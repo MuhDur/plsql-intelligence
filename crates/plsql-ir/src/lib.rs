@@ -56,7 +56,8 @@ pub use expr::{Expr, NameRef, UnknownExprReason, lower_expression};
 pub use fact::{Fact, FactId, FactKind, FactPayload, FactProvenance, FactStore, mint_fact};
 pub use fact_emit::{
     emit_call_facts, emit_declaration_facts, emit_declarations_from, emit_dynamic_sql_facts,
-    emit_privilege_facts, emit_reference_facts, emit_unknown_facts,
+    emit_flow_env_facts, emit_flow_facts, emit_privilege_facts, emit_reference_facts,
+    emit_unknown_facts,
 };
 pub use flow::{ConstantValue, StringShape, Taint, TaintCleanser, TaintKind, ValueFlow, ValueSet};
 pub use flow_inter::{

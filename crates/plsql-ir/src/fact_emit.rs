@@ -34,6 +34,8 @@ use std::collections::BTreeSet;
 use crate::DeclId;
 use crate::calls::CallSite;
 use crate::fact::{FactPayload, FactProvenance, FactStore};
+use crate::flow::{ValueFlow, ValueSet};
+use crate::flow_intra::FlowEnv;
 use crate::table_stub::DeclLike;
 
 /// Emit one `Declaration` fact per registered declaration.
@@ -155,6 +157,109 @@ where
     store.len() - before
 }
 
+/// Emit flow-lattice facts for every tracked name in a [`FlowEnv`].
+///
+/// This is the materialization boundary for FLOW state: the solver keeps
+/// returning its compact per-name lattice, and this projector lowers that
+/// state into stable `FactStore` rows for downstream consumers.
+pub fn emit_flow_env_facts(
+    store: &mut FactStore,
+    prov: &FactProvenance,
+    unit_logical_id: &str,
+    env: &FlowEnv,
+) -> usize {
+    emit_flow_facts(
+        store,
+        prov,
+        unit_logical_id,
+        env.iter()
+            .map(|(name, flow)| (name.to_string(), flow.clone())),
+    )
+}
+
+/// Emit flow-lattice facts from explicit `(name, ValueFlow)` rows.
+///
+/// The name is trimmed and upper-cased before fact emission, so
+/// whitespace/comment-only source changes that preserve semantic identity
+/// keep stable fact IDs.
+pub fn emit_flow_facts<I, N>(
+    store: &mut FactStore,
+    prov: &FactProvenance,
+    unit_logical_id: &str,
+    flows: I,
+) -> usize
+where
+    I: IntoIterator<Item = (N, ValueFlow)>,
+    N: Into<String>,
+{
+    let before = store.len();
+    let unit = unit_logical_id.trim().to_string();
+    let mut rows: Vec<(String, ValueFlow)> = flows
+        .into_iter()
+        .map(|(name, flow)| (normalise_flow_name(name.into()), flow))
+        .collect();
+    rows.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    for (name, flow) in rows {
+        if let Some(value) = flow.constant.clone() {
+            store.push(crate::fact::mint_fact(
+                prov.clone(),
+                FactPayload::ConstantValue {
+                    unit_logical_id: unit.clone(),
+                    name: name.clone(),
+                    value,
+                },
+            ));
+        }
+        if !matches!(flow.value_set, ValueSet::Top) {
+            store.push(crate::fact::mint_fact(
+                prov.clone(),
+                FactPayload::ValueSet {
+                    unit_logical_id: unit.clone(),
+                    name: name.clone(),
+                    value_set: flow.value_set.clone(),
+                },
+            ));
+        }
+        if let Some(shape) = flow.string_shape.clone() {
+            store.push(crate::fact::mint_fact(
+                prov.clone(),
+                FactPayload::StringShape {
+                    unit_logical_id: unit.clone(),
+                    name: name.clone(),
+                    shape,
+                },
+            ));
+        }
+        if !flow.taint.kinds.is_empty() {
+            store.push(crate::fact::mint_fact(
+                prov.clone(),
+                FactPayload::Taint {
+                    unit_logical_id: unit.clone(),
+                    name: name.clone(),
+                    kinds: flow.taint.kinds.clone(),
+                },
+            ));
+        }
+        if !flow.taint.cleansed_by.is_empty() {
+            store.push(crate::fact::mint_fact(
+                prov.clone(),
+                FactPayload::Sanitizer {
+                    unit_logical_id: unit.clone(),
+                    name,
+                    cleansed_by: flow.taint.cleansed_by,
+                },
+            ));
+        }
+    }
+
+    store.len() - before
+}
+
+fn normalise_flow_name(name: String) -> String {
+    name.trim().to_ascii_uppercase()
+}
+
 /// Convenience: emit a declaration fact for every entry a
 /// `DeclLike` source yields. The trait keeps this module free of
 /// a hard `plsql-symbols` dependency (which would invert the
@@ -194,18 +299,18 @@ fn classify_handler_body(body: &str) -> &'static str {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
-    if stmts.is_empty() || stmts.iter().all(|s| *s == "null") {
+    if stmts.is_empty() || stmts.iter().all(|s| s.eq(&"null")) {
         return "noop";
     }
     if stmts
         .iter()
-        .any(|s| s == &"commit" || s.starts_with("commit "))
+        .any(|s| s.eq(&"commit") || s.starts_with("commit "))
     {
         return "commit";
     }
     if stmts
         .iter()
-        .any(|s| s == &"rollback" || s.starts_with("rollback ") || s.starts_with("rollback to"))
+        .any(|s| s.eq(&"rollback") || s.starts_with("rollback ") || s.starts_with("rollback to"))
     {
         return "rollback";
     }
@@ -1323,12 +1428,138 @@ mod tests {
     use super::*;
     use crate::calls::{CallContext, CallSite};
     use crate::fact::FactKind;
+    use crate::flow::{ConstantValue, StringShape, Taint, TaintCleanser, TaintKind};
 
     fn prov() -> FactProvenance {
         FactProvenance {
             component: "plsql-ir".into(),
             component_version: "0.1.0".into(),
             run_id: String::new(),
+        }
+    }
+
+    fn flow_fixture_rows() -> Vec<(String, ValueFlow)> {
+        (0..10)
+            .map(|idx| {
+                let int_value = idx.to_string();
+                let next_value = (idx + 1).to_string();
+                (
+                    format!("v_{idx:02}"),
+                    ValueFlow {
+                        taint: Taint {
+                            kinds: vec![if idx % 2 == 0 {
+                                TaintKind::UserInput
+                            } else {
+                                TaintKind::BindVariable
+                            }],
+                            cleansed_by: vec![if idx % 2 == 0 {
+                                TaintCleanser::DbmsAssert
+                            } else {
+                                TaintCleanser::HexEncode
+                            }],
+                        },
+                        constant: Some(ConstantValue::Int {
+                            value: int_value.clone(),
+                        }),
+                        value_set: ValueSet::OneOf {
+                            values: vec![
+                                ConstantValue::Int { value: int_value },
+                                ConstantValue::Int { value: next_value },
+                            ],
+                        },
+                        string_shape: Some(StringShape::InterpolatedWithFix {
+                            literal_prefix: format!("select {idx} from "),
+                            literal_suffix: String::from(" where id = :id"),
+                        }),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn flow_payload_rows(store: &FactStore) -> Vec<String> {
+        store
+            .facts
+            .iter()
+            .filter_map(|fact| match &fact.payload {
+                FactPayload::ConstantValue {
+                    unit_logical_id,
+                    name,
+                    value,
+                } => Some(format!(
+                    "constant_value|{unit_logical_id}|{name}|{}",
+                    constant_value_label(value)
+                )),
+                FactPayload::ValueSet {
+                    unit_logical_id,
+                    name,
+                    value_set,
+                } => Some(format!(
+                    "value_set|{unit_logical_id}|{name}|{}",
+                    value_set_label(value_set)
+                )),
+                FactPayload::StringShape {
+                    unit_logical_id,
+                    name,
+                    shape,
+                } => Some(format!(
+                    "string_shape|{unit_logical_id}|{name}|{}",
+                    string_shape_label(shape)
+                )),
+                FactPayload::Taint {
+                    unit_logical_id,
+                    name,
+                    kinds,
+                } => Some(format!("taint|{unit_logical_id}|{name}|{kinds:?}")),
+                FactPayload::Sanitizer {
+                    unit_logical_id,
+                    name,
+                    cleansed_by,
+                } => Some(format!(
+                    "sanitizer|{unit_logical_id}|{name}|{cleansed_by:?}"
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn constant_value_label(value: &ConstantValue) -> String {
+        match value {
+            ConstantValue::Int { value } => format!("int:{value}"),
+            ConstantValue::Float { value } => format!("float:{value}"),
+            ConstantValue::Str { value } => format!("str:{value}"),
+            ConstantValue::Bool { value } => format!("bool:{value}"),
+            ConstantValue::Null => String::from("null"),
+        }
+    }
+
+    fn value_set_label(value_set: &ValueSet) -> String {
+        match value_set {
+            ValueSet::Top => String::from("top"),
+            ValueSet::Bottom => String::from("bottom"),
+            ValueSet::OneOf { values } => {
+                let labels: Vec<String> = values.iter().map(constant_value_label).collect();
+                format!("one_of:{}", labels.join(","))
+            }
+            ValueSet::Range { lo, hi } => {
+                format!(
+                    "range:{}..{}",
+                    constant_value_label(lo),
+                    constant_value_label(hi)
+                )
+            }
+        }
+    }
+
+    fn string_shape_label(shape: &StringShape) -> String {
+        match shape {
+            StringShape::Literal { value } => format!("literal:{value}"),
+            StringShape::InterpolatedWithFix {
+                literal_prefix,
+                literal_suffix,
+            } => format!("fix:{literal_prefix}|{literal_suffix}"),
+            StringShape::FullyOpaque => String::from("fully_opaque"),
+            StringShape::Empty => String::from("empty"),
         }
     }
 
@@ -1422,6 +1653,112 @@ mod tests {
         assert_eq!(store.by_kind(FactKind::Reference).count(), 1);
         assert_eq!(store.by_kind(FactKind::DependencyEdge).count(), 1);
         assert_eq!(store.len(), 3);
+    }
+
+    #[test]
+    fn flow_fact_projection_covers_ten_fixtures_per_family() {
+        let mut store = FactStore::default();
+        let emitted = emit_flow_facts(&mut store, &prov(), "hr.flow_pkg", flow_fixture_rows());
+
+        assert_eq!(emitted, 50);
+        assert_eq!(store.by_kind(FactKind::ConstantValue).count(), 10);
+        assert_eq!(store.by_kind(FactKind::ValueSet).count(), 10);
+        assert_eq!(store.by_kind(FactKind::StringShape).count(), 10);
+        assert_eq!(store.by_kind(FactKind::Taint).count(), 10);
+        assert_eq!(store.by_kind(FactKind::Sanitizer).count(), 10);
+    }
+
+    #[test]
+    fn flow_fact_projection_has_golden_payload_snapshot() {
+        let mut store = FactStore::default();
+        let flow = ValueFlow {
+            taint: Taint {
+                kinds: vec![TaintKind::UserInput, TaintKind::DynamicSql],
+                cleansed_by: vec![TaintCleanser::DbmsAssert],
+            },
+            constant: Some(ConstantValue::Str {
+                value: String::from("select * from users"),
+            }),
+            value_set: ValueSet::Range {
+                lo: ConstantValue::Int {
+                    value: String::from("1"),
+                },
+                hi: ConstantValue::Int {
+                    value: String::from("9"),
+                },
+            },
+            string_shape: Some(StringShape::InterpolatedWithFix {
+                literal_prefix: String::from("select * from "),
+                literal_suffix: String::from(" where id = :id"),
+            }),
+        };
+
+        emit_flow_facts(&mut store, &prov(), "hr.flow_pkg", vec![("v_sql", flow)]);
+
+        assert_eq!(
+            flow_payload_rows(&store),
+            vec![
+                "constant_value|hr.flow_pkg|V_SQL|str:select * from users",
+                "value_set|hr.flow_pkg|V_SQL|range:int:1..int:9",
+                "string_shape|hr.flow_pkg|V_SQL|fix:select * from | where id = :id",
+                "taint|hr.flow_pkg|V_SQL|[UserInput, DynamicSql]",
+                "sanitizer|hr.flow_pkg|V_SQL|[DbmsAssert]",
+            ]
+        );
+    }
+
+    #[test]
+    fn flow_fact_ids_are_stable_for_normalized_semantic_names() {
+        let flow = ValueFlow {
+            taint: Taint {
+                kinds: vec![TaintKind::UserInput],
+                cleansed_by: vec![TaintCleanser::DbmsAssert],
+            },
+            constant: Some(ConstantValue::Str {
+                value: String::from("safe_table"),
+            }),
+            value_set: ValueSet::OneOf {
+                values: vec![ConstantValue::Str {
+                    value: String::from("safe_table"),
+                }],
+            },
+            string_shape: Some(StringShape::Literal {
+                value: String::from("safe_table"),
+            }),
+        };
+        let mut left = FactStore::default();
+        let mut right = FactStore::default();
+
+        emit_flow_facts(
+            &mut left,
+            &prov(),
+            "hr.flow_pkg",
+            vec![("  v_table  ", flow.clone())],
+        );
+        emit_flow_facts(&mut right, &prov(), "hr.flow_pkg", vec![("V_TABLE", flow)]);
+
+        let left_ids: Vec<_> = left.facts.iter().map(|fact| fact.id.clone()).collect();
+        let right_ids: Vec<_> = right.facts.iter().map(|fact| fact.id.clone()).collect();
+        assert_eq!(left_ids, right_ids);
+        assert_eq!(left_ids.len(), 5);
+    }
+
+    #[test]
+    fn flow_env_projection_consumes_solver_output() {
+        let stmts = crate::lower_statement_body("v_sql := 'select * from ' || p_table;");
+        let env = crate::analyze_flow(
+            &stmts,
+            &crate::TaintSources {
+                user_input_names: vec![String::from("p_table")],
+                bind_names: vec![],
+            },
+        );
+        let mut store = FactStore::default();
+
+        emit_flow_env_facts(&mut store, &prov(), "hr.flow_pkg", &env);
+
+        assert_eq!(store.by_kind(FactKind::Taint).count(), 1);
+        assert_eq!(store.by_kind(FactKind::StringShape).count(), 1);
     }
 
     #[test]
@@ -1705,7 +2042,7 @@ mod tests {
     #[test]
     fn scan_password_assignment_literal_flagged() {
         let s = scan_hardcoded_credentials("hr.pkg.connect", "begin v_password := 'hunter2'; end;");
-        assert!(s.iter().any(|x| x.marker == "password"));
+        assert!(s.iter().any(|x| x.marker.eq("password")));
     }
 
     #[test]
@@ -1927,7 +2264,7 @@ mod tests {
             "hr.f",
             "function f return date deterministic is begin return sysdate; end;",
         );
-        assert!(s.iter().any(|x| x.detail == "SYSDATE"));
+        assert!(s.iter().any(|x| x.detail.eq("SYSDATE")));
         // DETERMINISTIC but pure: clean.
         assert!(
             scan_deterministic_misuse(

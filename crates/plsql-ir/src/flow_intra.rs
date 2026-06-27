@@ -54,6 +54,14 @@ impl FlowEnv {
         self.map.keys().cloned()
     }
 
+    /// Iterate every tracked name with its aggregate flow state.
+    /// Fact projection uses this to materialize the flow lattice into
+    /// normalized [`FactStore`](crate::FactStore) rows without exposing
+    /// mutation of the environment.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &ValueFlow)> + '_ {
+        self.map.iter().map(|(name, flow)| (name.as_str(), flow))
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.map.len()
@@ -531,10 +539,11 @@ mod tests {
     fn string_literal_assignment_records_shape() {
         let s = lower_statement_body("v_msg := 'hello';");
         let env = analyze_flow(&s, &src(&[]));
-        match &env.get("v_msg").unwrap().string_shape {
-            Some(StringShape::Literal { value }) => assert_eq!(value, "hello"),
-            other => panic!("{other:?}"),
-        }
+        let literal = env.get("v_msg").and_then(|flow| match &flow.string_shape {
+            Some(StringShape::Literal { value }) => Some(value.as_str()),
+            _ => None,
+        });
+        assert_eq!(literal, Some("hello"));
     }
 
     #[test]
