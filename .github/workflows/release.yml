@@ -49,8 +49,9 @@ jobs:
             cross: false
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
         with:
+          toolchain: nightly-2026-05-11
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
