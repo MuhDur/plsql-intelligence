@@ -228,6 +228,15 @@ impl<'a> PlsqlDispatchContext<'a> {
 /// This is intentionally a thin local wrapper around `oraclemcp-core`'s
 /// zero-cost type-level narrowing helper. It gives Phase C read loaders a
 /// `plsql-mcp` import point while preserving the upstream capability proof.
+///
+/// ```compile_fail
+/// use asupersync::Cx;
+/// use plsql_mcp::{ReadPathCaps, requires_privileged_effect};
+///
+/// fn read_handler(cx: &Cx<ReadPathCaps>) {
+///     requires_privileged_effect(cx);
+/// }
+/// ```
 #[must_use]
 pub fn narrow_dispatch_to_read_path<Caps>(cx: &Cx<Caps>) -> Cx<ReadPathCaps>
 where
@@ -379,12 +388,18 @@ pub fn dispatch_tool_with_runtime<'a>(
                 .await
                 .map_err(|err| *err),
             "list_connections" => run_list_connections(cx, live_runtime).map_err(|err| *err),
-            "current_database" => run_current_database(cx, live_runtime)
+            "current_database" => run_current_database(cx, context, live_runtime)
                 .await
                 .map_err(|err| *err),
-            "query" => run_query_live(cx, context.request_budget(), live_runtime, &arguments)
-                .await
-                .map_err(|err| *err),
+            "query" => run_query_live(
+                cx,
+                context,
+                context.request_budget(),
+                live_runtime,
+                &arguments,
+            )
+            .await
+            .map_err(|err| *err),
             _ => match dispatch_tool_outcome(name, &arguments) {
                 Ok(DispatchOutcome::Ran(value)) => Ok(value),
                 Ok(DispatchOutcome::RuntimeStateRequired(kind)) => {
@@ -640,6 +655,7 @@ fn run_list_connections(
 
 async fn run_current_database(
     cx: &Cx,
+    context: PlsqlDispatchContext<'_>,
     live_runtime: &LiveDbRuntime,
 ) -> Result<Value, Box<ErrorEnvelope>> {
     checkpoint(cx, "current_database")?;
@@ -651,6 +667,11 @@ async fn run_current_database(
     let safety = session.safety();
     let adapter =
         OraclemcpCatalogConnection::new(BorrowedOracleConnection::new(session.connection()));
+    let read_cx = context.narrow_to_read_path(cx);
+    // oraclemcp-db 0.4.0 still accepts `&Cx`, so keep passing the upstream
+    // trait shape while narrowing any ambient `Cx::current()` lookups during
+    // the catalog read.
+    let _read_path_guard = read_cx.set_current_restricted();
     let catalog = adapter.describe(cx).await.map_err(|err| {
         Box::new(ErrorEnvelope::new(
             ErrorClass::ConnectionFailed,
@@ -683,6 +704,7 @@ async fn run_current_database(
 
 async fn run_query_live(
     cx: &Cx,
+    context: PlsqlDispatchContext<'_>,
     request_budget: RequestBudget,
     live_runtime: &LiveDbRuntime,
     arguments: &Value,
@@ -714,7 +736,12 @@ async fn run_query_live(
     let connection = session.connection();
     let restore = install_request_call_timeout(cx, request_budget, connection)?;
     let adapter = OraclemcpCatalogConnection::new(BorrowedOracleConnection::new(connection));
+    let read_cx = context.narrow_to_read_path(cx);
     let rows_result = async {
+        // oraclemcp-db 0.4.0 still accepts `&Cx`, so keep passing the upstream
+        // trait shape while narrowing any ambient `Cx::current()` lookups during
+        // the live read.
+        let _read_path_guard = read_cx.set_current_restricted();
         checkpoint(cx, "query")?;
         let rows = match adapter.query_rows(cx, &args.sql, &[]).await {
             Ok(rows) => rows,
@@ -1060,6 +1087,25 @@ mod tests {
         })
     }
 
+    fn dispatch_with_runtime_on_cx_for_test(
+        cx: &Cx,
+        name: &str,
+        args: Value,
+        live_runtime: &mut LiveDbRuntime,
+    ) -> Result<Value, Box<ErrorEnvelope>> {
+        let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let context = PlsqlDispatchContext::from_cx(cx, DispatchContext::default());
+            dispatch_tool_with_runtime(cx, context, live_runtime, name, args)
+                .await
+                .map_err(Box::new)
+        })
+    }
+
     fn live_profile(name: &str) -> ConnectionProfile {
         ConnectionProfile {
             name: String::from(name),
@@ -1075,6 +1121,7 @@ mod tests {
     struct RecordingOracleConnection {
         queries: Arc<Mutex<Vec<String>>>,
         query_timeouts: Arc<Mutex<Vec<Option<Duration>>>>,
+        ambient_remote_seen: Arc<Mutex<Vec<Option<bool>>>>,
         current_timeout: Arc<Mutex<Option<Duration>>>,
         timeout_sets: Arc<Mutex<Vec<Option<Duration>>>>,
         query_delay: Option<Duration>,
@@ -1105,6 +1152,7 @@ mod tests {
             Self {
                 queries: Arc::new(Mutex::new(Vec::new())),
                 query_timeouts: Arc::new(Mutex::new(Vec::new())),
+                ambient_remote_seen: Arc::new(Mutex::new(Vec::new())),
                 current_timeout: Arc::new(Mutex::new(timeout)),
                 timeout_sets: Arc::new(Mutex::new(Vec::new())),
                 query_delay,
@@ -1121,6 +1169,13 @@ mod tests {
 
         fn observed_query_timeouts(&self) -> Vec<Option<Duration>> {
             self.query_timeouts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        fn observed_ambient_remote_seen(&self) -> Vec<Option<bool>> {
+            self.ambient_remote_seen
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone()
@@ -1155,6 +1210,10 @@ mod tests {
             &self,
             _cx: &Cx,
         ) -> Result<oraclemcp_db::OracleConnectionInfo, oraclemcp_db::DbError> {
+            self.ambient_remote_seen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(Cx::current().map(|cx| cx.has_remote()));
             Ok(oraclemcp_db::OracleConnectionInfo {
                 backend: Some(oraclemcp_db::OracleBackend::RustOracle),
                 current_schema: Some(String::from("SYSTEM")),
@@ -1174,6 +1233,10 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(timeout);
+            self.ambient_remote_seen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(Cx::current().map(|cx| cx.has_remote()));
             if let Some(delay) = self.query_delay {
                 std::thread::sleep(delay);
             }
@@ -1256,7 +1319,51 @@ mod tests {
 
             fn assert_read_path(_: &Cx<crate::ReadPathCaps>) {}
             assert_read_path(&read_cx);
+
+            crate::requires_privileged_effect(&cx);
         });
+    }
+
+    #[test]
+    fn live_catalog_reads_install_read_path_ambient_caps() {
+        let mut live_runtime = LiveDbRuntime::new();
+        let connection = RecordingOracleConnection::new();
+        let observed = connection.clone();
+        live_runtime
+            .insert_connected(live_profile("dev"), Box::new(connection))
+            .expect("stub session inserts");
+        dispatch_with_runtime_for_test("connect", json!({"name": "dev"}), &mut live_runtime)
+            .expect("connect activates existing live session");
+
+        let full_cx = Cx::for_testing_with_remote(asupersync::RemoteCap::new());
+        assert!(
+            full_cx.has_remote(),
+            "test setup must start from a privileged caller context"
+        );
+
+        let current = dispatch_with_runtime_on_cx_for_test(
+            &full_cx,
+            "current_database",
+            json!({}),
+            &mut live_runtime,
+        )
+        .expect("current_database runs through live runtime");
+        assert_eq!(current["active"]["catalog"]["current_schema"], "SYSTEM");
+
+        let query = dispatch_with_runtime_on_cx_for_test(
+            &full_cx,
+            "query",
+            json!({"sql": "SELECT 1 AS val FROM dual"}),
+            &mut live_runtime,
+        )
+        .expect("query runs through live runtime");
+
+        assert_eq!(query["rows"][0]["cells"][0]["value"], "1");
+        assert_eq!(
+            observed.observed_ambient_remote_seen(),
+            vec![Some(false), Some(false)],
+            "catalog read loaders must hide remote capability from ambient Cx lookups"
+        );
     }
 
     #[test]
