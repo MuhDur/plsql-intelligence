@@ -29,9 +29,11 @@ clap = { version = "4", features = ["derive"] }
 # Depend on the published engine-free oraclemcp core (extracted to the standalone
 # MuhDur/oraclemcp repo + crates.io). plsql-mcp is the full superset that adds the
 # PL/SQL intelligence layer on top of this shared MCP spine.
-oraclemcp-core = "0.1.0"
-oraclemcp-error = "0.1.0"
-oraclemcp-guard = "0.1.0"
+oraclemcp-audit = "=0.4.0"
+oraclemcp-core = "=0.4.0"
+oraclemcp-db = "=0.4.0"
+oraclemcp-error = "=0.4.0"
+oraclemcp-guard = "=0.4.0"
 plsql-catalog = { path = "../plsql-catalog" }
 plsql-cicd = { path = "../plsql-cicd" }
 plsql-core = { path = "../plsql-core" }
