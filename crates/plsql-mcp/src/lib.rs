@@ -37,6 +37,9 @@
 //! - `connections` — named connection profiles loaded from
 //!   `~/.plsql-mcp/connections.toml`, with structural
 //!   [`DbToolsAlias::probe`] for optional `~/.dbtools` mirroring.
+//! - `live_runtime` — stateful connected-session runtime: opened
+//!   `oraclemcp-db` connections, active-session leases, safety state,
+//!   and preview approvals.
 //!
 //! ## License
 //!
@@ -57,6 +60,7 @@ pub mod execute_approved;
 pub mod foundation_tools;
 pub mod graph_tools;
 pub mod list_objects;
+pub mod live_runtime;
 pub mod mcp_protocol;
 pub mod oraclemcp_catalog;
 pub mod parse_tools;
@@ -203,6 +207,10 @@ pub use source::{
 pub use list_objects::{
     DEFAULT_PAGE_SIZE, ListObjectsEntry, ListObjectsError, ListObjectsRequest, ListObjectsResponse,
     MAX_PAGE_SIZE, run_list_objects,
+};
+
+pub use live_runtime::{
+    BoxedOracleConnection, LiveDbRuntime, LiveDbSession, LiveRuntimeError, LiveSessionLease,
 };
 
 pub use query::{
