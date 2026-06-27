@@ -166,7 +166,7 @@ fn main() -> ExitCode {
 ///   `tcp::serve` accept loop. A `--listen` parse error names the exact
 ///   fix on stderr (Axiom 6) and exits non-zero (Axiom 14).
 fn run_serve(listen: Option<String>, allow_public_bind: bool, robot_json: bool) -> ExitCode {
-    let server = match PlsqlMcpServer::new(default_tool_registry()) {
+    let mut server = match PlsqlMcpServer::new(default_tool_registry()) {
         Ok(server) => server,
         Err(e) => {
             if robot_json {
@@ -212,7 +212,7 @@ fn run_serve(listen: Option<String>, allow_public_bind: bool, robot_json: bool) 
             let mut stdout = std::io::stdout();
             // `process_stream` is the exact dispatch loop the TCP path
             // uses — reuse it so stdio and TCP can never diverge.
-            match tcp::process_stream(BufReader::new(stdin.lock()), &mut stdout, &server) {
+            match tcp::process_stream(BufReader::new(stdin.lock()), &mut stdout, &mut server) {
                 Ok(()) => {
                     let _ = stdout.flush();
                     ExitCode::SUCCESS
@@ -268,7 +268,7 @@ fn run_serve(listen: Option<String>, allow_public_bind: bool, robot_json: bool) 
                     plsql_mcp::PROTOCOL_VERSION
                 );
             }
-            match tcp::serve(&target, &server) {
+            match tcp::serve(&target, &mut server) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("plsql-mcp serve: TCP transport error: {e}");
@@ -905,11 +905,11 @@ mod tests {
         let bound = listener.local_addr().unwrap();
 
         let server = std::thread::spawn(move || {
-            let server = PlsqlMcpServer::new(default_tool_registry())
+            let mut server = PlsqlMcpServer::new(default_tool_registry())
                 .expect("test MCP server runtime builds");
             // The real production accept loop (serve_with_listener),
             // bounded to one connection so the test terminates.
-            tcp::serve_bounded_on_listener(&listener, &server, 1)
+            tcp::serve_bounded_on_listener(&listener, &mut server, 1)
                 .expect("accept loop serves one connection cleanly");
         });
 

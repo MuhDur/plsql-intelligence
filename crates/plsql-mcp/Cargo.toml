@@ -25,6 +25,7 @@ name = "plsql-mcp"
 path = "src/main.rs"
 
 [dependencies]
+async-trait = "0.1"
 asupersync = "=0.3.4"
 clap = { version = "4", features = ["derive"] }
 # Depend on the published engine-free oraclemcp core (extracted to the standalone
@@ -53,9 +54,6 @@ sha2.workspace = true
 thiserror.workspace = true
 toml = "1.1"
 tracing.workspace = true
-
-[dev-dependencies]
-async-trait = "0.1"
 
 [lints]
 workspace = true

@@ -62,6 +62,7 @@ use crate::{
     run_dynamic_sql_evidence, run_get_symbol, run_inspect_profile, run_parse_file,
     run_plsql_analyze,
 };
+use crate::{LiveDbRuntime, LiveRuntimeError, OraclemcpCatalogConnection};
 
 /// Why a dispatched tool could not run to completion in the pure
 /// protocol layer. Distinct from [`DispatchError`]: the tool *is*
@@ -356,6 +357,38 @@ pub fn dispatch_tool<'a>(
     })
 }
 
+/// Runtime-aware dispatch used by the real MCP server.
+///
+/// The pure [`dispatch_tool`] entry point remains available for offline tests
+/// and `oraclemcp-core::ToolDispatch`, but the shipping server enters here so
+/// live-DB arms see the same request [`Cx`] and [`LiveDbRuntime`] that the
+/// protocol layer owns.
+#[must_use]
+pub fn dispatch_tool_with_runtime<'a>(
+    cx: &'a Cx,
+    _context: PlsqlDispatchContext<'a>,
+    live_runtime: &'a mut LiveDbRuntime,
+    name: &'a str,
+    arguments: Value,
+) -> DispatchFuture<'a> {
+    Box::pin(async move {
+        checkpoint(cx, name).map_err(|err| *err)?;
+        match name {
+            "list_connections" => run_list_connections(cx, live_runtime).map_err(|err| *err),
+            "current_database" => run_current_database(cx, live_runtime)
+                .await
+                .map_err(|err| *err),
+            _ => match dispatch_tool_outcome(name, &arguments) {
+                Ok(DispatchOutcome::Ran(value)) => Ok(value),
+                Ok(DispatchOutcome::RuntimeStateRequired(kind)) => {
+                    Err(runtime_state_envelope(kind, name))
+                }
+                Err(err) => Err(err.into_envelope()),
+            },
+        }
+    })
+}
+
 fn dispatch_tool_outcome(name: &str, arguments: &Value) -> Result<DispatchOutcome, DispatchError> {
     match name {
         // ── zero-arg discovery: a session-orientation report ──────
@@ -493,6 +526,156 @@ fn dispatch_tool_outcome(name: &str, arguments: &Value) -> Result<DispatchOutcom
         }
 
         other => Err(DispatchError::UnknownTool(other.to_string())),
+    }
+}
+
+fn run_list_connections(
+    cx: &Cx,
+    live_runtime: &LiveDbRuntime,
+) -> Result<Value, Box<ErrorEnvelope>> {
+    let mut connected = Vec::with_capacity(live_runtime.len());
+    for name in live_runtime.connected_names() {
+        checkpoint(cx, "list_connections")?;
+        connected.push(serde_json::json!({
+            "name": name,
+            "is_active": live_runtime.active_name() == Some(name),
+        }));
+    }
+    Ok(serde_json::json!({
+        "connected_count": live_runtime.len(),
+        "active": live_runtime.active_name(),
+        "connections": connected,
+    }))
+}
+
+async fn run_current_database(
+    cx: &Cx,
+    live_runtime: &LiveDbRuntime,
+) -> Result<Value, Box<ErrorEnvelope>> {
+    checkpoint(cx, "current_database")?;
+    let lease = live_runtime.active_lease().cloned();
+    let session = live_runtime
+        .active_session()
+        .map_err(|err| Box::new(live_runtime_error_envelope(err, "current_database")))?;
+    let profile = session.profile();
+    let safety = session.safety();
+    let adapter =
+        OraclemcpCatalogConnection::new(BorrowedOracleConnection::new(session.connection()));
+    let catalog = adapter.describe(cx).await.map_err(|err| {
+        Box::new(ErrorEnvelope::new(
+            ErrorClass::ConnectionFailed,
+            err.to_string(),
+        ))
+    })?;
+    checkpoint(cx, "current_database")?;
+
+    Ok(serde_json::json!({
+        "active": {
+            "name": profile.name.clone(),
+            "description": profile.description.clone(),
+            "connect_string": profile.connect_string.clone(),
+            "username": profile.username.clone(),
+            "permanently_read_only": profile.permanently_read_only,
+            "backend": format!("{:?}", session.backend()),
+            "safety_profile": safety.profile.as_str(),
+            "session_writes_enabled": safety.session_writes_enabled,
+            "active_enable_writes_token": safety.active_token.is_some(),
+            "lease": lease,
+            "catalog": {
+                "current_schema": catalog.current_schema,
+                "server_version": catalog.server_version,
+                "server_type": catalog.server_type,
+            },
+        },
+        "connected_count": live_runtime.len(),
+    }))
+}
+
+struct BorrowedOracleConnection<'a> {
+    inner: &'a dyn oraclemcp_db::OracleConnection,
+}
+
+impl<'a> BorrowedOracleConnection<'a> {
+    fn new(inner: &'a dyn oraclemcp_db::OracleConnection) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl oraclemcp_db::OracleConnection for BorrowedOracleConnection<'_> {
+    fn backend(&self) -> oraclemcp_db::OracleBackend {
+        self.inner.backend()
+    }
+
+    async fn ping(&self, cx: &Cx) -> Result<(), oraclemcp_db::DbError> {
+        self.inner.ping(cx).await
+    }
+
+    async fn describe(
+        &self,
+        cx: &Cx,
+    ) -> Result<oraclemcp_db::OracleConnectionInfo, oraclemcp_db::DbError> {
+        self.inner.describe(cx).await
+    }
+
+    async fn query_rows(
+        &self,
+        cx: &Cx,
+        sql: &str,
+        binds: &[oraclemcp_db::OracleBind],
+    ) -> Result<Vec<oraclemcp_db::OracleRow>, oraclemcp_db::DbError> {
+        self.inner.query_rows(cx, sql, binds).await
+    }
+
+    async fn query_rows_with_serialize_options(
+        &self,
+        cx: &Cx,
+        sql: &str,
+        binds: &[oraclemcp_db::OracleBind],
+        serialize_opts: &oraclemcp_db::SerializeOptions,
+    ) -> Result<Vec<oraclemcp_db::OracleRow>, oraclemcp_db::DbError> {
+        self.inner
+            .query_rows_with_serialize_options(cx, sql, binds, serialize_opts)
+            .await
+    }
+
+    async fn execute(
+        &self,
+        cx: &Cx,
+        sql: &str,
+        binds: &[oraclemcp_db::OracleBind],
+    ) -> Result<u64, oraclemcp_db::DbError> {
+        self.inner.execute(cx, sql, binds).await
+    }
+
+    async fn commit(&self, cx: &Cx) -> Result<(), oraclemcp_db::DbError> {
+        self.inner.commit(cx).await
+    }
+
+    async fn rollback(&self, cx: &Cx) -> Result<(), oraclemcp_db::DbError> {
+        self.inner.rollback(cx).await
+    }
+}
+
+fn checkpoint(cx: &Cx, tool: &str) -> Result<(), Box<ErrorEnvelope>> {
+    cx.checkpoint().map_err(|err| {
+        Box::new(ErrorEnvelope::new(
+            ErrorClass::Timeout,
+            format!("tool `{tool}` was cancelled at an Asupersync checkpoint: {err}"),
+        ))
+    })
+}
+
+fn live_runtime_error_envelope(err: LiveRuntimeError, tool: &str) -> ErrorEnvelope {
+    match err {
+        LiveRuntimeError::NoActiveConnection | LiveRuntimeError::UnknownConnection { .. } => {
+            runtime_state_envelope(RuntimeKind::SessionState, tool)
+        }
+        LiveRuntimeError::StaleLease { .. } => {
+            ErrorEnvelope::new(ErrorClass::LeaseRequired, format!("{err}"))
+                .with_next_step("Call `current_database` to refresh session state, then retry.")
+        }
+        other => ErrorEnvelope::new(ErrorClass::Internal, other.to_string()),
     }
 }
 

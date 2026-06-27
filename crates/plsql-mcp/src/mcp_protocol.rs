@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::live_runtime::LiveDbRuntime;
 use crate::safety::SafetyProfile;
 use crate::tools::{ToolDescriptor, ToolRegistry, ToolTier};
 
@@ -62,11 +63,19 @@ pub enum ServerInitError {
 /// so the async dispatcher can be added without another transport split.
 pub struct PlsqlMcpServer {
     registry: ToolRegistry,
+    live_runtime: LiveDbRuntime,
     dispatch_runtime: Runtime,
 }
 
 impl PlsqlMcpServer {
     pub fn new(registry: ToolRegistry) -> Result<Self, ServerInitError> {
+        Self::with_live_runtime(registry, LiveDbRuntime::new())
+    }
+
+    pub fn with_live_runtime(
+        registry: ToolRegistry,
+        live_runtime: LiveDbRuntime,
+    ) -> Result<Self, ServerInitError> {
         let dispatch_reactor =
             asupersync::runtime::reactor::create_reactor().map_err(ServerInitError::Reactor)?;
         let dispatch_runtime = RuntimeBuilder::current_thread()
@@ -75,6 +84,7 @@ impl PlsqlMcpServer {
             .map_err(|err| ServerInitError::Runtime(Box::new(err)))?;
         Ok(Self {
             registry,
+            live_runtime,
             dispatch_runtime,
         })
     }
@@ -90,12 +100,25 @@ impl PlsqlMcpServer {
     }
 
     #[must_use]
-    pub fn handle_request(&self, req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
+    pub fn live_runtime(&self) -> &LiveDbRuntime {
+        &self.live_runtime
+    }
+
+    #[must_use]
+    pub fn live_runtime_mut(&mut self) -> &mut LiveDbRuntime {
+        &mut self.live_runtime
+    }
+
+    #[must_use]
+    pub fn handle_request(&mut self, req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
+        let registry = &self.registry;
+        let live_runtime = &mut self.live_runtime;
+        let dispatch_runtime = &self.dispatch_runtime;
         // block-on-boundary: this is the one synchronous serve-entry bridge.
         // Blocking transports enter the server-owned Asupersync runtime here;
         // DB round trips and downstream dispatch code must not add their own
         // block_on shims.
-        self.dispatch_runtime.block_on(async {
+        dispatch_runtime.block_on(async {
             let Some(cx) = asupersync::Cx::current() else {
                 return req.id.clone().map(|id| {
                     JsonRpcResponse::err(
@@ -105,20 +128,34 @@ impl PlsqlMcpServer {
                     )
                 });
             };
-            self.handle_request_with_cx(&cx, req).await
+            handle_request_with_context(
+                req,
+                registry,
+                live_runtime,
+                &cx,
+                DispatchContext::default(),
+            )
+            .await
         })
     }
 
     pub async fn handle_request_with_cx(
-        &self,
+        &mut self,
         cx: &asupersync::Cx,
         req: &JsonRpcRequest,
     ) -> Option<JsonRpcResponse> {
-        handle_request_with_context(req, &self.registry, cx, DispatchContext::default()).await
+        handle_request_with_context(
+            req,
+            &self.registry,
+            &mut self.live_runtime,
+            cx,
+            DispatchContext::default(),
+        )
+        .await
     }
 
     #[must_use]
-    pub fn handle_request_line(&self, line: &str) -> Option<JsonRpcResponse> {
+    pub fn handle_request_line(&mut self, line: &str) -> Option<JsonRpcResponse> {
         match serde_json::from_str::<JsonRpcRequest>(line) {
             Ok(req) => self.handle_request(&req),
             Err(err) => Some(JsonRpcResponse::err(
@@ -248,6 +285,7 @@ pub fn handle_request(req: &JsonRpcRequest, registry: &ToolRegistry) -> Option<J
 pub async fn handle_request_with_context(
     req: &JsonRpcRequest,
     registry: &ToolRegistry,
+    live_runtime: &mut LiveDbRuntime,
     cx: &Cx,
     context: DispatchContext<'_>,
 ) -> Option<JsonRpcResponse> {
@@ -269,9 +307,9 @@ pub async fn handle_request_with_context(
     match req.method.as_str() {
         "initialize" => Some(handle_initialize(id, req.params.as_ref())),
         "tools/list" => Some(handle_tools_list(id, registry)),
-        "tools/call" => {
-            Some(handle_tools_call(id, req.params.as_ref(), registry, cx, context).await)
-        }
+        "tools/call" => Some(
+            handle_tools_call(id, req.params.as_ref(), registry, live_runtime, cx, context).await,
+        ),
         "ping" => Some(JsonRpcResponse::ok(id, Value::Object(Default::default()))),
         other => Some(JsonRpcResponse::err(
             id,
@@ -432,10 +470,11 @@ async fn handle_tools_call(
     id: Value,
     params: Option<&Value>,
     registry: &ToolRegistry,
+    live_runtime: &mut LiveDbRuntime,
     cx: &Cx,
     context: DispatchContext<'_>,
 ) -> JsonRpcResponse {
-    use crate::dispatch::{PlsqlDispatchContext, dispatch_tool};
+    use crate::dispatch::{PlsqlDispatchContext, dispatch_tool_with_runtime};
 
     let Some(params) = params else {
         return JsonRpcResponse::err(id, -32602, "tools/call requires params");
@@ -479,7 +518,7 @@ async fn handle_tools_call(
     // (self-contained static analysis) or returns an honest ErrorEnvelope for
     // tools that need a live connection / loaded graph / preview session.
     let dispatch_context = PlsqlDispatchContext::from_cx(cx, context);
-    match dispatch_tool(cx, dispatch_context, name, arguments).await {
+    match dispatch_tool_with_runtime(cx, dispatch_context, live_runtime, name, arguments).await {
         Ok(structured) => {
             let mut result =
                 tool_result(&structured_text(name, &structured), false, Some(structured));
@@ -576,6 +615,9 @@ fn structured_text(name: &str, structured: &Value) -> String {
 mod tests {
     use super::*;
     use crate::register_query_tool;
+    use asupersync::Cx;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn registry_with_query() -> ToolRegistry {
         let mut r = ToolRegistry::default();
@@ -593,10 +635,8 @@ mod tests {
     }
 
     fn server_response(registry: ToolRegistry, request: JsonRpcRequest) -> JsonRpcResponse {
-        PlsqlMcpServer::new(registry)
-            .expect("server runtime builds")
-            .handle_request(&request)
-            .expect("request response")
+        let mut server = PlsqlMcpServer::new(registry).expect("server runtime builds");
+        server.handle_request(&request).expect("request response")
     }
 
     #[test]
@@ -664,13 +704,146 @@ mod tests {
 
     #[test]
     fn server_runtime_boundary_preserves_protocol_behavior() {
-        let server = PlsqlMcpServer::new(registry_with_query()).expect("server runtime builds");
+        let mut server = PlsqlMcpServer::new(registry_with_query()).expect("server runtime builds");
         let request = req(15, "tools/list", None);
 
         let direct = handle_request(&request, server.registry()).expect("direct response");
         let through_server = server.handle_request(&request).expect("server response");
 
         assert_eq!(through_server, direct);
+    }
+
+    struct CxObservingConnection {
+        saw_current_cx: Arc<AtomicBool>,
+        checkpoint_ok: Arc<AtomicBool>,
+        describe_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl oraclemcp_db::OracleConnection for CxObservingConnection {
+        fn backend(&self) -> oraclemcp_db::OracleBackend {
+            oraclemcp_db::OracleBackend::RustOracle
+        }
+
+        async fn ping(&self, _cx: &Cx) -> Result<(), oraclemcp_db::DbError> {
+            Ok(())
+        }
+
+        async fn describe(
+            &self,
+            cx: &Cx,
+        ) -> Result<oraclemcp_db::OracleConnectionInfo, oraclemcp_db::DbError> {
+            self.describe_calls.fetch_add(1, Ordering::SeqCst);
+            self.saw_current_cx
+                .store(asupersync::Cx::current().is_some(), Ordering::SeqCst);
+            self.checkpoint_ok
+                .store(cx.checkpoint().is_ok(), Ordering::SeqCst);
+            Ok(oraclemcp_db::OracleConnectionInfo {
+                backend: Some(oraclemcp_db::OracleBackend::RustOracle),
+                server_version: Some(String::from("23ai")),
+                current_schema: Some(String::from("BILLING")),
+                database_role: Some(String::from("PRIMARY")),
+                ..oraclemcp_db::OracleConnectionInfo::default()
+            })
+        }
+
+        async fn query_rows(
+            &self,
+            _cx: &Cx,
+            _sql: &str,
+            _binds: &[oraclemcp_db::OracleBind],
+        ) -> Result<Vec<oraclemcp_db::OracleRow>, oraclemcp_db::DbError> {
+            Ok(Vec::new())
+        }
+
+        async fn query_rows_with_serialize_options(
+            &self,
+            cx: &Cx,
+            sql: &str,
+            binds: &[oraclemcp_db::OracleBind],
+            _serialize_opts: &oraclemcp_db::SerializeOptions,
+        ) -> Result<Vec<oraclemcp_db::OracleRow>, oraclemcp_db::DbError> {
+            self.query_rows(cx, sql, binds).await
+        }
+
+        async fn execute(
+            &self,
+            _cx: &Cx,
+            _sql: &str,
+            _binds: &[oraclemcp_db::OracleBind],
+        ) -> Result<u64, oraclemcp_db::DbError> {
+            Ok(0)
+        }
+
+        async fn commit(&self, _cx: &Cx) -> Result<(), oraclemcp_db::DbError> {
+            Ok(())
+        }
+
+        async fn rollback(&self, _cx: &Cx) -> Result<(), oraclemcp_db::DbError> {
+            Ok(())
+        }
+    }
+
+    fn live_profile(name: &str) -> crate::ConnectionProfile {
+        crate::ConnectionProfile {
+            name: String::from(name),
+            description: Some(format!("{name} test profile")),
+            connect_string: String::from("//localhost/FREEPDB1"),
+            username: Some(String::from("billing")),
+            permanently_read_only: false,
+            dbtools_alias: None,
+        }
+    }
+
+    #[test]
+    fn current_database_threads_live_runtime_and_request_cx_to_catalog_adapter() {
+        let saw_current_cx = Arc::new(AtomicBool::new(false));
+        let checkpoint_ok = Arc::new(AtomicBool::new(false));
+        let describe_calls = Arc::new(AtomicUsize::new(0));
+        let connection = CxObservingConnection {
+            saw_current_cx: Arc::clone(&saw_current_cx),
+            checkpoint_ok: Arc::clone(&checkpoint_ok),
+            describe_calls: Arc::clone(&describe_calls),
+        };
+        let mut server =
+            PlsqlMcpServer::new(crate::default_tool_registry()).expect("server runtime builds");
+        server
+            .live_runtime_mut()
+            .insert_and_activate(live_profile("dev"), Box::new(connection))
+            .expect("stub session activates");
+
+        let resp = server
+            .handle_request(&req(
+                17,
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "current_database",
+                    "arguments": {}
+                })),
+            ))
+            .expect("current_database response");
+
+        assert!(
+            resp.error.is_none(),
+            "live runtime call should run: {resp:?}"
+        );
+        let result = resp.result.expect("ok result");
+        assert_eq!(result["isError"], Value::Bool(false));
+        let structured = &result["structuredContent"];
+        assert_eq!(structured["active"]["name"], "dev");
+        assert_eq!(
+            structured["active"]["catalog"]["current_schema"],
+            Value::String(String::from("BILLING"))
+        );
+        assert_eq!(describe_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            saw_current_cx.load(Ordering::SeqCst),
+            "catalog adapter should receive the server-installed request Cx"
+        );
+        assert!(
+            checkpoint_ok.load(Ordering::SeqCst),
+            "request Cx should accept checkpoints inside the adapter call"
+        );
     }
 
     #[test]
@@ -912,7 +1085,7 @@ mod tests {
     #[test]
     fn successful_results_carry_next_actions_workflow_hints() {
         // oracle-da9j.7: a tool that runs attaches its natural follow-ups.
-        let server =
+        let mut server =
             PlsqlMcpServer::new(crate::default_tool_registry()).expect("server runtime builds");
         let resp = server
             .handle_request(&req(
@@ -1125,7 +1298,7 @@ mod tests {
         // that has no dispatch arm is a wire gap.
         let r = crate::default_tool_registry();
         let tool_names: Vec<String> = r.tools.iter().map(|tool| tool.name.clone()).collect();
-        let server = PlsqlMcpServer::new(r).expect("server runtime builds");
+        let mut server = PlsqlMcpServer::new(r).expect("server runtime builds");
         for tool_name in tool_names {
             let resp = server
                 .handle_request(&req(

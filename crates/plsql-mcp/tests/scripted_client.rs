@@ -41,7 +41,7 @@ fn server(registry: ToolRegistry) -> PlsqlMcpServer {
     PlsqlMcpServer::new(registry).expect("server runtime builds")
 }
 
-fn call(server: &PlsqlMcpServer, line: &str) -> serde_json::Value {
+fn call(server: &mut PlsqlMcpServer, line: &str) -> serde_json::Value {
     let resp = server
         .handle_request_line(line)
         .expect("server produced a response");
@@ -50,11 +50,11 @@ fn call(server: &PlsqlMcpServer, line: &str) -> serde_json::Value {
 
 #[test]
 fn scripted_session_golden_invariants() {
-    let server = server(foundation_registry());
+    let mut server = server(foundation_registry());
 
     // --- frame 1: initialize ---
     let init = call(
-        &server,
+        &mut server,
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
     );
     assert_eq!(init["jsonrpc"], "2.0");
@@ -69,7 +69,7 @@ fn scripted_session_golden_invariants() {
 
     // --- frame 2: tools/list — exact foundation surface ---
     let list = call(
-        &server,
+        &mut server,
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
     );
     assert_eq!(list["id"], 2);
@@ -91,7 +91,7 @@ fn scripted_session_golden_invariants() {
 
     // --- frame 3: ping — empty payload + trust block ---
     let ping = call(
-        &server,
+        &mut server,
         r#"{"jsonrpc":"2.0","id":3,"method":"ping","params":{}}"#,
     );
     assert_eq!(ping["id"], 3);
@@ -99,7 +99,7 @@ fn scripted_session_golden_invariants() {
 
     // --- frame 4: unknown method — typed JSON-RPC error ---
     let bad = call(
-        &server,
+        &mut server,
         r#"{"jsonrpc":"2.0","id":4,"method":"no/such","params":{}}"#,
     );
     assert_eq!(bad["id"], 4);
@@ -110,16 +110,16 @@ fn scripted_session_golden_invariants() {
     );
 
     // --- frame 5: malformed line — parse error, never a panic ---
-    let parse_err = call(&server, "{not valid json");
+    let parse_err = call(&mut server, "{not valid json");
     assert_eq!(parse_err["error"]["code"], -32700);
 }
 
 #[test]
 fn responses_are_deterministic_across_runs() {
-    let server = server(foundation_registry());
+    let mut server = server(foundation_registry());
     let line = r#"{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}"#;
-    let a = call(&server, line);
-    let b = call(&server, line);
+    let a = call(&mut server, line);
+    let b = call(&mut server, line);
     assert_eq!(a, b, "identical request -> byte-identical response");
 }
 
@@ -130,9 +130,9 @@ fn tools_call_parse_file_executes_a_real_tool_over_the_wire() {
     // parse result over the wire — not a placeholder. This is the
     // headline "fully wired" assertion, exercised through the exact
     // `handle_request_line` path a real MCP client uses.
-    let server = server(default_tool_registry());
+    let mut server = server(default_tool_registry());
     let resp = call(
-        &server,
+        &mut server,
         concat!(
             r#"{"jsonrpc":"2.0","id":50,"method":"tools/call","params":"#,
             r#"{"name":"parse_file","arguments":"#,
@@ -163,9 +163,9 @@ fn tools_call_live_db_tool_returns_an_honest_gated_result_over_the_wire() {
     // oracle-l65d: a live-DB tool (`query`) is wired — it dispatches
     // — but with no connection it returns a typed, honest error
     // result over the wire. Never a panic, never a fake success.
-    let server = server(default_tool_registry());
+    let mut server = server(default_tool_registry());
     let resp = call(
-        &server,
+        &mut server,
         concat!(
             r#"{"jsonrpc":"2.0","id":51,"method":"tools/call","params":"#,
             r#"{"name":"query","arguments":{"sql":"SELECT 1 FROM dual"}}}"#,
@@ -191,9 +191,9 @@ fn tools_call_live_db_tool_returns_an_honest_gated_result_over_the_wire() {
 fn tools_call_bad_arguments_returns_invalid_params_over_the_wire() {
     // oracle-l65d: un-deserializable arguments are a proper -32602
     // JSON-RPC error, never a panic.
-    let server = server(default_tool_registry());
+    let mut server = server(default_tool_registry());
     let resp = call(
-        &server,
+        &mut server,
         concat!(
             r#"{"jsonrpc":"2.0","id":52,"method":"tools/call","params":"#,
             r#"{"name":"parse_file","arguments":{"source":99}}}"#,
@@ -205,9 +205,9 @@ fn tools_call_bad_arguments_returns_invalid_params_over_the_wire() {
 
 #[test]
 fn every_registered_tool_is_discoverable_and_described() {
-    let server = server(foundation_registry());
+    let mut server = server(foundation_registry());
     let list = call(
-        &server,
+        &mut server,
         r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
     );
     for t in list["result"]["tools"].as_array().unwrap() {
