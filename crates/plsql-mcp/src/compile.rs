@@ -11,6 +11,7 @@
 //! Oracle error-code ranges documented in the database error reference
 //! (PLW-05xxx = severe, PLW-06xxx = informational, PLW-07xxx = performance).
 
+use asupersync::Cx;
 use plsql_catalog::{CatalogError, OracleConnection};
 use plsql_core::UnknownReason;
 use serde::{Deserialize, Serialize};
@@ -92,7 +93,8 @@ pub enum CompileToolError {
 /// `ALTER ... COMPILE` form Oracle accepts does not support bind variables
 /// for the identifier, so the function validates owner/name/object_type
 /// against an allowlist before interpolating them into the DDL string.
-pub fn run_compile_with_warnings<C: OracleConnection>(
+pub async fn run_compile_with_warnings<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     owner: &str,
     object_name: &str,
@@ -102,7 +104,8 @@ pub fn run_compile_with_warnings<C: OracleConnection>(
     validate_identifier(object_name)?;
     let normalized_type = normalize_object_type(object_type)?;
 
-    conn.execute("alter session set plsql_warnings = 'ENABLE:ALL'", &[])
+    conn.execute(cx, "alter session set plsql_warnings = 'ENABLE:ALL'", &[])
+        .await
         .map_err(|err| CompileToolError::BackendCompile(err.to_string()))?;
 
     let compile_sql = format!(
@@ -113,7 +116,7 @@ pub fn run_compile_with_warnings<C: OracleConnection>(
     );
     let mut success = true;
     let mut unknown_reasons = Vec::new();
-    if let Err(err) = conn.execute(&compile_sql, &[]) {
+    if let Err(err) = conn.execute(cx, &compile_sql, &[]).await {
         success = false;
         unknown_reasons.push(UnknownReason::ParserRecoveryRegion);
         // Oracle's ALTER ... COMPILE raises when the object has errors,
@@ -125,7 +128,7 @@ pub fn run_compile_with_warnings<C: OracleConnection>(
         );
     }
 
-    let errors_response = run_get_errors(conn, owner, object_name)?;
+    let errors_response = run_get_errors(cx, conn, owner, object_name).await?;
     // Propagate the K18 sanitization signal: if `run_get_errors` scrubbed
     // any free-text field on any row, the compile response must also flag
     // `ResponseSanitized` so the agent sees the same honesty marker. Avoid
@@ -220,7 +223,9 @@ fn normalize_object_type(text: &str) -> Result<NormalizedObjectType, CompileTool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::runtime::RuntimeBuilder;
     use plsql_catalog::{OracleBackend, OracleBind, OracleConnectionInfo, OracleRow};
+    use std::future::Future;
     use std::sync::Mutex;
 
     struct CompileStubConn {
@@ -229,14 +234,17 @@ mod tests {
         fail_compile: bool,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl OracleConnection for CompileStubConn {
         fn backend(&self) -> OracleBackend {
             OracleBackend::RustOracle
         }
-        fn ping(&self) -> Result<(), CatalogError> {
+        async fn ping(&self, cx: &Cx) -> Result<(), CatalogError> {
+            let _ = cx;
             Ok(())
         }
-        fn describe(&self) -> Result<OracleConnectionInfo, CatalogError> {
+        async fn describe(&self, cx: &Cx) -> Result<OracleConnectionInfo, CatalogError> {
+            let _ = cx;
             Ok(OracleConnectionInfo {
                 backend: OracleBackend::RustOracle,
                 connect_string: String::from("//localhost/XE"),
@@ -251,14 +259,22 @@ mod tests {
                 max_open_cursors: 500,
             })
         }
-        fn query_rows(
+        async fn query_rows(
             &self,
+            cx: &Cx,
             _sql: &str,
             _params: &[OracleBind],
         ) -> Result<Vec<OracleRow>, CatalogError> {
+            let _ = cx;
             Ok(self.error_rows.clone())
         }
-        fn execute(&self, sql: &str, _params: &[OracleBind]) -> Result<u64, CatalogError> {
+        async fn execute(
+            &self,
+            cx: &Cx,
+            sql: &str,
+            _params: &[OracleBind],
+        ) -> Result<u64, CatalogError> {
+            let _ = cx;
             self.executes.lock().unwrap().push(sql.to_string());
             if self.fail_compile && sql.contains("compile") {
                 Err(CatalogError::OracleBackendError {
@@ -269,6 +285,25 @@ mod tests {
                 Ok(0)
             }
         }
+    }
+
+    fn run_compile_future<F: Future>(future: F) -> F::Output {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("test asupersync runtime")
+            .block_on(future)
+    }
+
+    fn run_compile_with_warnings_for_test<C: OracleConnection>(
+        conn: &C,
+        owner: &str,
+        object_name: &str,
+        object_type: &str,
+    ) -> Result<CompileWithWarningsResponse, CompileToolError> {
+        run_compile_future(async {
+            let cx = Cx::current().expect("test runtime installs a request Cx");
+            run_compile_with_warnings(&cx, conn, owner, object_name, object_type).await
+        })
     }
 
     fn error_row(line: u32, attribute: &str, message_number: i64, text: &str) -> OracleRow {
@@ -400,7 +435,8 @@ mod tests {
             fail_compile: false,
         };
         let response =
-            run_compile_with_warnings(&stub, "BILLING", "BILLING_PKG", "PACKAGE BODY").unwrap();
+            run_compile_with_warnings_for_test(&stub, "BILLING", "BILLING_PKG", "PACKAGE BODY")
+                .unwrap();
         assert!(response.success);
         assert!(response.severe.is_empty());
         assert!(response.performance.is_empty());
@@ -427,7 +463,8 @@ mod tests {
             fail_compile: false,
         };
         let response =
-            run_compile_with_warnings(&stub, "BILLING", "BILLING_PKG", "PACKAGE BODY").unwrap();
+            run_compile_with_warnings_for_test(&stub, "BILLING", "BILLING_PKG", "PACKAGE BODY")
+                .unwrap();
         assert!(!response.success); // severe row → success = false
         assert_eq!(response.severe.len(), 1);
         assert_eq!(response.performance.len(), 1);
@@ -469,7 +506,8 @@ mod tests {
             fail_compile: false,
         };
         let response =
-            run_compile_with_warnings(&stub, "BILLING", "BILLING_PKG", "PACKAGE BODY").unwrap();
+            run_compile_with_warnings_for_test(&stub, "BILLING", "BILLING_PKG", "PACKAGE BODY")
+                .unwrap();
         assert_eq!(response.severe.len(), 1);
         assert!(
             !response.severe[0].text.contains('<') && !response.severe[0].text.contains('>'),
@@ -493,7 +531,8 @@ mod tests {
             fail_compile: true,
         };
         let response =
-            run_compile_with_warnings(&stub, "BILLING", "BILLING_PKG", "PACKAGE BODY").unwrap();
+            run_compile_with_warnings_for_test(&stub, "BILLING", "BILLING_PKG", "PACKAGE BODY")
+                .unwrap();
         assert!(!response.success);
         assert_eq!(response.severe.len(), 1);
         assert!(

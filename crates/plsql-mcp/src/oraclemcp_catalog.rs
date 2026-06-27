@@ -3,16 +3,15 @@
 //!
 //! This module deliberately lives in `plsql-mcp`: the offline catalog crate
 //! must not depend on `oraclemcp-db`, `oraclemcp-guard`, or the MCP runtime.
-//! The adapter is async and `Cx`-first like `oraclemcp-db`; the C.2 catalog
-//! trait migration will make this implement the catalog trait directly without
-//! adding a per-round-trip `block_on` bridge.
+//! The adapter implements the catalog trait directly without adding a
+//! per-round-trip `block_on` bridge.
 
 use asupersync::Cx;
 use oraclemcp_db::SerializeOptions;
 use plsql_catalog::{
     CatalogError, OracleBackend as CatalogBackend, OracleBind as CatalogBind,
-    OracleCell as CatalogCell, OracleConnectionInfo as CatalogConnectionInfo,
-    OracleRow as CatalogRow,
+    OracleCell as CatalogCell, OracleConnection as CatalogOracleConnection,
+    OracleConnectionInfo as CatalogConnectionInfo, OracleRow as CatalogRow,
 };
 
 /// MCP-side adapter over an `oraclemcp-db` connection.
@@ -135,6 +134,42 @@ where
             .execute(cx, sql, &upstream_binds)
             .await
             .map_err(map_db_error)
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl<C> CatalogOracleConnection for OraclemcpCatalogConnection<C>
+where
+    C: oraclemcp_db::OracleConnection,
+{
+    fn backend(&self) -> CatalogBackend {
+        OraclemcpCatalogConnection::backend(self)
+    }
+
+    async fn ping(&self, cx: &Cx) -> Result<(), CatalogError> {
+        OraclemcpCatalogConnection::ping(self, cx).await
+    }
+
+    async fn describe(&self, cx: &Cx) -> Result<CatalogConnectionInfo, CatalogError> {
+        OraclemcpCatalogConnection::describe(self, cx).await
+    }
+
+    async fn query_rows(
+        &self,
+        cx: &Cx,
+        sql: &str,
+        params: &[CatalogBind],
+    ) -> Result<Vec<CatalogRow>, CatalogError> {
+        OraclemcpCatalogConnection::query_rows(self, cx, sql, params).await
+    }
+
+    async fn execute(
+        &self,
+        cx: &Cx,
+        sql: &str,
+        params: &[CatalogBind],
+    ) -> Result<u64, CatalogError> {
+        OraclemcpCatalogConnection::execute(self, cx, sql, params).await
     }
 }
 

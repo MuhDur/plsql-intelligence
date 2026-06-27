@@ -59,32 +59,137 @@ fn hero_demo_dropcol_live_xe_is_feature_gated() {
 
 #[cfg(feature = "live-xe")]
 mod live {
-    use plsql_catalog::{OracleBind, OracleConnectOptions, OracleConnection, RustOracleConnection};
+    use asupersync::{Cx, runtime::RuntimeBuilder};
+    use plsql_catalog::{
+        CatalogError, OracleBind, OracleConnectOptions, OracleConnection, RustOracleConnection,
+    };
     use plsql_mcp::{
-        ListObjectsRequest, run_get_errors, run_get_object_source, run_list_objects, run_query,
+        GetErrorsResponse, GetObjectSourceResponse, ListObjectsRequest, ListObjectsResponse,
+        QueryError, QueryResponse, SourceToolError, run_get_errors as run_get_errors_async,
+        run_get_object_source as run_get_object_source_async,
+        run_list_objects as run_list_objects_async, run_query as run_query_async,
     };
     use serde::{Deserialize, Serialize};
-    use std::fs;
+    use std::{
+        fs,
+        future::Future,
+        sync::atomic::{AtomicU32, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     // ─── Connection constants ─────────────────────────────────────────────────
 
+    static SCRATCH_COUNTER: AtomicU32 = AtomicU32::new(0);
+
     const SYSTEM_USER: &str = "SYSTEM";
-    const SYSTEM_PASS: &str = "DemoPlsqlIntel#2026";
     const CONNECT_STRING: &str = "//localhost:1521/FREEPDB1";
 
     fn system_conn() -> RustOracleConnection {
-        let opts = OracleConnectOptions::new(SYSTEM_USER, SYSTEM_PASS, CONNECT_STRING)
+        let password = required_env("PLSQL_XE_SYSTEM_PASSWORD");
+        let opts = OracleConnectOptions::new(SYSTEM_USER, &password, CONNECT_STRING)
             .with_module("plsql-mcp-dropcol-hero-test")
             .with_action("PLSQL-LAB-008");
         RustOracleConnection::connect(opts)
             .expect("PLSQL-LAB-008: SYSTEM connection to //localhost:1521/FREEPDB1 must succeed")
     }
 
+    fn run_live_future<F: Future>(future: F) -> F::Output {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("live-xe asupersync runtime")
+            .block_on(future)
+    }
+
+    fn execute_sql<C: OracleConnection>(conn: &C, sql: &str) -> Result<u64, CatalogError> {
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            conn.execute(&cx, sql, &[]).await
+        })
+    }
+
+    fn run_query<C: OracleConnection>(
+        conn: &C,
+        sql: &str,
+        params: &[OracleBind],
+        lob_truncation_chars: Option<usize>,
+    ) -> Result<QueryResponse, QueryError> {
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            run_query_async(&cx, conn, sql, params, lob_truncation_chars).await
+        })
+    }
+
+    fn run_get_object_source<C: OracleConnection>(
+        conn: &C,
+        owner: &str,
+        object_name: &str,
+        object_type: &str,
+    ) -> Result<GetObjectSourceResponse, SourceToolError> {
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            run_get_object_source_async(&cx, conn, owner, object_name, object_type).await
+        })
+    }
+
+    fn run_get_errors<C: OracleConnection>(
+        conn: &C,
+        owner: &str,
+        object_name: &str,
+    ) -> Result<GetErrorsResponse, SourceToolError> {
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            run_get_errors_async(&cx, conn, owner, object_name).await
+        })
+    }
+
+    fn run_list_objects<C: OracleConnection>(
+        conn: &C,
+        request: &ListObjectsRequest,
+    ) -> Result<ListObjectsResponse, plsql_mcp::ListObjectsError> {
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            run_list_objects_async(&cx, conn, request).await
+        })
+    }
+
     // ─── Scratch schema helpers ───────────────────────────────────────────────
 
     /// Returns the scratch schema name unique to this test process.
     fn hero_schema_name() -> String {
-        format!("HEROCOL_T_{}", std::process::id())
+        format!("HEROCOL_T_{}", unique_suffix())
+    }
+
+    fn required_env(name: &str) -> String {
+        std::env::var(name).expect("required live-XE credential env var is not set")
+    }
+
+    fn unique_suffix() -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let counter = SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed) % 1000;
+        format!("{:015}{counter:03}", nanos % 1_000_000_000_000_000)
+    }
+
+    fn random_password(prefix: &str) -> String {
+        format!("{prefix}{}#", random_hex(8))
+    }
+
+    fn random_hex(byte_count: usize) -> String {
+        let mut bytes = vec![0_u8; byte_count];
+        getrandom::fill(&mut bytes).expect("OS randomness must be available for live-XE tests");
+        let mut out = String::with_capacity(byte_count * 2);
+        for byte in bytes {
+            push_hex_byte(&mut out, byte);
+        }
+        out
+    }
+
+    fn push_hex_byte(output: &mut String, byte: u8) {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
 
     /// Drop the entire scratch schema (user + all its objects) unconditionally.
@@ -95,7 +200,7 @@ mod live {
              EXCEPTION WHEN OTHERS THEN NULL; \
              END;"
         );
-        let _ = conn.execute(&sql, &[]);
+        let _ = execute_sql(conn, &sql);
     }
 
     /// Create a scratch schema with privileges needed for our DROP COLUMN test.
@@ -104,12 +209,12 @@ mod live {
         drop_scratch_schema(conn, schema);
 
         // 2. Create the user.
+        let password = random_password("HeroColT");
         let create_sql = format!(
-            "CREATE USER {schema} IDENTIFIED BY HeroColT3stPass#2026 \
+            "CREATE USER {schema} IDENTIFIED BY {password} \
              DEFAULT TABLESPACE USERS QUOTA UNLIMITED ON USERS"
         );
-        conn.execute(&create_sql, &[])
-            .unwrap_or_else(|e| panic!("PLSQL-LAB-008: CREATE USER {schema} failed: {e}"));
+        execute_sql(conn, &create_sql).expect("PLSQL-LAB-008: CREATE USER scratch schema failed");
 
         // 3. Grant privileges.
         for priv_sql in &[
@@ -119,8 +224,7 @@ mod live {
             format!("GRANT CREATE PROCEDURE TO {schema}"),
             format!("GRANT ALTER ANY TABLE TO {schema}"),
         ] {
-            conn.execute(priv_sql, &[])
-                .unwrap_or_else(|e| panic!("PLSQL-LAB-008: GRANT to {schema} failed: {e}"));
+            execute_sql(conn, priv_sql).expect("PLSQL-LAB-008: GRANT to scratch schema failed");
         }
     }
 
@@ -224,8 +328,7 @@ mod live {
                CONSTRAINT {schema}_CUST_PK PRIMARY KEY (CUSTOMER_ID) \
              )"
         );
-        conn.execute(&customers_ddl, &[])
-            .unwrap_or_else(|e| panic!("PLSQL-LAB-008: CREATE TABLE CUSTOMERS failed: {e}"));
+        execute_sql(&conn, &customers_ddl).expect("PLSQL-LAB-008: CREATE TABLE CUSTOMERS failed");
 
         // v_high_value_customers view — depends on legacy_segment
         let view_ddl = format!(
@@ -234,9 +337,8 @@ mod live {
                FROM {schema}.CUSTOMERS \
                WHERE LEGACY_SEGMENT IS NOT NULL"
         );
-        conn.execute(&view_ddl, &[]).unwrap_or_else(|e| {
-            panic!("PLSQL-LAB-008: CREATE VIEW V_HIGH_VALUE_CUSTOMERS failed: {e}")
-        });
+        execute_sql(&conn, &view_ddl)
+            .expect("PLSQL-LAB-008: CREATE VIEW V_HIGH_VALUE_CUSTOMERS failed");
 
         // pkg_customer_report spec — no column reference (stays VALID after drop)
         let spec_src = include_str!(concat!(
@@ -247,9 +349,8 @@ mod live {
             "CREATE OR REPLACE PACKAGE pkg_customer_report",
             &format!("CREATE OR REPLACE PACKAGE {schema}.PKG_CUSTOMER_REPORT"),
         );
-        conn.execute(&spec_src, &[]).unwrap_or_else(|e| {
-            panic!("PLSQL-LAB-008: CREATE PACKAGE PKG_CUSTOMER_REPORT spec failed: {e}")
-        });
+        execute_sql(&conn, &spec_src)
+            .expect("PLSQL-LAB-008: CREATE PACKAGE PKG_CUSTOMER_REPORT spec failed");
 
         // pkg_customer_report body — three references to legacy_segment
         let body_src = include_str!(concat!(
@@ -266,9 +367,8 @@ mod live {
             "customers.legacy_segment%TYPE",
             &format!("{schema}.CUSTOMERS.LEGACY_SEGMENT%TYPE"),
         );
-        conn.execute(&body_src, &[]).unwrap_or_else(|e| {
-            panic!("PLSQL-LAB-008: CREATE PACKAGE BODY PKG_CUSTOMER_REPORT failed: {e}")
-        });
+        execute_sql(&conn, &body_src)
+            .expect("PLSQL-LAB-008: CREATE PACKAGE BODY PKG_CUSTOMER_REPORT failed");
 
         // proc_segment_summary — %TYPE anchor + column reference
         let proc_src = include_str!(concat!(
@@ -284,9 +384,8 @@ mod live {
             "customers.legacy_segment%TYPE",
             &format!("{schema}.CUSTOMERS.LEGACY_SEGMENT%TYPE"),
         );
-        conn.execute(&proc_src, &[]).unwrap_or_else(|e| {
-            panic!("PLSQL-LAB-008: CREATE PROCEDURE PROC_SEGMENT_SUMMARY failed: {e}")
-        });
+        execute_sql(&conn, &proc_src)
+            .expect("PLSQL-LAB-008: CREATE PROCEDURE PROC_SEGMENT_SUMMARY failed");
 
         eprintln!("[PLSQL-LAB-008] 'before' corpus loaded into {schema}");
 
@@ -628,9 +727,8 @@ mod live {
         // This is the §1.4 hero action: the DDL the DBA is about to run.
         // We execute it to observe Oracle's actual response.
         let drop_col_sql = format!("ALTER TABLE {schema}.CUSTOMERS DROP COLUMN LEGACY_SEGMENT");
-        conn.execute(&drop_col_sql, &[]).unwrap_or_else(|e| {
-            panic!("PLSQL-LAB-008: ALTER TABLE CUSTOMERS DROP COLUMN LEGACY_SEGMENT failed: {e}")
-        });
+        execute_sql(&conn, &drop_col_sql)
+            .expect("PLSQL-LAB-008: ALTER TABLE CUSTOMERS DROP COLUMN LEGACY_SEGMENT failed");
 
         eprintln!("[PLSQL-LAB-008] DROP COLUMN executed: LEGACY_SEGMENT removed from CUSTOMERS");
 

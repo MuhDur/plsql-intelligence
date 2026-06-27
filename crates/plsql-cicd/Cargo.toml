@@ -17,6 +17,9 @@ oracle-driver = ["plsql-catalog/oracle-driver"]
 live-xe = ["oracle-driver"]
 
 [dependencies]
+async-trait = "0.1"
+asupersync = "=0.3.4"
+getrandom = "0.3"
 plsql-catalog = { path = "../plsql-catalog" }
 plsql-core = { path = "../plsql-core" }
 plsql-output = { path = "../plsql-output" }

@@ -6,6 +6,7 @@
 //! programmatically. All four tools share an `OracleConnection` shim and
 //! issue parameterized queries against `ALL_*` dictionary views.
 
+use asupersync::Cx;
 use oraclemcp_error::{ErrorClass, ErrorEnvelope, enrich_oracle_error, fuzzy_suggest};
 use plsql_catalog::{CatalogError, OracleBind, OracleConnection};
 use plsql_core::UnknownReason;
@@ -212,7 +213,8 @@ pub(crate) fn normalize_identifier(raw: &str) -> String {
 
 /// `describe_table(owner, name)` — emits column, constraint, index,
 /// comment, and partition info for a single TABLE.
-pub fn run_describe_table<C: OracleConnection>(
+pub async fn run_describe_table<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     owner: &str,
     name: &str,
@@ -221,11 +223,11 @@ pub fn run_describe_table<C: OracleConnection>(
     let name = normalize_identifier(name);
     let (owner, name) = (owner.as_str(), name.as_str());
     let mut sanitized_fields = 0usize;
-    let columns = load_columns(conn, owner, name, &mut sanitized_fields)?;
-    let comment = load_table_comment(conn, owner, name, &mut sanitized_fields)?;
-    let constraints = load_constraints(conn, owner, name, &mut sanitized_fields)?;
-    let indexes = load_indexes_for_table(conn, owner, name)?;
-    let (partitioned, partition_count) = load_partition_info(conn, owner, name)?;
+    let columns = load_columns(cx, conn, owner, name, &mut sanitized_fields).await?;
+    let comment = load_table_comment(cx, conn, owner, name, &mut sanitized_fields).await?;
+    let constraints = load_constraints(cx, conn, owner, name, &mut sanitized_fields).await?;
+    let indexes = load_indexes_for_table(cx, conn, owner, name).await?;
+    let (partitioned, partition_count) = load_partition_info(cx, conn, owner, name).await?;
     if columns.is_empty() && comment.is_none() && !partitioned {
         return Err(DescribeError::NotFound {
             owner: owner.to_string(),
@@ -251,7 +253,8 @@ pub fn run_describe_table<C: OracleConnection>(
     })
 }
 
-pub fn run_describe_view<C: OracleConnection>(
+pub async fn run_describe_view<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     owner: &str,
     name: &str,
@@ -261,14 +264,17 @@ pub fn run_describe_view<C: OracleConnection>(
     let name = normalize_identifier(name);
     let (owner, name) = (owner.as_str(), name.as_str());
     let mut sanitized_fields = 0usize;
-    let columns = load_columns(conn, owner, name, &mut sanitized_fields)?;
-    let view_row = conn.query_rows(
-        "select text_vc, read_only from all_views where owner = :1 and view_name = :2",
-        &[
-            OracleBind::from(owner.to_string()),
-            OracleBind::from(name.to_string()),
-        ],
-    )?;
+    let columns = load_columns(cx, conn, owner, name, &mut sanitized_fields).await?;
+    let view_row = conn
+        .query_rows(
+            cx,
+            "select text_vc, read_only from all_views where owner = :1 and view_name = :2",
+            &[
+                OracleBind::from(owner.to_string()),
+                OracleBind::from(name.to_string()),
+            ],
+        )
+        .await?;
     let Some(row) = view_row.into_iter().next() else {
         return Err(DescribeError::NotFound {
             owner: owner.to_string(),
@@ -283,7 +289,7 @@ pub fn run_describe_view<C: OracleConnection>(
     // point cannot panic.
     let text = scrub(row.text("TEXT_VC").map(String::from), &mut sanitized_fields);
     let read_only = row.text("READ_ONLY").map(|v| v.eq_ignore_ascii_case("Y"));
-    let comment = load_table_comment(conn, owner, name, &mut sanitized_fields)?;
+    let comment = load_table_comment(cx, conn, owner, name, &mut sanitized_fields).await?;
     let query_preview = match (text, text_preview_chars) {
         (Some(t), Some(limit)) if t.chars().count() > limit => {
             let mut truncated: String = t.chars().take(limit).collect();
@@ -309,7 +315,8 @@ pub fn run_describe_view<C: OracleConnection>(
     })
 }
 
-pub fn run_describe_trigger<C: OracleConnection>(
+pub async fn run_describe_trigger<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     owner: &str,
     name: &str,
@@ -317,14 +324,17 @@ pub fn run_describe_trigger<C: OracleConnection>(
     let owner = normalize_identifier(owner);
     let name = normalize_identifier(name);
     let (owner, name) = (owner.as_str(), name.as_str());
-    let rows = conn.query_rows(
-        "select trigger_type, triggering_event, table_owner, table_name, status, when_clause \
+    let rows = conn
+        .query_rows(
+            cx,
+            "select trigger_type, triggering_event, table_owner, table_name, status, when_clause \
          from all_triggers where owner = :1 and trigger_name = :2",
-        &[
-            OracleBind::from(owner.to_string()),
-            OracleBind::from(name.to_string()),
-        ],
-    )?;
+            &[
+                OracleBind::from(owner.to_string()),
+                OracleBind::from(name.to_string()),
+            ],
+        )
+        .await?;
     let Some(row) = rows.into_iter().next() else {
         return Err(DescribeError::NotFound {
             owner: owner.to_string(),
@@ -364,7 +374,8 @@ pub fn run_describe_trigger<C: OracleConnection>(
     })
 }
 
-pub fn run_describe_index<C: OracleConnection>(
+pub async fn run_describe_index<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     owner: &str,
     name: &str,
@@ -372,14 +383,17 @@ pub fn run_describe_index<C: OracleConnection>(
     let owner = normalize_identifier(owner);
     let name = normalize_identifier(name);
     let (owner, name) = (owner.as_str(), name.as_str());
-    let header = conn.query_rows(
-        "select table_owner, table_name, uniqueness, index_type, status \
+    let header = conn
+        .query_rows(
+            cx,
+            "select table_owner, table_name, uniqueness, index_type, status \
          from all_indexes where owner = :1 and index_name = :2",
-        &[
-            OracleBind::from(owner.to_string()),
-            OracleBind::from(name.to_string()),
-        ],
-    )?;
+            &[
+                OracleBind::from(owner.to_string()),
+                OracleBind::from(name.to_string()),
+            ],
+        )
+        .await?;
     let Some(row) = header.into_iter().next() else {
         return Err(DescribeError::NotFound {
             owner: owner.to_string(),
@@ -387,14 +401,17 @@ pub fn run_describe_index<C: OracleConnection>(
             object_type: String::from("INDEX"),
         });
     };
-    let column_rows = conn.query_rows(
-        "select column_name from all_ind_columns where index_owner = :1 and index_name = :2 \
+    let column_rows = conn
+        .query_rows(
+            cx,
+            "select column_name from all_ind_columns where index_owner = :1 and index_name = :2 \
          order by column_position",
-        &[
-            OracleBind::from(owner.to_string()),
-            OracleBind::from(name.to_string()),
-        ],
-    )?;
+            &[
+                OracleBind::from(owner.to_string()),
+                OracleBind::from(name.to_string()),
+            ],
+        )
+        .await?;
     let columns = column_rows
         .into_iter()
         .filter_map(|r| r.text("COLUMN_NAME").map(String::from))
@@ -418,13 +435,15 @@ pub fn run_describe_index<C: OracleConnection>(
 /// DB-controlled free-text fields on each column (DEFAULT_EXPRESSION and
 /// COMMENTS); the number of rewritten fields is accumulated into
 /// `sanitized` so the caller can surface `ResponseSanitized` honestly.
-fn load_columns<C: OracleConnection>(
+async fn load_columns<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     owner: &str,
     name: &str,
     sanitized: &mut usize,
 ) -> Result<Vec<DescribeColumn>, DescribeError> {
     let rows = conn.query_rows(
+        cx,
         "select c.column_name, c.data_type, c.nullable, c.data_default_vc as default_expression, \
                 c.column_id as position, m.comments \
          from all_tab_columns c \
@@ -435,7 +454,8 @@ fn load_columns<C: OracleConnection>(
             OracleBind::from(owner.to_string()),
             OracleBind::from(name.to_string()),
         ],
-    )?;
+    )
+    .await?;
     Ok(rows
         .into_iter()
         .map(|row| DescribeColumn {
@@ -455,19 +475,23 @@ fn load_columns<C: OracleConnection>(
         .collect())
 }
 
-fn load_table_comment<C: OracleConnection>(
+async fn load_table_comment<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     owner: &str,
     name: &str,
     sanitized: &mut usize,
 ) -> Result<Option<String>, DescribeError> {
-    let rows = conn.query_rows(
-        "select comments from all_tab_comments where owner = :1 and table_name = :2",
-        &[
-            OracleBind::from(owner.to_string()),
-            OracleBind::from(name.to_string()),
-        ],
-    )?;
+    let rows = conn
+        .query_rows(
+            cx,
+            "select comments from all_tab_comments where owner = :1 and table_name = :2",
+            &[
+                OracleBind::from(owner.to_string()),
+                OracleBind::from(name.to_string()),
+            ],
+        )
+        .await?;
     Ok(scrub(
         rows.into_iter()
             .next()
@@ -476,25 +500,29 @@ fn load_table_comment<C: OracleConnection>(
     ))
 }
 
-fn load_constraints<C: OracleConnection>(
+async fn load_constraints<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     owner: &str,
     name: &str,
     sanitized: &mut usize,
 ) -> Result<Vec<DescribeConstraint>, DescribeError> {
-    let rows = conn.query_rows(
-        "select c.constraint_name, c.constraint_type, c.search_condition_vc, \
+    let rows = conn
+        .query_rows(
+            cx,
+            "select c.constraint_name, c.constraint_type, c.search_condition_vc, \
                 c.r_owner, c.r_constraint_name, cc.column_name \
          from all_constraints c \
          left join all_cons_columns cc on cc.owner = c.owner \
                                      and cc.constraint_name = c.constraint_name \
          where c.owner = :1 and c.table_name = :2 \
          order by c.constraint_name, cc.position",
-        &[
-            OracleBind::from(owner.to_string()),
-            OracleBind::from(name.to_string()),
-        ],
-    )?;
+            &[
+                OracleBind::from(owner.to_string()),
+                OracleBind::from(name.to_string()),
+            ],
+        )
+        .await?;
     let mut current: Option<DescribeConstraint> = None;
     let mut out: Vec<DescribeConstraint> = Vec::new();
     for row in rows {
@@ -534,22 +562,26 @@ fn load_constraints<C: OracleConnection>(
     Ok(out)
 }
 
-fn load_indexes_for_table<C: OracleConnection>(
+async fn load_indexes_for_table<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     owner: &str,
     name: &str,
 ) -> Result<Vec<DescribeIndex>, DescribeError> {
-    let rows = conn.query_rows(
-        "select i.index_name, i.uniqueness, i.index_type, ic.column_name \
+    let rows = conn
+        .query_rows(
+            cx,
+            "select i.index_name, i.uniqueness, i.index_type, ic.column_name \
          from all_indexes i \
          left join all_ind_columns ic on ic.index_owner = i.owner and ic.index_name = i.index_name \
          where i.table_owner = :1 and i.table_name = :2 \
          order by i.index_name, ic.column_position",
-        &[
-            OracleBind::from(owner.to_string()),
-            OracleBind::from(name.to_string()),
-        ],
-    )?;
+            &[
+                OracleBind::from(owner.to_string()),
+                OracleBind::from(name.to_string()),
+            ],
+        )
+        .await?;
     let mut current: Option<DescribeIndex> = None;
     let mut out: Vec<DescribeIndex> = Vec::new();
     for row in rows {
@@ -588,7 +620,8 @@ fn load_indexes_for_table<C: OracleConnection>(
     Ok(out)
 }
 
-fn load_partition_info<C: OracleConnection>(
+async fn load_partition_info<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     owner: &str,
     name: &str,
@@ -598,13 +631,16 @@ fn load_partition_info<C: OracleConnection>(
     // is partitioned at all, then fetch the count from ALL_PART_TABLES only
     // when it is — avoiding the ORA-00904 that results from projecting a
     // non-existent `PARTITIONED` column from ALL_PART_TABLES.
-    let table_rows = conn.query_rows(
-        "select partitioned from all_tables where owner = :1 and table_name = :2",
-        &[
-            OracleBind::from(owner.to_string()),
-            OracleBind::from(name.to_string()),
-        ],
-    )?;
+    let table_rows = conn
+        .query_rows(
+            cx,
+            "select partitioned from all_tables where owner = :1 and table_name = :2",
+            &[
+                OracleBind::from(owner.to_string()),
+                OracleBind::from(name.to_string()),
+            ],
+        )
+        .await?;
     let Some(table_row) = table_rows.into_iter().next() else {
         return Ok((false, 0));
     };
@@ -615,13 +651,16 @@ fn load_partition_info<C: OracleConnection>(
     if !partitioned {
         return Ok((false, 0));
     }
-    let part_rows = conn.query_rows(
-        "select partition_count from all_part_tables where owner = :1 and table_name = :2",
-        &[
-            OracleBind::from(owner.to_string()),
-            OracleBind::from(name.to_string()),
-        ],
-    )?;
+    let part_rows = conn
+        .query_rows(
+            cx,
+            "select partition_count from all_part_tables where owner = :1 and table_name = :2",
+            &[
+                OracleBind::from(owner.to_string()),
+                OracleBind::from(name.to_string()),
+            ],
+        )
+        .await?;
     let count = part_rows
         .into_iter()
         .next()
@@ -633,8 +672,10 @@ fn load_partition_info<C: OracleConnection>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::runtime::RuntimeBuilder;
     use plsql_catalog::{OracleBackend, OracleConnectionInfo, OracleRow};
     use std::collections::HashMap;
+    use std::future::Future;
     use std::sync::Mutex;
 
     #[test]
@@ -662,14 +703,17 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl OracleConnection for RouterStub {
         fn backend(&self) -> OracleBackend {
             OracleBackend::RustOracle
         }
-        fn ping(&self) -> Result<(), CatalogError> {
+        async fn ping(&self, cx: &Cx) -> Result<(), CatalogError> {
+            let _ = cx;
             Ok(())
         }
-        fn describe(&self) -> Result<OracleConnectionInfo, CatalogError> {
+        async fn describe(&self, cx: &Cx) -> Result<OracleConnectionInfo, CatalogError> {
+            let _ = cx;
             Ok(OracleConnectionInfo {
                 backend: OracleBackend::RustOracle,
                 connect_string: String::from("//localhost/XE"),
@@ -684,11 +728,13 @@ mod tests {
                 max_open_cursors: 500,
             })
         }
-        fn query_rows(
+        async fn query_rows(
             &self,
+            cx: &Cx,
             sql: &str,
             _params: &[OracleBind],
         ) -> Result<Vec<OracleRow>, CatalogError> {
+            let _ = cx;
             let routes = self.routes.lock().unwrap();
             for (fragment, rows) in routes.iter() {
                 if sql.contains(fragment.as_str()) {
@@ -697,9 +743,67 @@ mod tests {
             }
             Ok(Vec::new())
         }
-        fn execute(&self, _sql: &str, _params: &[OracleBind]) -> Result<u64, CatalogError> {
+        async fn execute(
+            &self,
+            cx: &Cx,
+            _sql: &str,
+            _params: &[OracleBind],
+        ) -> Result<u64, CatalogError> {
+            let _ = cx;
             Ok(0)
         }
+    }
+
+    fn run_describe_future<F: Future>(future: F) -> F::Output {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("test asupersync runtime")
+            .block_on(future)
+    }
+
+    fn describe_table_for_test<C: OracleConnection>(
+        conn: &C,
+        owner: &str,
+        name: &str,
+    ) -> Result<DescribeTableResponse, DescribeError> {
+        run_describe_future(async {
+            let cx = Cx::current().expect("test runtime installs a request Cx");
+            run_describe_table(&cx, conn, owner, name).await
+        })
+    }
+
+    fn describe_view_for_test<C: OracleConnection>(
+        conn: &C,
+        owner: &str,
+        name: &str,
+        text_preview_chars: Option<usize>,
+    ) -> Result<DescribeViewResponse, DescribeError> {
+        run_describe_future(async {
+            let cx = Cx::current().expect("test runtime installs a request Cx");
+            run_describe_view(&cx, conn, owner, name, text_preview_chars).await
+        })
+    }
+
+    fn describe_trigger_for_test<C: OracleConnection>(
+        conn: &C,
+        owner: &str,
+        name: &str,
+    ) -> Result<DescribeTriggerResponse, DescribeError> {
+        run_describe_future(async {
+            let cx = Cx::current().expect("test runtime installs a request Cx");
+            run_describe_trigger(&cx, conn, owner, name).await
+        })
+    }
+
+    fn describe_index_for_test<C: OracleConnection>(
+        conn: &C,
+        owner: &str,
+        name: &str,
+    ) -> Result<DescribeIndexResponse, DescribeError> {
+        run_describe_future(async {
+            let cx = Cx::current().expect("test runtime installs a request Cx");
+            run_describe_index(&cx, conn, owner, name).await
+        })
     }
 
     fn row(columns: &[(&str, &str)]) -> OracleRow {
@@ -780,7 +884,7 @@ mod tests {
             vec![row(&[("PARTITION_COUNT", "12")])],
         );
 
-        let response = run_describe_table(&conn, "BILLING", "INVOICES").unwrap();
+        let response = describe_table_for_test(&conn, "BILLING", "INVOICES").unwrap();
         assert_eq!(response.columns.len(), 2);
         assert_eq!(response.columns[0].name, "INVOICE_ID");
         assert!(!response.columns[0].nullable);
@@ -801,7 +905,7 @@ mod tests {
     #[test]
     fn describe_table_returns_not_found_for_unknown_object() {
         let conn = RouterStub::default();
-        let err = run_describe_table(&conn, "BILLING", "MISSING").unwrap_err();
+        let err = describe_table_for_test(&conn, "BILLING", "MISSING").unwrap_err();
         assert!(matches!(err, DescribeError::NotFound { .. }));
     }
 
@@ -810,7 +914,7 @@ mod tests {
     #[test]
     fn not_found_maps_to_object_not_found_with_fuzzy_and_list_objects_tool() {
         let conn = RouterStub::default();
-        let err = run_describe_table(&conn, "BILLING", "INVOICE").unwrap_err();
+        let err = describe_table_for_test(&conn, "BILLING", "INVOICE").unwrap_err();
         let env = err.to_envelope(&["INVOICES", "CUSTOMERS", "PAYMENTS"]);
         assert_eq!(env.error_class, oraclemcp_error::ErrorClass::ObjectNotFound);
         // The near-miss `INVOICES` (one char from `INVOICE`) must surface.
@@ -865,7 +969,8 @@ mod tests {
             vec![row(&[("COMMENTS", "summary view")])],
         );
 
-        let response = run_describe_view(&conn, "BILLING", "INVOICE_SUMMARY", Some(20)).unwrap();
+        let response =
+            describe_view_for_test(&conn, "BILLING", "INVOICE_SUMMARY", Some(20)).unwrap();
         assert_eq!(response.read_only, Some(true));
         assert_eq!(response.view_comment.as_deref(), Some("summary view"));
         assert!(response.query_preview.as_deref().unwrap().ends_with('…'));
@@ -885,7 +990,7 @@ mod tests {
                 ("WHEN_CLAUSE", ":new.amount >= 0"),
             ])],
         );
-        let response = run_describe_trigger(&conn, "BILLING", "INVOICES_BIU").unwrap();
+        let response = describe_trigger_for_test(&conn, "BILLING", "INVOICES_BIU").unwrap();
         assert_eq!(response.trigger_type, "BEFORE EACH ROW");
         assert_eq!(response.base_object_name, "INVOICES");
         // The WHEN clause is DB-controlled free text routed through the K18
@@ -926,7 +1031,7 @@ mod tests {
                 row(&[("COLUMN_NAME", "CUSTOMER_ID")]),
             ],
         );
-        let response = run_describe_index(&conn, "BILLING", "INVOICES_PK_IDX").unwrap();
+        let response = describe_index_for_test(&conn, "BILLING", "INVOICES_PK_IDX").unwrap();
         assert!(response.unique);
         assert_eq!(response.columns, vec!["INVOICE_ID", "CUSTOMER_ID"]);
     }
@@ -977,7 +1082,7 @@ mod tests {
             vec![row(&[("PARTITIONED", "NO")])],
         );
 
-        let response = run_describe_table(&conn, "BILLING", "INVOICES").unwrap();
+        let response = describe_table_for_test(&conn, "BILLING", "INVOICES").unwrap();
 
         // Four DB-controlled free-text fields carried markup: column
         // default, column comment, table comment, CHECK condition.
@@ -1028,7 +1133,7 @@ mod tests {
         );
 
         // No truncation: the body is shorter than the limit.
-        let response = run_describe_view(&conn, "BILLING", "BAD_VIEW", Some(4000)).unwrap();
+        let response = describe_view_for_test(&conn, "BILLING", "BAD_VIEW", Some(4000)).unwrap();
         // View body, view comment, and column comment all carried markup.
         assert_eq!(response.sanitized_fields, 3);
         assert!(

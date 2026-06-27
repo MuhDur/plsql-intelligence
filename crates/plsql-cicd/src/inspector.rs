@@ -11,6 +11,7 @@
 //! and emit `CicdError::DisallowedWriteSqlInInspector` for any caller that
 //! passes a DDL/DML body.
 
+use asupersync::Cx;
 use plsql_catalog::{
     DbmsMetadataDdl, ObjectType, OracleBind, OracleConnection,
     fetch_dbms_metadata_ddl as catalog_fetch_dbms_metadata_ddl,
@@ -29,18 +30,19 @@ use crate::CicdError;
 /// [`CicdError::DisallowedWriteSqlInInspector`] — this is enforced at the
 /// helper boundary, not just by convention.
 pub struct CicdOracleInspector<'conn, C: OracleConnection> {
+    cx: &'conn Cx,
     conn: &'conn C,
 }
 
 impl<'conn, C: OracleConnection> CicdOracleInspector<'conn, C> {
     /// Build a new inspector for an already-connected `conn`.
-    pub fn new(conn: &'conn C) -> Self {
-        Self { conn }
+    pub fn new(cx: &'conn Cx, conn: &'conn C) -> Self {
+        Self { cx, conn }
     }
 
     /// Run a read-only query and return its rows. Refuses statements that
     /// are not `SELECT` / `WITH` (DDL, DML, anonymous PL/SQL blocks).
-    pub fn query_rows(
+    pub async fn query_rows(
         &self,
         sql: &str,
         params: &[OracleBind],
@@ -51,7 +53,8 @@ impl<'conn, C: OracleConnection> CicdOracleInspector<'conn, C> {
             });
         }
         self.conn
-            .query_rows(sql, params)
+            .query_rows(self.cx, sql, params)
+            .await
             .map_err(|err| CicdError::OracleBackendError {
                 message: err.to_string(),
             })
@@ -61,22 +64,22 @@ impl<'conn, C: OracleConnection> CicdOracleInspector<'conn, C> {
     /// single object. Mirrors `plsql_catalog::fetch_dbms_metadata_ddl` but
     /// stamped with the CICD error surface so callers don't need to import
     /// the catalog error type.
-    pub fn fetch_dbms_metadata_ddl(
+    pub async fn fetch_dbms_metadata_ddl(
         &self,
         object_type: ObjectType,
         name: &str,
         owner: &str,
     ) -> Result<Option<DbmsMetadataDdl>, CicdError> {
-        catalog_fetch_dbms_metadata_ddl(self.conn, object_type, name, owner).map_err(|err| {
-            CicdError::OracleBackendError {
+        catalog_fetch_dbms_metadata_ddl(self.cx, self.conn, object_type, name, owner)
+            .await
+            .map_err(|err| CicdError::OracleBackendError {
                 message: err.to_string(),
-            }
-        })
+            })
     }
 
     /// Cheap check that an object exists in the target DB. Returns
     /// `Ok(true)` only when `ALL_OBJECTS` has exactly one matching row.
-    pub fn object_exists(
+    pub async fn object_exists(
         &self,
         owner: &str,
         name: &str,
@@ -88,15 +91,17 @@ impl<'conn, C: OracleConnection> CicdOracleInspector<'conn, C> {
         // DBMS_METADATA type strings line up 1:1 with ALL_OBJECTS.OBJECT_TYPE
         // strings except that we use a space-separated form upstream.
         let object_type_text = dbms_type.replace('_', " ");
-        let rows = self.query_rows(
-            "select 1 from all_objects \
-             where owner = :1 and object_name = :2 and object_type = :3 and rownum = 1",
-            &[
-                OracleBind::from(owner.to_string()),
-                OracleBind::from(name.to_string()),
-                OracleBind::from(object_type_text),
-            ],
-        )?;
+        let rows = self
+            .query_rows(
+                "select 1 from all_objects \
+                 where owner = :1 and object_name = :2 and object_type = :3 and rownum = 1",
+                &[
+                    OracleBind::from(owner.to_string()),
+                    OracleBind::from(name.to_string()),
+                    OracleBind::from(object_type_text),
+                ],
+            )
+            .await?;
         Ok(!rows.is_empty())
     }
 }
@@ -134,23 +139,31 @@ fn preview_sql(sql: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::{Cx, runtime::RuntimeBuilder};
     use plsql_catalog::{
         OracleBackend, OracleBind, OracleConnection, OracleConnectionInfo, OracleRow,
     };
+    use std::future::Future;
 
     #[derive(Default)]
     struct StubConn {
         rows: Vec<OracleRow>,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl OracleConnection for StubConn {
         fn backend(&self) -> OracleBackend {
             OracleBackend::RustOracle
         }
-        fn ping(&self) -> Result<(), plsql_catalog::CatalogError> {
+        async fn ping(&self, cx: &Cx) -> Result<(), plsql_catalog::CatalogError> {
+            let _ = cx;
             Ok(())
         }
-        fn describe(&self) -> Result<OracleConnectionInfo, plsql_catalog::CatalogError> {
+        async fn describe(
+            &self,
+            cx: &Cx,
+        ) -> Result<OracleConnectionInfo, plsql_catalog::CatalogError> {
+            let _ = cx;
             Ok(OracleConnectionInfo {
                 backend: OracleBackend::RustOracle,
                 connect_string: String::from("//localhost/XE"),
@@ -165,20 +178,31 @@ mod tests {
                 max_open_cursors: 500,
             })
         }
-        fn query_rows(
+        async fn query_rows(
             &self,
+            cx: &Cx,
             _sql: &str,
             _params: &[OracleBind],
         ) -> Result<Vec<OracleRow>, plsql_catalog::CatalogError> {
+            let _ = cx;
             Ok(self.rows.clone())
         }
-        fn execute(
+        async fn execute(
             &self,
+            cx: &Cx,
             _sql: &str,
             _params: &[OracleBind],
         ) -> Result<u64, plsql_catalog::CatalogError> {
+            let _ = cx;
             Ok(0)
         }
+    }
+
+    fn run_inspector_future<F: Future>(future: F) -> F::Output {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("test asupersync runtime")
+            .block_on(future)
     }
 
     #[test]
@@ -207,10 +231,12 @@ mod tests {
     #[test]
     fn inspector_query_rows_rejects_writes() {
         let stub = StubConn::default();
-        let inspector = CicdOracleInspector::new(&stub);
-        let err = inspector
-            .query_rows("DELETE FROM CUSTOMERS", &[])
-            .unwrap_err();
+        let err = run_inspector_future(async {
+            let cx = Cx::current().expect("test runtime installs a request Cx");
+            let inspector = CicdOracleInspector::new(&cx, &stub);
+            inspector.query_rows("DELETE FROM CUSTOMERS", &[]).await
+        })
+        .unwrap_err();
         assert!(matches!(
             err,
             CicdError::DisallowedWriteSqlInInspector { .. }
@@ -220,10 +246,12 @@ mod tests {
     #[test]
     fn inspector_query_rows_accepts_selects() {
         let stub = StubConn::default();
-        let inspector = CicdOracleInspector::new(&stub);
-        let rows = inspector
-            .query_rows("SELECT 1 FROM DUAL", &[])
-            .expect("select ok");
+        let rows = run_inspector_future(async {
+            let cx = Cx::current().expect("test runtime installs a request Cx");
+            let inspector = CicdOracleInspector::new(&cx, &stub);
+            inspector.query_rows("SELECT 1 FROM DUAL", &[]).await
+        })
+        .expect("select ok");
         assert!(rows.is_empty());
     }
 }

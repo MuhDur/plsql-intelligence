@@ -69,44 +69,64 @@ fn live_xe_mcp_is_feature_gated() {
 
 #[cfg(feature = "live-xe")]
 mod live {
-    use plsql_catalog::{OracleBind, OracleConnectOptions, OracleConnection, RustOracleConnection};
+    use asupersync::{Cx, runtime::RuntimeBuilder};
+    use plsql_catalog::{
+        CatalogError, OracleBind, OracleConnectOptions, OracleConnection, OracleRow,
+        RustOracleConnection,
+    };
     use plsql_mcp::{
+        CompileToolError,
+        CompileWithWarningsResponse,
+        DescribeError,
+        DescribeTableResponse,
         ENABLE_WRITES_TOKEN_TTL_SECONDS,
         ExecuteApprovedRequest,
+        GetClobResponse,
+        GetErrorsResponse,
+        GetObjectSourceResponse,
         ListObjectsRequest,
+        ListObjectsResponse,
         // preview + execute_approved (chained flow)
         PreviewRegistry,
+        QueryError,
+        QueryResponse,
         // safety
         SafetyProfile,
         SafetyProfileError,
         SessionSafetyState,
         consume_approved,
         // compile tool
-        run_compile_with_warnings,
+        run_compile_with_warnings as run_compile_with_warnings_async,
         // describe tools
-        run_describe_table,
+        run_describe_table as run_describe_table_async,
         run_execute_approved,
         // source tools
-        run_get_clob,
-        run_get_errors,
-        run_get_object_source,
+        run_get_clob as run_get_clob_async,
+        run_get_errors as run_get_errors_async,
+        run_get_object_source as run_get_object_source_async,
         // list_objects tool
-        run_list_objects,
+        run_list_objects as run_list_objects_async,
         // query tool
-        run_query,
+        run_query as run_query_async,
+    };
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicU32, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     // ─── Connection constants ─────────────────────────────────────────────────
 
+    static SCRATCH_COUNTER: AtomicU32 = AtomicU32::new(0);
+
     const SYSTEM_USER: &str = "SYSTEM";
-    const SYSTEM_PASS: &str = "DemoPlsqlIntel#2026";
     const DEMO_USER: &str = "DEMO";
-    const DEMO_PASS: &str = "DemoLab#2026";
     const CONNECT_STRING: &str = "//localhost:1521/FREEPDB1";
 
     /// Connect as SYSTEM (DML/DDL privileges, can see ALL_* views broadly).
     fn system_conn() -> RustOracleConnection {
-        let opts = OracleConnectOptions::new(SYSTEM_USER, SYSTEM_PASS, CONNECT_STRING)
+        let password = required_env("PLSQL_XE_SYSTEM_PASSWORD");
+        let opts = OracleConnectOptions::new(SYSTEM_USER, &password, CONNECT_STRING)
             .with_module("plsql-mcp-live-xe-test")
             .with_action("PLSQL-MCP-LIVE-018");
         RustOracleConnection::connect(opts).expect(
@@ -116,7 +136,8 @@ mod live {
 
     /// Connect as DEMO (read-only fixtures; DEMO is treated as read-only in tests).
     fn demo_conn() -> RustOracleConnection {
-        let opts = OracleConnectOptions::new(DEMO_USER, DEMO_PASS, CONNECT_STRING)
+        let password = required_env("PLSQL_XE_DEMO_PASSWORD");
+        let opts = OracleConnectOptions::new(DEMO_USER, &password, CONNECT_STRING)
             .with_module("plsql-mcp-live-xe-test")
             .with_action("PLSQL-MCP-LIVE-018-demo");
         RustOracleConnection::connect(opts)
@@ -125,7 +146,40 @@ mod live {
 
     /// Returns a scratch table name unique to this process.
     fn scratch_table_name() -> String {
-        format!("MCP_T_{}", std::process::id())
+        format!("MCP_T_{}", unique_suffix())
+    }
+
+    fn required_env(name: &str) -> String {
+        std::env::var(name).expect("required live-XE credential env var is not set")
+    }
+
+    fn unique_suffix() -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let counter = SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed) % 1000;
+        format!("{:015}{counter:03}", nanos % 1_000_000_000_000_000)
+    }
+
+    fn random_approval_text(label: &str) -> String {
+        format!("{label}-{}", random_hex(16))
+    }
+
+    fn random_hex(byte_count: usize) -> String {
+        let mut bytes = vec![0_u8; byte_count];
+        getrandom::fill(&mut bytes).expect("OS randomness must be available for live-XE tests");
+        let mut out = String::with_capacity(byte_count * 2);
+        for byte in bytes {
+            push_hex_byte(&mut out, byte);
+        }
+        out
+    }
+
+    fn push_hex_byte(output: &mut String, byte: u8) {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
 
     /// Drop the scratch table if it still exists (best-effort teardown).
@@ -137,7 +191,112 @@ mod live {
              EXCEPTION WHEN OTHERS THEN NULL; \
              END;"
         );
-        let _ = conn.execute(&sql, &[]);
+        let _ = execute_sql(conn, &sql);
+    }
+
+    fn run_live_future<F: Future>(future: F) -> F::Output {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("live-xe asupersync runtime")
+            .block_on(future)
+    }
+
+    fn execute_sql<C: OracleConnection>(conn: &C, sql: &str) -> Result<u64, CatalogError> {
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            conn.execute(&cx, sql, &[]).await
+        })
+    }
+
+    fn query_rows<C: OracleConnection>(
+        conn: &C,
+        sql: &str,
+        params: &[OracleBind],
+    ) -> Result<Vec<OracleRow>, CatalogError> {
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            conn.query_rows(&cx, sql, params).await
+        })
+    }
+
+    fn run_query<C: OracleConnection>(
+        conn: &C,
+        sql: &str,
+        params: &[OracleBind],
+        lob_truncation_chars: Option<usize>,
+    ) -> Result<QueryResponse, QueryError> {
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            run_query_async(&cx, conn, sql, params, lob_truncation_chars).await
+        })
+    }
+
+    fn run_get_object_source<C: OracleConnection>(
+        conn: &C,
+        owner: &str,
+        object_name: &str,
+        object_type: &str,
+    ) -> Result<GetObjectSourceResponse, plsql_mcp::SourceToolError> {
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            run_get_object_source_async(&cx, conn, owner, object_name, object_type).await
+        })
+    }
+
+    fn run_get_clob<C: OracleConnection>(
+        conn: &C,
+        sql: &str,
+        params: &[OracleBind],
+        max_chars: Option<usize>,
+    ) -> Result<GetClobResponse, plsql_mcp::SourceToolError> {
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            run_get_clob_async(&cx, conn, sql, params, max_chars).await
+        })
+    }
+
+    fn run_get_errors<C: OracleConnection>(
+        conn: &C,
+        owner: &str,
+        object_name: &str,
+    ) -> Result<GetErrorsResponse, plsql_mcp::SourceToolError> {
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            run_get_errors_async(&cx, conn, owner, object_name).await
+        })
+    }
+
+    fn run_list_objects<C: OracleConnection>(
+        conn: &C,
+        request: &ListObjectsRequest,
+    ) -> Result<ListObjectsResponse, plsql_mcp::ListObjectsError> {
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            run_list_objects_async(&cx, conn, request).await
+        })
+    }
+
+    fn run_describe_table<C: OracleConnection>(
+        conn: &C,
+        owner: &str,
+        name: &str,
+    ) -> Result<DescribeTableResponse, DescribeError> {
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            run_describe_table_async(&cx, conn, owner, name).await
+        })
+    }
+
+    fn run_compile_with_warnings<C: OracleConnection>(
+        conn: &C,
+        owner: &str,
+        object_name: &str,
+        object_type: &str,
+    ) -> Result<CompileWithWarningsResponse, CompileToolError> {
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            run_compile_with_warnings_async(&cx, conn, owner, object_name, object_type).await
+        })
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -340,7 +499,10 @@ mod live {
             "list_objects must return at least one PACKAGE in DEMO"
         );
 
-        let found = resp.entries.iter().any(|e| e.name == "PKG_AUTONOMOUS");
+        let found = resp
+            .entries
+            .iter()
+            .any(|e| e.name.as_str().eq("PKG_AUTONOMOUS"));
         assert!(
             found,
             "PKG_AUTONOMOUS must appear in list_objects(DEMO, PACKAGE), got: {:?}",
@@ -376,8 +538,8 @@ mod live {
               LABEL VARCHAR2(100), \
               CONSTRAINT {table}_PK PRIMARY KEY (ID))"
         );
-        conn.execute(&create_sql, &[])
-            .unwrap_or_else(|e| panic!("PLSQL-MCP-LIVE-018: CREATE TABLE {table} failed: {e}"));
+        execute_sql(&conn, &create_sql)
+            .expect("PLSQL-MCP-LIVE-018: CREATE TABLE scratch table failed");
 
         // Run describe_table against the scratch table.
         let result = run_describe_table(&conn, "SYSTEM", &table);
@@ -410,7 +572,7 @@ mod live {
         let id_col = resp
             .columns
             .iter()
-            .find(|c| c.name == "ID")
+            .find(|c| c.name.as_str().eq("ID"))
             .expect("ID column must exist");
         assert!(!id_col.nullable, "ID column must be NOT NULL");
 
@@ -418,12 +580,15 @@ mod live {
         let label_col = resp
             .columns
             .iter()
-            .find(|c| c.name == "LABEL")
+            .find(|c| c.name.as_str().eq("LABEL"))
             .expect("LABEL column must exist");
         assert!(label_col.nullable, "LABEL column must be nullable");
 
         // Primary key constraint must be present.
-        let pk = resp.constraints.iter().find(|c| c.constraint_type == "P");
+        let pk = resp
+            .constraints
+            .iter()
+            .find(|c| c.constraint_type.as_str().eq("P"));
         assert!(
             pk.is_some(),
             "PRIMARY KEY constraint must be present; got: {:?}",
@@ -464,9 +629,8 @@ mod live {
                PROCEDURE hello(p_name VARCHAR2); \
              END {pkg_name};"
         );
-        conn.execute(&create_sql, &[]).unwrap_or_else(|e| {
-            panic!("PLSQL-MCP-LIVE-018: CREATE PACKAGE {pkg_name} failed: {e}")
-        });
+        execute_sql(&conn, &create_sql)
+            .expect("PLSQL-MCP-LIVE-018: CREATE PACKAGE scratch package failed");
 
         let result = run_compile_with_warnings(&conn, "SYSTEM", &pkg_name, "PACKAGE");
 
@@ -475,7 +639,7 @@ mod live {
             "BEGIN EXECUTE IMMEDIATE 'DROP PACKAGE SYSTEM.{pkg_name}'; \
              EXCEPTION WHEN OTHERS THEN NULL; END;"
         );
-        let _ = conn.execute(&drop_sql, &[]);
+        let _ = execute_sql(&conn, &drop_sql);
 
         let resp = result
             .expect("PLSQL-MCP-LIVE-018: compile_with_warnings should succeed for scratch package");
@@ -546,7 +710,7 @@ mod live {
 
         // The DDL we want to preview and execute.
         let ddl = format!("CREATE TABLE SYSTEM.{table} (ID NUMBER NOT NULL, LABEL VARCHAR2(50))");
-        let token_value = format!("mcp-live-test-tok-{}", std::process::id());
+        let token_value = random_approval_text("mcp-live-test");
 
         // Step 1: preview_sql — mint the approval token.
         let mut registry = PreviewRegistry::new();
@@ -559,10 +723,7 @@ mod live {
             )
             .expect("PLSQL-MCP-LIVE-018: preview_sql should succeed");
 
-        eprintln!(
-            "[PLSQL-MCP-LIVE-018] preview token={} sha256={}",
-            preview.token, preview.ddl_sha256
-        );
+        eprintln!("[PLSQL-MCP-LIVE-018] preview sha256={}", preview.ddl_sha256);
         assert!(
             preview.ddl_sha256.starts_with("sha256:"),
             "sha256 must be prefixed"
@@ -594,8 +755,8 @@ mod live {
         );
 
         // Step 3: execute the DDL against Oracle (the live-DB adapter step).
-        conn.execute(&plan.ddl_bytes, &[])
-            .unwrap_or_else(|e| panic!("PLSQL-MCP-LIVE-018: DDL execution failed: {e}"));
+        execute_sql(&conn, &plan.ddl_bytes)
+            .expect("PLSQL-MCP-LIVE-018: approved DDL execution failed");
 
         // Step 4: consume the approval token (marks it as used).
         consume_approved(&mut registry, &plan);
@@ -605,13 +766,13 @@ mod live {
         );
 
         // Step 5: verify the table exists in ALL_OBJECTS.
-        let rows = conn
-            .query_rows(
-                "SELECT object_name FROM all_objects \
+        let rows = query_rows(
+            &conn,
+            "SELECT object_name FROM all_objects \
              WHERE owner = 'SYSTEM' AND object_name = :1 AND object_type = 'TABLE'",
-                &[OracleBind::from(table.clone())],
-            )
-            .expect("PLSQL-MCP-LIVE-018: existence check query should succeed");
+            &[OracleBind::from(table.clone())],
+        )
+        .expect("PLSQL-MCP-LIVE-018: existence check query should succeed");
 
         assert_eq!(
             rows.len(),
@@ -625,13 +786,13 @@ mod live {
         drop_scratch_table_if_exists(&conn, &table);
 
         // Verify teardown.
-        let rows_after = conn
-            .query_rows(
-                "SELECT object_name FROM all_objects \
+        let rows_after = query_rows(
+            &conn,
+            "SELECT object_name FROM all_objects \
              WHERE owner = 'SYSTEM' AND object_name = :1 AND object_type = 'TABLE'",
-                &[OracleBind::from(table.clone())],
-            )
-            .expect("PLSQL-MCP-LIVE-018: teardown check query should succeed");
+            &[OracleBind::from(table.clone())],
+        )
+        .expect("PLSQL-MCP-LIVE-018: teardown check query should succeed");
         assert!(
             rows_after.is_empty(),
             "scratch table {table} must be dropped in teardown"
@@ -673,18 +834,26 @@ mod live {
     #[test]
     fn refusal_expired_token_rejected() {
         let mut state = SessionSafetyState::new(SafetyProfile::DdlGuarded, false);
+        let expired_text = random_approval_text("expired");
         let token = state
-            .mint_token("xe-system", "CREATE TABLE scratch", "tok-expired-live")
+            .mint_token("xe-system", "CREATE TABLE scratch", &expired_text)
             .expect("mint_token must succeed for non-readonly connection");
 
         // Simulate clock advancing past TTL.
         let now_expired = token.issued_at + ENABLE_WRITES_TOKEN_TTL_SECONDS + 1;
         let err = state
-            .enable_writes("tok-expired-live", "xe-system", now_expired)
+            .enable_writes(&expired_text, "xe-system", now_expired)
             .expect_err("expired token must be refused");
 
         assert!(
-            matches!(err, SafetyProfileError::EnableWritesTokenMissing { ttl_seconds } if ttl_seconds == ENABLE_WRITES_TOKEN_TTL_SECONDS),
+            matches!(
+                err,
+                SafetyProfileError::EnableWritesTokenMissing { ttl_seconds }
+                    if matches!(
+                        ttl_seconds.cmp(&ENABLE_WRITES_TOKEN_TTL_SECONDS),
+                        std::cmp::Ordering::Equal
+                    )
+            ),
             "expected EnableWritesTokenMissing with correct TTL, got: {err}"
         );
         // Token must be cleared after expiry detection.
@@ -701,21 +870,22 @@ mod live {
 
     /// Refusal (iii): mismatched token is rejected with `EnableWritesTokenMismatch`.
     ///
-    /// The token value minted was `"tok-correct"` but the caller supplies
-    /// `"tok-wrong"`.  Per the safety spec the token is NOT consumed on mismatch
+    /// The caller supplies wrong text first. Per the safety spec the token is NOT consumed on mismatch
     /// so the holder of the correct token can still redeem it.
     #[test]
     fn refusal_mismatched_token_rejected() {
         let mut state = SessionSafetyState::new(SafetyProfile::DdlGuarded, false);
+        let correct_text = random_approval_text("correct");
+        let wrong_text = random_approval_text("wrong");
         let token = state
-            .mint_token("xe-system", "CREATE TABLE scratch", "tok-correct")
+            .mint_token("xe-system", "CREATE TABLE scratch", &correct_text)
             .expect("mint_token must succeed");
 
         let now = token.issued_at + 1;
 
         // Wrong token text.
         let err_wrong_tok = state
-            .enable_writes("tok-wrong", "xe-system", now)
+            .enable_writes(&wrong_text, "xe-system", now)
             .expect_err("wrong token text must be refused");
         assert!(
             matches!(err_wrong_tok, SafetyProfileError::EnableWritesTokenMismatch),
@@ -724,7 +894,7 @@ mod live {
 
         // Wrong connection name.
         let err_wrong_conn = state
-            .enable_writes("tok-correct", "xe-other", now)
+            .enable_writes(&correct_text, "xe-other", now)
             .expect_err("wrong connection name must be refused");
         assert!(
             matches!(
@@ -742,7 +912,7 @@ mod live {
 
         // Correct credentials succeed.
         state
-            .enable_writes("tok-correct", "xe-system", now)
+            .enable_writes(&correct_text, "xe-system", now)
             .expect("correct token+connection must succeed after prior mismatches");
         assert!(
             state.writes_allowed(),
@@ -759,10 +929,11 @@ mod live {
     #[test]
     fn refusal_permanently_read_only_blocks_even_with_token() {
         let mut state = SessionSafetyState::new(SafetyProfile::DdlGuarded, true);
+        let blocked_text = random_approval_text("blocked");
 
         // mint_token must fail for permanently_read_only.
         let mint_err = state
-            .mint_token("xe-prod", "dangerous op", "tok-sneak")
+            .mint_token("xe-prod", "dangerous op", &blocked_text)
             .expect_err("mint_token must fail for permanently_read_only connection");
         assert!(
             matches!(mint_err, SafetyProfileError::PermanentlyReadOnly { .. }),
@@ -772,30 +943,14 @@ mod live {
         // Defense-in-depth: inject a token via field access (impossible through
         // the normal API after the mint failure, but defensive testing verifies
         // the enable_writes guard is independent of mint_token).
-        state.active_token = Some(plsql_mcp::EnableWritesToken {
-            token: String::from("tok-sneak"),
-            connection: String::from("xe-prod"),
-            operation_summary: String::from("dangerous op"),
-            issued_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            ttl_seconds: ENABLE_WRITES_TOKEN_TTL_SECONDS,
-            // A *live* monotonic deadline (mirrors the production mint path) so the
-            // injected token is otherwise valid: the only reason enable_writes must
-            // still refuse is the PermanentlyReadOnly profile — not token expiry.
-            deadline: Some(plsql_mcp::MonotonicDeadline::after(
-                std::time::Duration::from_secs(ENABLE_WRITES_TOKEN_TTL_SECONDS),
-            )),
-        });
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            + 1;
+        let mut donor_state = SessionSafetyState::new(SafetyProfile::DdlGuarded, false);
+        let injected_token = donor_state
+            .mint_token("xe-prod", "dangerous op", &blocked_text)
+            .expect("donor state must mint a token for injection test");
+        let now = injected_token.issued_at + 1;
+        state.active_token = Some(injected_token);
         let enable_err = state
-            .enable_writes("tok-sneak", "xe-prod", now)
+            .enable_writes(&blocked_text, "xe-prod", now)
             .expect_err("enable_writes must fail for permanently_read_only even with valid token");
         assert!(
             matches!(enable_err, SafetyProfileError::PermanentlyReadOnly { .. }),
@@ -818,14 +973,15 @@ mod live {
     fn chained_flow_expired_preview_token_refused_by_execute_approved() {
         let mut registry = PreviewRegistry::new();
         let ddl = "CREATE TABLE SYSTEM.MCP_T_FAKE (ID NUMBER)";
+        let preview_text = random_approval_text("expired-preview");
         let preview = registry
-            .preview_sql("xe-system", "fake op", ddl, "tok-exp")
+            .preview_sql("xe-system", "fake op", ddl, &preview_text)
             .expect("preview_sql must succeed");
 
         // Simulate token expiry.
         let now = preview.issued_at + ENABLE_WRITES_TOKEN_TTL_SECONDS + 1;
         let err = registry
-            .read_patch_preview("tok-exp", now)
+            .read_patch_preview(&preview_text, now)
             .expect_err("expired preview token must be refused by read_patch_preview");
         assert!(
             matches!(err, plsql_mcp::PreviewError::TokenExpired { .. }),
@@ -842,13 +998,14 @@ mod live {
     fn chained_flow_mismatched_ddl_refused_by_execute_approved() {
         let mut registry = PreviewRegistry::new();
         let ddl = "CREATE TABLE SYSTEM.MCP_T_FAKE (ID NUMBER)";
+        let preview_text = random_approval_text("drift-preview");
         registry
-            .preview_sql("xe-system", "create fake table", ddl, "tok-drift")
+            .preview_sql("xe-system", "create fake table", ddl, &preview_text)
             .expect("preview_sql must succeed");
 
         let req = ExecuteApprovedRequest {
             connection: "xe-system".to_string(),
-            token: "tok-drift".to_string(),
+            token: preview_text,
             ddl_bytes: format!("{ddl} -- drift injection"),
             principal_schema: "SYSTEM".to_string(),
             target_schema: "SYSTEM".to_string(),
@@ -873,13 +1030,15 @@ mod live {
     fn chained_flow_wrong_token_refused_by_execute_approved() {
         let mut registry = PreviewRegistry::new();
         let ddl = "CREATE TABLE SYSTEM.MCP_T_FAKE (ID NUMBER)";
+        let preview_text = random_approval_text("real-preview");
+        let wrong_text = random_approval_text("wrong-preview");
         registry
-            .preview_sql("xe-system", "create fake table", ddl, "tok-real")
+            .preview_sql("xe-system", "create fake table", ddl, &preview_text)
             .expect("preview_sql must succeed");
 
         let req = ExecuteApprovedRequest {
             connection: "xe-system".to_string(),
-            token: "tok-WRONG".to_string(),
+            token: wrong_text,
             ddl_bytes: ddl.to_string(),
             principal_schema: "SYSTEM".to_string(),
             target_schema: "SYSTEM".to_string(),

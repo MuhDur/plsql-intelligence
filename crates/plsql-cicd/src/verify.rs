@@ -5,8 +5,8 @@
 //! Applies a changeset's DDL statements to a fresh, throwaway Oracle schema
 //! (`VERIFY_T_<random>`) and reports per-statement success or failure. The
 //! schema is created immediately before verification begins and dropped
-//! immediately after — even on panic, via the [`ScratchSchemaGuard`] RAII
-//! helper.
+//! immediately after. [`ScratchSchemaGuard`] performs explicit async
+//! teardown on the normal path and a best-effort fallback from `Drop`.
 //!
 //! # ⚠️  NO ROLLBACK GUARANTEE
 //!
@@ -56,8 +56,13 @@
 //!   `DROP USER … CASCADE` are the canonical DBA-level schema lifecycle
 //!   verbs used throughout the Oracle SYSTEM / DBA playbook.
 
-use std::fmt;
+use std::{
+    fmt,
+    sync::atomic::{AtomicU32, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
+use asupersync::{Cx, runtime::RuntimeBuilder};
 use plsql_catalog::OracleConnection;
 use thiserror::Error;
 use tracing::instrument;
@@ -120,25 +125,36 @@ pub enum VerifyError {
 
 // ── Scratch schema naming ─────────────────────────────────────────────────────
 
-/// Generate a scratch schema name for this process.
+static SCRATCH_SCHEMA_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Generate a scratch schema name for this verification run.
 ///
-/// The name is `VERIFY_T_<pid>`, upper-cased and Oracle-identifier-safe. The
+/// The name is `VERIFY_T_<suffix>`, upper-cased and Oracle-identifier-safe. The
 /// `VERIFY_T_` prefix is the isolation contract recognised by the schema
 /// lifecycle helpers: they will only create or drop schemas whose names start
 /// with this prefix.
 ///
 /// Oracle identifiers are limited to 30 bytes in older editions and 128 in
-/// 23ai. `VERIFY_T_<u32>` — at most `VERIFY_T_` (9) + 10 digits = 19 chars —
-/// is well within either limit.
+/// 23ai. The generated suffix is 18 decimal digits, so the full name is 27
+/// chars and stays within either limit.
 #[must_use]
 pub fn scratch_schema_name() -> String {
-    scratch_schema_name_for_pid(std::process::id())
+    format!("VERIFY_T_{}", scratch_schema_suffix())
 }
 
 /// Inner helper, testable with an arbitrary pid.
 #[must_use]
 pub fn scratch_schema_name_for_pid(pid: u32) -> String {
     format!("VERIFY_T_{pid}")
+}
+
+fn scratch_schema_suffix() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let counter = SCRATCH_SCHEMA_COUNTER.fetch_add(1, Ordering::Relaxed) % 1000;
+    format!("{:015}{counter:03}", nanos % 1_000_000_000_000_000)
 }
 
 /// Maximum scratch-schema identifier length we accept. Oracle (pre-12.2) caps
@@ -407,8 +423,28 @@ impl VerifyOptions {
     pub fn effective_password(&self) -> String {
         self.scratch_user_password
             .clone()
-            .unwrap_or_else(|| String::from("V3r1fyTmp#2026"))
+            .unwrap_or_else(generated_scratch_password)
     }
+}
+
+fn generated_scratch_password() -> String {
+    let mut bytes = [0_u8; 12];
+    if getrandom::fill(&mut bytes).is_err() {
+        return format!("V_{}#", scratch_schema_suffix());
+    }
+
+    let mut password = String::from("V_");
+    for byte in bytes {
+        push_hex_byte(&mut password, byte);
+    }
+    password.push('#');
+    password
+}
+
+fn push_hex_byte(output: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    output.push(char::from(HEX[usize::from(byte >> 4)]));
+    output.push(char::from(HEX[usize::from(byte & 0x0f)]));
 }
 
 // ── In-place confirmation gate (PLSQL-CICD-005A / oracle-q2o8) ────────────────
@@ -525,14 +561,15 @@ impl<'a, C: OracleConnection> ScratchSchemaGuard<'a, C> {
     /// Explicitly drop the schema. Returns the Oracle error if the drop
     /// fails; this is idempotent — calling `drop_now` after `Drop` has
     /// already fired is a no-op.
-    pub fn drop_now(&mut self) -> Result<(), VerifyError> {
+    pub async fn drop_now(&mut self, cx: &Cx) -> Result<(), VerifyError> {
         if self.already_dropped {
             return Ok(());
         }
         self.already_dropped = true;
         let sql = format!("DROP USER {} CASCADE", self.schema);
         self.conn
-            .execute(&sql, &[])
+            .execute(cx, &sql, &[])
+            .await
             .map(|_| ())
             .map_err(|e| VerifyError::SchemaLifecycle {
                 message: format!("DROP USER {} CASCADE failed: {e}", self.schema),
@@ -547,8 +584,30 @@ impl<C: OracleConnection> Drop for ScratchSchemaGuard<'_, C> {
         }
         self.already_dropped = true;
         let sql = format!("DROP USER {} CASCADE", self.schema);
-        // Best-effort — we are in Drop, cannot propagate errors.
-        if let Err(e) = self.conn.execute(&sql, &[]) {
+        // Best-effort — Rust has no async Drop, so normal callers should
+        // always use drop_now(cx).await and treat this as panic-path cleanup.
+        let runtime = match RuntimeBuilder::current_thread().build() {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                tracing::error!(
+                    schema = %self.schema,
+                    error = %e,
+                    "ScratchSchemaGuard teardown: could not build fallback runtime"
+                );
+                return;
+            }
+        };
+        let result: Result<(), String> = runtime.block_on(async {
+            let Some(cx) = Cx::current() else {
+                return Err(String::from("fallback runtime did not install request Cx"));
+            };
+            self.conn
+                .execute(&cx, &sql, &[])
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+        if let Err(e) = result {
             tracing::error!(
                 schema = %self.schema,
                 error = %e,
@@ -620,7 +679,8 @@ pub fn validate_scratch_password(password: &str) -> Result<(), VerifyError> {
 ///   `CREATE TRIGGER`, `CREATE INDEX` (needed for common DDL statement kinds)
 /// - `UNLIMITED TABLESPACE` (avoids quota issues in the temporary schema)
 #[instrument(skip(conn, password), fields(schema))]
-pub fn create_scratch_schema<C: OracleConnection>(
+pub async fn create_scratch_schema<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     schema: &str,
     password: &str,
@@ -638,9 +698,11 @@ pub fn create_scratch_schema<C: OracleConnection>(
 
     // CREATE USER
     conn.execute(
+        cx,
         &format!("CREATE USER {schema} IDENTIFIED BY \"{password}\""),
         &[],
     )
+    .await
     .map_err(|e| VerifyError::SchemaLifecycle {
         message: format!("CREATE USER {schema} failed: {e}"),
     })?;
@@ -657,7 +719,8 @@ pub fn create_scratch_schema<C: OracleConnection>(
         "UNLIMITED TABLESPACE",
     ];
     for priv_name in grants {
-        conn.execute(&format!("GRANT {priv_name} TO {schema}"), &[])
+        conn.execute(cx, &format!("GRANT {priv_name} TO {schema}"), &[])
+            .await
             .map_err(|e| VerifyError::SchemaLifecycle {
                 message: format!("GRANT {priv_name} TO {schema} failed: {e}"),
             })?;
@@ -698,7 +761,8 @@ pub fn create_scratch_schema<C: OracleConnection>(
 /// errors — the function returns `Ok(report)` even when some statements fail
 /// so the caller receives the full picture.
 #[instrument(skip(admin_conn, changeset, options))]
-pub fn verify<C: OracleConnection>(
+pub async fn verify<C: OracleConnection>(
+    cx: &Cx,
     admin_conn: &C,
     changeset: &VerifyChangeset,
     options: &VerifyOptions,
@@ -711,7 +775,7 @@ pub fn verify<C: OracleConnection>(
     let password = options.effective_password();
 
     // Create the scratch schema — guard will drop it on exit.
-    create_scratch_schema(admin_conn, &schema, &password)?;
+    create_scratch_schema(cx, admin_conn, &schema, &password).await?;
     let mut guard = ScratchSchemaGuard::new(schema.clone(), admin_conn);
 
     // Connect to the scratch schema to execute changeset DDL.
@@ -719,7 +783,8 @@ pub fn verify<C: OracleConnection>(
     // need a second connection object; the guard still uses admin_conn for DROP.
     let switch_sql = format!("ALTER SESSION SET CURRENT_SCHEMA = {schema}");
     admin_conn
-        .execute(&switch_sql, &[])
+        .execute(cx, &switch_sql, &[])
+        .await
         .map_err(|e| VerifyError::SchemaLifecycle {
             message: format!("ALTER SESSION SET CURRENT_SCHEMA = {schema} failed: {e}"),
         })?;
@@ -737,7 +802,7 @@ pub fn verify<C: OracleConnection>(
             continue;
         }
 
-        let outcome = match admin_conn.execute(&stmt.sql, &[]) {
+        let outcome = match admin_conn.execute(cx, &stmt.sql, &[]).await {
             Ok(_) => StatementOutcome::Ok,
             Err(e) => {
                 failed = true;
@@ -755,10 +820,12 @@ pub fn verify<C: OracleConnection>(
 
     // Restore the session's current schema to the original (SYSTEM) before
     // dropping the scratch user — avoids "cannot drop current schema" ORA errors.
-    let _ = admin_conn.execute("ALTER SESSION SET CURRENT_SCHEMA = SYSTEM", &[]);
+    let _ = admin_conn
+        .execute(cx, "ALTER SESSION SET CURRENT_SCHEMA = SYSTEM", &[])
+        .await;
 
     // Explicit drop — guard will also fire on exit but this gives us the error.
-    guard.drop_now()?;
+    guard.drop_now(cx).await?;
 
     Ok(VerifyReport { schema, rows })
 }
@@ -768,6 +835,7 @@ pub fn verify<C: OracleConnection>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
 
     // ── scratch_schema_name ───────────────────────────────────────────────────
 
@@ -905,8 +973,12 @@ mod tests {
         // validated_schema, the injection-shaped name must be rejected before any
         // DDL is sent (oracle-hrzg.8).
         let conn = StubConn;
-        let err = create_scratch_schema(&conn, "VERIFY_T_1; GRANT DBA TO PUBLIC", "V3r1fyTmp#2026")
-            .expect_err("injection-shaped schema name must be rejected");
+        let err = create_scratch_schema_for_test(
+            &conn,
+            "VERIFY_T_1; GRANT DBA TO PUBLIC",
+            &VerifyOptions::default().effective_password(),
+        )
+        .expect_err("injection-shaped schema name must be rejected");
         assert!(
             matches!(err, VerifyError::InvalidScratchSchemaName { .. }),
             "expected InvalidScratchSchemaName, got {err:?}"
@@ -973,13 +1045,13 @@ mod tests {
     }
 
     #[test]
-    fn effective_schema_uses_process_id_when_no_override() {
+    fn effective_schema_uses_generated_suffix_when_no_override() {
         let opts = VerifyOptions::default();
         let schema = opts.effective_schema();
         assert!(schema.starts_with("VERIFY_T_"));
-        // Should be parseable as VERIFY_T_<number>
         let suffix = schema.strip_prefix("VERIFY_T_").unwrap();
-        let _pid: u32 = suffix.parse().expect("suffix should be a u32 pid");
+        assert_eq!(suffix.len(), 18);
+        assert!(suffix.chars().all(|ch| ch.is_ascii_digit()));
     }
 
     // ── StatementOutcome ──────────────────────────────────────────────────────
@@ -1107,14 +1179,17 @@ mod tests {
     use plsql_catalog::{CatalogError, OracleBackend, OracleBind, OracleConnectionInfo, OracleRow};
 
     struct StubConn;
+    #[async_trait::async_trait(?Send)]
     impl OracleConnection for StubConn {
         fn backend(&self) -> OracleBackend {
             OracleBackend::RustOracle
         }
-        fn ping(&self) -> Result<(), CatalogError> {
+        async fn ping(&self, cx: &Cx) -> Result<(), CatalogError> {
+            let _ = cx;
             Ok(())
         }
-        fn describe(&self) -> Result<OracleConnectionInfo, CatalogError> {
+        async fn describe(&self, cx: &Cx) -> Result<OracleConnectionInfo, CatalogError> {
+            let _ = cx;
             Ok(OracleConnectionInfo {
                 backend: OracleBackend::RustOracle,
                 connect_string: String::from("//localhost/XE"),
@@ -1129,16 +1204,53 @@ mod tests {
                 max_open_cursors: 500,
             })
         }
-        fn query_rows(
+        async fn query_rows(
             &self,
+            cx: &Cx,
             _sql: &str,
             _params: &[OracleBind],
         ) -> Result<Vec<OracleRow>, CatalogError> {
+            let _ = cx;
             Ok(vec![])
         }
-        fn execute(&self, _sql: &str, _params: &[OracleBind]) -> Result<u64, CatalogError> {
+        async fn execute(
+            &self,
+            cx: &Cx,
+            _sql: &str,
+            _params: &[OracleBind],
+        ) -> Result<u64, CatalogError> {
+            let _ = cx;
             Ok(0)
         }
+    }
+
+    fn run_verify_future<F: Future>(future: F) -> F::Output {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("test asupersync runtime")
+            .block_on(future)
+    }
+
+    fn verify_for_test<C: OracleConnection>(
+        conn: &C,
+        changeset: &VerifyChangeset,
+        options: &VerifyOptions,
+    ) -> Result<VerifyReport, VerifyError> {
+        run_verify_future(async {
+            let cx = Cx::current().expect("test runtime installs a request Cx");
+            verify(&cx, conn, changeset, options).await
+        })
+    }
+
+    fn create_scratch_schema_for_test<C: OracleConnection>(
+        conn: &C,
+        schema: &str,
+        password: &str,
+    ) -> Result<(), VerifyError> {
+        run_verify_future(async {
+            let cx = Cx::current().expect("test runtime installs a request Cx");
+            create_scratch_schema(&cx, conn, schema, password).await
+        })
     }
 
     #[test]
@@ -1146,7 +1258,7 @@ mod tests {
         let conn = StubConn;
         let cs = VerifyChangeset::default();
         let opts = VerifyOptions::default();
-        let err = verify(&conn, &cs, &opts).unwrap_err();
+        let err = verify_for_test(&conn, &cs, &opts).unwrap_err();
         assert!(
             matches!(err, VerifyError::EmptyChangeset),
             "expected EmptyChangeset, got {err:?}"
@@ -1162,7 +1274,7 @@ mod tests {
             schema_override: Some(String::from("PRODUCTION")),
             scratch_user_password: None,
         };
-        let err = verify(&conn, &cs, &opts).unwrap_err();
+        let err = verify_for_test(&conn, &cs, &opts).unwrap_err();
         assert!(
             matches!(err, VerifyError::InPlaceVerificationRefused { .. }),
             "expected InPlaceVerificationRefused, got {err:?}"
@@ -1178,7 +1290,7 @@ mod tests {
             (2, String::from("CREATE TABLE T2 (ID NUMBER)")),
         ]);
         let opts = VerifyOptions::default(); // VERIFY_T_<pid>
-        let report = verify(&conn, &cs, &opts).expect("stub verify should succeed");
+        let report = verify_for_test(&conn, &cs, &opts).expect("stub verify should succeed");
         assert!(report.is_clean(), "all stubs should pass");
         assert_eq!(report.ok_count(), 2);
         assert_eq!(report.failed_count(), 0);
@@ -1188,9 +1300,9 @@ mod tests {
     // ── validate_scratch_password (oracle-clgt.11) ────────────────────────────
 
     #[test]
-    fn validate_scratch_password_accepts_default_and_allowlist() {
-        // The hard-coded default must pass.
-        validate_scratch_password("V3r1fyTmp#2026").expect("default password must validate");
+    fn validate_scratch_password_accepts_generated_default_and_allowlist() {
+        let generated = VerifyOptions::default().effective_password();
+        validate_scratch_password(&generated).expect("generated default password must validate");
         // Every allowlisted character class.
         validate_scratch_password("Aa0#_$.+-").expect("full allowlist must validate");
     }
@@ -1217,15 +1329,13 @@ mod tests {
     #[test]
     fn validate_scratch_password_rejects_empty() {
         let err = validate_scratch_password("").expect_err("empty password must be rejected");
-        match err {
-            VerifyError::InvalidScratchPassword { reason } => {
-                assert!(
-                    reason.contains("empty"),
-                    "reason should mention empty: {reason}"
-                );
-            }
-            other => panic!("expected InvalidScratchPassword, got {other:?}"),
-        }
+        assert!(
+            matches!(
+                err,
+                VerifyError::InvalidScratchPassword { ref reason } if reason.contains("empty")
+            ),
+            "expected empty-password validation error, got {err:?}"
+        );
     }
 
     #[test]
@@ -1256,7 +1366,7 @@ mod tests {
         // Regression: a corrupting `"` in the password must be rejected before
         // any DDL is sent to the connection (oracle-clgt.11).
         let conn = StubConn;
-        let err = create_scratch_schema(&conn, "VERIFY_T_77", "a\"b")
+        let err = create_scratch_schema_for_test(&conn, "VERIFY_T_77", "a\"b")
             .expect_err("bad password must be rejected");
         assert!(
             matches!(err, VerifyError::InvalidScratchPassword { .. }),
@@ -1269,7 +1379,8 @@ mod tests {
         // The default password flows through create_scratch_schema cleanly
         // against the always-Ok stub connection.
         let conn = StubConn;
-        create_scratch_schema(&conn, "VERIFY_T_88", "V3r1fyTmp#2026")
+        let password = VerifyOptions::default().effective_password();
+        create_scratch_schema_for_test(&conn, "VERIFY_T_88", &password)
             .expect("default password must be accepted by create_scratch_schema");
     }
 
@@ -1290,8 +1401,8 @@ mod tests {
     fn once(s: &str) -> impl FnMut() -> std::io::Result<String> {
         let mut v = Some(s.to_string());
         move || {
-            Ok(v.take()
-                .unwrap_or_else(|| panic!("read_line called more than once")))
+            v.take()
+                .ok_or_else(|| std::io::Error::other("read_line called more than once"))
         }
     }
 
@@ -1302,7 +1413,7 @@ mod tests {
         let decision = confirm_in_place_verification(
             false,
             "HR_PROD",
-            || panic!("must not prompt when flag absent"),
+            || Err(std::io::Error::other("must not prompt when flag absent")),
             &mut out,
         )
         .expect("flag-absent path is infallible");
@@ -1338,13 +1449,14 @@ mod tests {
         let mut out = Vec::new();
         let err = confirm_in_place_verification(true, "HR_PROD", once("yes\n"), &mut out)
             .expect_err("non-matching input must NOT confirm");
-        match err {
-            VerifyError::InPlaceConfirmationMismatch { expected, got } => {
-                assert_eq!(expected, "HR_PROD");
-                assert_eq!(got, "yes");
-            }
-            other => panic!("expected InPlaceConfirmationMismatch, got {other:?}"),
-        }
+        assert!(
+            matches!(
+                err,
+                VerifyError::InPlaceConfirmationMismatch { ref expected, ref got }
+                    if expected == "HR_PROD" && got == "yes"
+            ),
+            "expected InPlaceConfirmationMismatch, got {err:?}"
+        );
     }
 
     #[test]

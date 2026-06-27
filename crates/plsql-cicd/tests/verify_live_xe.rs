@@ -43,22 +43,76 @@ fn live_xe_verify_is_feature_gated() {
 
 #[cfg(feature = "live-xe")]
 mod live {
-    use plsql_catalog::{OracleConnectOptions, RustOracleConnection};
+    use asupersync::{Cx, runtime::RuntimeBuilder};
+    use plsql_catalog::{
+        CatalogError, OracleBind, OracleConnectOptions, OracleConnection, OracleRow,
+        RustOracleConnection,
+    };
     use plsql_cicd::verify::{
-        StatementOutcome, VerifyChangeset, VerifyOptions, is_scratch_schema, verify,
+        StatementOutcome, VerifyChangeset, VerifyOptions, VerifyReport, is_scratch_schema,
+        verify as verify_async,
+    };
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicU32, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
     };
 
+    static SCRATCH_COUNTER: AtomicU32 = AtomicU32::new(0);
+
     const SYSTEM_USER: &str = "SYSTEM";
-    const SYSTEM_PASS: &str = "DemoPlsqlIntel#2026";
     const CONNECT_STRING: &str = "//localhost:1521/FREEPDB1";
 
     /// Connect as SYSTEM (has CREATE USER / DROP USER / GRANT privileges).
     fn system_conn() -> RustOracleConnection {
-        let opts = OracleConnectOptions::new(SYSTEM_USER, SYSTEM_PASS, CONNECT_STRING)
+        let password = required_env("PLSQL_XE_SYSTEM_PASSWORD");
+        let opts = OracleConnectOptions::new(SYSTEM_USER, &password, CONNECT_STRING)
             .with_module("plsql-cicd-verify-test")
             .with_action("PLSQL-CICD-005");
         RustOracleConnection::connect(opts)
             .expect("SYSTEM connection to //localhost:1521/FREEPDB1 must succeed")
+    }
+
+    fn run_live_future<F: Future>(future: F) -> F::Output {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("live-xe asupersync runtime")
+            .block_on(future)
+    }
+
+    fn required_env(name: &str) -> String {
+        std::env::var(name).expect("required live-XE credential env var is not set")
+    }
+
+    fn unique_suffix() -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let counter = SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed) % 1000;
+        format!("{:015}{counter:03}", nanos % 1_000_000_000_000_000)
+    }
+
+    fn verify(
+        conn: &RustOracleConnection,
+        changeset: &VerifyChangeset,
+        options: &VerifyOptions,
+    ) -> Result<VerifyReport, plsql_cicd::verify::VerifyError> {
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            verify_async(&cx, conn, changeset, options).await
+        })
+    }
+
+    fn query_rows<C: OracleConnection>(
+        conn: &C,
+        sql: &str,
+        params: &[OracleBind],
+    ) -> Result<Vec<OracleRow>, CatalogError> {
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            conn.query_rows(&cx, sql, params).await
+        })
     }
 
     /// Build the synthetic three-statement changeset:
@@ -186,13 +240,12 @@ mod live {
 
         // Verify the scratch schema has been dropped (teardown).
         // Query ALL_USERS — if the schema persists it would appear here.
-        use plsql_catalog::{OracleBind, OracleConnection};
-        let rows = conn
-            .query_rows(
-                "SELECT 1 FROM all_users WHERE username = :1",
-                &[OracleBind::String(report.schema.clone())],
-            )
-            .expect("schema existence check query should succeed");
+        let rows = query_rows(
+            &conn,
+            "SELECT 1 FROM all_users WHERE username = :1",
+            &[OracleBind::String(report.schema.clone())],
+        )
+        .expect("schema existence check query should succeed");
         assert!(
             rows.is_empty(),
             "scratch schema `{}` should have been dropped in teardown, but still exists",
@@ -217,7 +270,7 @@ mod live {
             ),
         ]);
         let opts = VerifyOptions {
-            schema_override: Some(format!("VERIFY_T_{}_2", std::process::id())),
+            schema_override: Some(format!("VERIFY_T_{}_2", unique_suffix())),
             ..Default::default()
         };
 
@@ -241,13 +294,12 @@ mod live {
         assert_eq!(report.skipped_count(), 0);
 
         // Confirm schema dropped.
-        use plsql_catalog::{OracleBind, OracleConnection};
-        let rows = conn
-            .query_rows(
-                "SELECT 1 FROM all_users WHERE username = :1",
-                &[OracleBind::String(report.schema.clone())],
-            )
-            .expect("schema existence check");
+        let rows = query_rows(
+            &conn,
+            "SELECT 1 FROM all_users WHERE username = :1",
+            &[OracleBind::String(report.schema.clone())],
+        )
+        .expect("schema existence check");
         assert!(
             rows.is_empty(),
             "schema `{}` should be dropped after clean run",
@@ -273,7 +325,7 @@ mod live {
             ),
         ]);
         let opts = VerifyOptions {
-            schema_override: Some(format!("VERIFY_T_{}_3", std::process::id())),
+            schema_override: Some(format!("VERIFY_T_{}_3", unique_suffix())),
             ..Default::default()
         };
 
@@ -300,13 +352,12 @@ mod live {
         assert!(!report.is_clean());
 
         // Schema still dropped even though execution failed.
-        use plsql_catalog::{OracleBind, OracleConnection};
-        let rows = conn
-            .query_rows(
-                "SELECT 1 FROM all_users WHERE username = :1",
-                &[OracleBind::String(report.schema.clone())],
-            )
-            .expect("schema existence check");
+        let rows = query_rows(
+            &conn,
+            "SELECT 1 FROM all_users WHERE username = :1",
+            &[OracleBind::String(report.schema.clone())],
+        )
+        .expect("schema existence check");
         assert!(
             rows.is_empty(),
             "schema `{}` should be dropped even after failure",

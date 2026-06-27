@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
+use asupersync::Cx;
 use chrono::{DateTime, Utc};
 #[cfg(feature = "oracle-driver")]
 use oracle::sql_type::ToSql as OracleToSql;
@@ -956,20 +957,28 @@ pub struct OracleConnectionInfo {
     pub max_open_cursors: u32,
 }
 
+#[async_trait::async_trait(?Send)]
 pub trait OracleConnection: Send + Sync {
     fn backend(&self) -> OracleBackend;
-    fn ping(&self) -> Result<(), CatalogError>;
-    fn describe(&self) -> Result<OracleConnectionInfo, CatalogError>;
-    fn query_rows(&self, sql: &str, params: &[OracleBind]) -> Result<Vec<OracleRow>, CatalogError>;
-    fn execute(&self, sql: &str, params: &[OracleBind]) -> Result<u64, CatalogError>;
+    async fn ping(&self, cx: &Cx) -> Result<(), CatalogError>;
+    async fn describe(&self, cx: &Cx) -> Result<OracleConnectionInfo, CatalogError>;
+    async fn query_rows(
+        &self,
+        cx: &Cx,
+        sql: &str,
+        params: &[OracleBind],
+    ) -> Result<Vec<OracleRow>, CatalogError>;
+    async fn execute(&self, cx: &Cx, sql: &str, params: &[OracleBind])
+    -> Result<u64, CatalogError>;
 
     #[instrument(level = "trace", skip(self, sql, params))]
-    fn query_optional_row(
+    async fn query_optional_row(
         &self,
+        cx: &Cx,
         sql: &str,
         params: &[OracleBind],
     ) -> Result<Option<OracleRow>, CatalogError> {
-        let mut rows = self.query_rows(sql, params)?;
+        let mut rows = self.query_rows(cx, sql, params).await?;
         match rows.len() {
             0 => Ok(None),
             1 => Ok(rows.pop()),
@@ -981,8 +990,13 @@ pub trait OracleConnection: Send + Sync {
     }
 
     #[instrument(level = "trace", skip(self, sql, params))]
-    fn query_one_row(&self, sql: &str, params: &[OracleBind]) -> Result<OracleRow, CatalogError> {
-        let mut rows = self.query_rows(sql, params)?;
+    async fn query_one_row(
+        &self,
+        cx: &Cx,
+        sql: &str,
+        params: &[OracleBind],
+    ) -> Result<OracleRow, CatalogError> {
+        let mut rows = self.query_rows(cx, sql, params).await?;
         match rows.len() {
             1 => rows.pop().ok_or(CatalogError::UnexpectedRowCount {
                 expected: String::from("exactly 1"),
@@ -1038,6 +1052,7 @@ impl RustOracleConnection {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl OracleConnection for RustOracleConnection {
     #[instrument(level = "trace", skip(self))]
     fn backend(&self) -> OracleBackend {
@@ -1045,7 +1060,8 @@ impl OracleConnection for RustOracleConnection {
     }
 
     #[instrument(level = "trace", skip(self))]
-    fn ping(&self) -> Result<(), CatalogError> {
+    async fn ping(&self, cx: &Cx) -> Result<(), CatalogError> {
+        let _ = cx;
         #[cfg(not(feature = "oracle-driver"))]
         {
             Err(CatalogError::OracleBackendNotCompiled {
@@ -1061,9 +1077,10 @@ impl OracleConnection for RustOracleConnection {
     }
 
     #[instrument(level = "trace", skip(self))]
-    fn describe(&self) -> Result<OracleConnectionInfo, CatalogError> {
+    async fn describe(&self, cx: &Cx) -> Result<OracleConnectionInfo, CatalogError> {
         #[cfg(not(feature = "oracle-driver"))]
         {
+            let _ = cx;
             Err(CatalogError::OracleBackendNotCompiled {
                 backend: OracleBackend::RustOracle,
                 feature: "oracle-driver",
@@ -1076,9 +1093,11 @@ impl OracleConnection for RustOracleConnection {
             let (_, server_version) = self.inner.server_version().map_err(map_rust_oracle_error)?;
             let current_schema = self
                 .query_optional_row(
+                    cx,
                     "select sys_context('userenv', 'current_schema') as current_schema from dual",
                     &[],
-                )?
+                )
+                .await?
                 .and_then(|row| row.text("CURRENT_SCHEMA").map(String::from));
 
             Ok(OracleConnectionInfo {
@@ -1098,7 +1117,13 @@ impl OracleConnection for RustOracleConnection {
     }
 
     #[instrument(level = "trace", skip(self, sql, params))]
-    fn query_rows(&self, sql: &str, params: &[OracleBind]) -> Result<Vec<OracleRow>, CatalogError> {
+    async fn query_rows(
+        &self,
+        cx: &Cx,
+        sql: &str,
+        params: &[OracleBind],
+    ) -> Result<Vec<OracleRow>, CatalogError> {
+        let _ = cx;
         #[cfg(not(feature = "oracle-driver"))]
         {
             let _ = sql;
@@ -1129,7 +1154,13 @@ impl OracleConnection for RustOracleConnection {
     }
 
     #[instrument(level = "trace", skip(self, sql, params))]
-    fn execute(&self, sql: &str, params: &[OracleBind]) -> Result<u64, CatalogError> {
+    async fn execute(
+        &self,
+        cx: &Cx,
+        sql: &str,
+        params: &[OracleBind],
+    ) -> Result<u64, CatalogError> {
+        let _ = cx;
         #[cfg(not(feature = "oracle-driver"))]
         {
             let _ = sql;
@@ -1263,11 +1294,16 @@ pub fn load_snapshot_from_json(path: &std::path::Path) -> Result<CatalogSnapshot
     let raw = fs::read_to_string(path)?;
     let document: CatalogSnapshotDocument = serde_json::from_str(&raw)?;
 
-    if document.schema_id != CATALOG_SNAPSHOT_SCHEMA_ID {
+    if !document.schema_id.as_str().eq(CATALOG_SNAPSHOT_SCHEMA_ID) {
         return Err(CatalogError::UnexpectedSchemaId(document.schema_id));
     }
 
-    if document.schema_version != CATALOG_SNAPSHOT_SCHEMA_VERSION {
+    if !matches!(
+        document
+            .schema_version
+            .cmp(&CATALOG_SNAPSHOT_SCHEMA_VERSION),
+        std::cmp::Ordering::Equal
+    ) {
         return Err(CatalogError::UnsupportedSchemaVersion {
             schema_id: String::from(CATALOG_SNAPSHOT_SCHEMA_ID),
             found: document.schema_version,
@@ -1339,7 +1375,11 @@ pub fn load_from_dbms_metadata_dir(dir: &std::path::Path) -> Result<CatalogSnaps
     // platforms — `read_dir` ordering is unspecified.
     let mut paths: Vec<std::path::PathBuf> = fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("sql"))
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| ext.eq("sql"))
+        })
         .collect();
     paths.sort();
 
@@ -1676,23 +1716,23 @@ impl<'a> Cursor<'a> {
             }
             // `--` line comment.
             if self.pos + 1 < self.bytes.len()
-                && self.bytes[self.pos] == b'-'
-                && self.bytes[self.pos + 1] == b'-'
+                && self.bytes[self.pos].eq(&b'-')
+                && self.bytes[self.pos + 1].eq(&b'-')
             {
                 self.pos += 2;
-                while self.pos < self.bytes.len() && self.bytes[self.pos] != b'\n' {
+                while self.pos < self.bytes.len() && self.bytes[self.pos].ne(&b'\n') {
                     self.pos += 1;
                 }
                 continue;
             }
             // `/* … */` block comment.
             if self.pos + 1 < self.bytes.len()
-                && self.bytes[self.pos] == b'/'
-                && self.bytes[self.pos + 1] == b'*'
+                && self.bytes[self.pos].eq(&b'/')
+                && self.bytes[self.pos + 1].eq(&b'*')
             {
                 self.pos += 2;
                 while self.pos + 1 < self.bytes.len()
-                    && !(self.bytes[self.pos] == b'*' && self.bytes[self.pos + 1] == b'/')
+                    && !(self.bytes[self.pos].eq(&b'*') && self.bytes[self.pos + 1].eq(&b'/'))
                 {
                     self.pos += 1;
                 }
@@ -1721,7 +1761,7 @@ impl<'a> Cursor<'a> {
         // Word boundary check — `CREATEDOC` must not match `CREATE`.
         if end < self.bytes.len() {
             let next = self.bytes[end];
-            if next == b'_' || next.is_ascii_alphanumeric() {
+            if next.eq(&b'_') || next.is_ascii_alphanumeric() {
                 return false;
             }
         }
@@ -1754,7 +1794,7 @@ impl<'a> Cursor<'a> {
         let start = self.pos;
         while self.pos < self.bytes.len() {
             let b = self.bytes[self.pos];
-            if b.is_ascii_alphanumeric() || b == b'_' {
+            if b.is_ascii_alphanumeric() || b.eq(&b'_') {
                 self.pos += 1;
             } else {
                 break;
@@ -1791,11 +1831,11 @@ fn extract_owner_and_name(after_kind: &str) -> Option<(Option<String>, String)> 
     let bytes = after.as_bytes();
     let mut i = 0usize;
     'scan: while i < bytes.len() {
-        if bytes[i] == b'"' {
+        if bytes[i].eq(&b'"') {
             // Quoted segment: consume up to (and including) the closing `"`.
             let content_start = i + 1;
             let mut j = content_start;
-            while j < bytes.len() && bytes[j] != b'"' {
+            while j < bytes.len() && bytes[j].ne(&b'"') {
                 j += 1;
             }
             // Unterminated quote ⇒ malformed header; give up.
@@ -1814,7 +1854,7 @@ fn extract_owner_and_name(after_kind: &str) -> Option<(Option<String>, String)> 
             let start = i;
             while i < bytes.len() {
                 let c = bytes[i] as char;
-                if c.is_ascii_alphanumeric() || c == '_' {
+                if c.is_ascii_alphanumeric() || c.eq(&'_') {
                     i += 1;
                 } else {
                     break;
@@ -1822,7 +1862,7 @@ fn extract_owner_and_name(after_kind: &str) -> Option<(Option<String>, String)> 
             }
             // An empty unquoted run means we hit a non-identifier byte
             // that is not a segment separator: stop scanning the token.
-            if i == start {
+            if i.eq(&start) {
                 break 'scan;
             }
             segments.push(Segment {
@@ -1833,7 +1873,7 @@ fn extract_owner_and_name(after_kind: &str) -> Option<(Option<String>, String)> 
 
         // After a segment, a `.` continues into the next (NAME) segment;
         // anything else ends the `[OWNER.]NAME` token.
-        if i < bytes.len() && bytes[i] == b'.' {
+        if i < bytes.len() && bytes[i].eq(&b'.') {
             i += 1;
         } else {
             break 'scan;
@@ -1846,7 +1886,7 @@ fn extract_owner_and_name(after_kind: &str) -> Option<(Option<String>, String)> 
         if seg.text.is_empty() {
             return false;
         }
-        seg.quoted || seg.text.chars().all(|c| c.is_alphanumeric() || c == '_')
+        seg.quoted || seg.text.chars().all(|c| c.is_alphanumeric() || c.eq(&'_'))
     };
 
     match segments.as_slice() {
@@ -1865,17 +1905,18 @@ struct Segment {
     text: String,
     quoted: bool,
 }
-#[instrument(level = "trace", skip(conn, request))]
-pub fn load_snapshot_from_connection<C: OracleConnection>(
+#[instrument(level = "trace", skip(cx, conn, request))]
+pub async fn load_snapshot_from_connection<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     request: &CatalogLoadRequest,
 ) -> Result<CatalogSnapshot, CatalogError> {
-    let connection_info = conn.describe()?;
+    let connection_info = conn.describe(cx).await?;
     let resolved_schemas = resolve_schema_filters(&connection_info, request)?;
     let (oracle_version, version_warning) =
         oracle_version_from_server_version(&connection_info.server_version);
 
-    let mut capabilities = negotiate_capabilities(conn);
+    let mut capabilities = negotiate_capabilities(cx, conn).await;
     if let Some(warning) = version_warning {
         capabilities.warnings.push(warning);
     }
@@ -1898,31 +1939,31 @@ pub fn load_snapshot_from_connection<C: OracleConnection>(
         snapshot.profile.current_schema = snapshot.intern_schema_name(current_schema);
     }
 
-    load_catalog_objects(conn, &mut snapshot, &resolved_schemas)?;
-    load_catalog_columns(conn, &mut snapshot, &resolved_schemas)?;
-    load_catalog_constraints(conn, &mut snapshot, &resolved_schemas)?;
-    load_catalog_indexes(conn, &mut snapshot, &resolved_schemas)?;
-    load_catalog_triggers(conn, &mut snapshot, &resolved_schemas)?;
-    load_catalog_synonyms(conn, &mut snapshot, &resolved_schemas)?;
-    load_catalog_routines(conn, &mut snapshot, &resolved_schemas)?;
-    load_catalog_views(conn, &mut snapshot, &resolved_schemas)?;
-    load_catalog_mviews(conn, &mut snapshot, &resolved_schemas)?;
-    load_catalog_sequences(conn, &mut snapshot, &resolved_schemas)?;
-    load_catalog_type_attrs(conn, &mut snapshot, &resolved_schemas)?;
+    load_catalog_objects(cx, conn, &mut snapshot, &resolved_schemas).await?;
+    load_catalog_columns(cx, conn, &mut snapshot, &resolved_schemas).await?;
+    load_catalog_constraints(cx, conn, &mut snapshot, &resolved_schemas).await?;
+    load_catalog_indexes(cx, conn, &mut snapshot, &resolved_schemas).await?;
+    load_catalog_triggers(cx, conn, &mut snapshot, &resolved_schemas).await?;
+    load_catalog_synonyms(cx, conn, &mut snapshot, &resolved_schemas).await?;
+    load_catalog_routines(cx, conn, &mut snapshot, &resolved_schemas).await?;
+    load_catalog_views(cx, conn, &mut snapshot, &resolved_schemas).await?;
+    load_catalog_mviews(cx, conn, &mut snapshot, &resolved_schemas).await?;
+    load_catalog_sequences(cx, conn, &mut snapshot, &resolved_schemas).await?;
+    load_catalog_type_attrs(cx, conn, &mut snapshot, &resolved_schemas).await?;
     // Must precede grant extraction: ALL_TAB_PRIVS has no user/role
     // discriminator, so grantee classification consults `known_users`.
-    load_catalog_users(conn, &mut snapshot)?;
-    load_catalog_grants(conn, &mut snapshot, &resolved_schemas)?;
-    load_catalog_db_links(conn, &mut snapshot, &resolved_schemas)?;
-    load_catalog_table_comments(conn, &mut snapshot, &resolved_schemas)?;
-    load_catalog_column_comments(conn, &mut snapshot, &resolved_schemas)?;
-    load_catalog_editions(conn, &mut snapshot)?;
-    load_catalog_editioning_views(conn, &mut snapshot, &resolved_schemas)?;
-    load_catalog_vpd_policies(conn, &mut snapshot, &resolved_schemas)?;
-    load_catalog_dependencies(conn, &mut snapshot, &resolved_schemas)?;
+    load_catalog_users(cx, conn, &mut snapshot).await?;
+    load_catalog_grants(cx, conn, &mut snapshot, &resolved_schemas).await?;
+    load_catalog_db_links(cx, conn, &mut snapshot, &resolved_schemas).await?;
+    load_catalog_table_comments(cx, conn, &mut snapshot, &resolved_schemas).await?;
+    load_catalog_column_comments(cx, conn, &mut snapshot, &resolved_schemas).await?;
+    load_catalog_editions(cx, conn, &mut snapshot).await?;
+    load_catalog_editioning_views(cx, conn, &mut snapshot, &resolved_schemas).await?;
+    load_catalog_vpd_policies(cx, conn, &mut snapshot, &resolved_schemas).await?;
+    load_catalog_dependencies(cx, conn, &mut snapshot, &resolved_schemas).await?;
     if snapshot.capabilities.plscope_enabled {
-        load_catalog_plscope_availability(conn, &mut snapshot, &resolved_schemas)?;
-        load_catalog_plscope_identifiers(conn, &mut snapshot, &resolved_schemas)?;
+        load_catalog_plscope_availability(cx, conn, &mut snapshot, &resolved_schemas).await?;
+        load_catalog_plscope_identifiers(cx, conn, &mut snapshot, &resolved_schemas).await?;
     }
 
     Ok(snapshot)
@@ -2007,7 +2048,7 @@ fn resolve_schema_filters(
             }
         };
 
-        if !resolved.iter().any(|candidate| candidate == &schema_name) {
+        if !resolved.iter().any(|candidate| candidate.eq(&schema_name)) {
             resolved.push(schema_name);
         }
     }
@@ -2027,8 +2068,9 @@ fn resolve_schema_filters(
 /// run. `object_type` must map to a DBMS_METADATA object type (see
 /// [`object_type_to_dbms_metadata_value`]); unknown types return an
 /// `Ok(None)` so the caller can continue without aborting the snapshot.
-#[instrument(level = "trace", skip(conn))]
-pub fn fetch_dbms_metadata_ddl<C: OracleConnection>(
+#[instrument(level = "trace", skip(cx, conn))]
+pub async fn fetch_dbms_metadata_ddl<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     object_type: ObjectType,
     name: &str,
@@ -2044,7 +2086,7 @@ pub fn fetch_dbms_metadata_ddl<C: OracleConnection>(
         OracleBind::from(name.to_string()),
         OracleBind::from(owner.to_string()),
     ];
-    let rows = conn.query_rows(sql, &params)?;
+    let rows = conn.query_rows(cx, sql, &params).await?;
     let Some(row) = rows.into_iter().next() else {
         return Ok(None);
     };
@@ -2068,8 +2110,9 @@ pub fn fetch_dbms_metadata_ddl<C: OracleConnection>(
 /// `capabilities.can_use_dbms_metadata` is false. Failures on individual
 /// objects are recorded as `CapabilityWarning`s on the snapshot and do not
 /// abort the populate pass.
-#[instrument(level = "trace", skip(conn, snapshot))]
-pub fn populate_dbms_metadata_ddl<C: OracleConnection>(
+#[instrument(level = "trace", skip(cx, conn, snapshot))]
+pub async fn populate_dbms_metadata_ddl<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     snapshot: &mut CatalogSnapshot,
 ) -> Result<(), CatalogError> {
@@ -2107,7 +2150,7 @@ pub fn populate_dbms_metadata_ddl<C: OracleConnection>(
         if owner_text.is_empty() || name_text.is_empty() {
             continue;
         }
-        match fetch_dbms_metadata_ddl(conn, object_type, &name_text, &owner_text) {
+        match fetch_dbms_metadata_ddl(cx, conn, object_type, &name_text, &owner_text).await {
             Ok(Some(ddl)) => writes.push((owner_symbol, name_symbol, ddl)),
             Ok(None) => {}
             Err(error) => warnings.push(CapabilityWarning {
@@ -2164,7 +2207,7 @@ pub fn normalize_dbms_metadata_ddl(text: &str) -> String {
     let mut normalized = String::with_capacity(trimmed.len());
     let mut prev_space = false;
     for c in trimmed.chars() {
-        if c == ' ' || c == '\t' {
+        if c.eq(&' ') || c.eq(&'\t') {
             if !prev_space {
                 normalized.push(' ');
                 prev_space = true;
@@ -2211,8 +2254,8 @@ pub fn object_type_to_dbms_metadata_value(object_type: ObjectType) -> Option<&'s
 /// back to `false` on any error, with a typed `CapabilityWarning` carrying
 /// the probe name + Oracle error message + remediation hint.
 #[must_use]
-#[instrument(level = "trace", skip(conn))]
-pub fn negotiate_capabilities<C: OracleConnection>(conn: &C) -> CatalogCapabilities {
+#[instrument(level = "trace", skip(cx, conn))]
+pub async fn negotiate_capabilities<C: OracleConnection>(cx: &Cx, conn: &C) -> CatalogCapabilities {
     let mut capabilities = CatalogCapabilities {
         can_query_all_views: false,
         ..CatalogCapabilities::default()
@@ -2259,7 +2302,7 @@ pub fn negotiate_capabilities<C: OracleConnection>(conn: &C) -> CatalogCapabilit
     ];
 
     for (sql, probe_code, remediation, setter) in probes {
-        match conn.query_rows(sql, &[]) {
+        match conn.query_rows(cx, sql, &[]).await {
             Ok(_) => setter(&mut capabilities),
             Err(error) => capabilities.warnings.push(CapabilityWarning {
                 code: String::from(*probe_code),
@@ -2275,7 +2318,7 @@ pub fn negotiate_capabilities<C: OracleConnection>(conn: &C) -> CatalogCapabilit
     // effects.
     let dbms_metadata_probe =
         "begin if dbms_metadata.get_ddl('TABLE', 'DUAL', 'SYS') is null then null; end if; end;";
-    match conn.execute(dbms_metadata_probe, &[]) {
+    match conn.execute(cx, dbms_metadata_probe, &[]).await {
         Ok(_) => {
             capabilities.can_use_dbms_metadata = true;
         }
@@ -2326,7 +2369,8 @@ fn oracle_version_from_server_version(
     }
 }
 
-fn load_catalog_objects<C: OracleConnection>(
+async fn load_catalog_objects<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     snapshot: &mut CatalogSnapshot,
     schema_names: &[String],
@@ -2361,14 +2405,15 @@ order by owner, object_type, object_name
     );
     let params = schema_filter_params(schema_names);
 
-    for row in conn.query_rows(&sql, &params)? {
+    for row in conn.query_rows(cx, &sql, &params).await? {
         apply_object_row(snapshot, &row)?;
     }
 
     Ok(())
 }
 
-fn load_catalog_plscope_identifiers<C: OracleConnection>(
+async fn load_catalog_plscope_identifiers<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     snapshot: &mut CatalogSnapshot,
     schema_names: &[String],
@@ -2390,7 +2435,7 @@ order by owner, object_name, line, col
 "
     );
     let params = schema_filter_params(schema_names);
-    let rows = match conn.query_rows(&sql, &params) {
+    let rows = match conn.query_rows(cx, &sql, &params).await {
         Ok(rows) => rows,
         Err(error) => {
             snapshot.capabilities.warnings.push(CapabilityWarning {
@@ -2458,7 +2503,8 @@ order by owner, object_name, line, col
     Ok(())
 }
 
-fn load_catalog_plscope_availability<C: OracleConnection>(
+async fn load_catalog_plscope_availability<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     snapshot: &mut CatalogSnapshot,
     schema_names: &[String],
@@ -2474,7 +2520,7 @@ where owner in ({owner_clause})
 "
     );
     let params = schema_filter_params(schema_names);
-    let rows = match conn.query_rows(&sql, &params) {
+    let rows = match conn.query_rows(cx, &sql, &params).await {
         Ok(rows) => rows,
         Err(error) => {
             // Record the warning, leave per-schema plscope as None (the
@@ -2545,7 +2591,8 @@ struct PlScopeTally {
     with_statements: usize,
 }
 
-fn load_catalog_dependencies<C: OracleConnection>(
+async fn load_catalog_dependencies<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     snapshot: &mut CatalogSnapshot,
     schema_names: &[String],
@@ -2568,14 +2615,15 @@ order by owner, name, referenced_owner, referenced_name
     );
     let params = schema_filter_params(schema_names);
 
-    for row in conn.query_rows(&sql, &params)? {
+    for row in conn.query_rows(cx, &sql, &params).await? {
         apply_dependency_row(snapshot, &row)?;
     }
 
     Ok(())
 }
 
-fn load_catalog_columns<C: OracleConnection>(
+async fn load_catalog_columns<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     snapshot: &mut CatalogSnapshot,
     schema_names: &[String],
@@ -2605,14 +2653,15 @@ order by owner, table_name, nvl(column_id, internal_column_id)
     );
     let params = schema_filter_params(schema_names);
 
-    for row in conn.query_rows(&sql, &params)? {
+    for row in conn.query_rows(cx, &sql, &params).await? {
         apply_column_row(snapshot, &row)?;
     }
 
     Ok(())
 }
 
-fn load_catalog_constraints<C: OracleConnection>(
+async fn load_catalog_constraints<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     snapshot: &mut CatalogSnapshot,
     schema_names: &[String],
@@ -2651,14 +2700,15 @@ order by c.owner, c.constraint_name, child.position
     );
     let params = schema_filter_params(schema_names);
 
-    for row in conn.query_rows(&sql, &params)? {
+    for row in conn.query_rows(cx, &sql, &params).await? {
         apply_constraint_row(snapshot, &row)?;
     }
 
     Ok(())
 }
 
-fn load_catalog_indexes<C: OracleConnection>(
+async fn load_catalog_indexes<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     snapshot: &mut CatalogSnapshot,
     schema_names: &[String],
@@ -2688,14 +2738,15 @@ order by i.owner, i.index_name, c.column_position
     );
     let params = schema_filter_params(schema_names);
 
-    for row in conn.query_rows(&sql, &params)? {
+    for row in conn.query_rows(cx, &sql, &params).await? {
         apply_index_row(snapshot, &row)?;
     }
 
     Ok(())
 }
 
-fn load_catalog_triggers<C: OracleConnection>(
+async fn load_catalog_triggers<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     snapshot: &mut CatalogSnapshot,
     schema_names: &[String],
@@ -2719,14 +2770,15 @@ order by owner, trigger_name
     );
     let params = schema_filter_params(schema_names);
 
-    for row in conn.query_rows(&sql, &params)? {
+    for row in conn.query_rows(cx, &sql, &params).await? {
         apply_trigger_row(snapshot, &row)?;
     }
 
     Ok(())
 }
 
-fn load_catalog_synonyms<C: OracleConnection>(
+async fn load_catalog_synonyms<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     snapshot: &mut CatalogSnapshot,
     schema_names: &[String],
@@ -2748,14 +2800,15 @@ order by owner, synonym_name
     );
     let params = schema_filter_params(schema_names);
 
-    for row in conn.query_rows(&sql, &params)? {
+    for row in conn.query_rows(cx, &sql, &params).await? {
         apply_synonym_row(snapshot, &row)?;
     }
 
     Ok(())
 }
 
-fn load_catalog_routines<C: OracleConnection>(
+async fn load_catalog_routines<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     snapshot: &mut CatalogSnapshot,
     schema_names: &[String],
@@ -2804,8 +2857,8 @@ order by owner, package_name, object_name, subprogram_id, sequence
 "
     );
     let params = schema_filter_params(schema_names);
-    let procedure_rows = conn.query_rows(&procedure_sql, &params)?;
-    let argument_rows = conn.query_rows(&argument_sql, &params)?;
+    let procedure_rows = conn.query_rows(cx, &procedure_sql, &params).await?;
+    let argument_rows = conn.query_rows(cx, &argument_sql, &params).await?;
     let mut routines = HashMap::<RoutineLocator, RoutineAccumulator>::new();
 
     for row in &procedure_rows {
@@ -2818,7 +2871,8 @@ order by owner, package_name, object_name, subprogram_id, sequence
     finalize_routines(snapshot, routines)
 }
 
-fn load_catalog_views<C: OracleConnection>(
+async fn load_catalog_views<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     snapshot: &mut CatalogSnapshot,
     schema_names: &[String],
@@ -2838,14 +2892,15 @@ order by owner, view_name
     );
     let params = schema_filter_params(schema_names);
 
-    for row in conn.query_rows(&sql, &params)? {
+    for row in conn.query_rows(cx, &sql, &params).await? {
         apply_view_row(snapshot, &row)?;
     }
 
     Ok(())
 }
 
-fn load_catalog_mviews<C: OracleConnection>(
+async fn load_catalog_mviews<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     snapshot: &mut CatalogSnapshot,
     schema_names: &[String],
@@ -2866,14 +2921,15 @@ order by owner, mview_name
     );
     let params = schema_filter_params(schema_names);
 
-    for row in conn.query_rows(&sql, &params)? {
+    for row in conn.query_rows(cx, &sql, &params).await? {
         apply_mview_row(snapshot, &row)?;
     }
 
     Ok(())
 }
 
-fn load_catalog_sequences<C: OracleConnection>(
+async fn load_catalog_sequences<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     snapshot: &mut CatalogSnapshot,
     schema_names: &[String],
@@ -2897,14 +2953,15 @@ order by sequence_owner, sequence_name
     );
     let params = schema_filter_params(schema_names);
 
-    for row in conn.query_rows(&sql, &params)? {
+    for row in conn.query_rows(cx, &sql, &params).await? {
         apply_sequence_row(snapshot, &row)?;
     }
 
     Ok(())
 }
 
-fn load_catalog_type_attrs<C: OracleConnection>(
+async fn load_catalog_type_attrs<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     snapshot: &mut CatalogSnapshot,
     schema_names: &[String],
@@ -2929,7 +2986,7 @@ order by owner, type_name, attr_no
     );
     let params = schema_filter_params(schema_names);
 
-    for row in conn.query_rows(&sql, &params)? {
+    for row in conn.query_rows(cx, &sql, &params).await? {
         apply_type_attr_row(snapshot, &row)?;
     }
 
@@ -2943,7 +3000,8 @@ order by owner, type_name, attr_no
 /// `owner in ({schemas}) or owner = 'PUBLIC'` so public links always
 /// surface — a remote reference can target a public link from any
 /// schema and lineage needs that resolution to succeed.
-fn load_catalog_db_links<C: OracleConnection>(
+async fn load_catalog_db_links<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     snapshot: &mut CatalogSnapshot,
     schema_names: &[String],
@@ -2963,7 +3021,7 @@ order by owner, db_link
     );
     let params = schema_filter_params(schema_names);
 
-    for row in conn.query_rows(&sql, &params)? {
+    for row in conn.query_rows(cx, &sql, &params).await? {
         apply_db_link_row(snapshot, &row)?;
     }
 
@@ -2974,7 +3032,8 @@ order by owner, db_link
 /// One row per (object, policy_group, policy_name) triple. Filters to
 /// enabled and disabled policies alike because lineage needs to know
 /// about disabled ones as deployment-debt.
-fn load_catalog_vpd_policies<C: OracleConnection>(
+async fn load_catalog_vpd_policies<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     snapshot: &mut CatalogSnapshot,
     schema_names: &[String],
@@ -3002,7 +3061,7 @@ order by object_owner, object_name, policy_group, policy_name
     );
     let params = schema_filter_params(schema_names);
 
-    for row in conn.query_rows(&sql, &params)? {
+    for row in conn.query_rows(cx, &sql, &params).await? {
         apply_vpd_policy_row(snapshot, &row)?;
     }
     Ok(())
@@ -3011,7 +3070,8 @@ order by object_owner, object_name, policy_group, policy_name
 /// Load `ALL_EDITIONS` into [`CatalogSnapshot::editions`]. The edition
 /// tree is database-wide (not per-schema) so this loader takes no schema
 /// filter.
-fn load_catalog_editions<C: OracleConnection>(
+async fn load_catalog_editions<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     snapshot: &mut CatalogSnapshot,
 ) -> Result<(), CatalogError> {
@@ -3023,7 +3083,7 @@ select
 from all_editions
 order by edition_name
 ";
-    for row in conn.query_rows(sql, &[])? {
+    for row in conn.query_rows(cx, sql, &[]).await? {
         apply_edition_row(snapshot, &row)?;
     }
     Ok(())
@@ -3031,7 +3091,8 @@ order by edition_name
 
 /// Load `ALL_EDITIONING_VIEWS` rows into
 /// [`SchemaCatalog::editioning_views`].
-fn load_catalog_editioning_views<C: OracleConnection>(
+async fn load_catalog_editioning_views<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     snapshot: &mut CatalogSnapshot,
     schema_names: &[String],
@@ -3050,7 +3111,7 @@ order by owner, view_name
     );
     let params = schema_filter_params(schema_names);
 
-    for row in conn.query_rows(&sql, &params)? {
+    for row in conn.query_rows(cx, &sql, &params).await? {
         apply_editioning_view_row(snapshot, &row)?;
     }
     Ok(())
@@ -3058,7 +3119,8 @@ order by owner, view_name
 
 /// Load `ALL_TAB_COMMENTS` rows into [`SchemaCatalog::table_comments`].
 /// Filters NULL comments at the source to keep the snapshot compact.
-fn load_catalog_table_comments<C: OracleConnection>(
+async fn load_catalog_table_comments<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     snapshot: &mut CatalogSnapshot,
     schema_names: &[String],
@@ -3079,7 +3141,7 @@ order by owner, table_name
     );
     let params = schema_filter_params(schema_names);
 
-    for row in conn.query_rows(&sql, &params)? {
+    for row in conn.query_rows(cx, &sql, &params).await? {
         apply_table_comment_row(snapshot, &row)?;
     }
 
@@ -3088,7 +3150,8 @@ order by owner, table_name
 
 /// Load `ALL_COL_COMMENTS` rows into [`SchemaCatalog::column_comments`].
 /// Filters NULL comments at the source.
-fn load_catalog_column_comments<C: OracleConnection>(
+async fn load_catalog_column_comments<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     snapshot: &mut CatalogSnapshot,
     schema_names: &[String],
@@ -3109,7 +3172,7 @@ order by owner, table_name, column_name
     );
     let params = schema_filter_params(schema_names);
 
-    for row in conn.query_rows(&sql, &params)? {
+    for row in conn.query_rows(cx, &sql, &params).await? {
         apply_column_comment_row(snapshot, &row)?;
     }
 
@@ -3125,15 +3188,16 @@ order by owner, table_name, column_name
 /// real users versus database roles.
 ///
 /// Failure is non-fatal: if `ALL_USERS` cannot be read, the snapshot keeps
-/// `known_users == None` (an explicit "undetermined" state, R13) and records
+/// `known_users` set to `None` (an explicit "undetermined" state, R13) and records
 /// a [`CapabilityWarning`] rather than aborting the extraction. Callers must
 /// invoke this BEFORE [`load_catalog_grants`].
-fn load_catalog_users<C: OracleConnection>(
+async fn load_catalog_users<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     snapshot: &mut CatalogSnapshot,
 ) -> Result<(), CatalogError> {
     let sql = "select username from all_users order by username";
-    match conn.query_rows(sql, &[]) {
+    match conn.query_rows(cx, sql, &[]).await {
         Ok(rows) => {
             let mut users = HashSet::with_capacity(rows.len());
             for row in &rows {
@@ -3151,7 +3215,7 @@ fn load_catalog_users<C: OracleConnection>(
         }
         Err(error) => {
             // R13: do not fail the snapshot and do not silently pretend the
-            // grantee universe is known. Leave `known_users == None` so
+            // grantee universe is known. Leave `known_users` as `None` so
             // grantee classification stays conservative downstream.
             snapshot.known_users = None;
             snapshot.capabilities.warnings.push(CapabilityWarning {
@@ -3166,7 +3230,8 @@ fn load_catalog_users<C: OracleConnection>(
     Ok(())
 }
 
-fn load_catalog_grants<C: OracleConnection>(
+async fn load_catalog_grants<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     snapshot: &mut CatalogSnapshot,
     schema_names: &[String],
@@ -3188,7 +3253,7 @@ order by table_schema, table_name, grantee, privilege
     );
     let params = schema_filter_params(schema_names);
 
-    for row in conn.query_rows(&sql, &params)? {
+    for row in conn.query_rows(cx, &sql, &params).await? {
         apply_grant_row(snapshot, &row)?;
     }
 
@@ -3996,7 +4061,7 @@ fn apply_type_attr_row(
         match metadata
             .attributes
             .iter()
-            .position(|existing| existing.position == attribute.position)
+            .position(|existing| existing.position.eq(&attribute.position))
         {
             Some(index) => metadata.attributes[index] = attribute,
             None => metadata.attributes.push(attribute),
@@ -4278,7 +4343,7 @@ fn apply_grant_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<()
     if !schema_catalog
         .grants
         .iter()
-        .any(|existing| existing == &grant)
+        .any(|existing| existing.eq(&grant))
     {
         schema_catalog.grants.push(grant);
     }
@@ -4298,7 +4363,7 @@ fn apply_grant_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<()
 ///   the resolver then caps it at Low confidence and emits a
 ///   `RuntimeGrantOrRole` ambiguity because a role grant only applies when
 ///   the role is enabled in `SESSION_ROLES` at runtime).
-/// * username set NOT loaded (`known_users == None`) -> [`Grantee::Role`]
+/// * username set NOT loaded (`known_users` is `None`) -> [`Grantee::Role`]
 ///   as well. This is the R13 fail-toward-restrictive choice: when the
 ///   grantee class is genuinely undetermined we must NOT default to a
 ///   high-confidence direct user grant (a fail-toward-permissive result in
@@ -4386,7 +4451,7 @@ fn apply_argument_row(
         });
     let position = required_u32(row, "POSITION")?;
 
-    if position == 0 {
+    if position.eq(&0) {
         signature.return_type = Some(data_type);
         accumulator.kind_hint = Some(RoutineKind::Function);
         return Ok(());
@@ -4478,8 +4543,8 @@ fn object_status_from_dictionary_value(text: &str) -> ObjectStatus {
 
 fn routine_kind_from_dictionary_value(text: Option<&str>) -> Option<RoutineKind> {
     match text.map(|value| value.trim().to_ascii_uppercase()) {
-        Some(value) if value == "FUNCTION" => Some(RoutineKind::Function),
-        Some(value) if value == "PROCEDURE" => Some(RoutineKind::Procedure),
+        Some(value) if value.eq("FUNCTION") => Some(RoutineKind::Function),
+        Some(value) if value.eq("PROCEDURE") => Some(RoutineKind::Procedure),
         _ => None,
     }
 }
@@ -4743,7 +4808,8 @@ fn upsert_top_level_routine(
 
 fn upsert_signature(signatures: &mut Vec<RoutineSignature>, signature: RoutineSignature) {
     if let Some(existing) = signatures.iter_mut().find(|candidate| {
-        candidate.routine_name == signature.routine_name && candidate.overload == signature.overload
+        candidate.routine_name.eq(&signature.routine_name)
+            && candidate.overload.eq(&signature.overload)
     }) {
         *existing = signature;
     } else {
@@ -4782,8 +4848,8 @@ fn data_type_ref_from_argument_row(
 
 fn parameter_mode_from_dictionary_value(text: Option<&str>) -> ParameterMode {
     match text.map(|value| value.trim().to_ascii_uppercase()) {
-        Some(value) if value == "OUT" => ParameterMode::Out,
-        Some(value) if value == "IN/OUT" => ParameterMode::InOut,
+        Some(value) if value.eq("OUT") => ParameterMode::Out,
+        Some(value) if value.eq("IN/OUT") => ParameterMode::InOut,
         _ => ParameterMode::In,
     }
 }
@@ -5051,7 +5117,7 @@ pub struct DatabaseLink {
     /// Connect-target host string. Can be a TNS alias, an EZCONNECT
     /// string, or a full `(DESCRIPTION=...)` block.
     pub host: Option<String>,
-    /// `true` when `owner == 'PUBLIC'`. Surfaced for fast filtering in
+    /// `true` when `owner` is `PUBLIC`. Surfaced for fast filtering in
     /// downstream lineage without re-resolving the schema interner.
     pub public_link: bool,
 }
@@ -5433,13 +5499,13 @@ pub enum CatalogObject {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
+    use std::future::Future;
 
+    use asupersync::{Cx, runtime::RuntimeBuilder};
     use chrono::{DateTime, Utc};
     use plsql_core::{AnalysisProfile, ColumnName, MemberName, ObjectName, SchemaName, SymbolId};
     use tempfile::tempdir;
-
-    use std::collections::HashSet;
 
     #[cfg(not(feature = "oracle-driver"))]
     use crate::RustOracleConnection;
@@ -5454,7 +5520,8 @@ mod tests {
         SynonymName, SynonymTarget, TableMetadata, TriggerEvent, TriggerLevel, TriggerName,
         TriggerTiming, TypeFinality, TypeInstantiable, export_snapshot_to_json,
         grantee_from_dictionary_value, load_catalog_users, load_from_dbms_metadata_dir,
-        load_snapshot_from_connection, load_snapshot_from_json, rust_oracle_driver_compiled,
+        load_snapshot_from_connection, load_snapshot_from_json, negotiate_capabilities,
+        populate_dbms_metadata_ddl, rust_oracle_driver_compiled,
     };
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5495,28 +5562,33 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl OracleConnection for StaticConnection {
         fn backend(&self) -> OracleBackend {
             OracleBackend::RustOracle
         }
 
-        fn ping(&self) -> Result<(), CatalogError> {
+        async fn ping(&self, cx: &Cx) -> Result<(), CatalogError> {
+            let _ = cx;
             Ok(())
         }
 
-        fn describe(&self) -> Result<OracleConnectionInfo, CatalogError> {
+        async fn describe(&self, cx: &Cx) -> Result<OracleConnectionInfo, CatalogError> {
+            let _ = cx;
             Ok(self.connection_info.clone())
         }
 
-        fn query_rows(
+        async fn query_rows(
             &self,
+            cx: &Cx,
             sql: &str,
             params: &[OracleBind],
         ) -> Result<Vec<OracleRow>, CatalogError> {
+            let _ = cx;
             if !self.expected_queries.is_empty() {
                 if let Some(expectation) = self.expected_queries.iter().find(|expectation| {
                     sql.contains(expectation.sql_contains.as_str())
-                        && params == expectation.params.as_slice()
+                        && params.eq(expectation.params.as_slice())
                 }) {
                     return Ok(expectation.rows.clone());
                 }
@@ -5530,9 +5602,63 @@ mod tests {
             Ok(self.rows.clone())
         }
 
-        fn execute(&self, _sql: &str, _params: &[OracleBind]) -> Result<u64, CatalogError> {
+        async fn execute(
+            &self,
+            cx: &Cx,
+            _sql: &str,
+            _params: &[OracleBind],
+        ) -> Result<u64, CatalogError> {
+            let _ = cx;
             Ok(self.row_count)
         }
+    }
+
+    fn run_catalog_future<F: Future>(future: F) -> F::Output {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("test asupersync runtime")
+            .block_on(future)
+    }
+
+    fn test_cx() -> Cx {
+        Cx::current().expect("test runtime installs a request Cx")
+    }
+
+    fn load_snapshot_for_test<C: OracleConnection>(
+        connection: &C,
+        request: &CatalogLoadRequest,
+    ) -> Result<CatalogSnapshot, CatalogError> {
+        run_catalog_future(async {
+            let cx = test_cx();
+            load_snapshot_from_connection(&cx, connection, request).await
+        })
+    }
+
+    fn load_catalog_users_for_test<C: OracleConnection>(
+        connection: &C,
+        snapshot: &mut CatalogSnapshot,
+    ) -> Result<(), CatalogError> {
+        run_catalog_future(async {
+            let cx = test_cx();
+            load_catalog_users(&cx, connection, snapshot).await
+        })
+    }
+
+    fn populate_dbms_metadata_ddl_for_test<C: OracleConnection>(
+        connection: &C,
+        snapshot: &mut CatalogSnapshot,
+    ) -> Result<(), CatalogError> {
+        run_catalog_future(async {
+            let cx = test_cx();
+            populate_dbms_metadata_ddl(&cx, connection, snapshot).await
+        })
+    }
+
+    fn negotiate_capabilities_for_test<C: OracleConnection>(connection: &C) -> CatalogCapabilities {
+        run_catalog_future(async {
+            let cx = test_cx();
+            negotiate_capabilities(&cx, connection).await
+        })
     }
 
     fn oracle_row(columns: &[(&str, &str, Option<&str>)]) -> OracleRow {
@@ -5597,7 +5723,7 @@ mod tests {
         assert_eq!(row.parse_bool("EDITIONABLE").ok(), Some(true));
         assert!(matches!(
             row.require_text("ddl_text"),
-            Err(CatalogError::NullColumnValue { column }) if column == "DDL_TEXT"
+            Err(CatalogError::NullColumnValue { column }) if column.eq("DDL_TEXT")
         ));
     }
 
@@ -5624,18 +5750,18 @@ mod tests {
                 column,
                 expected: "bool",
                 ..
-            }) if column == "FLAG"
+            }) if column.eq("FLAG")
         ));
         // Missing column and NULL value are distinct typed errors.
         let empty = oracle_row(&[]);
         assert!(matches!(
             empty.parse_bool("FLAG"),
-            Err(CatalogError::MissingColumn { column }) if column == "FLAG"
+            Err(CatalogError::MissingColumn { column }) if column.eq("FLAG")
         ));
         let nullv = oracle_row(&[("FLAG", "VARCHAR2(1)", None)]);
         assert!(matches!(
             nullv.parse_bool("FLAG"),
-            Err(CatalogError::NullColumnValue { column }) if column == "FLAG"
+            Err(CatalogError::NullColumnValue { column }) if column.eq("FLAG")
         ));
 
         // parse_u64 must reject a negative value (Oracle NUMBER can
@@ -6142,8 +6268,7 @@ mod tests {
             ..StaticConnection::default()
         };
 
-        let snapshot =
-            load_snapshot_from_connection(&connection, &CatalogLoadRequest::default()).unwrap();
+        let snapshot = load_snapshot_for_test(&connection, &CatalogLoadRequest::default()).unwrap();
 
         let current_schema = snapshot
             .profile
@@ -6168,31 +6293,56 @@ mod tests {
         let invoices_name = schema_catalog
             .objects
             .keys()
-            .find(|name| snapshot.interner.resolve(name.symbol()) == Some("INVOICES"))
+            .find(|name| {
+                snapshot
+                    .interner
+                    .resolve(name.symbol())
+                    .is_some_and(|label| label.eq("INVOICES"))
+            })
             .copied()
             .expect("object name should intern");
         let invoice_summary_name = schema_catalog
             .objects
             .keys()
-            .find(|name| snapshot.interner.resolve(name.symbol()) == Some("INVOICE_SUMMARY"))
+            .find(|name| {
+                snapshot
+                    .interner
+                    .resolve(name.symbol())
+                    .is_some_and(|label| label.eq("INVOICE_SUMMARY"))
+            })
             .copied()
             .expect("object name should intern");
         let package_object_name = schema_catalog
             .objects
             .keys()
-            .find(|name| snapshot.interner.resolve(name.symbol()) == Some("BILLING_API"))
+            .find(|name| {
+                snapshot
+                    .interner
+                    .resolve(name.symbol())
+                    .is_some_and(|label| label.eq("BILLING_API"))
+            })
             .copied()
             .expect("package object name should intern");
         let tax_function_name = schema_catalog
             .objects
             .keys()
-            .find(|name| snapshot.interner.resolve(name.symbol()) == Some("CALCULATE_TAX"))
+            .find(|name| {
+                snapshot
+                    .interner
+                    .resolve(name.symbol())
+                    .is_some_and(|label| label.eq("CALCULATE_TAX"))
+            })
             .copied()
             .expect("function object name should intern");
         let trigger_object_name = schema_catalog
             .objects
             .keys()
-            .find(|name| snapshot.interner.resolve(name.symbol()) == Some("INVOICES_BIU"))
+            .find(|name| {
+                snapshot
+                    .interner
+                    .resolve(name.symbol())
+                    .is_some_and(|label| label.eq("INVOICES_BIU"))
+            })
             .copied()
             .expect("trigger object name should intern");
 
@@ -6210,7 +6360,10 @@ mod tests {
         let invoice_id = invoices_table
             .and_then(|table| {
                 table.columns.values().find(|column| {
-                    snapshot.interner.resolve(column.name.symbol()) == Some("INVOICE_ID")
+                    snapshot
+                        .interner
+                        .resolve(column.name.symbol())
+                        .is_some_and(|label| label.eq("INVOICE_ID"))
                 })
             })
             .expect("table column should exist");
@@ -6236,7 +6389,10 @@ mod tests {
         let total_due = invoice_summary_view
             .and_then(|view| {
                 view.columns.values().find(|column| {
-                    snapshot.interner.resolve(column.name.symbol()) == Some("TOTAL_DUE")
+                    snapshot
+                        .interner
+                        .resolve(column.name.symbol())
+                        .is_some_and(|label| label.eq("TOTAL_DUE"))
                 })
             })
             .expect("view column should exist");
@@ -6248,7 +6404,12 @@ mod tests {
         let invoices_pk_index = schema_catalog
             .indexes
             .values()
-            .find(|index| snapshot.interner.resolve(index.name.symbol()) == Some("INVOICES_PK_IDX"))
+            .find(|index| {
+                snapshot
+                    .interner
+                    .resolve(index.name.symbol())
+                    .is_some_and(|label| label.eq("INVOICES_PK_IDX"))
+            })
             .expect("index metadata should exist");
         assert!(invoices_pk_index.unique);
         assert_eq!(invoices_pk_index.index_type, "NORMAL");
@@ -6265,7 +6426,10 @@ mod tests {
             .constraints
             .values()
             .find(|constraint| {
-                snapshot.interner.resolve(constraint.name.symbol()) == Some("INVOICES_CUSTOMER_FK")
+                snapshot
+                    .interner
+                    .resolve(constraint.name.symbol())
+                    .is_some_and(|label| label.eq("INVOICES_CUSTOMER_FK"))
             })
             .expect("foreign key should exist");
         assert_eq!(customer_fk.constraint_type, ConstraintType::ForeignKey);
@@ -6294,7 +6458,10 @@ mod tests {
             .constraints
             .values()
             .find(|constraint| {
-                snapshot.interner.resolve(constraint.name.symbol()) == Some("INVOICES_CUSTOMER_NN")
+                snapshot
+                    .interner
+                    .resolve(constraint.name.symbol())
+                    .is_some_and(|label| label.eq("INVOICES_CUSTOMER_NN"))
             })
             .expect("not-null constraint should exist");
         assert_eq!(customer_not_null.constraint_type, ConstraintType::NotNull);
@@ -6303,7 +6470,10 @@ mod tests {
             .triggers
             .values()
             .find(|trigger| {
-                snapshot.interner.resolve(trigger.common.name.symbol()) == Some("INVOICES_BIU")
+                snapshot
+                    .interner
+                    .resolve(trigger.common.name.symbol())
+                    .is_some_and(|label| label.eq("INVOICES_BIU"))
             })
             .expect("trigger metadata should exist");
         assert_eq!(trigger_metadata.timing, TriggerTiming::Before);
@@ -6329,7 +6499,10 @@ mod tests {
             .synonyms
             .values()
             .find(|synonym| {
-                snapshot.interner.resolve(synonym.target_name.symbol()) == Some("INVOICES")
+                snapshot
+                    .interner
+                    .resolve(synonym.target_name.symbol())
+                    .is_some_and(|label| label.eq("INVOICES"))
             })
             .expect("private synonym should exist");
         assert!(!latest_invoice_synonym.public_synonym);
@@ -6337,7 +6510,12 @@ mod tests {
         let public_schema_name = snapshot
             .schemas
             .keys()
-            .find(|name| snapshot.interner.resolve(name.symbol()) == Some("PUBLIC"))
+            .find(|name| {
+                snapshot
+                    .interner
+                    .resolve(name.symbol())
+                    .is_some_and(|label| label.eq("PUBLIC"))
+            })
             .copied()
             .expect("public schema should exist");
         let public_schema = snapshot
@@ -6348,7 +6526,10 @@ mod tests {
             .synonyms
             .values()
             .find(|synonym| {
-                snapshot.interner.resolve(synonym.target_name.symbol()) == Some("INVOICES")
+                snapshot
+                    .interner
+                    .resolve(synonym.target_name.symbol())
+                    .is_some_and(|label| label.eq("INVOICES"))
             })
             .expect("public synonym should exist");
         assert!(public_synonym.public_synonym);
@@ -6368,7 +6549,10 @@ mod tests {
             .procedures
             .iter()
             .find(|signature| {
-                snapshot.interner.resolve(signature.routine_name.symbol()) == Some("CREATE_INVOICE")
+                snapshot
+                    .interner
+                    .resolve(signature.routine_name.symbol())
+                    .is_some_and(|label| label.eq("CREATE_INVOICE"))
             })
             .expect("package procedure should exist");
         assert_eq!(create_invoice.arguments.len(), 2);
@@ -6376,8 +6560,10 @@ mod tests {
             .functions
             .iter()
             .find(|signature| {
-                snapshot.interner.resolve(signature.routine_name.symbol())
-                    == Some("TOTAL_FOR_CUSTOMER")
+                snapshot
+                    .interner
+                    .resolve(signature.routine_name.symbol())
+                    .is_some_and(|label| label.eq("TOTAL_FOR_CUSTOMER"))
             })
             .expect("package function should exist");
         assert_eq!(total_for_customer.overload, Some(1));
@@ -6487,17 +6673,24 @@ mod tests {
         // this bead fixes (previously always `Grantee::User`).
         let role =
             grantee_from_dictionary_value(&mut snapshot, "APP_READER_ROLE").expect("grantee");
-        let crate::Grantee::Role(role_name) = role else {
-            panic!("APP_READER_ROLE must classify as a role, got {role:?}");
+        let role_name = match role {
+            crate::Grantee::Role(role_name) => Some(role_name),
+            _ => None,
         };
+        assert!(
+            role_name.is_some(),
+            "APP_READER_ROLE must classify as a role"
+        );
         assert_eq!(
-            snapshot.interner.resolve(role_name.symbol()),
+            snapshot
+                .interner
+                .resolve(role_name.expect("role assertion above").symbol()),
             Some("APP_READER_ROLE")
         );
     }
 
     /// oracle-qm3q.2: if `ALL_USERS` cannot be read, `load_catalog_users`
-    /// must leave `known_users == None` (so grantees stay conservatively
+    /// must leave `known_users` as `None` (so grantees stay conservatively
     /// classified) and record a capability warning rather than aborting the
     /// extraction or silently assuming the grantee universe.
     #[test]
@@ -6519,7 +6712,7 @@ mod tests {
             DateTime::<Utc>::UNIX_EPOCH,
         );
 
-        load_catalog_users(&connection, &mut snapshot).expect("non-fatal");
+        load_catalog_users_for_test(&connection, &mut snapshot).expect("non-fatal");
         assert!(
             snapshot.known_users.is_none(),
             "failed ALL_USERS read must leave grantee universe undetermined"
@@ -6529,7 +6722,7 @@ mod tests {
                 .capabilities
                 .warnings
                 .iter()
-                .any(|w| w.code == "all-users-probe"),
+                .any(|w| w.code.eq("all-users-probe")),
             "a capability warning must record the ALL_USERS read failure"
         );
     }
@@ -6829,8 +7022,7 @@ mod tests {
             ..StaticConnection::default()
         };
 
-        let snapshot =
-            load_snapshot_from_connection(&connection, &CatalogLoadRequest::default()).unwrap();
+        let snapshot = load_snapshot_for_test(&connection, &CatalogLoadRequest::default()).unwrap();
 
         let schema = snapshot
             .profile
@@ -6938,7 +7130,7 @@ mod tests {
         let private_link = schema_catalog
             .db_links
             .iter()
-            .find(|link| link.name == "REPORTING_LINK")
+            .find(|link| link.name.eq("REPORTING_LINK"))
             .expect("private db link present on BILLING schema");
         assert!(!private_link.public_link);
         assert_eq!(private_link.host.as_deref(), Some("reporting-db.internal"));
@@ -6956,7 +7148,7 @@ mod tests {
                     schema_catalog
                         .db_links
                         .iter()
-                        .find(|link| link.name == "WORLDWIDE_LINK")
+                        .find(|link| link.name.eq("WORLDWIDE_LINK"))
                 } else {
                     None
                 }
@@ -6990,14 +7182,14 @@ mod tests {
         let root = snapshot
             .editions
             .iter()
-            .find(|e| e.edition_name == "ORA$BASE")
+            .find(|e| e.edition_name.eq("ORA$BASE"))
             .expect("root edition present");
         assert!(root.parent_edition_name.is_none());
         assert!(root.usable);
         let child = snapshot
             .editions
             .iter()
-            .find(|e| e.edition_name == "PATCH_2026_05")
+            .find(|e| e.edition_name.eq("PATCH_2026_05"))
             .expect("child edition present");
         assert_eq!(child.parent_edition_name.as_deref(), Some("ORA$BASE"));
         assert_eq!(schema_catalog.editioning_views.len(), 1);
@@ -7035,7 +7227,7 @@ mod tests {
             ..StaticConnection::default()
         };
 
-        let error = load_snapshot_from_connection(&connection, &CatalogLoadRequest::default());
+        let error = load_snapshot_for_test(&connection, &CatalogLoadRequest::default());
 
         assert!(matches!(error, Err(CatalogError::CurrentSchemaUnavailable)));
     }
@@ -7060,11 +7252,21 @@ mod tests {
             ..StaticConnection::default()
         };
 
-        assert!(single.query_one_row("select * from dual", &[]).is_ok());
+        let single_result = run_catalog_future(async {
+            let cx = test_cx();
+            single.query_one_row(&cx, "select * from dual", &[]).await
+        });
+        assert!(single_result.is_ok());
+        let multiple_result = run_catalog_future(async {
+            let cx = test_cx();
+            multiple
+                .query_optional_row(&cx, "select * from dual", &[])
+                .await
+        });
         assert!(matches!(
-            multiple.query_optional_row("select * from dual", &[]),
+            multiple_result,
             Err(CatalogError::UnexpectedRowCount { expected, actual })
-                if expected == "0 or 1" && actual == 2
+                if expected.eq("0 or 1") && actual.eq(&2)
         ));
     }
 
@@ -7293,8 +7495,13 @@ mod tests {
             return;
         };
 
-        assert_eq!(document.schema_id, CATALOG_SNAPSHOT_SCHEMA_ID);
-        assert_eq!(document.schema_version, CATALOG_SNAPSHOT_SCHEMA_VERSION);
+        assert!(document.schema_id.as_str().eq(CATALOG_SNAPSHOT_SCHEMA_ID));
+        assert!(matches!(
+            document
+                .schema_version
+                .cmp(&CATALOG_SNAPSHOT_SCHEMA_VERSION),
+            std::cmp::Ordering::Equal
+        ));
         assert_eq!(
             document
                 .snapshot
@@ -7452,9 +7659,10 @@ mod tests {
             .expect("at least one schema bucket with an object");
         let obj = bucket.objects.values().next().unwrap();
         let common = match obj {
-            CatalogObject::Table(t) => &t.common,
-            other => panic!("expected Table, got {other:?}"),
-        };
+            CatalogObject::Table(t) => Some(&t.common),
+            _ => None,
+        }
+        .expect("expected Table");
         let ddl = common
             .ddl
             .as_ref()
@@ -7626,8 +7834,7 @@ mod tests {
             ..StaticConnection::default()
         };
 
-        let snapshot =
-            load_snapshot_from_connection(&connection, &CatalogLoadRequest::default()).unwrap();
+        let snapshot = load_snapshot_for_test(&connection, &CatalogLoadRequest::default()).unwrap();
         let schema = snapshot
             .profile
             .current_schema
@@ -7694,8 +7901,7 @@ mod tests {
     #[test]
     fn doctor_report_counts_objects_columns_and_indexes() {
         let connection = StaticConnection::default();
-        let snapshot =
-            load_snapshot_from_connection(&connection, &CatalogLoadRequest::default()).unwrap();
+        let snapshot = load_snapshot_for_test(&connection, &CatalogLoadRequest::default()).unwrap();
         let mut snapshot = snapshot;
         let billing = snapshot.intern_schema_name("BILLING").expect("schema name");
         let invoices = snapshot
@@ -7893,7 +8099,7 @@ mod tests {
             "from all_dependencies",
         ] {
             // all_editions is database-wide — no schema-bind param.
-            let params = if fragment == "from all_editions" {
+            let params = if fragment.eq("from all_editions") {
                 vec![]
             } else {
                 billing_only.clone()
@@ -7913,13 +8119,17 @@ mod tests {
             expected_queries,
             ..StaticConnection::default()
         };
-        let snapshot =
-            load_snapshot_from_connection(&connection, &CatalogLoadRequest::default()).unwrap();
+        let snapshot = load_snapshot_for_test(&connection, &CatalogLoadRequest::default()).unwrap();
 
         let billing = snapshot
             .schemas
             .keys()
-            .find(|name| snapshot.interner.resolve(name.symbol()) == Some("BILLING"))
+            .find(|name| {
+                snapshot
+                    .interner
+                    .resolve(name.symbol())
+                    .is_some_and(|label| label.eq("BILLING"))
+            })
             .copied()
             .expect("billing schema");
         let plscope = snapshot
@@ -7935,7 +8145,12 @@ mod tests {
         let reporting = snapshot
             .schemas
             .keys()
-            .find(|name| snapshot.interner.resolve(name.symbol()) == Some("REPORTING"))
+            .find(|name| {
+                snapshot
+                    .interner
+                    .resolve(name.symbol())
+                    .is_some_and(|label| label.eq("REPORTING"))
+            })
             .copied()
             .expect("reporting schema");
         let reporting_plscope = snapshot
@@ -8000,7 +8215,7 @@ mod tests {
             "from all_dependencies",
             "from all_plsql_object_settings",
         ] {
-            let params = if fragment == "from all_editions" {
+            let params = if fragment.eq("from all_editions") {
                 vec![]
             } else {
                 billing_only.clone()
@@ -8020,13 +8235,17 @@ mod tests {
             expected_queries,
             ..StaticConnection::default()
         };
-        let snapshot =
-            load_snapshot_from_connection(&connection, &CatalogLoadRequest::default()).unwrap();
+        let snapshot = load_snapshot_for_test(&connection, &CatalogLoadRequest::default()).unwrap();
 
         let billing = snapshot
             .schemas
             .keys()
-            .find(|name| snapshot.interner.resolve(name.symbol()) == Some("BILLING"))
+            .find(|name| {
+                snapshot
+                    .interner
+                    .resolve(name.symbol())
+                    .is_some_and(|label| label.eq("BILLING"))
+            })
             .copied()
             .expect("billing schema");
         let plscope = snapshot
@@ -8078,7 +8297,7 @@ mod tests {
 
     #[test]
     fn populate_dbms_metadata_ddl_records_warnings_on_fetch_failure() {
-        use crate::{CatalogCapabilities, populate_dbms_metadata_ddl};
+        use crate::CatalogCapabilities;
 
         // Build a tiny snapshot with one TABLE object, then run populate
         // against a mock that returns Err on every query. We expect the
@@ -8126,26 +8345,26 @@ mod tests {
             ..StaticConnection::default()
         };
 
-        populate_dbms_metadata_ddl(&failing_connection, &mut snapshot).unwrap();
+        populate_dbms_metadata_ddl_for_test(&failing_connection, &mut snapshot).unwrap();
 
         assert!(
             snapshot
                 .capabilities
                 .warnings
                 .iter()
-                .any(|w| w.code == "dbms-metadata-fetch-failed")
+                .any(|w| w.code.eq("dbms-metadata-fetch-failed"))
         );
 
         // Capability disabled → populate is a no-op (no extra warning).
         snapshot.capabilities.can_use_dbms_metadata = false;
         let baseline_warnings = snapshot.capabilities.warnings.len();
-        populate_dbms_metadata_ddl(&failing_connection, &mut snapshot).unwrap();
+        populate_dbms_metadata_ddl_for_test(&failing_connection, &mut snapshot).unwrap();
         assert_eq!(snapshot.capabilities.warnings.len(), baseline_warnings);
     }
 
     #[test]
     fn populate_dbms_metadata_ddl_writes_ddl_field_on_success() {
-        use crate::{CatalogCapabilities, populate_dbms_metadata_ddl};
+        use crate::CatalogCapabilities;
 
         let mut snapshot = CatalogSnapshot::new(
             plsql_core::AnalysisProfile::default(),
@@ -8203,7 +8422,7 @@ mod tests {
             ..StaticConnection::default()
         };
 
-        populate_dbms_metadata_ddl(&connection, &mut snapshot).unwrap();
+        populate_dbms_metadata_ddl_for_test(&connection, &mut snapshot).unwrap();
 
         let stored = snapshot
             .schemas
@@ -8230,8 +8449,6 @@ mod tests {
 
     #[test]
     fn negotiate_capabilities_reports_failures_as_warnings() {
-        use crate::negotiate_capabilities;
-
         let connection = StaticConnection {
             expected_queries: capability_probe_expectations()
                 .into_iter()
@@ -8245,7 +8462,7 @@ mod tests {
             ..StaticConnection::default()
         };
 
-        let capabilities = negotiate_capabilities(&connection);
+        let capabilities = negotiate_capabilities_for_test(&connection);
 
         assert!(!capabilities.can_query_all_views);
         assert!(!capabilities.can_query_dba_views);
@@ -8262,24 +8479,22 @@ mod tests {
             capabilities
                 .warnings
                 .iter()
-                .any(|w| w.code == "all-views-probe")
+                .any(|w| w.code.eq("all-views-probe"))
         );
         assert!(
             capabilities
                 .warnings
                 .iter()
-                .any(|w| w.code == "plscope-probe")
+                .any(|w| w.code.eq("plscope-probe"))
         );
     }
 
     #[test]
     fn negotiate_capabilities_marks_every_probe_succeeded_on_open_mock() {
-        use crate::negotiate_capabilities;
-
         // Default StaticConnection has no expected_queries — falls through to
         // returning self.rows (empty) for every query → every probe succeeds.
         let connection = StaticConnection::default();
-        let capabilities = negotiate_capabilities(&connection);
+        let capabilities = negotiate_capabilities_for_test(&connection);
         assert!(capabilities.can_query_all_views);
         assert!(capabilities.can_query_dba_views);
         assert!(capabilities.can_read_source);
@@ -8544,7 +8759,12 @@ mod tests {
         let hr = snapshot
             .schemas
             .iter()
-            .find(|(s, _)| snapshot.interner.resolve(s.symbol()) == Some("HR"))
+            .find(|(s, _)| {
+                snapshot
+                    .interner
+                    .resolve(s.symbol())
+                    .is_some_and(|label| label.eq("HR"))
+            })
             .map(|(_, c)| c)
             .expect("HR schema present");
         assert_eq!(hr.objects.len(), 2, "two distinct objects, no collision");
@@ -8552,14 +8772,14 @@ mod tests {
         let mut names: Vec<&str> = hr
             .objects
             .values()
-            .map(|o| {
-                let common = match o {
-                    CatalogObject::Table(m) => &m.common,
-                    _ => panic!("expected tables"),
+            .filter_map(|o| {
+                let CatalogObject::Table(m) = o else {
+                    return None;
                 };
-                snapshot.interner.resolve(common.name.symbol()).unwrap()
+                snapshot.interner.resolve(m.common.name.symbol())
             })
             .collect();
+        assert_eq!(names.len(), 2, "all HR objects must be tables");
         names.sort_unstable();
         assert_eq!(names, vec!["MY OTHER", "MY TABLE"]);
     }

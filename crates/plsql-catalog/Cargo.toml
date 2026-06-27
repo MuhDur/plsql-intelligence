@@ -11,6 +11,8 @@ oracle-driver = ["dep:oracle"]
 live-xe = ["oracle-driver"]
 
 [dependencies]
+async-trait = "0.1"
+asupersync = "=0.3.4"
 chrono = { version = "0.4.44", features = ["serde"] }
 oracle = { version = "0.6.3", optional = true }
 plsql-core = { path = "../plsql-core" }

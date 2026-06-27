@@ -11,6 +11,7 @@
 //! K18-sanitized exactly like the source/CLOB paths before they can reach
 //! an agent.
 
+use asupersync::Cx;
 use plsql_catalog::{CatalogError, OracleBind, OracleConnection, OracleRow};
 use plsql_core::UnknownReason;
 use serde::{Deserialize, Serialize};
@@ -70,7 +71,8 @@ pub enum SourceToolError {
 /// `ALL_SOURCE` ordered by `LINE` and reassembles the body. Runs K18
 /// sanitization per line so individual bad lines can be redacted without
 /// dropping the surrounding source.
-pub fn run_get_object_source<C: OracleConnection>(
+pub async fn run_get_object_source<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     owner: &str,
     object_name: &str,
@@ -84,7 +86,7 @@ pub fn run_get_object_source<C: OracleConnection>(
         OracleBind::from(object_name.to_string()),
         OracleBind::from(object_type.to_string()),
     ];
-    let rows = conn.query_rows(sql, &params)?;
+    let rows = conn.query_rows(cx, sql, &params).await?;
     let mut sanitized_lines = 0usize;
     let mut buffer = String::new();
     for row in &rows {
@@ -117,13 +119,14 @@ pub fn run_get_object_source<C: OracleConnection>(
 /// `get_clob(sql, params, max_chars)` — read-only CLOB fetcher. The agent
 /// supplies a one-row SELECT that projects a single CLOB column; the tool
 /// applies K18 sanitization + optional truncation.
-pub fn run_get_clob<C: OracleConnection>(
+pub async fn run_get_clob<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     sql: &str,
     params: &[OracleBind],
     max_chars: Option<usize>,
 ) -> Result<GetClobResponse, SourceToolError> {
-    let rows = conn.query_rows(sql, params)?;
+    let rows = conn.query_rows(cx, sql, params).await?;
     let Some(row) = rows.into_iter().next() else {
         return Ok(GetClobResponse::default());
     };
@@ -156,7 +159,8 @@ pub fn run_get_clob<C: OracleConnection>(
 /// `get_errors(owner, object_name)` — read `ALL_ERRORS` for the given
 /// object and return structured rows. When `owner` is empty the tool
 /// targets the current schema via `USER_ERRORS`.
-pub fn run_get_errors<C: OracleConnection>(
+pub async fn run_get_errors<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     owner: &str,
     object_name: &str,
@@ -164,19 +168,23 @@ pub fn run_get_errors<C: OracleConnection>(
     let trimmed_owner = owner.trim();
     let rows = if trimmed_owner.is_empty() {
         conn.query_rows(
+            cx,
             "select user as owner, name, type, line, position, attribute, message_number, text \
              from user_errors where name = :1 order by sequence",
             &[OracleBind::from(object_name.to_string())],
-        )?
+        )
+        .await?
     } else {
         conn.query_rows(
+            cx,
             "select owner, name, type, line, position, attribute, message_number, text \
              from all_errors where owner = :1 and name = :2 order by sequence",
             &[
                 OracleBind::from(trimmed_owner.to_string()),
                 OracleBind::from(object_name.to_string()),
             ],
-        )?
+        )
+        .await?
     };
 
     // Free-text fields carry attacker-influenceable content (Oracle echoes
@@ -227,21 +235,26 @@ pub fn run_get_errors<C: OracleConnection>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::runtime::RuntimeBuilder;
     use plsql_catalog::{OracleBackend, OracleConnectionInfo};
+    use std::future::Future;
 
     #[derive(Default, Clone)]
     struct StubConn {
         rows: Vec<OracleRow>,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl OracleConnection for StubConn {
         fn backend(&self) -> OracleBackend {
             OracleBackend::RustOracle
         }
-        fn ping(&self) -> Result<(), CatalogError> {
+        async fn ping(&self, cx: &Cx) -> Result<(), CatalogError> {
+            let _ = cx;
             Ok(())
         }
-        fn describe(&self) -> Result<OracleConnectionInfo, CatalogError> {
+        async fn describe(&self, cx: &Cx) -> Result<OracleConnectionInfo, CatalogError> {
+            let _ = cx;
             Ok(OracleConnectionInfo {
                 backend: OracleBackend::RustOracle,
                 connect_string: String::from("//localhost/XE"),
@@ -256,16 +269,66 @@ mod tests {
                 max_open_cursors: 500,
             })
         }
-        fn query_rows(
+        async fn query_rows(
             &self,
+            cx: &Cx,
             _sql: &str,
             _params: &[OracleBind],
         ) -> Result<Vec<OracleRow>, CatalogError> {
+            let _ = cx;
             Ok(self.rows.clone())
         }
-        fn execute(&self, _sql: &str, _params: &[OracleBind]) -> Result<u64, CatalogError> {
+        async fn execute(
+            &self,
+            cx: &Cx,
+            _sql: &str,
+            _params: &[OracleBind],
+        ) -> Result<u64, CatalogError> {
+            let _ = cx;
             Ok(0)
         }
+    }
+
+    fn run_source_future<F: Future>(future: F) -> F::Output {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("test asupersync runtime")
+            .block_on(future)
+    }
+
+    fn get_object_source_for_test<C: OracleConnection>(
+        conn: &C,
+        owner: &str,
+        object_name: &str,
+        object_type: &str,
+    ) -> Result<GetObjectSourceResponse, SourceToolError> {
+        run_source_future(async {
+            let cx = Cx::current().expect("test runtime installs a request Cx");
+            run_get_object_source(&cx, conn, owner, object_name, object_type).await
+        })
+    }
+
+    fn get_clob_for_test<C: OracleConnection>(
+        conn: &C,
+        sql: &str,
+        params: &[OracleBind],
+        max_chars: Option<usize>,
+    ) -> Result<GetClobResponse, SourceToolError> {
+        run_source_future(async {
+            let cx = Cx::current().expect("test runtime installs a request Cx");
+            run_get_clob(&cx, conn, sql, params, max_chars).await
+        })
+    }
+
+    fn get_errors_for_test<C: OracleConnection>(
+        conn: &C,
+        owner: &str,
+        object_name: &str,
+    ) -> Result<GetErrorsResponse, SourceToolError> {
+        run_source_future(async {
+            let cx = Cx::current().expect("test runtime installs a request Cx");
+            run_get_errors(&cx, conn, owner, object_name).await
+        })
     }
 
     fn source_row(line: &str, text: &str) -> OracleRow {
@@ -298,7 +361,7 @@ mod tests {
             ],
         };
         let response =
-            run_get_object_source(&conn, "BILLING", "BILLING_PKG", "PACKAGE BODY").unwrap();
+            get_object_source_for_test(&conn, "BILLING", "BILLING_PKG", "PACKAGE BODY").unwrap();
         assert!(response.source.starts_with("PACKAGE BODY billing_pkg"));
         assert!(response.source.contains("PROCEDURE step;"));
         assert!(response.source.trim_end().ends_with("END billing_pkg;"));
@@ -320,7 +383,7 @@ mod tests {
             rows: vec![source_row("1", &tainted_line)],
         };
         let response =
-            run_get_object_source(&conn, "BILLING", "BILLING_PKG", "PACKAGE BODY").unwrap();
+            get_object_source_for_test(&conn, "BILLING", "BILLING_PKG", "PACKAGE BODY").unwrap();
         assert_eq!(response.sanitized_lines, 1);
         assert!(
             response
@@ -335,7 +398,7 @@ mod tests {
         let mut row = OracleRow::default();
         row.insert("CLOB_VALUE", "CLOB", Some(String::from("0123456789abcdef")));
         let conn = StubConn { rows: vec![row] };
-        let response = run_get_clob(&conn, "select clob_value from x", &[], Some(4)).unwrap();
+        let response = get_clob_for_test(&conn, "select clob_value from x", &[], Some(4)).unwrap();
         assert!(response.truncated);
         assert!(response.text.ends_with('…'));
         assert_eq!(response.text.chars().count(), 5); // 4 visible + ellipsis
@@ -344,7 +407,7 @@ mod tests {
     #[test]
     fn get_clob_empty_result_is_safe() {
         let conn = StubConn::default();
-        let response = run_get_clob(&conn, "select clob_value from x", &[], None).unwrap();
+        let response = get_clob_for_test(&conn, "select clob_value from x", &[], None).unwrap();
         assert!(response.text.is_empty());
         assert!(!response.sanitized);
         assert!(!response.truncated);
@@ -358,7 +421,7 @@ mod tests {
                 error_row(5, "WARNING", "PLW-07203: parameter ..."),
             ],
         };
-        let response = run_get_errors(&conn, "BILLING", "BILLING_PKG").unwrap();
+        let response = get_errors_for_test(&conn, "BILLING", "BILLING_PKG").unwrap();
         assert_eq!(response.errors.len(), 2);
         assert_eq!(response.errors[0].line, 2);
         assert_eq!(response.errors[0].attribute, "ERROR");
@@ -371,7 +434,7 @@ mod tests {
     fn get_errors_routes_to_user_errors_when_owner_blank() {
         // Empty owner string → tool issues USER_ERRORS query.
         let conn = StubConn::default();
-        let response = run_get_errors(&conn, "", "BILLING_PKG").unwrap();
+        let response = get_errors_for_test(&conn, "", "BILLING_PKG").unwrap();
         assert!(response.errors.is_empty());
         assert!(response.unknown_reasons.is_empty());
     }
@@ -381,7 +444,7 @@ mod tests {
         let conn = StubConn {
             rows: vec![error_row(2, "ERROR", "PLS-00201: identifier 'FOO'")],
         };
-        let response = run_get_errors(&conn, "BILLING", "BILLING_PKG").unwrap();
+        let response = get_errors_for_test(&conn, "BILLING", "BILLING_PKG").unwrap();
         assert_eq!(response.errors.len(), 1);
         assert!(
             response.unknown_reasons.is_empty(),
@@ -408,7 +471,7 @@ mod tests {
         let conn = StubConn {
             rows: vec![error_row(2, &tainted_attribute, &tainted_text)],
         };
-        let response = run_get_errors(&conn, "BILLING", "BILLING_PKG").unwrap();
+        let response = get_errors_for_test(&conn, "BILLING", "BILLING_PKG").unwrap();
         assert_eq!(response.errors.len(), 1);
         let row = &response.errors[0];
         // No surviving ASCII angle brackets anywhere in the free-text fields.

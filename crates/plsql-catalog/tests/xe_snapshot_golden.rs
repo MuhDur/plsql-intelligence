@@ -47,13 +47,13 @@ fn live_xe_is_feature_gated() {
 mod live {
     use std::path::Path;
 
+    use asupersync::{Cx, runtime::RuntimeBuilder};
     use plsql_catalog::{
         CatalogLoadRequest, CatalogObject, CatalogSnapshot, OracleConnectOptions,
         RustOracleConnection, load_snapshot_from_connection,
     };
 
     const USERNAME: &str = "DEMO";
-    const PASSWORD: &str = "DemoLab#2026";
     const CONNECT_STRING: &str = "//localhost:1521/FREEPDB1";
     const GOLDEN_PATH: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -79,7 +79,9 @@ mod live {
 
     /// Connects to the DEMO schema on the live XE container.
     fn connect() -> RustOracleConnection {
-        let opts = OracleConnectOptions::new(USERNAME, PASSWORD, CONNECT_STRING);
+        let password = std::env::var("PLSQL_XE_DEMO_PASSWORD")
+            .expect("PLSQL_XE_DEMO_PASSWORD must be set for live-xe catalog tests");
+        let opts = OracleConnectOptions::new(USERNAME, &password, CONNECT_STRING);
         RustOracleConnection::connect(opts)
             .expect("PLSQL-CAT-008: failed to connect to DEMO@//localhost:1521/FREEPDB1")
     }
@@ -151,7 +153,13 @@ mod live {
         // Scope extraction to the DEMO schema by name so that it works
         // regardless of whether the current schema in the session is DEMO.
         let request = CatalogLoadRequest::for_named_schemas(["DEMO"]);
-        let snapshot = load_snapshot_from_connection(&conn, &request)
+        let snapshot = RuntimeBuilder::current_thread()
+            .build()
+            .expect("PLSQL-CAT-008: asupersync runtime")
+            .block_on(async {
+                let cx = Cx::current().expect("PLSQL-CAT-008: request Cx");
+                load_snapshot_from_connection(&cx, &conn, &request).await
+            })
             .expect("PLSQL-CAT-008: load_snapshot_from_connection failed");
 
         // --- sanity: at least one schema came back ---

@@ -10,6 +10,7 @@
 //! local lexical screen as defense in depth so this crate never becomes looser
 //! than its pre-classifier behavior.
 
+use asupersync::Cx;
 use oraclemcp_error::{ErrorClass, ErrorEnvelope, enrich_oracle_error};
 use oraclemcp_guard::{Classifier, DangerLevel};
 use plsql_catalog::{CatalogError, OracleBind, OracleConnection, OracleRow};
@@ -117,14 +118,15 @@ impl QueryError {
 }
 
 /// Run a read-only query and return a structured response.
-pub fn run_query<C: OracleConnection>(
+pub async fn run_query<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     sql: &str,
     params: &[OracleBind],
     lob_truncation_chars: Option<usize>,
 ) -> Result<QueryResponse, QueryError> {
     ensure_read_only_query(sql)?;
-    let raw_rows = conn.query_rows(sql, params)?;
+    let raw_rows = conn.query_rows(cx, sql, params).await?;
     Ok(query_response_from_rows(raw_rows, lob_truncation_chars))
 }
 
@@ -714,21 +716,26 @@ fn preview_sql(sql: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::runtime::RuntimeBuilder;
     use plsql_catalog::{OracleBackend, OracleConnectionInfo};
+    use std::future::Future;
 
     #[derive(Default)]
     struct StubConn {
         rows: Vec<OracleRow>,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl OracleConnection for StubConn {
         fn backend(&self) -> OracleBackend {
             OracleBackend::RustOracle
         }
-        fn ping(&self) -> Result<(), CatalogError> {
+        async fn ping(&self, cx: &Cx) -> Result<(), CatalogError> {
+            let _ = cx;
             Ok(())
         }
-        fn describe(&self) -> Result<OracleConnectionInfo, CatalogError> {
+        async fn describe(&self, cx: &Cx) -> Result<OracleConnectionInfo, CatalogError> {
+            let _ = cx;
             Ok(OracleConnectionInfo {
                 backend: OracleBackend::RustOracle,
                 connect_string: String::from("//localhost/XE"),
@@ -743,16 +750,43 @@ mod tests {
                 max_open_cursors: 500,
             })
         }
-        fn query_rows(
+        async fn query_rows(
             &self,
+            cx: &Cx,
             _sql: &str,
             _params: &[OracleBind],
         ) -> Result<Vec<OracleRow>, CatalogError> {
+            let _ = cx;
             Ok(self.rows.clone())
         }
-        fn execute(&self, _sql: &str, _params: &[OracleBind]) -> Result<u64, CatalogError> {
+        async fn execute(
+            &self,
+            cx: &Cx,
+            _sql: &str,
+            _params: &[OracleBind],
+        ) -> Result<u64, CatalogError> {
+            let _ = cx;
             Ok(0)
         }
+    }
+
+    fn run_query_future<F: Future>(future: F) -> F::Output {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("test asupersync runtime")
+            .block_on(future)
+    }
+
+    fn run_query_for_test<C: OracleConnection>(
+        conn: &C,
+        sql: &str,
+        params: &[OracleBind],
+        lob_truncation_chars: Option<usize>,
+    ) -> Result<QueryResponse, QueryError> {
+        run_query_future(async {
+            let cx = Cx::current().expect("test runtime installs a request Cx");
+            run_query(&cx, conn, sql, params, lob_truncation_chars).await
+        })
     }
 
     fn make_row(columns: &[(&str, &str, Option<&str>)]) -> OracleRow {
@@ -766,7 +800,7 @@ mod tests {
     #[test]
     fn rejects_non_select_sql() {
         let conn = StubConn::default();
-        let err = run_query(&conn, "DELETE FROM CUSTOMERS", &[], None).unwrap_err();
+        let err = run_query_for_test(&conn, "DELETE FROM CUSTOMERS", &[], None).unwrap_err();
         assert!(matches!(err, QueryError::NotReadOnly { .. }));
     }
 
@@ -797,7 +831,8 @@ mod tests {
     fn not_read_only_maps_to_forbidden_statement_with_write_path_step() {
         // The read-only gate refusal must classify as ForbiddenStatement and
         // steer the agent to the guarded-write path, not a bare string.
-        let err = run_query(&StubConn::default(), "DELETE FROM CUSTOMERS", &[], None).unwrap_err();
+        let err = run_query_for_test(&StubConn::default(), "DELETE FROM CUSTOMERS", &[], None)
+            .unwrap_err();
         let env = err.to_envelope(None, &[]);
         assert_eq!(
             env.error_class,
@@ -832,7 +867,7 @@ mod tests {
                 ("NAME", "VARCHAR2(20)", Some("Alice")),
             ])],
         };
-        let response = run_query(&conn, "SELECT id, name FROM users", &[], None).unwrap();
+        let response = run_query_for_test(&conn, "SELECT id, name FROM users", &[], None).unwrap();
         assert_eq!(response.columns.len(), 2);
         assert_eq!(response.rows.len(), 1);
         assert_eq!(response.rows[0].cells.len(), 2);
@@ -845,7 +880,7 @@ mod tests {
         let conn = StubConn {
             rows: vec![make_row(&[("ID", "NUMBER(10)", None)])],
         };
-        let response = run_query(&conn, "SELECT id FROM users", &[], None).unwrap();
+        let response = run_query_for_test(&conn, "SELECT id FROM users", &[], None).unwrap();
         assert_eq!(response.rows[0].cells[0].value, None);
         assert!(!response.rows[0].cells[0].sanitized);
     }
@@ -863,7 +898,7 @@ mod tests {
         let conn = StubConn {
             rows: vec![make_row(&[("NOTE", "VARCHAR2(200)", Some(&payload))])],
         };
-        let response = run_query(&conn, "SELECT note FROM logs", &[], None).unwrap();
+        let response = run_query_for_test(&conn, "SELECT note FROM logs", &[], None).unwrap();
         assert_eq!(response.sanitized_cells, 1);
         assert!(
             response
@@ -890,7 +925,7 @@ mod tests {
         let conn = StubConn {
             rows: vec![make_row(&[("BODY", "CLOB", Some("0123456789abcdef"))])],
         };
-        let response = run_query(&conn, "SELECT body FROM docs", &[], Some(4)).unwrap();
+        let response = run_query_for_test(&conn, "SELECT body FROM docs", &[], Some(4)).unwrap();
         assert_eq!(response.truncated_cells, 1);
         let value = response.rows[0].cells[0].value.as_deref().unwrap();
         assert!(value.ends_with('…'));
@@ -1184,7 +1219,7 @@ mod tests {
         let conn = StubConn {
             rows: vec![make_row(&[("NOTE", "VARCHAR2(200)", Some("hello"))])],
         };
-        let response = run_query(&conn, "SELECT note FROM logs", &[], None).unwrap();
+        let response = run_query_for_test(&conn, "SELECT note FROM logs", &[], None).unwrap();
         assert!(
             !response.untrusted_data_notice.is_empty(),
             "response must carry the untrusted-data envelope notice"
@@ -1212,7 +1247,7 @@ mod tests {
         let conn = StubConn {
             rows: vec![make_row(&[("NOTE", "VARCHAR2(200)", Some(&payload))])],
         };
-        let response = run_query(&conn, "SELECT note FROM logs", &[], None).unwrap();
+        let response = run_query_for_test(&conn, "SELECT note FROM logs", &[], None).unwrap();
         assert_eq!(response.sanitized_cells, 1, "obfuscated marker counted");
         let cell = response.rows[0].cells[0].value.as_deref().unwrap();
         assert!(

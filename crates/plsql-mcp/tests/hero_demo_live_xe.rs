@@ -49,21 +49,34 @@ fn hero_demo_live_xe_is_feature_gated() {
 
 #[cfg(feature = "live-xe")]
 mod live {
-    use plsql_catalog::{OracleBind, OracleConnectOptions, OracleConnection, RustOracleConnection};
+    use asupersync::{Cx, runtime::RuntimeBuilder};
+    use plsql_catalog::{
+        CatalogError, OracleBind, OracleConnectOptions, OracleConnection, RustOracleConnection,
+    };
     use plsql_mcp::{
-        ListObjectsRequest, run_get_errors, run_get_object_source, run_list_objects, run_query,
+        GetErrorsResponse, GetObjectSourceResponse, ListObjectsRequest, ListObjectsResponse,
+        QueryError, QueryResponse, SourceToolError, run_get_errors as run_get_errors_async,
+        run_get_object_source as run_get_object_source_async,
+        run_list_objects as run_list_objects_async, run_query as run_query_async,
     };
     use serde::{Deserialize, Serialize};
-    use std::fs;
+    use std::{
+        fs,
+        future::Future,
+        sync::atomic::{AtomicU32, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     // ─── Connection constants ─────────────────────────────────────────────────
 
+    static SCRATCH_COUNTER: AtomicU32 = AtomicU32::new(0);
+
     const SYSTEM_USER: &str = "SYSTEM";
-    const SYSTEM_PASS: &str = "DemoPlsqlIntel#2026";
     const CONNECT_STRING: &str = "//localhost:1521/FREEPDB1";
 
     fn system_conn() -> RustOracleConnection {
-        let opts = OracleConnectOptions::new(SYSTEM_USER, SYSTEM_PASS, CONNECT_STRING)
+        let password = required_env("PLSQL_XE_SYSTEM_PASSWORD");
+        let opts = OracleConnectOptions::new(SYSTEM_USER, &password, CONNECT_STRING)
             .with_module("plsql-mcp-hero-demo-test")
             .with_action("PLSQL-MCP-LIVE-019");
         RustOracleConnection::connect(opts).expect(
@@ -71,11 +84,103 @@ mod live {
         )
     }
 
+    fn run_live_future<F: Future>(future: F) -> F::Output {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("live-xe asupersync runtime")
+            .block_on(future)
+    }
+
+    fn execute_sql<C: OracleConnection>(conn: &C, sql: &str) -> Result<u64, CatalogError> {
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            conn.execute(&cx, sql, &[]).await
+        })
+    }
+
+    fn run_query<C: OracleConnection>(
+        conn: &C,
+        sql: &str,
+        params: &[OracleBind],
+        lob_truncation_chars: Option<usize>,
+    ) -> Result<QueryResponse, QueryError> {
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            run_query_async(&cx, conn, sql, params, lob_truncation_chars).await
+        })
+    }
+
+    fn run_get_object_source<C: OracleConnection>(
+        conn: &C,
+        owner: &str,
+        object_name: &str,
+        object_type: &str,
+    ) -> Result<GetObjectSourceResponse, SourceToolError> {
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            run_get_object_source_async(&cx, conn, owner, object_name, object_type).await
+        })
+    }
+
+    fn run_get_errors<C: OracleConnection>(
+        conn: &C,
+        owner: &str,
+        object_name: &str,
+    ) -> Result<GetErrorsResponse, SourceToolError> {
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            run_get_errors_async(&cx, conn, owner, object_name).await
+        })
+    }
+
+    fn run_list_objects<C: OracleConnection>(
+        conn: &C,
+        request: &ListObjectsRequest,
+    ) -> Result<ListObjectsResponse, plsql_mcp::ListObjectsError> {
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            run_list_objects_async(&cx, conn, request).await
+        })
+    }
+
     // ─── Scratch schema helpers ───────────────────────────────────────────────
 
     /// Returns the scratch schema name unique to this test process.
     fn hero_schema_name() -> String {
-        format!("HERO_T_{}", std::process::id())
+        format!("HERO_T_{}", unique_suffix())
+    }
+
+    fn required_env(name: &str) -> String {
+        std::env::var(name).expect("required live-XE credential env var is not set")
+    }
+
+    fn unique_suffix() -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let counter = SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed) % 1000;
+        format!("{:015}{counter:03}", nanos % 1_000_000_000_000_000)
+    }
+
+    fn random_password(prefix: &str) -> String {
+        format!("{prefix}{}#", random_hex(8))
+    }
+
+    fn random_hex(byte_count: usize) -> String {
+        let mut bytes = vec![0_u8; byte_count];
+        getrandom::fill(&mut bytes).expect("OS randomness must be available for live-XE tests");
+        let mut out = String::with_capacity(byte_count * 2);
+        for byte in bytes {
+            push_hex_byte(&mut out, byte);
+        }
+        out
+    }
+
+    fn push_hex_byte(output: &mut String, byte: u8) {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
 
     /// Drop the entire scratch schema (user + all its objects) unconditionally.
@@ -87,7 +192,7 @@ mod live {
              EXCEPTION WHEN OTHERS THEN NULL; \
              END;"
         );
-        let _ = conn.execute(&sql, &[]);
+        let _ = execute_sql(conn, &sql);
     }
 
     /// Create a minimal schema (user) with CONNECT + RESOURCE privileges so we
@@ -97,12 +202,13 @@ mod live {
         drop_scratch_schema(conn, schema);
 
         // 2. Create the user.
+        let password = random_password("HeroT");
         let create_sql = format!(
-            "CREATE USER {schema} IDENTIFIED BY HeroT3stPass#2026 \
+            "CREATE USER {schema} IDENTIFIED BY {password} \
              DEFAULT TABLESPACE USERS QUOTA UNLIMITED ON USERS"
         );
-        conn.execute(&create_sql, &[])
-            .unwrap_or_else(|e| panic!("PLSQL-MCP-LIVE-019: CREATE USER {schema} failed: {e}"));
+        execute_sql(conn, &create_sql)
+            .expect("PLSQL-MCP-LIVE-019: CREATE USER scratch schema failed");
 
         // 3. Grant privileges needed to create packages.
         for priv_sql in &[
@@ -110,8 +216,8 @@ mod live {
             format!("GRANT CREATE PROCEDURE TO {schema}"),
             format!("GRANT CREATE TABLE TO {schema}"),
         ] {
-            conn.execute(priv_sql, &[])
-                .unwrap_or_else(|e| panic!("PLSQL-MCP-LIVE-019: GRANT to {schema} failed: {e}"));
+            execute_sql(conn, priv_sql)
+                .expect("PLSQL-MCP-LIVE-019: GRANT to scratch schema failed");
         }
     }
 
@@ -228,8 +334,8 @@ mod live {
                CONSTRAINT {schema}_EMP_PK PRIMARY KEY (EMP_ID) \
              )"
         );
-        conn.execute(&employees_ddl, &[])
-            .unwrap_or_else(|e| panic!("PLSQL-MCP-LIVE-019: CREATE TABLE EMPLOYEES failed: {e}"));
+        execute_sql(&conn, &employees_ddl)
+            .expect("PLSQL-MCP-LIVE-019: CREATE TABLE EMPLOYEES failed");
 
         // Fixture: before/pkg_employee_mgmt.pks — replace `employee_mgmt` with
         // schema-qualified name so Oracle compiles it under HERO_T_<pid>.
@@ -254,12 +360,10 @@ mod live {
         .replace("FROM employees", &format!("FROM {schema}.EMPLOYEES"))
         .replace("INTO employees", &format!("INTO {schema}.EMPLOYEES"));
 
-        conn.execute(&spec_ddl, &[]).unwrap_or_else(|e| {
-            panic!("PLSQL-MCP-LIVE-019: CREATE PACKAGE EMPLOYEE_MGMT spec failed: {e}")
-        });
-        conn.execute(&body_ddl, &[]).unwrap_or_else(|e| {
-            panic!("PLSQL-MCP-LIVE-019: CREATE PACKAGE BODY EMPLOYEE_MGMT failed: {e}")
-        });
+        execute_sql(&conn, &spec_ddl)
+            .expect("PLSQL-MCP-LIVE-019: CREATE PACKAGE EMPLOYEE_MGMT spec failed");
+        execute_sql(&conn, &body_ddl)
+            .expect("PLSQL-MCP-LIVE-019: CREATE PACKAGE BODY EMPLOYEE_MGMT failed");
 
         eprintln!("[PLSQL-MCP-LIVE-019] objects loaded into {schema}");
 
@@ -507,9 +611,8 @@ mod live {
             &format!("CREATE OR REPLACE PACKAGE {schema}.EMPLOYEE_MGMT"),
         );
 
-        conn.execute(&after_spec_ddl, &[]).unwrap_or_else(|e| {
-            panic!("PLSQL-MCP-LIVE-019: CREATE OR REPLACE PACKAGE (after spec) failed: {e}")
-        });
+        execute_sql(&conn, &after_spec_ddl)
+            .expect("PLSQL-MCP-LIVE-019: CREATE OR REPLACE PACKAGE after spec failed");
 
         record!(
             "create_or_replace",

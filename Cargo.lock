@@ -1996,6 +1996,8 @@ dependencies = [
 name = "plsql-catalog"
 version = "0.1.0"
 dependencies = [
+ "asupersync",
+ "async-trait",
  "chrono",
  "oracle",
  "plsql-core",
@@ -2012,6 +2014,9 @@ dependencies = [
 name = "plsql-cicd"
 version = "0.1.0"
 dependencies = [
+ "asupersync",
+ "async-trait",
+ "getrandom 0.3.4",
  "plsql-catalog",
  "plsql-core",
  "plsql-output",
@@ -2116,6 +2121,7 @@ dependencies = [
  "asupersync",
  "async-trait",
  "clap",
+ "getrandom 0.3.4",
  "oraclemcp-audit",
  "oraclemcp-core",
  "oraclemcp-db",

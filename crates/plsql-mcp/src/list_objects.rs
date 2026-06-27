@@ -7,6 +7,7 @@
 //! carries a `next_cursor: Option<String>` that the agent feeds into the
 //! next call.
 
+use asupersync::Cx;
 use plsql_catalog::{CatalogError, OracleBind, OracleConnection};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -74,7 +75,8 @@ pub enum ListObjectsError {
 }
 
 /// Run the `list_objects` tool against `conn`.
-pub fn run_list_objects<C: OracleConnection>(
+pub async fn run_list_objects<C: OracleConnection>(
+    cx: &Cx,
     conn: &C,
     request: &ListObjectsRequest,
 ) -> Result<ListObjectsResponse, ListObjectsError> {
@@ -84,7 +86,7 @@ pub fn run_list_objects<C: OracleConnection>(
         .unwrap_or(DEFAULT_PAGE_SIZE)
         .clamp(1, MAX_PAGE_SIZE);
     let (sql, params) = build_query(request, &cursor, page_size + 1);
-    let rows = conn.query_rows(&sql, &params)?;
+    let rows = conn.query_rows(cx, &sql, &params).await?;
     let mut entries = Vec::with_capacity(rows.len().min(page_size));
     let mut last_seen: Option<CursorState> = None;
     for (index, row) in rows.iter().enumerate() {
@@ -237,21 +239,26 @@ fn build_query(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::runtime::RuntimeBuilder;
     use plsql_catalog::{OracleBackend, OracleConnectionInfo, OracleRow};
+    use std::future::Future;
 
     #[derive(Default, Clone)]
     struct StubConn {
         rows: Vec<OracleRow>,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl OracleConnection for StubConn {
         fn backend(&self) -> OracleBackend {
             OracleBackend::RustOracle
         }
-        fn ping(&self) -> Result<(), CatalogError> {
+        async fn ping(&self, cx: &Cx) -> Result<(), CatalogError> {
+            let _ = cx;
             Ok(())
         }
-        fn describe(&self) -> Result<OracleConnectionInfo, CatalogError> {
+        async fn describe(&self, cx: &Cx) -> Result<OracleConnectionInfo, CatalogError> {
+            let _ = cx;
             Ok(OracleConnectionInfo {
                 backend: OracleBackend::RustOracle,
                 connect_string: String::from("//localhost/XE"),
@@ -266,16 +273,41 @@ mod tests {
                 max_open_cursors: 500,
             })
         }
-        fn query_rows(
+        async fn query_rows(
             &self,
+            cx: &Cx,
             _sql: &str,
             _params: &[OracleBind],
         ) -> Result<Vec<OracleRow>, CatalogError> {
+            let _ = cx;
             Ok(self.rows.clone())
         }
-        fn execute(&self, _sql: &str, _params: &[OracleBind]) -> Result<u64, CatalogError> {
+        async fn execute(
+            &self,
+            cx: &Cx,
+            _sql: &str,
+            _params: &[OracleBind],
+        ) -> Result<u64, CatalogError> {
+            let _ = cx;
             Ok(0)
         }
+    }
+
+    fn run_list_future<F: Future>(future: F) -> F::Output {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("test asupersync runtime")
+            .block_on(future)
+    }
+
+    fn run_list_objects_for_test<C: OracleConnection>(
+        conn: &C,
+        request: &ListObjectsRequest,
+    ) -> Result<ListObjectsResponse, ListObjectsError> {
+        run_list_future(async {
+            let cx = Cx::current().expect("test runtime installs a request Cx");
+            run_list_objects(&cx, conn, request).await
+        })
     }
 
     fn row(
@@ -317,7 +349,7 @@ mod tests {
             page_size: Some(5),
             ..Default::default()
         };
-        let response = run_list_objects(&conn, &request).unwrap();
+        let response = run_list_objects_for_test(&conn, &request).unwrap();
         assert_eq!(response.entries.len(), 2);
         assert!(response.next_cursor.is_none());
     }
@@ -338,7 +370,7 @@ mod tests {
             page_size: Some(2),
             ..Default::default()
         };
-        let response = run_list_objects(&conn, &request).unwrap();
+        let response = run_list_objects_for_test(&conn, &request).unwrap();
         assert_eq!(response.entries.len(), 2);
         assert!(response.next_cursor.is_some());
         // The cursor encodes the second row's (owner, name) tuple.
@@ -354,7 +386,7 @@ mod tests {
             cursor: Some(String::from("only-one-half")),
             ..Default::default()
         };
-        let err = run_list_objects(&StubConn::default(), &request).unwrap_err();
+        let err = run_list_objects_for_test(&StubConn::default(), &request).unwrap_err();
         assert!(matches!(err, ListObjectsError::InvalidCursor { .. }));
     }
 
@@ -368,7 +400,7 @@ mod tests {
         };
         // Even with an oversized request, no rows are pumped through. The
         // function should still run (no panic) and return empty entries.
-        let response = run_list_objects(&conn, &request).unwrap();
+        let response = run_list_objects_for_test(&conn, &request).unwrap();
         assert!(response.entries.is_empty());
         assert!(response.next_cursor.is_none());
     }
@@ -377,7 +409,7 @@ mod tests {
     fn schema_filter_uses_all_objects_otherwise_user_objects() {
         // With schema filter set we expect "all_objects" in the issued SQL.
         let conn = StubConn::default();
-        let with_schema = run_list_objects(
+        let with_schema = run_list_objects_for_test(
             &conn,
             &ListObjectsRequest {
                 schema: Some(String::from("BILLING")),
@@ -388,7 +420,7 @@ mod tests {
         .unwrap();
         assert!(with_schema.issued_sql.contains("from all_objects"));
 
-        let without_schema = run_list_objects(
+        let without_schema = run_list_objects_for_test(
             &conn,
             &ListObjectsRequest {
                 page_size: Some(1),
@@ -402,7 +434,7 @@ mod tests {
     #[test]
     fn object_type_and_name_filter_appear_in_issued_sql() {
         let conn = StubConn::default();
-        let response = run_list_objects(
+        let response = run_list_objects_for_test(
             &conn,
             &ListObjectsRequest {
                 schema: Some(String::from("BILLING")),
