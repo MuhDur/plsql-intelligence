@@ -47,6 +47,7 @@
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::time::Duration;
 
 use asupersync::Cx;
 use asupersync::cx::SubsetOf;
@@ -366,7 +367,7 @@ pub fn dispatch_tool<'a>(
 #[must_use]
 pub fn dispatch_tool_with_runtime<'a>(
     cx: &'a Cx,
-    _context: PlsqlDispatchContext<'a>,
+    context: PlsqlDispatchContext<'a>,
     live_runtime: &'a mut LiveDbRuntime,
     name: &'a str,
     arguments: Value,
@@ -381,7 +382,7 @@ pub fn dispatch_tool_with_runtime<'a>(
             "current_database" => run_current_database(cx, live_runtime)
                 .await
                 .map_err(|err| *err),
-            "query" => run_query_live(cx, live_runtime, &arguments)
+            "query" => run_query_live(cx, context.request_budget(), live_runtime, &arguments)
                 .await
                 .map_err(|err| *err),
             _ => match dispatch_tool_outcome(name, &arguments) {
@@ -682,6 +683,7 @@ async fn run_current_database(
 
 async fn run_query_live(
     cx: &Cx,
+    request_budget: RequestBudget,
     live_runtime: &LiveDbRuntime,
     arguments: &Value,
 ) -> Result<Value, Box<ErrorEnvelope>> {
@@ -705,19 +707,88 @@ async fn run_query_live(
             .map_err(|err| Box::new(live_runtime_error_envelope(err, "query")))?,
     };
 
-    let adapter =
-        OraclemcpCatalogConnection::new(BorrowedOracleConnection::new(session.connection()));
-    checkpoint(cx, "query")?;
-    let rows = adapter
-        .query_rows(cx, &args.sql, &[])
-        .await
-        .map_err(|err| Box::new(query_error_envelope(&QueryError::Backend(err))))?;
-    checkpoint(cx, "query")?;
+    request_budget
+        .enforce(cx)
+        .map_err(|err| Box::new(db_error_envelope(err, "query")))?;
+
+    let connection = session.connection();
+    let restore = install_request_call_timeout(cx, request_budget, connection)?;
+    let adapter = OraclemcpCatalogConnection::new(BorrowedOracleConnection::new(connection));
+    let rows_result = async {
+        checkpoint(cx, "query")?;
+        let rows = match adapter.query_rows(cx, &args.sql, &[]).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                if let Err(budget_err) = request_budget.enforce(cx) {
+                    return Err(Box::new(db_error_envelope(budget_err, "query")));
+                }
+                return Err(Box::new(query_error_envelope(&QueryError::Backend(err))));
+            }
+        };
+        request_budget
+            .enforce(cx)
+            .map_err(|err| Box::new(db_error_envelope(err, "query")))?;
+        checkpoint(cx, "query")?;
+        Ok(rows)
+    }
+    .await;
+    let restore_result = restore_request_call_timeout(connection, restore);
+    let rows = match (rows_result, restore_result) {
+        (Ok(rows), Ok(())) => rows,
+        (Err(err), Ok(())) => return Err(err),
+        (Ok(_), Err(err)) => return Err(err),
+        (Err(err), Err(_)) => return Err(err),
+    };
+
     Ok(serde_json::to_value(crate::query::query_response_from_rows(
         rows,
         args.lob_truncation_chars,
     ))
     .unwrap_or(Value::Object(Default::default())))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CallTimeoutRestore {
+    previous: Option<Duration>,
+}
+
+fn install_request_call_timeout(
+    cx: &Cx,
+    request_budget: RequestBudget,
+    connection: &dyn oraclemcp_db::OracleConnection,
+) -> Result<Option<CallTimeoutRestore>, Box<ErrorEnvelope>> {
+    let Some(remaining) = request_budget_call_timeout(cx, request_budget) else {
+        return Ok(None);
+    };
+    let previous = connection
+        .call_timeout()
+        .map_err(|err| Box::new(db_error_envelope(err, "query")))?;
+    let effective = previous.map_or(remaining, |existing| existing.min(remaining));
+    connection
+        .set_call_timeout(Some(effective))
+        .map_err(|err| Box::new(db_error_envelope(err, "query")))?;
+    Ok(Some(CallTimeoutRestore { previous }))
+}
+
+fn restore_request_call_timeout(
+    connection: &dyn oraclemcp_db::OracleConnection,
+    restore: Option<CallTimeoutRestore>,
+) -> Result<(), Box<ErrorEnvelope>> {
+    let Some(restore) = restore else {
+        return Ok(());
+    };
+    connection
+        .set_call_timeout(restore.previous)
+        .map_err(|err| Box::new(db_error_envelope(err, "query")))
+}
+
+fn request_budget_call_timeout(cx: &Cx, request_budget: RequestBudget) -> Option<Duration> {
+    let deadline = request_budget.budget().deadline?;
+    let remaining = Duration::from_nanos(deadline.duration_since(cx.now()));
+    // Oracle call timeouts are millisecond-granularity downstream; preserve
+    // sub-millisecond budgets as a cancellable 1ms backend timeout and let
+    // RequestBudget checkpoints enforce the exact budget boundary.
+    Some(remaining.max(Duration::from_millis(1)))
 }
 
 struct BorrowedOracleConnection<'a> {
@@ -784,6 +855,14 @@ impl oraclemcp_db::OracleConnection for BorrowedOracleConnection<'_> {
     async fn rollback(&self, cx: &Cx) -> Result<(), oraclemcp_db::DbError> {
         self.inner.rollback(cx).await
     }
+
+    fn call_timeout(&self) -> Result<Option<Duration>, oraclemcp_db::DbError> {
+        self.inner.call_timeout()
+    }
+
+    fn set_call_timeout(&self, timeout: Option<Duration>) -> Result<(), oraclemcp_db::DbError> {
+        self.inner.set_call_timeout(timeout)
+    }
 }
 
 fn checkpoint(cx: &Cx, tool: &str) -> Result<(), Box<ErrorEnvelope>> {
@@ -832,6 +911,17 @@ fn db_connection_error_envelope(err: oraclemcp_db::DbError, tool: &str) -> Error
     .with_next_step(
         "Verify the connect_string, username/password or external-auth settings, then retry connect.",
     )
+}
+
+fn db_error_envelope(err: oraclemcp_db::DbError, tool: &str) -> ErrorEnvelope {
+    let envelope = err.into_envelope();
+    if envelope.error_class == ErrorClass::Timeout {
+        return envelope.with_next_step(format!(
+            "The `{tool}` call exhausted its request budget or was cancelled; retry with a fresh \
+             request budget or narrow the query."
+        ));
+    }
+    envelope
 }
 
 fn query_error_envelope(err: &QueryError) -> ErrorEnvelope {
@@ -922,6 +1012,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     fn dispatch_for_test(name: &str, args: Value) -> Result<Value, Box<ErrorEnvelope>> {
         let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
@@ -943,6 +1034,17 @@ mod tests {
         args: Value,
         live_runtime: &mut LiveDbRuntime,
     ) -> Result<Value, Box<ErrorEnvelope>> {
+        dispatch_with_runtime_and_budget_for_test(name, args, live_runtime, |cx| {
+            RequestBudget::from_budget(cx.budget())
+        })
+    }
+
+    fn dispatch_with_runtime_and_budget_for_test(
+        name: &str,
+        args: Value,
+        live_runtime: &mut LiveDbRuntime,
+        request_budget: impl FnOnce(&Cx) -> RequestBudget,
+    ) -> Result<Value, Box<ErrorEnvelope>> {
         let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(reactor)
@@ -950,7 +1052,8 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let cx = Cx::current().expect("block_on installs a request Cx");
-            let context = PlsqlDispatchContext::from_cx(&cx, DispatchContext::default());
+            let context =
+                PlsqlDispatchContext::new(DispatchContext::default(), request_budget(&cx));
             dispatch_tool_with_runtime(&cx, context, live_runtime, name, args)
                 .await
                 .map_err(Box::new)
@@ -971,12 +1074,41 @@ mod tests {
     #[derive(Debug, Clone)]
     struct RecordingOracleConnection {
         queries: Arc<Mutex<Vec<String>>>,
+        query_timeouts: Arc<Mutex<Vec<Option<Duration>>>>,
+        current_timeout: Arc<Mutex<Option<Duration>>>,
+        timeout_sets: Arc<Mutex<Vec<Option<Duration>>>>,
+        query_delay: Option<Duration>,
+        query_error: Option<oraclemcp_db::DbError>,
     }
 
     impl RecordingOracleConnection {
         fn new() -> Self {
+            Self::with_initial_timeout(None)
+        }
+
+        fn with_initial_timeout(timeout: Option<Duration>) -> Self {
+            Self::with_initial_timeout_and_query_delay(timeout, None)
+        }
+
+        fn with_initial_timeout_and_query_delay(
+            timeout: Option<Duration>,
+            query_delay: Option<Duration>,
+        ) -> Self {
+            Self::with_initial_timeout_delay_and_error(timeout, query_delay, None)
+        }
+
+        fn with_initial_timeout_delay_and_error(
+            timeout: Option<Duration>,
+            query_delay: Option<Duration>,
+            query_error: Option<oraclemcp_db::DbError>,
+        ) -> Self {
             Self {
                 queries: Arc::new(Mutex::new(Vec::new())),
+                query_timeouts: Arc::new(Mutex::new(Vec::new())),
+                current_timeout: Arc::new(Mutex::new(timeout)),
+                timeout_sets: Arc::new(Mutex::new(Vec::new())),
+                query_delay,
+                query_error,
             }
         }
 
@@ -985,6 +1117,27 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone()
+        }
+
+        fn observed_query_timeouts(&self) -> Vec<Option<Duration>> {
+            self.query_timeouts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        fn observed_timeout_sets(&self) -> Vec<Option<Duration>> {
+            self.timeout_sets
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        fn current_timeout(&self) -> Option<Duration> {
+            *self
+                .current_timeout
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
         }
     }
 
@@ -1016,10 +1169,21 @@ mod tests {
             sql: &str,
             _binds: &[oraclemcp_db::OracleBind],
         ) -> Result<Vec<oraclemcp_db::OracleRow>, oraclemcp_db::DbError> {
+            let timeout = self.current_timeout();
+            self.query_timeouts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(timeout);
+            if let Some(delay) = self.query_delay {
+                std::thread::sleep(delay);
+            }
             self.queries
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(String::from(sql));
+            if let Some(err) = self.query_error.clone() {
+                return Err(err);
+            }
             Ok(vec![oraclemcp_db::OracleRow {
                 columns: vec![(
                     String::from("VAL"),
@@ -1042,6 +1206,22 @@ mod tests {
         }
 
         async fn rollback(&self, _cx: &Cx) -> Result<(), oraclemcp_db::DbError> {
+            Ok(())
+        }
+
+        fn call_timeout(&self) -> Result<Option<Duration>, oraclemcp_db::DbError> {
+            Ok(self.current_timeout())
+        }
+
+        fn set_call_timeout(&self, timeout: Option<Duration>) -> Result<(), oraclemcp_db::DbError> {
+            *self
+                .current_timeout
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = timeout;
+            self.timeout_sets
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(timeout);
             Ok(())
         }
     }
@@ -1251,6 +1431,147 @@ mod tests {
         assert_eq!(
             observed.observed_queries(),
             vec!["SELECT 1 AS val FROM dual"]
+        );
+    }
+
+    #[test]
+    fn live_query_applies_request_budget_timeout_and_restores_session_timeout() {
+        let mut live_runtime = LiveDbRuntime::new();
+        let connection =
+            RecordingOracleConnection::with_initial_timeout(Some(Duration::from_secs(30)));
+        let observed = connection.clone();
+        live_runtime
+            .insert_connected(live_profile("dev"), Box::new(connection))
+            .expect("stub session inserts");
+        dispatch_with_runtime_for_test("connect", json!({"name": "dev"}), &mut live_runtime)
+            .expect("connect activates existing live session");
+
+        let result = dispatch_with_runtime_and_budget_for_test(
+            "query",
+            json!({"sql": "SELECT 1 AS val FROM dual"}),
+            &mut live_runtime,
+            |cx| RequestBudget::from_call_timeout(cx.now(), Some(Duration::from_millis(250))),
+        )
+        .expect("query runs with budget timeout");
+
+        assert_eq!(result["rows"][0]["cells"][0]["value"], "1");
+        assert_eq!(observed.current_timeout(), Some(Duration::from_secs(30)));
+        let sets = observed.observed_timeout_sets();
+        assert_eq!(sets.len(), 2);
+        assert_eq!(sets.get(1), Some(&Some(Duration::from_secs(30))));
+        let applied = sets
+            .first()
+            .copied()
+            .flatten()
+            .expect("budget installs a finite call timeout");
+        assert!(applied > Duration::ZERO);
+        assert!(applied <= Duration::from_millis(250));
+
+        let query_timeouts = observed.observed_query_timeouts();
+        assert_eq!(query_timeouts.len(), 1);
+        assert_eq!(query_timeouts[0], Some(applied));
+    }
+
+    #[test]
+    fn live_query_that_outlives_request_budget_returns_timeout_and_restores_timeout() {
+        let mut live_runtime = LiveDbRuntime::new();
+        let connection = RecordingOracleConnection::with_initial_timeout_and_query_delay(
+            Some(Duration::from_secs(30)),
+            Some(Duration::from_millis(75)),
+        );
+        let observed = connection.clone();
+        live_runtime
+            .insert_connected(live_profile("dev"), Box::new(connection))
+            .expect("stub session inserts");
+        dispatch_with_runtime_for_test("connect", json!({"name": "dev"}), &mut live_runtime)
+            .expect("connect activates existing live session");
+
+        let err = dispatch_with_runtime_and_budget_for_test(
+            "query",
+            json!({"sql": "SELECT 1 AS val FROM dual"}),
+            &mut live_runtime,
+            |cx| RequestBudget::from_call_timeout(cx.now(), Some(Duration::from_millis(25))),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.error_class, ErrorClass::Timeout);
+        assert_eq!(
+            observed.observed_queries(),
+            vec!["SELECT 1 AS val FROM dual"]
+        );
+        assert_eq!(observed.current_timeout(), Some(Duration::from_secs(30)));
+        let sets = observed.observed_timeout_sets();
+        assert_eq!(sets.len(), 2);
+        assert_eq!(sets.get(1), Some(&Some(Duration::from_secs(30))));
+        let applied = sets
+            .first()
+            .copied()
+            .flatten()
+            .expect("budget installs a finite call timeout");
+        assert!(applied > Duration::ZERO);
+        assert!(applied <= Duration::from_millis(25));
+    }
+
+    #[test]
+    fn live_query_backend_error_after_budget_expiry_returns_timeout() {
+        let mut live_runtime = LiveDbRuntime::new();
+        let connection = RecordingOracleConnection::with_initial_timeout_delay_and_error(
+            Some(Duration::from_secs(30)),
+            Some(Duration::from_millis(75)),
+            Some(oraclemcp_db::DbError::Query(String::from(
+                "ORA-01013: user requested cancel of current operation",
+            ))),
+        );
+        let observed = connection.clone();
+        live_runtime
+            .insert_connected(live_profile("dev"), Box::new(connection))
+            .expect("stub session inserts");
+        dispatch_with_runtime_for_test("connect", json!({"name": "dev"}), &mut live_runtime)
+            .expect("connect activates existing live session");
+
+        let err = dispatch_with_runtime_and_budget_for_test(
+            "query",
+            json!({"sql": "SELECT 1 AS val FROM dual"}),
+            &mut live_runtime,
+            |cx| RequestBudget::from_call_timeout(cx.now(), Some(Duration::from_millis(25))),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.error_class, ErrorClass::Timeout);
+        assert_eq!(
+            observed.observed_queries(),
+            vec!["SELECT 1 AS val FROM dual"]
+        );
+        assert_eq!(observed.current_timeout(), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn live_query_exhausted_request_budget_fails_before_query() {
+        let mut live_runtime = LiveDbRuntime::new();
+        let connection = RecordingOracleConnection::new();
+        let observed = connection.clone();
+        live_runtime
+            .insert_connected(live_profile("dev"), Box::new(connection))
+            .expect("stub session inserts");
+        dispatch_with_runtime_for_test("connect", json!({"name": "dev"}), &mut live_runtime)
+            .expect("connect activates existing live session");
+
+        let err = dispatch_with_runtime_and_budget_for_test(
+            "query",
+            json!({"sql": "SELECT 1 AS val FROM dual"}),
+            &mut live_runtime,
+            |_| RequestBudget::from_budget(asupersync::Budget::ZERO),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.error_class, ErrorClass::Timeout);
+        assert!(
+            observed.observed_queries().is_empty(),
+            "exhausted budget must fail before touching Oracle"
+        );
+        assert!(
+            observed.observed_timeout_sets().is_empty(),
+            "exhausted budget must not mutate session call timeout"
         );
     }
 
