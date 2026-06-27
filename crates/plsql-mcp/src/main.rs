@@ -14,6 +14,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use plsql_mcp::config::McpConfig;
 use plsql_mcp::default_tool_registry;
 use plsql_mcp::doctor::{DoctorReport, DoctorSeverity, doctor_report};
+use plsql_mcp::mcp_protocol::PlsqlMcpServer;
 use plsql_mcp::tcp;
 
 #[derive(Parser, Debug)]
@@ -165,7 +166,25 @@ fn main() -> ExitCode {
 ///   `tcp::serve` accept loop. A `--listen` parse error names the exact
 ///   fix on stderr (Axiom 6) and exits non-zero (Axiom 14).
 fn run_serve(listen: Option<String>, allow_public_bind: bool, robot_json: bool) -> ExitCode {
-    let registry = default_tool_registry();
+    let server = match PlsqlMcpServer::new(default_tool_registry()) {
+        Ok(server) => server,
+        Err(e) => {
+            if robot_json {
+                eprintln!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "kind": "error",
+                        "code": "MCP_RUNTIME_INIT_FAILED",
+                        "message": e.to_string(),
+                    }))
+                    .unwrap()
+                );
+            } else {
+                eprintln!("plsql-mcp serve: failed to initialize MCP runtime: {e}");
+            }
+            return ExitCode::from(1);
+        }
+    };
 
     match listen {
         None => {
@@ -177,7 +196,7 @@ fn run_serve(listen: Option<String>, allow_public_bind: bool, robot_json: bool) 
                     serde_json::to_string(&serde_json::json!({
                         "kind": "status",
                         "transport": "stdio",
-                        "registered_tool_count": registry.len(),
+                        "registered_tool_count": server.registry().len(),
                         "mcp_protocol_version": plsql_mcp::PROTOCOL_VERSION,
                     }))
                     .unwrap()
@@ -185,7 +204,7 @@ fn run_serve(listen: Option<String>, allow_public_bind: bool, robot_json: bool) 
             } else {
                 eprintln!(
                     "plsql-mcp serve: stdio transport ready ({} tools, MCP {})",
-                    registry.len(),
+                    server.registry().len(),
                     plsql_mcp::PROTOCOL_VERSION
                 );
             }
@@ -193,7 +212,7 @@ fn run_serve(listen: Option<String>, allow_public_bind: bool, robot_json: bool) 
             let mut stdout = std::io::stdout();
             // `process_stream` is the exact dispatch loop the TCP path
             // uses — reuse it so stdio and TCP can never diverge.
-            match tcp::process_stream(BufReader::new(stdin.lock()), &mut stdout, &registry) {
+            match tcp::process_stream(BufReader::new(stdin.lock()), &mut stdout, &server) {
                 Ok(()) => {
                     let _ = stdout.flush();
                     ExitCode::SUCCESS
@@ -236,7 +255,7 @@ fn run_serve(listen: Option<String>, allow_public_bind: bool, robot_json: bool) 
                         "kind": "status",
                         "transport": "tcp",
                         "listen": tcp::describe(&target),
-                        "registered_tool_count": registry.len(),
+                        "registered_tool_count": server.registry().len(),
                         "mcp_protocol_version": plsql_mcp::PROTOCOL_VERSION,
                     }))
                     .unwrap()
@@ -245,11 +264,11 @@ fn run_serve(listen: Option<String>, allow_public_bind: bool, robot_json: bool) 
                 eprintln!(
                     "plsql-mcp serve: TCP transport listening on {} ({} tools, MCP {})",
                     tcp::describe(&target),
-                    registry.len(),
+                    server.registry().len(),
                     plsql_mcp::PROTOCOL_VERSION
                 );
             }
-            match tcp::serve(&target, &registry) {
+            match tcp::serve(&target, &server) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("plsql-mcp serve: TCP transport error: {e}");
@@ -886,10 +905,11 @@ mod tests {
         let bound = listener.local_addr().unwrap();
 
         let server = std::thread::spawn(move || {
-            let reg = default_tool_registry();
+            let server = PlsqlMcpServer::new(default_tool_registry())
+                .expect("test MCP server runtime builds");
             // The real production accept loop (serve_with_listener),
             // bounded to one connection so the test terminates.
-            tcp::serve_bounded_on_listener(&listener, &reg, 1)
+            tcp::serve_bounded_on_listener(&listener, &server, 1)
                 .expect("accept loop serves one connection cleanly");
         });
 

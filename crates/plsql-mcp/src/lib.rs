@@ -147,8 +147,8 @@ pub fn register_patch_view_tool(registry: &mut ToolRegistry) {
     );
 }
 pub use mcp_protocol::{
-    JsonRpcError, JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION, handle_request,
-    handle_request_line,
+    JsonRpcError, JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION, PlsqlMcpServer,
+    ServerInitError, handle_request, handle_request_line,
 };
 pub use preview::{PreviewError, PreviewRegistry, PreviewedDdl};
 

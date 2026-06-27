@@ -31,8 +31,10 @@
 //!   live-DB tool registrations. This module is the transport shim
 //!   above those tools, not an Oracle behaviour change.
 
+use asupersync::runtime::{Runtime, RuntimeBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use thiserror::Error;
 
 use crate::safety::SafetyProfile;
 use crate::tools::{ToolDescriptor, ToolRegistry, ToolTier};
@@ -41,6 +43,60 @@ use crate::tools::{ToolDescriptor, ToolRegistry, ToolTier};
 /// that advertise a higher version receive a `version_mismatch`
 /// error response from `handle_initialize`.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
+
+#[derive(Debug, Error)]
+pub enum ServerInitError {
+    #[error("failed to create Asupersync reactor for MCP dispatch")]
+    Reactor(#[source] std::io::Error),
+    #[error("failed to build Asupersync runtime for MCP dispatch")]
+    Runtime(#[source] Box<asupersync::Error>),
+}
+
+/// Runtime-owned MCP server state shared by stdio and TCP transports.
+///
+/// B.2 intentionally keeps dispatch synchronous for now: this type owns the
+/// current `ToolRegistry` plus the Asupersync runtime that B.3/B.4 will use to
+/// drive `DispatchFuture`s. The transport pumps already depend on this wrapper,
+/// so the async dispatcher can be added without another transport split.
+pub struct PlsqlMcpServer {
+    registry: ToolRegistry,
+    dispatch_runtime: Runtime,
+}
+
+impl PlsqlMcpServer {
+    pub fn new(registry: ToolRegistry) -> Result<Self, ServerInitError> {
+        let dispatch_reactor =
+            asupersync::runtime::reactor::create_reactor().map_err(ServerInitError::Reactor)?;
+        let dispatch_runtime = RuntimeBuilder::current_thread()
+            .with_reactor(dispatch_reactor)
+            .build()
+            .map_err(|err| ServerInitError::Runtime(Box::new(err)))?;
+        Ok(Self {
+            registry,
+            dispatch_runtime,
+        })
+    }
+
+    #[must_use]
+    pub fn registry(&self) -> &ToolRegistry {
+        &self.registry
+    }
+
+    #[must_use]
+    pub fn dispatch_runtime(&self) -> &Runtime {
+        &self.dispatch_runtime
+    }
+
+    #[must_use]
+    pub fn handle_request(&self, req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
+        handle_request(req, &self.registry)
+    }
+
+    #[must_use]
+    pub fn handle_request_line(&self, line: &str) -> Option<JsonRpcResponse> {
+        handle_request_line(line, &self.registry)
+    }
+}
 
 /// JSON-RPC 2.0 request envelope.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -552,6 +608,20 @@ mod tests {
     }
 
     #[test]
+    fn server_construction_owns_an_asupersync_runtime() {
+        let server = PlsqlMcpServer::new(registry_with_query()).expect("server runtime builds");
+        assert_eq!(server.registry().len(), 1);
+
+        let cx_is_installed = server
+            .dispatch_runtime()
+            .block_on(async { asupersync::Cx::current().is_some() });
+        assert!(
+            cx_is_installed,
+            "server-owned runtime must install an Asupersync Cx during block_on"
+        );
+    }
+
+    #[test]
     fn tools_list_advertises_real_schemas_and_destructive_annotations() {
         // oracle-da9j.1 + .9: tools/list must advertise each tool's real argument
         // schema (so an agent can construct a valid first call) and surface
@@ -563,7 +633,7 @@ mod tests {
             tools
                 .iter()
                 .find(|t| t["name"] == name)
-                .unwrap_or_else(|| panic!("tool {name} advertised"))
+                .expect("tool advertised")
                 .clone()
         };
         // Real schemas with the right required fields (.1).
@@ -578,7 +648,7 @@ mod tests {
             let t = by(name);
             let req_arr = t["inputSchema"]["required"]
                 .as_array()
-                .unwrap_or_else(|| panic!("{name} has a required[] (not the permissive blob)"));
+                .expect("tool has a required[] array");
             assert!(
                 req_arr.iter().any(|v| v == field),
                 "{name} inputSchema.required must contain {field}: {t}"
@@ -741,7 +811,7 @@ mod tests {
             tools
                 .iter()
                 .find(|t| t["name"] == n)
-                .unwrap_or_else(|| panic!("{n} listed"))
+                .expect("tool listed")
                 .clone()
         };
         if !cfg!(feature = "live-db") {

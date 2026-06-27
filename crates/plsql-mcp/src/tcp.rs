@@ -47,8 +47,7 @@ use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::mcp_protocol::handle_request_line;
-use crate::tools::ToolRegistry;
+use crate::mcp_protocol::PlsqlMcpServer;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenTarget {
@@ -152,14 +151,14 @@ pub fn describe(target: &ListenTarget) -> String {
 pub fn process_stream<R: BufRead, W: Write>(
     reader: R,
     writer: &mut W,
-    registry: &ToolRegistry,
+    server: &PlsqlMcpServer,
 ) -> std::io::Result<()> {
     for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(resp) = handle_request_line(&line, registry) {
+        if let Some(resp) = server.handle_request_line(&line) {
             let mut bytes = serde_json::to_vec(&resp)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             bytes.push(b'\n');
@@ -172,10 +171,10 @@ pub fn process_stream<R: BufRead, W: Write>(
 
 /// Serve one accepted TCP connection: many line-delimited requests until
 /// the peer closes the stream.
-fn handle_connection(stream: TcpStream, registry: &ToolRegistry) -> std::io::Result<()> {
+fn handle_connection(stream: TcpStream, server: &PlsqlMcpServer) -> std::io::Result<()> {
     let read_half = stream.try_clone()?;
     let mut write_half = stream;
-    process_stream(BufReader::new(read_half), &mut write_half, registry)
+    process_stream(BufReader::new(read_half), &mut write_half, server)
 }
 
 /// Accept loop over an already-bound listener. `max_conns` bounds how many
@@ -183,12 +182,12 @@ fn handle_connection(stream: TcpStream, registry: &ToolRegistry) -> std::io::Res
 /// bound exists so integration tests can run the real loop to completion.
 fn serve_with_listener(
     listener: &TcpListener,
-    registry: &ToolRegistry,
+    server: &PlsqlMcpServer,
     max_conns: Option<usize>,
 ) -> std::io::Result<()> {
     for (idx, incoming) in listener.incoming().enumerate() {
         let stream = incoming?;
-        if let Err(e) = handle_connection(stream, registry) {
+        if let Err(e) = handle_connection(stream, server) {
             tracing::warn!(error = %e, "tcp connection terminated with an error");
         }
         if max_conns.is_some_and(|max| idx + 1 >= max) {
@@ -203,10 +202,10 @@ fn serve_with_listener(
 /// The target is assumed to have passed [`parse_listen_target`] (which
 /// enforces the public-bind refusal); `serve` does not re-validate, it
 /// honours the decision already encoded in `ListenTarget`.
-pub fn serve(target: &ListenTarget, registry: &ToolRegistry) -> std::io::Result<()> {
+pub fn serve(target: &ListenTarget, server: &PlsqlMcpServer) -> std::io::Result<()> {
     let listener = TcpListener::bind(target.socket)?;
     tracing::info!(target = %describe(target), "plsql-mcp TCP transport listening");
-    serve_with_listener(&listener, registry, None)
+    serve_with_listener(&listener, server, None)
 }
 
 /// Run the **real** accept loop over a caller-supplied, already-bound
@@ -222,15 +221,16 @@ pub fn serve(target: &ListenTarget, registry: &ToolRegistry) -> std::io::Result<
 /// touch [`parse_listen_target`] semantics.
 pub fn serve_bounded_on_listener(
     listener: &TcpListener,
-    registry: &ToolRegistry,
+    server: &PlsqlMcpServer,
     max_conns: usize,
 ) -> std::io::Result<()> {
-    serve_with_listener(listener, registry, Some(max_conns))
+    serve_with_listener(listener, server, Some(max_conns))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ToolRegistry;
 
     #[test]
     fn loopback_v4_accepted_without_override() {
@@ -289,8 +289,7 @@ mod tests {
             "169.254.1.1:9000",
             "[fc00::1]:9000",
         ] {
-            let t = parse_listen_target(raw, true)
-                .unwrap_or_else(|e| panic!("{raw} should bind with override: {e}"));
+            let t = parse_listen_target(raw, true).expect("target should bind with override");
             assert!(t.allow_public_bind);
         }
     }
@@ -354,9 +353,10 @@ mod tests {
             "\n",
             "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n",
         );
-        let reg = ToolRegistry::new();
+        let server =
+            PlsqlMcpServer::new(ToolRegistry::new()).expect("test MCP server runtime builds");
         let mut out: Vec<u8> = Vec::new();
-        process_stream(Cursor::new(input.as_bytes()), &mut out, &reg).unwrap();
+        process_stream(Cursor::new(input.as_bytes()), &mut out, &server).unwrap();
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 2, "two requests → two responses: {text:?}");
@@ -373,9 +373,10 @@ mod tests {
 
     #[test]
     fn process_stream_returns_parse_error_for_garbage_line() {
-        let reg = ToolRegistry::new();
+        let server =
+            PlsqlMcpServer::new(ToolRegistry::new()).expect("test MCP server runtime builds");
         let mut out: Vec<u8> = Vec::new();
-        process_stream(Cursor::new(&b"not json\n"[..]), &mut out, &reg).unwrap();
+        process_stream(Cursor::new(&b"not json\n"[..]), &mut out, &server).unwrap();
         let v: serde_json::Value =
             serde_json::from_str(String::from_utf8(out).unwrap().trim()).unwrap();
         assert_eq!(v["error"]["code"], -32700, "JSON parse error code");
@@ -389,8 +390,9 @@ mod tests {
         let listener = TcpListener::bind(target.socket).unwrap();
         let bound = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            let reg = ToolRegistry::new();
-            serve_with_listener(&listener, &reg, Some(1)).unwrap();
+            let server =
+                PlsqlMcpServer::new(ToolRegistry::new()).expect("test MCP server runtime builds");
+            serve_with_listener(&listener, &server, Some(1)).unwrap();
         });
 
         let mut client = TcpStream::connect(bound).unwrap();

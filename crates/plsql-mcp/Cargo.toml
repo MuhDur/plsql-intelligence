@@ -25,6 +25,7 @@ name = "plsql-mcp"
 path = "src/main.rs"
 
 [dependencies]
+asupersync = "=0.3.4"
 clap = { version = "4", features = ["derive"] }
 # Depend on the published engine-free oraclemcp core (extracted to the standalone
 # MuhDur/oraclemcp repo + crates.io). plsql-mcp is the full superset that adds the
