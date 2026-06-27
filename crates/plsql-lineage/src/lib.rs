@@ -11,6 +11,7 @@
 //! `plsql-output::RobotJsonEnvelope` so the CLI, MCP, and CI gate
 //! consumers see stable schema IDs (R5, R10).
 
+use plsql_ir::{FactKind, FactPayload, FactStore};
 use plsql_output::{RobotJsonEnvelope, SchemaDescriptor, SchemaVersion};
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
@@ -438,6 +439,179 @@ use plsql_depgraph::{DepGraph, NodeId, NodeSelector};
 // ---------------------------------------------------------------------------
 use std::collections::BTreeMap;
 use std::path::Path;
+
+fn canonical_logical_id(id: &str) -> String {
+    id.trim().to_ascii_uppercase()
+}
+
+fn logical_id_matches(left: &str, right: &str) -> bool {
+    left.trim().eq_ignore_ascii_case(right.trim())
+}
+
+/// Project all `DependencyEdge` rows from a normalized [`FactStore`] into
+/// lineage edges.
+///
+/// This is the FactStore-first consumption path for product surfaces that
+/// already hold an `AnalysisRun` artifact and should not rebuild lineage by
+/// walking raw IR. The engine convention is preserved: `source` is the
+/// dependent object and `target` is the dependency.
+#[must_use]
+pub fn dependency_edges_from_facts(facts: &FactStore) -> Vec<LineageEdge> {
+    let mut edges: Vec<LineageEdge> = facts
+        .by_kind(FactKind::DependencyEdge)
+        .filter_map(|fact| {
+            let FactPayload::DependencyEdge {
+                from_logical_id,
+                to_logical_id,
+                edge_kind,
+            } = &fact.payload
+            else {
+                return None;
+            };
+            Some(LineageEdge {
+                source: from_logical_id.clone(),
+                target: to_logical_id.clone(),
+                kind: edge_kind.clone(),
+                confidence: Confidence::Exact,
+            })
+        })
+        .collect();
+    edges.sort_by(|a, b| {
+        (&a.source, &a.target, &a.kind, a.confidence.rank()).cmp(&(
+            &b.source,
+            &b.target,
+            &b.kind,
+            b.confidence.rank(),
+        ))
+    });
+    edges.dedup();
+    edges
+}
+
+/// Walk upstream dependencies from `anchor` using only normalized
+/// `DependencyEdge` facts.
+#[must_use]
+pub fn dependencies_from_facts(
+    facts: &FactStore,
+    anchor: &str,
+    max_depth: Option<u32>,
+) -> LineageResult {
+    let edges = dependency_edges_from_facts(facts);
+    let depth_limit = max_depth.unwrap_or(u32::MAX);
+    let mut result = LineageResult::default();
+    let mut emitted = std::collections::BTreeSet::new();
+    let mut visited = std::collections::BTreeSet::new();
+    let mut queue = std::collections::VecDeque::new();
+
+    visited.insert(canonical_logical_id(anchor));
+    queue.push_back((anchor.to_string(), 0u32));
+
+    while let Some((current, depth)) = queue.pop_front() {
+        if depth >= depth_limit {
+            continue;
+        }
+        for edge in edges
+            .iter()
+            .filter(|edge| logical_id_matches(&edge.source, &current))
+        {
+            let edge_key = (
+                canonical_logical_id(&edge.source),
+                canonical_logical_id(&edge.target),
+                edge.kind.clone(),
+            );
+            if emitted.insert(edge_key) {
+                result.edges.push(edge.clone());
+            }
+            if visited.insert(canonical_logical_id(&edge.target)) {
+                queue.push_back((edge.target.clone(), depth + 1));
+            }
+        }
+    }
+
+    result.query = Some(LineageQuery {
+        anchor: anchor.to_string(),
+        direction: LineageDirection::Upstream,
+        max_depth,
+        min_confidence: None,
+    });
+    result
+}
+
+/// Walk downstream impact from `anchor` using only normalized
+/// `DependencyEdge` facts.
+#[must_use]
+pub fn impact_from_facts(facts: &FactStore, anchor: &str, max_depth: Option<u32>) -> LineageResult {
+    let edges = dependency_edges_from_facts(facts);
+    let depth_limit = max_depth.unwrap_or(u32::MAX);
+    let mut result = LineageResult::default();
+    let mut emitted = std::collections::BTreeSet::new();
+    let mut best: std::collections::BTreeMap<String, (String, Confidence, u32)> =
+        std::collections::BTreeMap::new();
+    let mut queue = std::collections::VecDeque::new();
+
+    best.insert(
+        canonical_logical_id(anchor),
+        (anchor.to_string(), Confidence::Exact, 0),
+    );
+    queue.push_back((anchor.to_string(), 0u32, Confidence::Exact));
+
+    while let Some((current, depth, path_confidence)) = queue.pop_front() {
+        if depth >= depth_limit {
+            continue;
+        }
+        for edge in edges
+            .iter()
+            .filter(|edge| logical_id_matches(&edge.target, &current))
+        {
+            let next_confidence = path_confidence.min(edge.confidence);
+            let edge_key = (
+                canonical_logical_id(&edge.source),
+                canonical_logical_id(&edge.target),
+                edge.kind.clone(),
+            );
+            if emitted.insert(edge_key) {
+                result.edges.push(edge.clone());
+            }
+
+            let source_key = canonical_logical_id(&edge.source);
+            let improved = best
+                .get(&source_key)
+                .is_none_or(|(_, existing, _)| next_confidence.rank() > existing.rank());
+            if improved {
+                best.insert(
+                    source_key,
+                    (edge.source.clone(), next_confidence, depth + 1),
+                );
+                queue.push_back((edge.source.clone(), depth + 1, next_confidence));
+            }
+        }
+    }
+
+    let anchor_key = canonical_logical_id(anchor);
+    result.affected_nodes = best
+        .into_iter()
+        .filter(|(id, _)| id != &anchor_key)
+        .map(|(_, (logical_id, path_confidence, hops))| AffectedNode {
+            logical_id,
+            hops,
+            path_confidence,
+        })
+        .collect();
+    result.affected_nodes.sort_by(|a, b| {
+        b.path_confidence
+            .rank()
+            .cmp(&a.path_confidence.rank())
+            .then_with(|| a.hops.cmp(&b.hops))
+            .then_with(|| a.logical_id.cmp(&b.logical_id))
+    });
+    result.query = Some(LineageQuery {
+        anchor: anchor.to_string(),
+        direction: LineageDirection::Downstream,
+        max_depth,
+        min_confidence: None,
+    });
+    result
+}
 
 /// Classify changes between two git refs in a repository.
 ///
@@ -3113,6 +3287,25 @@ fn push_xml_data(buf: &mut String, key: &str, value: &str) {
 mod tests {
     use super::*;
 
+    fn fact_provenance() -> plsql_ir::FactProvenance {
+        plsql_ir::FactProvenance {
+            component: "lineage-test".to_string(),
+            component_version: "0".to_string(),
+            run_id: String::new(),
+        }
+    }
+
+    fn dependency_fact(from: &str, to: &str, kind: &str) -> plsql_ir::Fact {
+        plsql_ir::mint_fact(
+            fact_provenance(),
+            plsql_ir::FactPayload::DependencyEdge {
+                from_logical_id: from.to_string(),
+                to_logical_id: to.to_string(),
+                edge_kind: kind.to_string(),
+            },
+        )
+    }
+
     #[test]
     fn result_roundtrip_json() {
         let res = LineageResult {
@@ -3145,6 +3338,116 @@ mod tests {
     fn confidence_serializes_lowercase() {
         let json = serde_json::to_string(&Confidence::Exact).unwrap();
         assert_eq!(json, "\"exact\"");
+    }
+
+    #[test]
+    fn dependency_edges_from_facts_filters_dependency_edge_facts() {
+        let mut facts = FactStore::default();
+        facts.push(dependency_fact(
+            "billing.report_pkg",
+            "billing.customers",
+            "Reads",
+        ));
+        facts.push(plsql_ir::mint_fact(
+            fact_provenance(),
+            plsql_ir::FactPayload::DynamicSqlEvidence {
+                site: "dyn_sql".to_string(),
+            },
+        ));
+
+        let edges = dependency_edges_from_facts(&facts);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].source, "billing.report_pkg");
+        assert_eq!(edges[0].target, "billing.customers");
+        assert_eq!(edges[0].kind, "Reads");
+        assert_eq!(edges[0].confidence, Confidence::Exact);
+    }
+
+    #[test]
+    fn dependencies_from_facts_walks_upstream_without_depgraph() {
+        let mut facts = FactStore::default();
+        facts.push(dependency_fact(
+            "billing.summary_job",
+            "billing.report_pkg",
+            "Calls",
+        ));
+        facts.push(dependency_fact(
+            "billing.report_pkg",
+            "billing.customers",
+            "Reads",
+        ));
+
+        let result = dependencies_from_facts(&facts, "billing.summary_job", None);
+        assert_eq!(result.edges.len(), 2);
+        assert_eq!(
+            result
+                .edges
+                .iter()
+                .map(|edge| (edge.source.as_str(), edge.target.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("billing.summary_job", "billing.report_pkg"),
+                ("billing.report_pkg", "billing.customers"),
+            ]
+        );
+        let query = result.query.expect("query echoed");
+        assert_eq!(query.direction, LineageDirection::Upstream);
+        assert_eq!(query.anchor, "billing.summary_job");
+    }
+
+    #[test]
+    fn impact_from_facts_walks_downstream_without_depgraph() {
+        let mut facts = FactStore::default();
+        facts.push(dependency_fact(
+            "billing.summary_job",
+            "billing.report_pkg",
+            "Calls",
+        ));
+        facts.push(dependency_fact(
+            "billing.report_pkg",
+            "billing.customers",
+            "Reads",
+        ));
+
+        let result = impact_from_facts(&facts, "billing.customers", None);
+        assert_eq!(result.edges.len(), 2);
+        assert_eq!(
+            result
+                .affected_nodes
+                .iter()
+                .map(|node| (node.logical_id.as_str(), node.hops))
+                .collect::<Vec<_>>(),
+            vec![("billing.report_pkg", 1), ("billing.summary_job", 2)]
+        );
+        let query = result.query.expect("query echoed");
+        assert_eq!(query.direction, LineageDirection::Downstream);
+        assert_eq!(query.anchor, "billing.customers");
+    }
+
+    #[test]
+    fn fact_backed_lineage_respects_max_depth() {
+        let mut facts = FactStore::default();
+        facts.push(dependency_fact(
+            "billing.summary_job",
+            "billing.report_pkg",
+            "Calls",
+        ));
+        facts.push(dependency_fact(
+            "billing.report_pkg",
+            "billing.customers",
+            "Reads",
+        ));
+
+        let result = impact_from_facts(&facts, "billing.customers", Some(1));
+        assert_eq!(result.edges.len(), 1);
+        assert_eq!(
+            result
+                .affected_nodes
+                .iter()
+                .map(|node| node.logical_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["billing.report_pkg"]
+        );
     }
 
     #[test]
@@ -3778,14 +4081,15 @@ mod impact_tests {
         let diff = "diff --git a/pkg/billing.pkb b/pkg/billing.pkb\n--- a/pkg/billing.pkb\n+++ b/pkg/billing.pkb\n@@ -1,3 +1,4 @@\n line1\n-old\n+new\n+extra\n";
         let cs = parse_unified_diff(diff).unwrap();
         assert_eq!(cs.changes.len(), 1, "{:?}", cs.changes);
-        match &cs.changes[0] {
-            ChangeRecord::Body(bc) => {
-                assert_eq!(bc.object_id, "pkg.billing");
-                assert_eq!(bc.hash_before.as_deref(), Some("diff:-1"));
-                assert_eq!(bc.hash_after.as_deref(), Some("diff:+2"));
-            }
-            other => panic!("expected Body, got {other:?}"),
-        }
+        let body = match &cs.changes[0] {
+            ChangeRecord::Body(bc) => Some(bc),
+            _ => None,
+        };
+        assert!(body.is_some(), "expected Body, got {:?}", cs.changes[0]);
+        let Some(bc) = body else { return };
+        assert_eq!(bc.object_id, "pkg.billing");
+        assert_eq!(bc.hash_before.as_deref(), Some("diff:-1"));
+        assert_eq!(bc.hash_after.as_deref(), Some("diff:+2"));
     }
 
     #[test]
@@ -3862,16 +4166,17 @@ mod impact_tests {
         let diff = "diff --git a/proc.sql b/proc.sql\nindex 09c7876..5b737da 100644\n--- a/proc.sql\n+++ b/proc.sql\n@@ -1,4 +1,3 @@\n--- old comment line\n create or replace procedure hr.p is\n begin\n   null;\n end;\n";
         let cs = parse_unified_diff(diff).expect("deleted -- comment must not abort the diff");
         assert_eq!(cs.changes.len(), 1, "{:?}", cs.changes);
-        match &cs.changes[0] {
-            ChangeRecord::Body(bc) => {
-                assert_eq!(bc.object_id, "proc");
-                // The removed `-- old comment line` is the single
-                // deletion; there are no additions.
-                assert_eq!(bc.hash_before.as_deref(), Some("diff:-1"));
-                assert_eq!(bc.hash_after.as_deref(), Some("diff:+0"));
-            }
-            other => panic!("expected Body, got {other:?}"),
-        }
+        let body = match &cs.changes[0] {
+            ChangeRecord::Body(bc) => Some(bc),
+            _ => None,
+        };
+        assert!(body.is_some(), "expected Body, got {:?}", cs.changes[0]);
+        let Some(bc) = body else { return };
+        assert_eq!(bc.object_id, "proc");
+        // The removed `-- old comment line` is the single
+        // deletion; there are no additions.
+        assert_eq!(bc.hash_before.as_deref(), Some("diff:-1"));
+        assert_eq!(bc.hash_after.as_deref(), Some("diff:+0"));
     }
 
     // oracle-hrzg.4 regression: editing a `-- comment` mid-hunk must
@@ -3883,14 +4188,15 @@ mod impact_tests {
         let diff = "--- a/pkg/c.pkb\n+++ b/pkg/c.pkb\n@@ -1,4 +1,4 @@\n create or replace package body c is\n--- old note\n+-- new note\n begin null; end;\n";
         let cs = parse_unified_diff(diff).expect("edited -- comment must parse");
         assert_eq!(cs.changes.len(), 1, "{:?}", cs.changes);
-        match &cs.changes[0] {
-            ChangeRecord::Body(bc) => {
-                assert_eq!(bc.object_id, "pkg.c");
-                assert_eq!(bc.hash_before.as_deref(), Some("diff:-1"));
-                assert_eq!(bc.hash_after.as_deref(), Some("diff:+1"));
-            }
-            other => panic!("expected Body, got {other:?}"),
-        }
+        let body = match &cs.changes[0] {
+            ChangeRecord::Body(bc) => Some(bc),
+            _ => None,
+        };
+        assert!(body.is_some(), "expected Body, got {:?}", cs.changes[0]);
+        let Some(bc) = body else { return };
+        assert_eq!(bc.object_id, "pkg.c");
+        assert_eq!(bc.hash_before.as_deref(), Some("diff:-1"));
+        assert_eq!(bc.hash_after.as_deref(), Some("diff:+1"));
     }
 
     // oracle-hrzg.4 regression: a deleted line whose content itself
@@ -3905,14 +4211,15 @@ mod impact_tests {
             "--- a/pkg/d.pkb\n+++ b/pkg/d.pkb\n@@ -1,3 +1,3 @@\n begin\n--- a\n+++ b\n null;\n";
         let cs = parse_unified_diff(diff).expect("-- / ++ content must parse");
         assert_eq!(cs.changes.len(), 1, "{:?}", cs.changes);
-        match &cs.changes[0] {
-            ChangeRecord::Body(bc) => {
-                assert_eq!(bc.object_id, "pkg.d");
-                assert_eq!(bc.hash_before.as_deref(), Some("diff:-1"));
-                assert_eq!(bc.hash_after.as_deref(), Some("diff:+1"));
-            }
-            other => panic!("expected Body, got {other:?}"),
-        }
+        let body = match &cs.changes[0] {
+            ChangeRecord::Body(bc) => Some(bc),
+            _ => None,
+        };
+        assert!(body.is_some(), "expected Body, got {:?}", cs.changes[0]);
+        let Some(bc) = body else { return };
+        assert_eq!(bc.object_id, "pkg.d");
+        assert_eq!(bc.hash_before.as_deref(), Some("diff:-1"));
+        assert_eq!(bc.hash_after.as_deref(), Some("diff:+1"));
     }
 
     // oracle-hrzg.4 regression: the multi-file failure mode from the
@@ -3925,26 +4232,41 @@ mod impact_tests {
         let diff = "diff --git a/proc.sql b/proc.sql\n--- a/proc.sql\n+++ b/proc.sql\n@@ -1,2 +1,1 @@\n--- old comment line\n create or replace procedure hr.p is begin null; end;\ndiff --git a/next.sql b/next.sql\n--- a/next.sql\n+++ b/next.sql\n@@ -1,2 +1,2 @@\n-old\n+new\n context\n";
         let cs = parse_unified_diff(diff).expect("multi-file diff must parse");
         assert_eq!(cs.changes.len(), 2, "{:?}", cs.changes);
-        match &cs.changes[0] {
-            ChangeRecord::Body(bc) => {
-                assert_eq!(bc.object_id, "proc");
-                assert_eq!(
-                    bc.hash_before.as_deref(),
-                    Some("diff:-1"),
-                    "deletion must be tallied"
-                );
-                assert_eq!(bc.hash_after.as_deref(), Some("diff:+0"));
-            }
-            other => panic!("expected Body for proc, got {other:?}"),
-        }
-        match &cs.changes[1] {
-            ChangeRecord::Body(bc) => {
-                assert_eq!(bc.object_id, "next");
-                assert_eq!(bc.hash_before.as_deref(), Some("diff:-1"));
-                assert_eq!(bc.hash_after.as_deref(), Some("diff:+1"));
-            }
-            other => panic!("expected Body for next, got {other:?}"),
-        }
+        let proc_record = match &cs.changes[0] {
+            ChangeRecord::Body(body) => Some(body),
+            _ => None,
+        };
+        assert!(
+            proc_record.is_some(),
+            "expected Body for proc, got {:?}",
+            cs.changes[0]
+        );
+        let Some(proc_body) = proc_record else {
+            return;
+        };
+        assert_eq!(proc_body.object_id, "proc");
+        assert_eq!(
+            proc_body.hash_before.as_deref(),
+            Some("diff:-1"),
+            "deletion must be tallied"
+        );
+        assert_eq!(proc_body.hash_after.as_deref(), Some("diff:+0"));
+
+        let next_record = match &cs.changes[1] {
+            ChangeRecord::Body(body) => Some(body),
+            _ => None,
+        };
+        assert!(
+            next_record.is_some(),
+            "expected Body for next, got {:?}",
+            cs.changes[1]
+        );
+        let Some(next_body) = next_record else {
+            return;
+        };
+        assert_eq!(next_body.object_id, "next");
+        assert_eq!(next_body.hash_before.as_deref(), Some("diff:-1"));
+        assert_eq!(next_body.hash_after.as_deref(), Some("diff:+1"));
     }
 
     // oracle-hrzg.4 regression: a header-less `diff -u` stream (no
@@ -4073,31 +4395,33 @@ mod impact_tests {
     fn explain_edge_returns_summary_and_confidence() {
         let g = linear_chain_graph();
         let explanation = explain_edge(&g, plsql_depgraph::EdgeId::new(1)).unwrap();
-        match explanation {
-            LineageExplanation::Edge(e) => {
-                assert!(matches!(e.confidence, Confidence::Exact));
-                assert!(e.unknown_reason.is_none());
-                assert!(e.remediation.is_none());
-                assert!(e.summary.contains("billing.customers"));
-                assert!(e.summary.contains("billing.report_pkg"));
-            }
-            other => panic!("expected Edge explanation, got {other:?}"),
-        }
+        let edge = match explanation {
+            LineageExplanation::Edge(e) => Some(e),
+            _ => None,
+        };
+        assert!(edge.is_some(), "expected Edge explanation");
+        let Some(e) = edge else { return };
+        assert!(matches!(e.confidence, Confidence::Exact));
+        assert!(e.unknown_reason.is_none());
+        assert!(e.remediation.is_none());
+        assert!(e.summary.contains("billing.customers"));
+        assert!(e.summary.contains("billing.report_pkg"));
     }
 
     #[test]
     fn explain_edge_reports_unknown_reason_and_remediation_for_opaque_edge() {
         let g = branching_graph();
         let explanation = explain_edge(&g, plsql_depgraph::EdgeId::new(5)).unwrap();
-        match explanation {
-            LineageExplanation::Edge(e) => {
-                assert!(matches!(e.confidence, Confidence::Unknown));
-                assert_eq!(e.unknown_reason.as_deref(), Some("DynamicSqlOpaque"));
-                let remediation = e.remediation.expect("remediation provided");
-                assert!(remediation.contains("Bind variables"));
-            }
-            other => panic!("expected Edge explanation, got {other:?}"),
-        }
+        let edge = match explanation {
+            LineageExplanation::Edge(e) => Some(e),
+            _ => None,
+        };
+        assert!(edge.is_some(), "expected Edge explanation");
+        let Some(e) = edge else { return };
+        assert!(matches!(e.confidence, Confidence::Unknown));
+        assert_eq!(e.unknown_reason.as_deref(), Some("DynamicSqlOpaque"));
+        let remediation = e.remediation.expect("remediation provided");
+        assert!(remediation.contains("Bind variables"));
     }
 
     #[test]
@@ -4105,14 +4429,15 @@ mod impact_tests {
         let g = linear_chain_graph();
         let selector = NodeSelector::NodeId(NodeId::new(2));
         let explanation = explain_node(&g, &selector).unwrap();
-        match explanation {
-            LineageExplanation::Node(n) => {
-                assert_eq!(n.incoming_count, 1);
-                assert_eq!(n.outgoing_count, 1);
-                assert!(n.summary.contains("incoming"));
-            }
-            other => panic!("expected Node explanation, got {other:?}"),
-        }
+        let node = match explanation {
+            LineageExplanation::Node(n) => Some(n),
+            _ => None,
+        };
+        assert!(node.is_some(), "expected Node explanation");
+        let Some(n) = node else { return };
+        assert_eq!(n.incoming_count, 1);
+        assert_eq!(n.outgoing_count, 1);
+        assert!(n.summary.contains("incoming"));
     }
 
     #[test]
@@ -4124,15 +4449,16 @@ mod impact_tests {
         let from = NodeSelector::NodeId(NodeId::new(5));
         let to = NodeSelector::NodeId(NodeId::new(1));
         let explanation = explain_path(&g, &from, &to).unwrap();
-        match explanation {
-            LineageExplanation::Path(p) => {
-                assert!(p.path.found);
-                assert!(matches!(p.aggregate_confidence, Confidence::Unknown));
-                assert_eq!(p.blockers, vec!["DynamicSqlOpaque"]);
-                assert!(p.summary.contains("aggregate confidence"));
-            }
-            other => panic!("expected Path explanation, got {other:?}"),
-        }
+        let path = match explanation {
+            LineageExplanation::Path(p) => Some(p),
+            _ => None,
+        };
+        assert!(path.is_some(), "expected Path explanation");
+        let Some(p) = path else { return };
+        assert!(p.path.found);
+        assert!(matches!(p.aggregate_confidence, Confidence::Unknown));
+        assert_eq!(p.blockers, vec!["DynamicSqlOpaque"]);
+        assert!(p.summary.contains("aggregate confidence"));
     }
 
     #[test]
@@ -4144,10 +4470,7 @@ mod impact_tests {
         let json = serde_json::to_string(&envelope).unwrap();
         assert!(json.contains("plsql.lineage.explain"));
         let back: RobotJsonEnvelope<LineageExplanation> = serde_json::from_str(&json).unwrap();
-        match back.payload {
-            LineageExplanation::Edge(_) => {}
-            other => panic!("expected Edge variant after roundtrip, got {other:?}"),
-        }
+        assert!(matches!(back.payload, LineageExplanation::Edge(_)));
     }
 
     #[test]
@@ -4158,14 +4481,15 @@ mod impact_tests {
         let from = NodeSelector::NodeId(NodeId::new(1));
         let to = NodeSelector::NodeId(NodeId::new(2));
         let explanation = explain_path(&g, &from, &to).unwrap();
-        match explanation {
-            LineageExplanation::Path(p) => {
-                assert!(!p.path.found);
-                assert!(p.summary.starts_with("no path"));
-                assert!(matches!(p.aggregate_confidence, Confidence::Exact));
-            }
-            other => panic!("expected Path explanation, got {other:?}"),
-        }
+        let path = match explanation {
+            LineageExplanation::Path(p) => Some(p),
+            _ => None,
+        };
+        assert!(path.is_some(), "expected Path explanation");
+        let Some(p) = path else { return };
+        assert!(!p.path.found);
+        assert!(p.summary.starts_with("no path"));
+        assert!(matches!(p.aggregate_confidence, Confidence::Exact));
     }
 
     #[test]

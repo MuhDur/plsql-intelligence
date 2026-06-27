@@ -18,6 +18,15 @@ use serde::{Deserialize, Serialize};
 use crate::{CompletenessSnapshot, Finding, Rule, ScanUnit, run_scan};
 use plsql_ir::{FactStore, FlowEnv};
 
+#[cfg(test)]
+fn corpus_provenance() -> plsql_ir::FactProvenance {
+    plsql_ir::FactProvenance {
+        component: "corpus".into(),
+        component_version: "0".into(),
+        run_id: String::new(),
+    }
+}
+
 /// One known-clean unit: its logical id, source path, and the
 /// Layer-2 inputs a scan would see for it.
 pub struct NegativeCase<'a> {
@@ -111,13 +120,15 @@ mod tests {
         );
         let mut facts_literal = FactStore::default();
         facts_literal.push(plsql_ir::mint_fact(
-            plsql_ir::FactProvenance {
-                component: "corpus".into(),
-                component_version: "0".into(),
-                run_id: String::new(),
-            },
+            corpus_provenance(),
             plsql_ir::FactPayload::DynamicSqlEvidence { site: "DYN".into() },
         ));
+        plsql_ir::emit_flow_env_facts(
+            &mut facts_literal,
+            &corpus_provenance(),
+            "safe.literal",
+            &env_literal,
+        );
 
         // Case 2: dynamic SQL built only from constants + a
         // non-user expression (no taint source) — out of SEC001
@@ -131,13 +142,15 @@ mod tests {
         );
         let mut facts_const = FactStore::default();
         facts_const.push(plsql_ir::mint_fact(
-            plsql_ir::FactProvenance {
-                component: "corpus".into(),
-                component_version: "0".into(),
-                run_id: String::new(),
-            },
+            corpus_provenance(),
             plsql_ir::FactPayload::DynamicSqlEvidence { site: "DYN".into() },
         ));
+        plsql_ir::emit_flow_env_facts(
+            &mut facts_const,
+            &corpus_provenance(),
+            "safe.const",
+            &env_const,
+        );
 
         // Case 3: privileges granted only to named roles, never
         // PUBLIC — SEC006 must stay silent.
@@ -148,11 +161,7 @@ mod tests {
             ("APP_ROLE", "EXECUTE", "HR.PKG"),
         ] {
             facts_priv.push(plsql_ir::mint_fact(
-                plsql_ir::FactProvenance {
-                    component: "corpus".into(),
-                    component_version: "0".into(),
-                    run_id: String::new(),
-                },
+                corpus_provenance(),
                 plsql_ir::FactPayload::Privilege {
                     grantee: g.into(),
                     privilege: p.into(),

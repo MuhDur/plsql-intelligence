@@ -2,7 +2,7 @@
 //! its [`ScanContext`](crate::ScanContext); the harness gates and
 //! drives them.
 
-use plsql_ir::{FactKind, FactPayload, StringShape};
+use plsql_ir::{FactId, FactKind, FactPayload, StringShape, TaintKind};
 
 use crate::{
     CompletenessRequirement, Finding, Rule, RuleOutput, ScanContext, Severity, SkipReason, finding,
@@ -32,6 +32,62 @@ use crate::{
 /// dynamic SQL) + `DATABASE-REFERENCE.md` (`EXECUTE IMMEDIATE`,
 /// `DBMS_ASSERT` cleansers).
 pub struct Sec001ExecuteImmediateInjection;
+
+fn normalise_flow_fact_name(name: &str) -> String {
+    name.trim().to_ascii_uppercase()
+}
+
+fn fact_unit_matches(fact_unit: &str, ctx_unit: &str) -> bool {
+    fact_unit.trim().eq_ignore_ascii_case(ctx_unit.trim())
+}
+
+fn taint_fact_for<'a>(
+    ctx: &'a ScanContext<'_>,
+    site: &str,
+) -> Option<(&'a FactId, &'a [TaintKind])> {
+    let wanted = normalise_flow_fact_name(site);
+    ctx.facts.by_kind(FactKind::Taint).find_map(|fact| {
+        let FactPayload::Taint {
+            unit_logical_id,
+            name,
+            kinds,
+        } = &fact.payload
+        else {
+            return None;
+        };
+        if fact_unit_matches(unit_logical_id, ctx.unit_logical_id)
+            && name.eq_ignore_ascii_case(&wanted)
+        {
+            Some((&fact.id, kinds.as_slice()))
+        } else {
+            None
+        }
+    })
+}
+
+fn string_shape_fact_for<'a>(
+    ctx: &'a ScanContext<'_>,
+    site: &str,
+) -> Option<(&'a FactId, &'a StringShape)> {
+    let wanted = normalise_flow_fact_name(site);
+    ctx.facts.by_kind(FactKind::StringShape).find_map(|fact| {
+        let FactPayload::StringShape {
+            unit_logical_id,
+            name,
+            shape,
+        } = &fact.payload
+        else {
+            return None;
+        };
+        if fact_unit_matches(unit_logical_id, ctx.unit_logical_id)
+            && name.eq_ignore_ascii_case(&wanted)
+        {
+            Some((&fact.id, shape))
+        } else {
+            None
+        }
+    })
+}
 
 impl Rule for Sec001ExecuteImmediateInjection {
     fn id(&self) -> &'static str {
@@ -80,10 +136,8 @@ impl Rule for Sec001ExecuteImmediateInjection {
                 continue;
             }
 
-            let answer = ctx.flow.taint_of(site);
-            if answer.is_tainted {
-                let kinds = answer
-                    .kinds
+            if let Some((taint_fact_id, kinds)) = taint_fact_for(ctx, site) {
+                let kinds = kinds
                     .iter()
                     .map(|k| format!("{k:?}"))
                     .collect::<Vec<_>>()
@@ -92,7 +146,9 @@ impl Rule for Sec001ExecuteImmediateInjection {
                     self.id(),
                     self.default_severity(),
                     &format!(
-                        "Uncleansed tainted value ({kinds}) reaches EXECUTE IMMEDIATE at `{site}`"
+                        "Uncleansed tainted value ({kinds}) reaches EXECUTE IMMEDIATE at `{site}` \
+                         (TaintFact {})",
+                        taint_fact_id.0
                     ),
                     ctx.source_file,
                     0,
@@ -109,7 +165,7 @@ impl Rule for Sec001ExecuteImmediateInjection {
                 continue;
             }
 
-            match ctx.flow.string_shape_of(site) {
+            match string_shape_fact_for(ctx, site).map(|(_, shape)| shape) {
                 Some(StringShape::Literal { .. }) | Some(StringShape::Empty) => {
                     // Provably constant — safe, nothing to report.
                 }
@@ -121,7 +177,7 @@ impl Rule for Sec001ExecuteImmediateInjection {
                     out = out.skip(ctx.skip(
                         self.id(),
                         SkipReason::MissingFlowFacts,
-                        &format!("no string/taint evidence for dynamic-SQL site `{site}`"),
+                        &format!("no StringShape/Taint facts for dynamic-SQL site `{site}`"),
                     ));
                 }
             }
@@ -255,12 +311,16 @@ impl Rule for Sec002DbmsSqlParse {
             if !reason.to_ascii_uppercase().contains("DBMS_SQL") {
                 continue;
             }
+            let evidence = string_shape_fact_for(ctx, target_logical_id)
+                .map(|(id, shape)| format!("StringShapeFact {} ({shape:?})", id.0))
+                .unwrap_or_else(|| format!("OpacityFact {}", fact.id.0));
             let f: Finding = finding(
                 self.id(),
                 self.default_severity(),
                 &format!(
                     "DBMS_SQL dynamic SQL at `{target_logical_id}` is opaque to taint \
-                     analysis ({reason}); injection cannot be ruled out automatically"
+                     analysis ({reason}); injection cannot be ruled out automatically \
+                     ({evidence})"
                 ),
                 ctx.source_file,
                 0,
@@ -1174,7 +1234,7 @@ impl Rule for Perf003IsNullOnIndexedColumn {
 mod tests {
     use super::*;
     use crate::{CompletenessSnapshot, ScanUnit, run_scan};
-    use plsql_ir::{FactProvenance, FactStore, FlowEnv, mint_fact};
+    use plsql_ir::{FactProvenance, FactStore, FlowEnv, emit_flow_env_facts, mint_fact};
 
     fn prov() -> FactProvenance {
         FactProvenance {
@@ -1308,6 +1368,17 @@ mod tests {
         )
     }
 
+    fn shape_fact(unit: &str, name: &str, shape: StringShape) -> plsql_ir::Fact {
+        mint_fact(
+            prov(),
+            FactPayload::StringShape {
+                unit_logical_id: unit.to_string(),
+                name: name.trim().to_ascii_uppercase(),
+                shape,
+            },
+        )
+    }
+
     #[test]
     fn sec001_flags_tainted_value_reaching_execute_immediate() {
         let stmts = plsql_ir::lower_statement_body("dyn := p_user || ' x';");
@@ -1320,16 +1391,33 @@ mod tests {
         );
         let mut facts = FactStore::default();
         facts.push(dynsql_fact("DYN"));
+        emit_flow_env_facts(&mut facts, &prov(), "hr.proc", &env);
+        let taint_fact_id = facts
+            .by_kind(FactKind::Taint)
+            .find_map(|fact| match &fact.payload {
+                FactPayload::Taint {
+                    unit_logical_id,
+                    name,
+                    ..
+                } if unit_logical_id == "hr.proc" && name == "DYN" => Some(fact.id.0.clone()),
+                _ => None,
+            })
+            .expect("flow projection must emit a DYN taint fact");
+        let empty_env = FlowEnv::default();
         let units = [ScanUnit {
             unit_logical_id: "hr.proc",
             source_file: "hr.sql",
-            flow: &env,
+            flow: &empty_env,
         }];
         let rules: Vec<Box<dyn Rule>> = vec![Box::new(Sec001ExecuteImmediateInjection)];
         let r = run_scan(&rules, &units, &facts, &CompletenessSnapshot::default());
         assert_eq!(r.findings.len(), 1, "tainted DYN -> injection");
         assert_eq!(r.findings[0].rule_id, "SEC001");
         assert_eq!(r.findings[0].severity, Severity::Critical);
+        assert!(
+            r.findings[0].message.contains(&taint_fact_id),
+            "finding must cite the stable TaintFact id"
+        );
         assert!(
             r.findings[0]
                 .remediation
@@ -1385,10 +1473,12 @@ mod tests {
         );
         let mut facts = FactStore::default();
         facts.push(dynsql_fact("DYN"));
+        emit_flow_env_facts(&mut facts, &prov(), "u", &env);
+        let empty_env = FlowEnv::default();
         let units = [ScanUnit {
             unit_logical_id: "u",
             source_file: "u.sql",
-            flow: &env,
+            flow: &empty_env,
         }];
         let rules: Vec<Box<dyn Rule>> = vec![Box::new(Sec001ExecuteImmediateInjection)];
         let r = run_scan(&rules, &units, &facts, &CompletenessSnapshot::default());
@@ -1427,10 +1517,17 @@ mod tests {
     fn sec002_flags_dbms_sql_opaque_site_as_review() {
         let env = FlowEnv::default();
         let mut facts = FactStore::default();
-        facts.push(opacity_reason(
-            "hr.proc.c1",
-            "dynamic SQL via DBMS_SQL.PARSE",
-        ));
+        facts.push(opacity_reason("sql_text", "dynamic SQL via DBMS_SQL.PARSE"));
+        let shape = shape_fact(
+            "hr.proc",
+            "sql_text",
+            StringShape::InterpolatedWithFix {
+                literal_prefix: "select * from ".to_string(),
+                literal_suffix: String::new(),
+            },
+        );
+        let shape_fact_id = shape.id.0.clone();
+        facts.push(shape);
         let units = [ScanUnit {
             unit_logical_id: "hr.proc",
             source_file: "hr.sql",
@@ -1441,6 +1538,10 @@ mod tests {
         assert_eq!(r.findings.len(), 1);
         assert_eq!(r.findings[0].rule_id, "SEC002");
         assert_eq!(r.findings[0].severity, Severity::Medium);
+        assert!(
+            r.findings[0].message.contains(&shape_fact_id),
+            "review finding must cite the stable StringShapeFact id"
+        );
         assert_eq!(
             r.findings[0].confidence.level,
             plsql_core::ConfidenceLevel::Medium,
@@ -1517,7 +1618,11 @@ mod tests {
         facts.push(cfl_fact("hr.pkg.p", "rec", true));
         let rep = one_unit_scan(Box::new(Perf001CursorForLoopBulkCollect), &facts);
         assert_eq!(rep.findings.len(), 2, "PERF001 fires on every cursor loop");
-        assert!(rep.findings.iter().all(|f| f.rule_id == "PERF001"));
+        assert!(
+            rep.findings
+                .iter()
+                .all(|f| f.rule_id.as_str().eq("PERF001"))
+        );
         assert!(rep.findings[0].message.contains("BULK COLLECT"));
     }
 

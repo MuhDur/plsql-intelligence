@@ -9,6 +9,7 @@ description = "Lineage engine — cross-object impact + classify-change queries.
 plsql-catalog = { path = "../plsql-catalog" }
 plsql-core = { path = "../plsql-core" }
 plsql-depgraph = { path = "../plsql-depgraph" }
+plsql-ir = { path = "../plsql-ir" }
 plsql-output = { path = "../plsql-output" }
 plsql-render = { path = "../plsql-render" }
 serde = { workspace = true, features = ["derive"] }

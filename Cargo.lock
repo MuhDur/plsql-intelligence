@@ -2111,6 +2111,7 @@ dependencies = [
  "plsql-catalog",
  "plsql-core",
  "plsql-depgraph",
+ "plsql-ir",
  "plsql-output",
  "plsql-render",
  "serde",
