@@ -67,6 +67,9 @@ If that audit trail is missing, then you must act as if the operation never happ
 ## Rust toolchain
 
 - **Build system:** Cargo workspace. One crate per component (plan.md §6.2.1).
+- **Toolchain:** `rust-toolchain.toml` pins `nightly-2026-05-11`. There is
+  no stable MSRV or `rust-version` floor while the live-DB convergence depends
+  on nightly-only `asupersync` features.
 - **Style:** `cargo fmt` (default config) + `cargo clippy -- -D warnings`. No exceptions.
 - **Errors:** `miette` for human diagnostics, `thiserror` for library errors. No `anyhow` except `main()`.
 - **Observability:** `tracing` with structured fields. Spans on every public API call.

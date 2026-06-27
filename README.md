@@ -15,7 +15,7 @@ self-healing coverage flywheel.
 [![USR Loop](https://github.com/MuhDur/plsql-intelligence/actions/workflows/usr.yml/badge.svg)](https://github.com/MuhDur/plsql-intelligence/actions/workflows/usr.yml)
 [![License: Apache-2.0 OR MIT](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](#license)
 [![unsafe: forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](#design-commitments)
-[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](rust-toolchain.toml)
+[![Rust nightly-2026-05-11](https://img.shields.io/badge/rust-nightly--2026--05--11-orange.svg)](rust-toolchain.toml)
 
 </div>
 
@@ -313,8 +313,10 @@ registry advertises has a dispatch arm.
 
 ## Installation
 
-The workspace builds and tests with stable Rust (`rust-version = "1.85"`,
-see `rust-toolchain.toml`).
+The workspace builds and tests with the pinned nightly in
+`rust-toolchain.toml` (`nightly-2026-05-11`). There is no stable MSRV or
+`rust-version` floor while the live-DB convergence work depends on
+nightly-only `asupersync` features.
 
 ### From source (recommended)
 
@@ -435,7 +437,7 @@ cargo run -p plan-lint -- --doctor     # health summary
 | `usr-loop gate` exits 4 | Gate sha-pin mismatch. The gate script changed without a sha bump in `crates/plsql-accretion/gate.sha256`. This is intentional fail-closed behavior; re-pin only via a reviewed commit. |
 | `usr-loop gate`/`land` exits 9 | An I-PRIVACY leak signal at G8. The run aborted and persisted nothing, by design. Inspect the offending fixture; do not weaken G8. |
 | `usr_acceptance.sh` exits 0 with an "estate-absent" banner | No private estate is configured (`PLSQL_PRIVATE_ESTATE` unset or empty), so the DoD is not proven here. Run it with the variable pointing at a private estate, or rely on nightly CI. |
-| `--features antlr-codegen` build fails | Codegen needs the nightly toolchain: `rustup run nightly cargo build -p plsql-parser-antlr --features antlr-codegen`. |
+| `--features antlr-codegen` build fails | Codegen uses the pinned nightly toolchain: `cargo +nightly-2026-05-11 build -p plsql-parser-antlr --features antlr-codegen`. |
 | Empty dependency graph on a real estate | Expected for the dialect tail the parser cannot yet reach; those are recorded as typed `UnknownReason` and are exactly the USR Loop's repair input, not a silent failure. |
 
 ---
