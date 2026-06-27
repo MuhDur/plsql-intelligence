@@ -31,7 +31,9 @@
 //!   live-DB tool registrations. This module is the transport shim
 //!   above those tools, not an Oracle behaviour change.
 
+use asupersync::Cx;
 use asupersync::runtime::{Runtime, RuntimeBuilder};
+use oraclemcp_core::DispatchContext;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -109,10 +111,10 @@ impl PlsqlMcpServer {
 
     pub async fn handle_request_with_cx(
         &self,
-        _cx: &asupersync::Cx,
+        cx: &asupersync::Cx,
         req: &JsonRpcRequest,
     ) -> Option<JsonRpcResponse> {
-        handle_request(req, &self.registry)
+        handle_request_with_context(req, &self.registry, cx, DispatchContext::default()).await
     }
 
     #[must_use]
@@ -227,7 +229,49 @@ pub fn handle_request(req: &JsonRpcRequest, registry: &ToolRegistry) -> Option<J
     match req.method.as_str() {
         "initialize" => Some(handle_initialize(id, req.params.as_ref())),
         "tools/list" => Some(handle_tools_list(id, registry)),
-        "tools/call" => Some(handle_tools_call(id, req.params.as_ref(), registry)),
+        "tools/call" => Some(JsonRpcResponse::err(
+            id,
+            -32603,
+            "tools/call requires the server-owned Asupersync dispatch context",
+        )),
+        "ping" => Some(JsonRpcResponse::ok(id, Value::Object(Default::default()))),
+        other => Some(JsonRpcResponse::err(
+            id,
+            -32601,
+            format!("method not found: {other}"),
+        )),
+    }
+}
+
+/// Dispatch a single JSON-RPC frame with the explicit async dispatch context
+/// needed by `tools/call`.
+pub async fn handle_request_with_context(
+    req: &JsonRpcRequest,
+    registry: &ToolRegistry,
+    cx: &Cx,
+    context: DispatchContext<'_>,
+) -> Option<JsonRpcResponse> {
+    if req.jsonrpc != "2.0" {
+        if let Some(id) = req.id.clone() {
+            return Some(JsonRpcResponse::err(
+                id,
+                -32600,
+                format!("invalid jsonrpc version: {:?}", req.jsonrpc),
+            ));
+        }
+        return None;
+    }
+    let Some(id) = req.id.clone() else {
+        handle_notification(&req.method);
+        return None;
+    };
+
+    match req.method.as_str() {
+        "initialize" => Some(handle_initialize(id, req.params.as_ref())),
+        "tools/list" => Some(handle_tools_list(id, registry)),
+        "tools/call" => {
+            Some(handle_tools_call(id, req.params.as_ref(), registry, cx, context).await)
+        }
         "ping" => Some(JsonRpcResponse::ok(id, Value::Object(Default::default()))),
         other => Some(JsonRpcResponse::err(
             id,
@@ -384,12 +428,14 @@ fn tool_to_mcp_value(t: &ToolDescriptor) -> Value {
     })
 }
 
-fn handle_tools_call(
+async fn handle_tools_call(
     id: Value,
     params: Option<&Value>,
     registry: &ToolRegistry,
+    cx: &Cx,
+    context: DispatchContext<'_>,
 ) -> JsonRpcResponse {
-    use crate::dispatch::{DispatchError, DispatchOutcome, dispatch_tool};
+    use crate::dispatch::dispatch_tool;
 
     let Some(params) = params else {
         return JsonRpcResponse::err(id, -32602, "tools/call requires params");
@@ -422,17 +468,18 @@ fn handle_tools_call(
     // `arguments` is optional per MCP; a missing object means "no
     // arguments", which the per-tool Request types accept or reject
     // on their own terms.
-    let empty = Value::Object(Default::default());
-    let arguments = params.get("arguments").unwrap_or(&empty);
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Default::default()));
 
     // oracle-l65d: dispatch into the real `run_*` implementation.
-    // `dispatch_tool` is the single dispatch table; it deserializes
-    // the arguments into the tool's Request type and either runs the
-    // tool (self-contained static analysis) or returns an honest
-    // "runtime state required" outcome for tools that need a live
-    // connection / loaded graph / preview session.
-    match dispatch_tool(name, arguments) {
-        Ok(DispatchOutcome::Ran(structured)) => {
+    // `dispatch_tool` is the single async dispatch table; it deserializes the
+    // arguments into the tool's Request type and either runs the tool
+    // (self-contained static analysis) or returns an honest ErrorEnvelope for
+    // tools that need a live connection / loaded graph / preview session.
+    match dispatch_tool(cx, context, name, arguments).await {
+        Ok(structured) => {
             let mut result =
                 tool_result(&structured_text(name, &structured), false, Some(structured));
             // Workflow-first: attach the natural follow-up tools so an agent can
@@ -447,69 +494,25 @@ fn handle_tools_call(
             }
             JsonRpcResponse::ok(id, result)
         }
-        Ok(DispatchOutcome::RuntimeStateRequired(kind)) => {
+        Err(envelope)
+            if envelope.error_class == oraclemcp_error::ErrorClass::RuntimeStateRequired =>
+        {
             // Wired, arguments validated — but the runtime state is absent.
             // Honest error *result* (transport-level call succeeded; the tool
             // reports it cannot run here) carrying a structured envelope that
             // names the REAL tool to call next (oracle-da9j.2).
-            let msg = kind.message(name);
-            let envelope = oraclemcp_error::ErrorEnvelope::new(
-                oraclemcp_error::ErrorClass::RuntimeStateRequired,
-                msg.clone(),
-            )
-            .with_suggested_tool(runtime_kind_recovery_tool(kind))
-            .with_next_step(format!(
-                "Call `{}` to provide the missing runtime state, then retry `{name}`.",
-                runtime_kind_recovery_tool(kind)
-            ));
-            JsonRpcResponse::ok(id, tool_result(&msg, true, Some(envelope.to_json())))
-        }
-        Err(DispatchError::UnknownTool(tool)) => {
-            // Registry/dispatch drift — should be impossible (the lockstep test
-            // guards it), but never panic.
-            let names: Vec<&str> = registry.tools.iter().map(|t| t.name.as_str()).collect();
-            let envelope = oraclemcp_error::ErrorEnvelope::new(
-                oraclemcp_error::ErrorClass::InvalidArguments,
-                format!("tool not found: {tool}"),
-            )
-            .with_fuzzy_matches(oraclemcp_error::fuzzy_suggest(&tool, &names, 5));
-            JsonRpcResponse::err_with_data(
+            JsonRpcResponse::ok(
                 id,
-                -32601,
-                format!("tool not found: {tool}"),
-                envelope.to_json(),
+                tool_result(&envelope.message, true, Some(envelope.to_json())),
             )
         }
-        Err(DispatchError::InvalidArguments { tool, detail }) => {
-            let envelope = oraclemcp_error::ErrorEnvelope::new(
-                oraclemcp_error::ErrorClass::InvalidArguments,
-                format!("invalid arguments for tool `{tool}`: {detail}"),
-            )
-            .with_next_step(format!(
-                "Inspect `{tool}`'s inputSchema in tools/list and supply the required fields."
-            ));
-            JsonRpcResponse::err_with_data(
-                id,
-                -32602,
-                format!("invalid arguments for tool `{tool}`: {detail}"),
-                envelope.to_json(),
-            )
+        Err(envelope) if envelope.message.starts_with("tool not found:") => {
+            // Registry/dispatch drift — should be impossible (the lockstep
+            // test guards it), but never panic.
+            JsonRpcResponse::err_with_data(id, -32601, envelope.message.clone(), envelope.to_json())
         }
-    }
-}
-
-/// The real plsql-mcp tool an agent should call to satisfy a
-/// [`RuntimeKind`]'s missing state (oracle-da9j.2 — names a tool that actually
-/// exists on the surface, not a placeholder).
-fn runtime_kind_recovery_tool(kind: crate::dispatch::RuntimeKind) -> &'static str {
-    use crate::dispatch::RuntimeKind;
-    match kind {
-        // A loaded dependency graph comes from a project analysis.
-        RuntimeKind::DependencyGraph => "analyze_project",
-        // Live connection / preview / session state all require an active
-        // connected live-db session, entered via `connect`.
-        RuntimeKind::LiveConnection | RuntimeKind::PreviewSession | RuntimeKind::SessionState => {
-            "connect"
+        Err(envelope) => {
+            JsonRpcResponse::err_with_data(id, -32602, envelope.message.clone(), envelope.to_json())
         }
     }
 }
@@ -588,6 +591,13 @@ mod tests {
         }
     }
 
+    fn server_response(registry: ToolRegistry, request: JsonRpcRequest) -> JsonRpcResponse {
+        PlsqlMcpServer::new(registry)
+            .expect("server runtime builds")
+            .handle_request(&request)
+            .expect("request response")
+    }
+
     #[test]
     fn initialize_returns_server_info_and_capabilities() {
         let r = registry_with_query();
@@ -663,6 +673,43 @@ mod tests {
     }
 
     #[test]
+    fn post_async_dispatch_regression_preserves_offline_tool_behavior() {
+        let resp = server_response(
+            crate::default_tool_registry(),
+            req(
+                16,
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "parse_file",
+                    "arguments": {
+                        "source": "CREATE OR REPLACE PROCEDURE p IS BEGIN NULL; END;\n/\n"
+                    }
+                })),
+            ),
+        );
+
+        assert!(
+            resp.error.is_none(),
+            "offline tool call should not be a JSON-RPC error"
+        );
+        let result = resp.result.expect("ok result");
+        assert_eq!(result["isError"], Value::Bool(false));
+        let structured = &result["structuredContent"];
+        assert!(
+            structured["declaration_count"].as_u64().unwrap() >= 1,
+            "async dispatch still reaches the real parser: {structured:?}"
+        );
+        assert!(
+            result["next_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s.as_str().unwrap_or("").contains("get_symbol")),
+            "parse_file follow-up hints must survive async dispatch: {result:?}"
+        );
+    }
+
+    #[test]
     fn tools_list_advertises_real_schemas_and_destructive_annotations() {
         // oracle-da9j.1 + .9: tools/list must advertise each tool's real argument
         // schema (so an agent can construct a valid first call) and surface
@@ -722,16 +769,14 @@ mod tests {
         // oracle-da9j.2: a misspelled tool name returns a structured ErrorEnvelope
         // in error.data with fuzzy "did you mean" candidates, so an agent
         // self-heals in one round instead of parsing a bare string.
-        let r = crate::default_tool_registry();
-        let resp = handle_request(
-            &req(
+        let resp = server_response(
+            crate::default_tool_registry(),
+            req(
                 8,
                 "tools/call",
                 Some(serde_json::json!({"name": "parse_fil", "arguments": {}})),
             ),
-            &r,
-        )
-        .unwrap();
+        );
         let err = resp.error.expect("protocol error");
         assert_eq!(err.code, -32601);
         let data = err.data.expect("structured envelope in error.data");
@@ -749,16 +794,14 @@ mod tests {
         // oracle-da9j.2: a wired tool needing runtime state returns an honest
         // isError result whose structuredContent envelope names a REAL recovery
         // tool (find_callers needs a DepGraph -> analyze_project).
-        let r = crate::default_tool_registry();
-        let resp = handle_request(
-            &req(
+        let resp = server_response(
+            crate::default_tool_registry(),
+            req(
                 9,
                 "tools/call",
                 Some(serde_json::json!({"name": "find_callers", "arguments": {"target": "a.b/1"}})),
             ),
-            &r,
-        )
-        .unwrap();
+        );
         let result = resp.result.expect("ok result");
         assert_eq!(result["isError"], Value::Bool(true));
         let env = &result["structuredContent"];
@@ -772,15 +815,14 @@ mod tests {
         // tool that runs over the wire and reports feature flags + next_actions.
         let r = crate::default_tool_registry();
         assert!(r.tools.iter().any(|t| t.name == "oracle_capabilities"));
-        let resp = handle_request(
-            &req(
+        let resp = server_response(
+            r,
+            req(
                 11,
                 "tools/call",
                 Some(serde_json::json!({"name": "oracle_capabilities", "arguments": {}})),
             ),
-            &r,
-        )
-        .unwrap();
+        );
         let result = resp.result.expect("ok result");
         assert_eq!(result["isError"], Value::Bool(false));
         let doc = &result["structuredContent"];
@@ -869,19 +911,18 @@ mod tests {
     #[test]
     fn successful_results_carry_next_actions_workflow_hints() {
         // oracle-da9j.7: a tool that runs attaches its natural follow-ups.
-        let r = crate::default_tool_registry();
-        let resp = handle_request(
-            &req(
+        let server =
+            PlsqlMcpServer::new(crate::default_tool_registry()).expect("server runtime builds");
+        let resp = server
+            .handle_request(&req(
                 15,
                 "tools/call",
                 Some(serde_json::json!({
                     "name": "parse_file",
                     "arguments": {"source": "BEGIN NULL; END;\n/\n"}
                 })),
-            ),
-            &r,
-        )
-        .unwrap();
+            ))
+            .unwrap();
         let na = resp.result.expect("ok")["next_actions"]
             .as_array()
             .expect("next_actions present")
@@ -892,15 +933,13 @@ mod tests {
             "parse_file should chain to get_symbol/compile_check: {na:?}"
         );
         // The discovery tool chains to tools/list + analyze_project.
-        let cap = handle_request(
-            &req(
+        let cap = server
+            .handle_request(&req(
                 16,
                 "tools/call",
                 Some(serde_json::json!({"name": "oracle_capabilities", "arguments": {}})),
-            ),
-            &r,
-        )
-        .unwrap();
+            ))
+            .unwrap();
         assert!(
             cap.result.unwrap()["next_actions"]
                 .as_array()
@@ -914,17 +953,15 @@ mod tests {
     fn invalid_arguments_error_carries_a_next_step() {
         // oracle-da9j.2: bad arguments return -32602 with an envelope that points
         // the agent at the tool's inputSchema.
-        let r = crate::default_tool_registry();
-        let resp = handle_request(
-            &req(
+        let resp = server_response(
+            crate::default_tool_registry(),
+            req(
                 10,
                 "tools/call",
                 // get_symbol requires `source` + `symbol`; omit both.
                 Some(serde_json::json!({"name": "get_symbol", "arguments": {"wrong": 1}})),
             ),
-            &r,
-        )
-        .unwrap();
+        );
         let err = resp.error.expect("protocol error");
         assert_eq!(err.code, -32602);
         let data = err.data.expect("structured envelope");
@@ -940,9 +977,9 @@ mod tests {
         // oracle-l65d: a `parse_file` call must reach the real
         // `run_parse_file` implementation and return a structured
         // parse result — not a static "execution gated" placeholder.
-        let r = crate::default_tool_registry();
-        let resp = handle_request(
-            &req(
+        let resp = server_response(
+            crate::default_tool_registry(),
+            req(
                 40,
                 "tools/call",
                 Some(serde_json::json!({
@@ -952,9 +989,7 @@ mod tests {
                     }
                 })),
             ),
-            &r,
-        )
-        .unwrap();
+        );
         let result = resp.result.expect("ok result");
         assert_eq!(result["isError"], Value::Bool(false));
         // The structured tool output carries the real ParseFileResponse.
@@ -969,9 +1004,9 @@ mod tests {
     #[test]
     fn tools_call_compile_check_reports_real_diagnostics() {
         // A clean source must come back clean=true through the wire.
-        let r = crate::default_tool_registry();
-        let resp = handle_request(
-            &req(
+        let resp = server_response(
+            crate::default_tool_registry(),
+            req(
                 41,
                 "tools/call",
                 Some(serde_json::json!({
@@ -981,9 +1016,7 @@ mod tests {
                     }
                 })),
             ),
-            &r,
-        )
-        .unwrap();
+        );
         let sc = resp.result.unwrap()["structuredContent"].clone();
         assert_eq!(sc["clean"], Value::Bool(true));
         assert_eq!(sc["error_count"].as_u64().unwrap(), 0);
@@ -994,9 +1027,9 @@ mod tests {
         // analyze_project takes a project_root path in its arguments —
         // a fully self-contained static tool. An empty root is a clean
         // zero run, not an error.
-        let r = crate::default_tool_registry();
-        let resp = handle_request(
-            &req(
+        let resp = server_response(
+            crate::default_tool_registry(),
+            req(
                 42,
                 "tools/call",
                 Some(serde_json::json!({
@@ -1004,9 +1037,7 @@ mod tests {
                     "arguments": {"project_root": ""}
                 })),
             ),
-            &r,
-        )
-        .unwrap();
+        );
         let result = resp.result.expect("ok result");
         assert_eq!(result["isError"], Value::Bool(false));
         assert_eq!(
@@ -1019,9 +1050,9 @@ mod tests {
     fn tools_call_bad_arguments_returns_invalid_params() {
         // oracle-l65d: arguments that do not deserialize into the
         // tool's Request type are a proper -32602, never a panic.
-        let r = crate::default_tool_registry();
-        let resp = handle_request(
-            &req(
+        let resp = server_response(
+            crate::default_tool_registry(),
+            req(
                 43,
                 "tools/call",
                 Some(serde_json::json!({
@@ -1029,9 +1060,7 @@ mod tests {
                     "arguments": {"wrong_field": 123}
                 })),
             ),
-            &r,
-        )
-        .unwrap();
+        );
         let err = resp.error.expect("invalid arguments => error");
         assert_eq!(err.code, -32602);
     }
@@ -1043,9 +1072,9 @@ mod tests {
         // a typed, honest result, never a panic and never a fake
         // success. `isError` is true; the message names the missing
         // runtime state.
-        let r = crate::default_tool_registry();
-        let resp = handle_request(
-            &req(
+        let resp = server_response(
+            crate::default_tool_registry(),
+            req(
                 44,
                 "tools/call",
                 Some(serde_json::json!({
@@ -1053,9 +1082,7 @@ mod tests {
                     "arguments": {"sql": "SELECT 1 FROM dual"}
                 })),
             ),
-            &r,
-        )
-        .unwrap();
+        );
         let result = resp.result.expect("a result, not a transport error");
         assert_eq!(
             result["isError"],
@@ -1076,9 +1103,9 @@ mod tests {
     fn tools_call_live_db_arguments_still_validated_before_gating() {
         // Even a gated live-DB tool deserializes its arguments first:
         // malformed arguments are -32602, not a generic gate message.
-        let r = crate::default_tool_registry();
-        let resp = handle_request(
-            &req(
+        let resp = server_response(
+            crate::default_tool_registry(),
+            req(
                 45,
                 "tools/call",
                 Some(serde_json::json!({
@@ -1086,9 +1113,7 @@ mod tests {
                     "arguments": {"sql": 12345}
                 })),
             ),
-            &r,
-        )
-        .unwrap();
+        );
         assert_eq!(resp.error.expect("bad args => error").code, -32602);
     }
 
@@ -1098,19 +1123,19 @@ mod tests {
         // must stay in lockstep — a tool advertised over tools/list
         // that has no dispatch arm is a wire gap.
         let r = crate::default_tool_registry();
-        for tool in &r.tools {
-            let resp = handle_request(
-                &req(
+        let tool_names: Vec<String> = r.tools.iter().map(|tool| tool.name.clone()).collect();
+        let server = PlsqlMcpServer::new(r).expect("server runtime builds");
+        for tool_name in tool_names {
+            let resp = server
+                .handle_request(&req(
                     99,
                     "tools/call",
                     Some(serde_json::json!({
-                        "name": tool.name,
+                        "name": tool_name,
                         "arguments": {}
                     })),
-                ),
-                &r,
-            )
-            .expect("a response");
+                ))
+                .expect("a response");
             // A dispatched tool answers with EITHER a result (ran, or
             // honestly gated, or arg-validation result) OR a -32602
             // invalid-params error for the empty arguments. What it
@@ -1120,7 +1145,7 @@ mod tests {
                 assert_ne!(
                     err.code, -32601,
                     "tool `{}` is registered but has no dispatch arm",
-                    tool.name
+                    tool_name
                 );
             }
         }
@@ -1128,18 +1153,16 @@ mod tests {
 
     #[test]
     fn tools_call_for_unknown_tool_returns_method_not_found() {
-        let r = registry_with_query();
-        let resp = handle_request(
-            &req(
+        let resp = server_response(
+            registry_with_query(),
+            req(
                 5,
                 "tools/call",
                 Some(serde_json::json!({
                     "name": "nonexistent"
                 })),
             ),
-            &r,
-        )
-        .unwrap();
+        );
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32601);
         assert!(err.message.contains("tool not found"));
@@ -1147,8 +1170,10 @@ mod tests {
 
     #[test]
     fn tools_call_missing_name_param_returns_invalid_params() {
-        let r = registry_with_query();
-        let resp = handle_request(&req(6, "tools/call", Some(serde_json::json!({}))), &r).unwrap();
+        let resp = server_response(
+            registry_with_query(),
+            req(6, "tools/call", Some(serde_json::json!({}))),
+        );
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32602);
     }

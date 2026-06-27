@@ -6,7 +6,11 @@
 //! reachable over the JSON-RPC wire. This module is the missing
 //! bridge: for each registered tool name it deserializes the JSON
 //! `arguments` into that tool's Request type, calls the real
-//! implementation, and serializes the Response back.
+//! implementation, and serializes the Response back. The public dispatch
+//! entry point matches `oraclemcp-core`'s Cx-aware async dispatch contract;
+//! today's offline arms still run synchronously inside the returned future,
+//! while Phase D can replace the gated live-DB arms with real awaits without
+//! adding another runtime boundary.
 //!
 //! ## Single source of truth
 //!
@@ -43,6 +47,10 @@
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+
+use asupersync::Cx;
+use oraclemcp_core::{DispatchContext, DispatchFuture, ToolDispatch};
+use oraclemcp_error::{ErrorClass, ErrorEnvelope};
 
 use crate::{
     AnalyzeProjectRequest, CompileCheckRequest, CompletenessReportRequest, DocLookupRequest,
@@ -94,7 +102,7 @@ impl RuntimeKind {
     }
 }
 
-/// The result of dispatching one `tools/call`.
+/// Internal result of dispatching one `tools/call`.
 #[derive(Clone, Debug)]
 pub enum DispatchOutcome {
     /// A self-contained tool ran; carries its structured Response.
@@ -112,6 +120,43 @@ pub enum DispatchError {
     /// `arguments` did not deserialize into the Request type →
     /// `-32602`. Carries the serde message verbatim.
     InvalidArguments { tool: String, detail: String },
+}
+
+impl DispatchError {
+    fn into_envelope(self) -> ErrorEnvelope {
+        match self {
+            Self::UnknownTool(tool) => ErrorEnvelope::new(
+                ErrorClass::InvalidArguments,
+                format!("tool not found: {tool}"),
+            )
+            .with_next_step(
+                "Call tools/list to see the exact tool names, then retry with one of them.",
+            ),
+            Self::InvalidArguments { tool, detail } => ErrorEnvelope::new(
+                ErrorClass::InvalidArguments,
+                format!("invalid arguments for tool `{tool}`: {detail}"),
+            )
+            .with_next_step(format!(
+                "Inspect `{tool}`'s inputSchema in tools/list and supply the required fields."
+            )),
+        }
+    }
+}
+
+/// Stateless adapter implementing the 0.4.0 `oraclemcp-core` dispatch trait.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlsqlToolDispatch;
+
+impl ToolDispatch for PlsqlToolDispatch {
+    fn dispatch<'a>(
+        &'a self,
+        cx: &'a Cx,
+        context: DispatchContext<'a>,
+        name: &'a str,
+        args: Value,
+    ) -> DispatchFuture<'a> {
+        dispatch_tool(cx, context, name, args)
+    }
 }
 
 /// Every tool name with a dispatch arm. The single source of truth
@@ -208,18 +253,35 @@ fn parse_args<T: DeserializeOwned>(tool: &str, arguments: &Value) -> Result<T, D
 
 /// Dispatch one `tools/call` by tool name.
 ///
-/// `arguments` is the raw `params.arguments` object (defaulting to
-/// `{}` when the caller omitted it). Self-contained tools run and
-/// return [`DispatchOutcome::Ran`]; tools needing ambient runtime
-/// state validate their arguments (where a Request type exists)
-/// and then return [`DispatchOutcome::RuntimeStateRequired`].
+/// `arguments` is the owned raw `params.arguments` object (defaulting to
+/// `{}` when the caller omitted it). Self-contained tools run and return their
+/// structured JSON payload. Tools needing ambient runtime state validate their
+/// arguments (where a Request type exists) and then return an
+/// [`ErrorEnvelope`] with [`ErrorClass::RuntimeStateRequired`].
 ///
 /// # Errors
 ///
-/// [`DispatchError::UnknownTool`] when `name` has no arm, and
-/// [`DispatchError::InvalidArguments`] when `arguments` does not
-/// deserialize into the tool's Request type.
-pub fn dispatch_tool(name: &str, arguments: &Value) -> Result<DispatchOutcome, DispatchError> {
+/// Returns [`ErrorClass::InvalidArguments`] when `name` has no arm or when
+/// `arguments` does not deserialize into the tool's Request type.
+#[must_use]
+pub fn dispatch_tool<'a>(
+    _cx: &'a Cx,
+    _context: DispatchContext<'a>,
+    name: &'a str,
+    arguments: Value,
+) -> DispatchFuture<'a> {
+    Box::pin(async move {
+        match dispatch_tool_outcome(name, &arguments) {
+            Ok(DispatchOutcome::Ran(value)) => Ok(value),
+            Ok(DispatchOutcome::RuntimeStateRequired(kind)) => {
+                Err(runtime_state_envelope(kind, name))
+            }
+            Err(err) => Err(err.into_envelope()),
+        }
+    })
+}
+
+fn dispatch_tool_outcome(name: &str, arguments: &Value) -> Result<DispatchOutcome, DispatchError> {
     match name {
         // ── zero-arg discovery: a session-orientation report ──────
         "oracle_capabilities" => Ok(DispatchOutcome::Ran(capabilities_report())),
@@ -359,6 +421,25 @@ pub fn dispatch_tool(name: &str, arguments: &Value) -> Result<DispatchOutcome, D
     }
 }
 
+fn runtime_state_envelope(kind: RuntimeKind, tool: &str) -> ErrorEnvelope {
+    let msg = kind.message(tool);
+    ErrorEnvelope::new(ErrorClass::RuntimeStateRequired, msg.clone())
+        .with_suggested_tool(runtime_kind_recovery_tool(kind))
+        .with_next_step(format!(
+            "Call `{}` to provide the missing runtime state, then retry `{tool}`.",
+            runtime_kind_recovery_tool(kind)
+        ))
+}
+
+fn runtime_kind_recovery_tool(kind: RuntimeKind) -> &'static str {
+    match kind {
+        RuntimeKind::DependencyGraph => "analyze_project",
+        RuntimeKind::LiveConnection | RuntimeKind::PreviewSession | RuntimeKind::SessionState => {
+            "connect"
+        }
+    }
+}
+
 /// Serialize a tool Response into a [`DispatchOutcome::Ran`]. The
 /// Response types are all `Serialize`, so this never fails in
 /// practice; a serialization failure is surfaced as an empty
@@ -403,6 +484,20 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn dispatch_for_test(name: &str, args: Value) -> Result<Value, Box<ErrorEnvelope>> {
+        let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().expect("block_on installs a request Cx");
+            dispatch_tool(&cx, DispatchContext::default(), name, args)
+                .await
+                .map_err(Box::new)
+        })
+    }
+
     #[test]
     fn dispatch_table_matches_default_registry() {
         // oracle-l65d: the dispatch table and the registry the
@@ -426,9 +521,12 @@ mod tests {
         // either it runs, gates, or rejects the empty args as
         // invalid, but it is never "unknown".
         for name in dispatch_table() {
-            let outcome = dispatch_tool(name, &json!({}));
-            if let Err(DispatchError::UnknownTool(t)) = &outcome {
-                panic!("table entry `{t}` has no dispatch arm");
+            let outcome = dispatch_for_test(name, json!({}));
+            if let Err(envelope) = &outcome {
+                assert!(
+                    !envelope.message.contains("tool not found"),
+                    "table entry `{name}` has no dispatch arm: {envelope:?}"
+                );
             }
         }
     }
@@ -467,14 +565,16 @@ mod tests {
             ("plsql_analyze", json!({ "project_root": root })),
         ];
         for (name, args) in cases {
-            let outcome = dispatch_tool(name, args)
-                .unwrap_or_else(|e| panic!("self-contained tool `{name}` errored: {e:?}"));
-            let DispatchOutcome::Ran(v) = outcome else {
-                panic!("self-contained tool `{name}` must return Ran, got a gated outcome");
-            };
+            let value = dispatch_for_test(name, args.clone());
             assert!(
-                v.is_object() || v.is_array(),
-                "tool `{name}` must return a structured result, got {v}"
+                value.is_ok(),
+                "self-contained tool `{name}` errored: {:?}",
+                value.as_ref().err()
+            );
+            let value = value.unwrap_or(Value::Null);
+            assert!(
+                value.is_object() || value.is_array(),
+                "tool `{name}` must return a structured result, got {value}"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -482,87 +582,78 @@ mod tests {
 
     #[test]
     fn parse_file_runs_and_returns_real_response() {
-        let out = dispatch_tool(
+        let out = dispatch_for_test(
             "parse_file",
-            &json!({"source": "CREATE PROCEDURE p IS BEGIN NULL; END;\n/\n"}),
+            json!({"source": "CREATE PROCEDURE p IS BEGIN NULL; END;\n/\n"}),
         )
         .unwrap();
-        let DispatchOutcome::Ran(v) = out else {
-            panic!("parse_file is self-contained, must run");
-        };
-        assert!(v["declaration_count"].as_u64().unwrap() >= 1);
+        assert!(out["declaration_count"].as_u64().unwrap() >= 1);
     }
 
     #[test]
     fn get_symbol_absent_is_a_real_found_none() {
-        let out = dispatch_tool(
+        let out = dispatch_for_test(
             "get_symbol",
-            &json!({
+            json!({
                 "source": "CREATE PROCEDURE p IS BEGIN NULL; END;\n/\n",
                 "symbol": "NOPE"
             }),
         )
         .unwrap();
-        let DispatchOutcome::Ran(v) = out else {
-            panic!("get_symbol runs");
-        };
-        assert!(v["found"].is_null(), "absent symbol => found:null");
+        assert!(out["found"].is_null(), "absent symbol => found:null");
     }
 
     #[test]
     fn inspect_profile_ignores_arguments() {
         // No request fields — even junk arguments are accepted.
-        let out = dispatch_tool("inspect_profile", &json!({"junk": true})).unwrap();
-        assert!(matches!(out, DispatchOutcome::Ran(_)));
+        let out = dispatch_for_test("inspect_profile", json!({"junk": true})).unwrap();
+        assert!(out.is_object());
     }
 
     #[test]
     fn unknown_tool_is_a_typed_error() {
-        let err = dispatch_tool("no_such_tool", &json!({})).unwrap_err();
-        assert!(matches!(err, DispatchError::UnknownTool(_)));
+        let err = dispatch_for_test("no_such_tool", json!({})).unwrap_err();
+        assert_eq!(err.error_class, ErrorClass::InvalidArguments);
+        assert!(err.message.contains("tool not found"));
     }
 
     #[test]
     fn malformed_arguments_are_invalid_arguments() {
         // `parse_file` needs a string `source`; a number fails.
-        let err = dispatch_tool("parse_file", &json!({"source": 42})).unwrap_err();
-        assert!(matches!(err, DispatchError::InvalidArguments { .. }));
+        let err = dispatch_for_test("parse_file", json!({"source": 42})).unwrap_err();
+        assert_eq!(err.error_class, ErrorClass::InvalidArguments);
     }
 
     #[test]
     fn query_without_connection_gates_honestly() {
-        let out = dispatch_tool("query", &json!({"sql": "SELECT 1 FROM dual"})).unwrap();
-        assert!(matches!(
-            out,
-            DispatchOutcome::RuntimeStateRequired(RuntimeKind::LiveConnection)
-        ));
+        let err = dispatch_for_test("query", json!({"sql": "SELECT 1 FROM dual"})).unwrap_err();
+        assert_eq!(err.error_class, ErrorClass::RuntimeStateRequired);
+        assert_eq!(err.suggested_tool.as_deref(), Some("connect"));
     }
 
     #[test]
     fn query_with_bad_sql_type_fails_before_gating() {
         // Argument validation runs before the runtime gate.
-        let err = dispatch_tool("query", &json!({"sql": 7})).unwrap_err();
-        assert!(matches!(err, DispatchError::InvalidArguments { .. }));
+        let err = dispatch_for_test("query", json!({"sql": 7})).unwrap_err();
+        assert_eq!(err.error_class, ErrorClass::InvalidArguments);
     }
 
     #[test]
     fn graph_tool_validates_selector_then_gates() {
         // A well-formed GraphQueryRequest gates on the missing graph.
-        let out = dispatch_tool("find_callers", &json!({"target": "pkg.proc/1"})).unwrap();
-        assert!(matches!(
-            out,
-            DispatchOutcome::RuntimeStateRequired(RuntimeKind::DependencyGraph)
-        ));
+        let err = dispatch_for_test("find_callers", json!({"target": "pkg.proc/1"})).unwrap_err();
+        assert_eq!(err.error_class, ErrorClass::RuntimeStateRequired);
+        assert_eq!(err.suggested_tool.as_deref(), Some("analyze_project"));
         // A malformed selector is rejected before the gate.
-        let err = dispatch_tool("find_callers", &json!({"target": 99})).unwrap_err();
-        assert!(matches!(err, DispatchError::InvalidArguments { .. }));
+        let err = dispatch_for_test("find_callers", json!({"target": 99})).unwrap_err();
+        assert_eq!(err.error_class, ErrorClass::InvalidArguments);
     }
 
     #[test]
     fn patch_package_validates_request_then_gates() {
-        let out = dispatch_tool(
+        let err = dispatch_for_test(
             "patch_package",
-            &json!({
+            json!({
                 "connection": "c",
                 "schema": "HR",
                 "package": "PKG",
@@ -571,11 +662,9 @@ mod tests {
                 "mode": {"mode": "dry_run"}
             }),
         )
-        .unwrap();
-        assert!(matches!(
-            out,
-            DispatchOutcome::RuntimeStateRequired(RuntimeKind::PreviewSession)
-        ));
+        .unwrap_err();
+        assert_eq!(err.error_class, ErrorClass::RuntimeStateRequired);
+        assert_eq!(err.suggested_tool.as_deref(), Some("connect"));
     }
 
     #[test]
