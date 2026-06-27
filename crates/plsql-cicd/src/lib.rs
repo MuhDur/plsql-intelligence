@@ -7,10 +7,16 @@
 //! `verify` live in their own modules.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use plsql_catalog::Hash;
-use plsql_core::{CompletenessReport, Confidence, ObjectName, SchemaName, UnknownReason};
+use plsql_core::{
+    CompletenessReport, Confidence, ObjectName, SchemaName, SymbolInterner, UnknownReason,
+};
+use plsql_lineage::{
+    BodyChange, ChangeRecord, ColumnChangeDetail, DdlChange, SemanticChangeSet, TypeChangeDetail,
+    classify_dir_diff, classify_git_diff, parse_change_file, parse_unified_diff,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::instrument;
@@ -156,6 +162,343 @@ impl ChangeSet {
     pub fn object_count(&self) -> usize {
         self.objects.len()
     }
+
+    #[instrument(level = "trace", skip(repo))]
+    pub fn from_git_diff(repo: &Path, from: &str, to: &str) -> Result<Self, CicdError> {
+        let semantic = classify_git_diff(repo, from, to)?;
+        Self::from_semantic_changes(
+            Some(ChangeSetOrigin::GitDiff {
+                range: format!("{from}..{to}"),
+            }),
+            semantic,
+        )
+    }
+
+    #[instrument(level = "trace", skip(range, diff))]
+    pub fn from_unified_diff(range: impl Into<String>, diff: &str) -> Result<Self, CicdError> {
+        let semantic = parse_unified_diff(diff)?;
+        Self::from_semantic_changes(
+            Some(ChangeSetOrigin::GitDiff {
+                range: range.into(),
+            }),
+            semantic,
+        )
+    }
+
+    #[instrument(level = "trace")]
+    pub fn from_before_after_dirs(before: &Path, after: &Path) -> Result<Self, CicdError> {
+        let semantic = classify_dir_diff(before, after)?;
+        Self::from_semantic_changes(
+            Some(ChangeSetOrigin::BeforeAfterDirectories {
+                before: before.to_path_buf(),
+                after: after.to_path_buf(),
+            }),
+            semantic,
+        )
+    }
+
+    #[instrument(level = "trace")]
+    pub fn from_directory(path: &Path) -> Result<Self, CicdError> {
+        let mut files = Vec::new();
+        collect_plsql_paths(path, path, &mut files)?;
+        let mut semantic = SemanticChangeSet::new();
+        for rel in files {
+            semantic.changes.push(ChangeRecord::Created {
+                object_id: path_to_object_id(&rel),
+            });
+        }
+        Self::from_semantic_changes(
+            Some(ChangeSetOrigin::Directory {
+                path: path.to_path_buf(),
+            }),
+            semantic,
+        )
+    }
+
+    #[instrument(level = "trace")]
+    pub fn from_ddl_script(path: &Path) -> Result<Self, CicdError> {
+        if !path.exists() {
+            return Err(CicdError::MissingChangeSetFile {
+                path: path.to_path_buf(),
+            });
+        }
+        Ok(Self {
+            origin: Some(ChangeSetOrigin::DdlScript {
+                path: path.to_path_buf(),
+            }),
+            objects: vec![],
+            unclassified_files: vec![path.to_path_buf()],
+        })
+    }
+
+    #[instrument(level = "trace")]
+    pub fn from_change_file(path: &Path) -> Result<Self, CicdError> {
+        let semantic = parse_change_file(path)?;
+        Self::from_semantic_changes(
+            Some(ChangeSetOrigin::DdlScript {
+                path: path.to_path_buf(),
+            }),
+            semantic,
+        )
+    }
+
+    #[instrument(level = "trace", skip(semantic))]
+    pub fn from_semantic_changes(
+        origin: Option<ChangeSetOrigin>,
+        semantic: SemanticChangeSet,
+    ) -> Result<Self, CicdError> {
+        let mut interner = SymbolInterner::new();
+        let mut objects = Vec::new();
+        for record in semantic.changes {
+            objects.push(changed_object_from_record(&mut interner, record)?);
+        }
+        objects.sort_by(|a, b| {
+            (
+                a.owner.symbol().get(),
+                a.name.symbol().get(),
+                format!("{:?}", a.kind),
+            )
+                .cmp(&(
+                    b.owner.symbol().get(),
+                    b.name.symbol().get(),
+                    format!("{:?}", b.kind),
+                ))
+        });
+        Ok(Self {
+            origin,
+            objects,
+            unclassified_files: vec![],
+        })
+    }
+}
+
+fn changed_object_from_record(
+    interner: &mut SymbolInterner,
+    record: ChangeRecord,
+) -> Result<ChangedObject, CicdError> {
+    match record {
+        ChangeRecord::Created { object_id } | ChangeRecord::Dropped { object_id } => {
+            changed_object(
+                interner,
+                &object_id,
+                ChangedObjectKind::Unclassified,
+                None,
+                None,
+                vec![UnknownReason::MissingCatalogObject],
+            )
+        }
+        ChangeRecord::Body(BodyChange {
+            object_id,
+            hash_before,
+            hash_after,
+        }) => changed_object(
+            interner,
+            &object_id,
+            ChangedObjectKind::Unclassified,
+            hash_after.map(Hash::new),
+            hash_before.map(Hash::new),
+            vec![UnknownReason::MissingCatalogObject],
+        ),
+        ChangeRecord::Signature(change) => changed_object(
+            interner,
+            &change.object_id,
+            ChangedObjectKind::StandaloneRoutineSignature,
+            None,
+            None,
+            vec![],
+        ),
+        ChangeRecord::Privilege(change) => changed_object(
+            interner,
+            &change.object_id,
+            ChangedObjectKind::GrantOrRevoke,
+            None,
+            None,
+            vec![],
+        ),
+        ChangeRecord::Synonym(change) => changed_object(
+            interner,
+            &change.synonym_id,
+            ChangedObjectKind::SynonymRetargeting,
+            None,
+            None,
+            vec![],
+        ),
+        ChangeRecord::Column(change) => {
+            let kind = match change.change {
+                ColumnChangeDetail::Added => ChangedObjectKind::TableAdditiveDdl,
+                ColumnChangeDetail::Dropped
+                | ColumnChangeDetail::TypeChanged { .. }
+                | ColumnChangeDetail::NullabilityChanged { .. } => {
+                    ChangedObjectKind::TableDestructiveDdl
+                }
+            };
+            changed_object(interner, &change.object_id, kind, None, None, vec![])
+        }
+        ChangeRecord::Type(change) => {
+            let uncertainty = match change.detail {
+                TypeChangeDetail::FinalityChanged | TypeChangeDetail::InstantiabilityChanged => {
+                    vec![UnknownReason::MissingCatalogObject]
+                }
+                TypeChangeDetail::AttributeAdded { .. }
+                | TypeChangeDetail::AttributeRemoved { .. } => {
+                    vec![]
+                }
+            };
+            changed_object(
+                interner,
+                &change.type_id,
+                ChangedObjectKind::TypeEvolution,
+                None,
+                None,
+                uncertainty,
+            )
+        }
+        ChangeRecord::Grant(change) => changed_object(
+            interner,
+            &change.object_id,
+            ChangedObjectKind::GrantOrRevoke,
+            None,
+            None,
+            vec![],
+        ),
+        ChangeRecord::Ddl(change) => changed_object(
+            interner,
+            &change.object_id,
+            kind_from_ddl(&change),
+            None,
+            None,
+            vec![],
+        ),
+    }
+}
+
+fn changed_object(
+    interner: &mut SymbolInterner,
+    object_id: &str,
+    kind: ChangedObjectKind,
+    new_hash: Option<Hash>,
+    previous_hash: Option<Hash>,
+    mut uncertainties: Vec<UnknownReason>,
+) -> Result<ChangedObject, CicdError> {
+    let (owner_text, name_text, unqualified) = split_logical_object_id(object_id);
+    if unqualified && !uncertainties.contains(&UnknownReason::MissingCatalogObject) {
+        uncertainties.push(UnknownReason::MissingCatalogObject);
+    }
+    let owner = intern_schema(interner, &owner_text)?;
+    let name = intern_object(interner, &name_text)?;
+    Ok(ChangedObject {
+        owner,
+        name,
+        kind,
+        new_hash,
+        previous_hash,
+        file_paths: vec![],
+        uncertainties,
+    })
+}
+
+fn split_logical_object_id(object_id: &str) -> (String, String, bool) {
+    let trimmed = object_id.trim().trim_matches('.');
+    let normalized = if trimmed.is_empty() {
+        "unknown"
+    } else {
+        trimmed
+    };
+    if let Some((owner, rest)) = normalized.split_once('.') {
+        if !owner.trim().is_empty() && !rest.trim().is_empty() {
+            return (
+                owner.trim().to_ascii_uppercase(),
+                rest.trim().to_ascii_uppercase(),
+                false,
+            );
+        }
+    }
+    (
+        "UNQUALIFIED".to_string(),
+        normalized.to_ascii_uppercase(),
+        true,
+    )
+}
+
+fn intern_schema(interner: &mut SymbolInterner, value: &str) -> Result<SchemaName, CicdError> {
+    interner
+        .intern_schema_name(value)
+        .ok_or_else(|| CicdError::SymbolInterningFailed {
+            name: value.to_string(),
+        })
+}
+
+fn intern_object(interner: &mut SymbolInterner, value: &str) -> Result<ObjectName, CicdError> {
+    interner
+        .intern(value)
+        .map(ObjectName::from)
+        .ok_or_else(|| CicdError::SymbolInterningFailed {
+            name: value.to_string(),
+        })
+}
+
+fn kind_from_ddl(change: &DdlChange) -> ChangedObjectKind {
+    let object_type = change.object_type.trim().to_ascii_uppercase();
+    let normalized = object_type.replace(' ', "_");
+    match normalized.as_str() {
+        "INDEX" => ChangedObjectKind::IndexChange,
+        "TRIGGER" => ChangedObjectKind::TriggerChange,
+        "SEQUENCE" => ChangedObjectKind::SequenceChange,
+        "VIEW" => ChangedObjectKind::ViewDefinitionChange,
+        "MATERIALIZED_VIEW" => ChangedObjectKind::MaterializedViewRefreshAffecting,
+        "SYNONYM" => ChangedObjectKind::SynonymRetargeting,
+        "TYPE" | "OBJECT_TYPE" => ChangedObjectKind::TypeEvolution,
+        "PACKAGE" | "PACKAGE_SPEC" => ChangedObjectKind::PackageSpec,
+        "PACKAGE_BODY" => ChangedObjectKind::PackageBody,
+        "TABLE" => {
+            let detail = change.detail.to_ascii_uppercase();
+            if detail.contains("DROP") || detail.contains("TRUNCATE") || detail.contains("RENAME") {
+                ChangedObjectKind::TableDestructiveDdl
+            } else {
+                ChangedObjectKind::TableAdditiveDdl
+            }
+        }
+        _ => ChangedObjectKind::OtherKnownKind { object_type },
+    }
+}
+
+fn collect_plsql_paths(
+    root: &Path,
+    current: &Path,
+    out: &mut Vec<String>,
+) -> Result<(), CicdError> {
+    for entry in std::fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_plsql_paths(root, &path, out)?;
+        } else if is_plsql_path(&path) {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(path.as_path())
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push(rel);
+        }
+    }
+    out.sort();
+    Ok(())
+}
+
+fn is_plsql_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "sql" | "pls" | "plsql" | "pkb" | "pks"
+            )
+        })
+}
+
+fn path_to_object_id(path: &str) -> String {
+    let stripped = path.rsplit_once('.').map(|(base, _)| base).unwrap_or(path);
+    stripped.replace('/', ".")
 }
 
 /// How a prediction was computed (plan.md §15.2). The mode determines the
@@ -402,6 +745,10 @@ pub enum CicdError {
     Io(#[from] std::io::Error),
     #[error("serde error while loading changeset: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("change classifier error while loading changeset: {0}")]
+    Classify(#[from] plsql_lineage::ClassifyError),
+    #[error("symbol table overflow while interning `{name}`")]
+    SymbolInterningFailed { name: String },
     #[error("CicdOracleInspector refuses non-read-only SQL (preview: `{preview}`)")]
     DisallowedWriteSqlInInspector { preview: String },
     #[error("oracle backend error: {message}")]
@@ -564,6 +911,165 @@ mod tests {
         let serialized = serde_json::to_string(&changeset).expect("serialize");
         let deserialized: ChangeSet = serde_json::from_str(&serialized).expect("deserialize");
         assert_eq!(changeset, deserialized);
+    }
+
+    fn fixture_root(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        PathBuf::from("target")
+            .join("tmp")
+            .join(format!("plsql-cicd-{label}-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn changeset_from_unified_diff_builds_structural_objects() {
+        let diff = "diff --git a/billing/pkg_api.pkb b/billing/pkg_api.pkb\n--- a/billing/pkg_api.pkb\n+++ b/billing/pkg_api.pkb\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/billing/new_pkg.pks b/billing/new_pkg.pks\n--- /dev/null\n+++ b/billing/new_pkg.pks\n@@ -0,0 +1 @@\n+CREATE PACKAGE new_pkg AS END;\ndiff --git a/billing/old_pkg.sql b/billing/old_pkg.sql\n--- a/billing/old_pkg.sql\n+++ /dev/null\n@@ -1 +0,0 @@\n-DROP ME\ndiff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-a\n+b\n";
+
+        let changeset = ChangeSet::from_unified_diff("main..feature", diff)
+            .expect("fixture diff should classify");
+
+        assert!(matches!(
+            &changeset.origin,
+            Some(ChangeSetOrigin::GitDiff { range }) if range == "main..feature"
+        ));
+        assert_eq!(changeset.objects.len(), 3);
+        assert!(changeset.unclassified_files.is_empty());
+        assert!(
+            changeset
+                .objects
+                .iter()
+                .all(|object| matches!(object.kind, ChangedObjectKind::Unclassified))
+        );
+        let body = changeset
+            .objects
+            .iter()
+            .find(|object| object.previous_hash == Some(Hash::new("diff:-1")))
+            .expect("modified package body should preserve diff hash");
+        assert_eq!(body.new_hash, Some(Hash::new("diff:+1")));
+        assert!(
+            body.uncertainties
+                .contains(&UnknownReason::MissingCatalogObject)
+        );
+    }
+
+    #[test]
+    fn changeset_from_before_after_dirs_uses_lineage_directory_diff() {
+        let root = fixture_root("dirs");
+        let before = root.join("before");
+        let after = root.join("after");
+        std::fs::create_dir_all(before.join("billing")).expect("before dir");
+        std::fs::create_dir_all(after.join("billing")).expect("after dir");
+        std::fs::write(before.join("billing/pkg_api.pkb"), "old").expect("old body");
+        std::fs::write(after.join("billing/pkg_api.pkb"), "new").expect("new body");
+        std::fs::write(before.join("billing/old_pkg.pks"), "old").expect("old spec");
+        std::fs::write(after.join("billing/new_pkg.pks"), "new").expect("new spec");
+        std::fs::write(after.join("billing/readme.md"), "ignored").expect("ignored");
+
+        let changeset =
+            ChangeSet::from_before_after_dirs(&before, &after).expect("dir diff changeset");
+
+        assert!(matches!(
+            &changeset.origin,
+            Some(ChangeSetOrigin::BeforeAfterDirectories { before: b, after: a })
+                if b == &before && a == &after
+        ));
+        assert_eq!(changeset.objects.len(), 3);
+        assert_eq!(
+            changeset
+                .objects
+                .iter()
+                .filter(|object| object.previous_hash.is_some() && object.new_hash.is_some())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn changeset_from_directory_and_script_preserve_origins() {
+        let root = fixture_root("inputs");
+        let staged = root.join("staged");
+        let scripts = root.join("scripts");
+        std::fs::create_dir_all(staged.join("billing")).expect("staged dir");
+        std::fs::create_dir_all(&scripts).expect("scripts dir");
+        std::fs::write(
+            staged.join("billing/pkg_api.pks"),
+            "CREATE PACKAGE p AS END;",
+        )
+        .expect("staged package");
+        std::fs::write(staged.join("billing/readme.md"), "ignored").expect("ignored file");
+        let script = scripts.join("deploy.sql");
+        std::fs::write(&script, "ALTER TABLE billing.customers ADD x NUMBER;").expect("script");
+
+        let directory_changeset = ChangeSet::from_directory(&staged).expect("directory changeset");
+        assert!(matches!(
+            &directory_changeset.origin,
+            Some(ChangeSetOrigin::Directory { path }) if path == &staged
+        ));
+        assert_eq!(directory_changeset.objects.len(), 1);
+
+        let script_changeset = ChangeSet::from_ddl_script(&script).expect("script changeset");
+        assert!(matches!(
+            &script_changeset.origin,
+            Some(ChangeSetOrigin::DdlScript { path }) if path == &script
+        ));
+        assert!(script_changeset.objects.is_empty());
+        assert_eq!(script_changeset.unclassified_files, vec![script]);
+    }
+
+    #[test]
+    fn semantic_changes_map_precise_records_to_cicd_kinds() {
+        let mut semantic = SemanticChangeSet::new();
+        semantic.push(ChangeRecord::Column(plsql_lineage::ColumnChange {
+            object_id: "billing.customers".into(),
+            column_name: "legacy_segment".into(),
+            change: ColumnChangeDetail::Dropped,
+        }));
+        semantic.push(ChangeRecord::Synonym(plsql_lineage::SynonymChange {
+            synonym_id: "billing.syn_customers".into(),
+            target_before: Some("old.customers".into()),
+            target_after: Some("billing.customers".into()),
+        }));
+        semantic.push(ChangeRecord::Grant(plsql_lineage::GrantChange {
+            object_id: "billing.customers".into(),
+            grantee: "app".into(),
+            privilege: "select".into(),
+            action: plsql_lineage::GrantAction::Granted,
+        }));
+        semantic.push(ChangeRecord::Ddl(plsql_lineage::DdlChange {
+            object_id: "billing.ix_customers".into(),
+            object_type: "INDEX".into(),
+            detail: "rebuilt".into(),
+        }));
+
+        let changeset = ChangeSet::from_semantic_changes(None, semantic)
+            .expect("semantic changeset should lower");
+        let kinds = changeset
+            .objects
+            .iter()
+            .map(|object| &object.kind)
+            .collect::<Vec<_>>();
+        assert!(
+            kinds
+                .iter()
+                .any(|kind| matches!(kind, ChangedObjectKind::TableDestructiveDdl))
+        );
+        assert!(
+            kinds
+                .iter()
+                .any(|kind| matches!(kind, ChangedObjectKind::SynonymRetargeting))
+        );
+        assert!(
+            kinds
+                .iter()
+                .any(|kind| matches!(kind, ChangedObjectKind::GrantOrRevoke))
+        );
+        assert!(
+            kinds
+                .iter()
+                .any(|kind| matches!(kind, ChangedObjectKind::IndexChange))
+        );
     }
 
     #[test]
