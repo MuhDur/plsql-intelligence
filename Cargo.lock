@@ -2022,6 +2022,8 @@ dependencies = [
  "getrandom 0.3.4",
  "plsql-catalog",
  "plsql-core",
+ "plsql-depgraph",
+ "plsql-lineage",
  "plsql-output",
  "serde",
  "serde_json",

@@ -7,24 +7,56 @@
 //! emits, and the confidence band — so adding a new Oracle 23ai rule
 //! is one row, not a code re-architecture.
 //!
-//! ## Scope: direct (single-hop) invalidations only
-//!
-//! Every row this module emits is `distance: 1` — the directly changed
-//! object. Transitive blast-radius (walking dependents through a
-//! lineage `DepGraph` via `plsql_lineage::impact()` and attaching each
-//! transitive dependent as a `distance > 1` `PredictedInvalidation`) is
-//! **not yet implemented here**: `plsql-cicd` does not depend on
-//! `plsql-lineage`, and there is no `predict_with_lineage` entry point.
-//! When transitive coverage lands it will be a separate, explicitly
-//! lineage-fed walker; until then callers must treat the gate's
-//! `max_invalidations` as a bound on *direct* invalidations only.
+//! `predict` itself remains the source-only/direct rule engine: every
+//! row it emits is `distance: 1`. `predict_with_lineage` composes that
+//! direct output with one or more `plsql_lineage::impact()` results and
+//! adds downstream dependents from `LineageResult::affected_nodes` as
+//! transitive `PredictedInvalidation` rows (`distance > 1` when the
+//! dependent is downstream-of-downstream).
 
-use plsql_core::{Confidence, ConfidenceLevel, UnknownReason};
+use std::collections::{BTreeMap, BTreeSet};
+
+use plsql_core::{Confidence, ConfidenceLevel, ObjectName, SchemaName, UnknownReason};
+use plsql_lineage::{AffectedNode, Confidence as LineageConfidence, LineageResult, UnknownEdge};
 
 use crate::{
     ChangeSet, ChangedObject, ChangedObjectKind, InvalidationPrediction, InvalidationReason,
-    PredictMode, PredictedInvalidation, UncertaintyRecord,
+    PredictMode, PredictedInvalidation, RecompileItem, UncertaintyRecord,
 };
+
+/// Metadata needed to lower a lineage logical id into the CI/CD prediction
+/// surface.
+///
+/// `plsql-lineage` reports impact in graph-native string IDs
+/// (`schema.object`, `schema.package.member`, ...). `plsql-cicd`
+/// predictions use the workspace's interned [`SchemaName`] /
+/// [`ObjectName`] identifiers instead, so the caller supplies this
+/// metadata from the same symbol table/catalog/depgraph that produced
+/// the lineage result. The predictor never guesses symbols from strings.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LineageObjectMetadata {
+    pub owner: SchemaName,
+    pub name: ObjectName,
+    pub object_type: String,
+    pub force_compile: bool,
+}
+
+impl LineageObjectMetadata {
+    #[must_use]
+    pub fn new(
+        owner: SchemaName,
+        name: ObjectName,
+        object_type: impl Into<String>,
+        force_compile: bool,
+    ) -> Self {
+        Self {
+            owner,
+            name,
+            object_type: object_type.into(),
+            force_compile,
+        }
+    }
+}
 
 /// Run the predict pipeline over `changeset`. `mode` decides the
 /// completeness profile (plan §15.2): `SourceOnly` records a
@@ -77,9 +109,125 @@ pub fn predict(changeset: &ChangeSet, mode: PredictMode) -> InvalidationPredicti
     prediction.completeness.finalize_posture();
 
     // Sort by `(distance, owner, name)` so reports diff cleanly across runs.
+    sort_prediction(&mut prediction);
+    prediction
+}
+
+/// Run direct Oracle invalidation rules and append transitive downstream
+/// dependents from lineage `impact()` results.
+///
+/// Each `LineageResult` should be produced by
+/// [`plsql_lineage::impact`] for one changed object in `changeset`.
+/// The resolver maps the result's graph-native `logical_id` strings
+/// back to the interned names used by the CI/CD prediction structs.
+/// Unresolvable affected nodes are not dropped: they become typed
+/// `UnknownReason::MissingCatalogObject` uncertainty records.
+#[must_use]
+pub fn predict_with_lineage<F>(
+    changeset: &ChangeSet,
+    mode: PredictMode,
+    impact_results: &[LineageResult],
+    mut resolve_object: F,
+) -> InvalidationPrediction
+where
+    F: FnMut(&str) -> Option<LineageObjectMetadata>,
+{
+    let mut prediction = predict(changeset, mode);
+    let direct_keys: BTreeSet<(SchemaName, ObjectName, String)> = prediction
+        .predicted_invalidations
+        .iter()
+        .map(|row| (row.owner, row.name, row.object_type.clone()))
+        .collect();
+
+    let mut lineage_rows: BTreeMap<(SchemaName, ObjectName, String), PredictedInvalidation> =
+        BTreeMap::new();
+    let mut recompile_rows: BTreeMap<(SchemaName, ObjectName, String), RecompileItem> =
+        BTreeMap::new();
+    let mut unresolved_nodes = 0usize;
+
+    for impact in impact_results {
+        let anchor = impact
+            .query
+            .as_ref()
+            .map(|query| query.anchor.as_str())
+            .unwrap_or("<unknown anchor>");
+
+        for node in &impact.affected_nodes {
+            if node.hops == 0 {
+                continue;
+            }
+            let Some(metadata) = resolve_object(node.logical_id.as_str()) else {
+                unresolved_nodes += 1;
+                prediction.uncertainties.push(unresolved_lineage_node(node));
+                continue;
+            };
+
+            let key = (metadata.owner, metadata.name, metadata.object_type.clone());
+            if direct_keys.contains(&key) {
+                continue;
+            }
+
+            let candidate = PredictedInvalidation {
+                owner: metadata.owner,
+                name: metadata.name,
+                object_type: metadata.object_type.clone(),
+                reason: InvalidationReason::Other {
+                    description: format!(
+                        "lineage impact from `{anchor}` reaches `{}`",
+                        node.logical_id
+                    ),
+                },
+                confidence: confidence_from_lineage(node.path_confidence),
+                distance: node.hops,
+            };
+
+            match lineage_rows.get_mut(&key) {
+                Some(existing) if prediction_row_is_stronger(&candidate, existing) => {
+                    *existing = candidate;
+                }
+                Some(_) => {}
+                None => {
+                    lineage_rows.insert(key.clone(), candidate);
+                }
+            }
+
+            recompile_rows.entry(key).or_insert_with(|| RecompileItem {
+                owner: metadata.owner,
+                name: metadata.name,
+                object_type: metadata.object_type,
+                force_compile: metadata.force_compile,
+            });
+        }
+
+        for unknown in &impact.unknown_edges {
+            prediction
+                .uncertainties
+                .push(uncertainty_from_unknown_edge(unknown, &mut resolve_object));
+        }
+    }
+
+    let added_rows = lineage_rows.len();
     prediction
         .predicted_invalidations
-        .sort_by_key(|p| (p.distance, p.owner, p.name));
+        .extend(lineage_rows.into_values());
+    prediction
+        .recompile_order
+        .extend(recompile_rows.into_values());
+    prediction.attributes.insert(
+        String::from("lineage.impact_results"),
+        impact_results.len().to_string(),
+    );
+    prediction.attributes.insert(
+        String::from("lineage.transitive_invalidations"),
+        added_rows.to_string(),
+    );
+    prediction.attributes.insert(
+        String::from("lineage.unresolved_logical_ids"),
+        unresolved_nodes.to_string(),
+    );
+    prediction.completeness.diagnostics_total = prediction.uncertainties.len();
+    prediction.completeness.finalize_posture();
+    sort_prediction(&mut prediction);
     prediction
 }
 
@@ -355,10 +503,105 @@ fn low_confidence(reason: &str) -> Confidence {
     Confidence::new(ConfidenceLevel::Low, Some(String::from(reason)))
 }
 
+fn confidence_from_lineage(confidence: LineageConfidence) -> Confidence {
+    match confidence {
+        LineageConfidence::Exact => Confidence::new(
+            ConfidenceLevel::High,
+            Some(String::from("lineage impact path exact")),
+        ),
+        LineageConfidence::Heuristic => Confidence::new(
+            ConfidenceLevel::Medium,
+            Some(String::from("lineage impact path heuristic")),
+        ),
+        LineageConfidence::Unknown => Confidence::new(
+            ConfidenceLevel::Opaque,
+            Some(String::from("lineage impact path unknown")),
+        ),
+    }
+}
+
+fn prediction_row_is_stronger(
+    candidate: &PredictedInvalidation,
+    existing: &PredictedInvalidation,
+) -> bool {
+    candidate.distance < existing.distance
+        || (candidate.distance == existing.distance
+            && confidence_rank(candidate.confidence.level)
+                > confidence_rank(existing.confidence.level))
+}
+
+fn confidence_rank(level: ConfidenceLevel) -> u8 {
+    match level {
+        ConfidenceLevel::High => 3,
+        ConfidenceLevel::Medium => 2,
+        ConfidenceLevel::Low => 1,
+        ConfidenceLevel::Opaque => 0,
+    }
+}
+
+fn unresolved_lineage_node(node: &AffectedNode) -> UncertaintyRecord {
+    UncertaintyRecord {
+        reason: UnknownReason::MissingCatalogObject,
+        affected_owner: None,
+        affected_name: None,
+        description: format!(
+            "lineage impact node `{}` could not be resolved to CI/CD object metadata",
+            node.logical_id
+        ),
+    }
+}
+
+fn uncertainty_from_unknown_edge<F>(edge: &UnknownEdge, resolve_object: &mut F) -> UncertaintyRecord
+where
+    F: FnMut(&str) -> Option<LineageObjectMetadata>,
+{
+    let resolved = resolve_object(edge.source.as_str());
+    UncertaintyRecord {
+        reason: unknown_reason_from_lineage(edge.unknown_reason.as_str()),
+        affected_owner: resolved.as_ref().map(|meta| meta.owner),
+        affected_name: resolved.as_ref().map(|meta| meta.name),
+        description: match &edge.detail {
+            Some(detail) => format!(
+                "lineage edge from `{}` is unresolved: {} ({detail})",
+                edge.source, edge.unknown_reason
+            ),
+            None => format!(
+                "lineage edge from `{}` is unresolved: {}",
+                edge.source, edge.unknown_reason
+            ),
+        },
+    }
+}
+
+fn unknown_reason_from_lineage(reason: &str) -> UnknownReason {
+    match reason {
+        "DynamicSqlOpaque" => UnknownReason::DynamicSqlOpaque,
+        "DbLinkRemoteObject" => UnknownReason::DbLinkRemoteObject,
+        "WrappedSource" => UnknownReason::WrappedSource,
+        "MissingPackageBody" => UnknownReason::MissingPackageBody,
+        _ => UnknownReason::MissingCatalogObject,
+    }
+}
+
+fn sort_prediction(prediction: &mut InvalidationPrediction) {
+    prediction
+        .predicted_invalidations
+        .sort_by_key(|p| (p.distance, p.owner, p.name, p.object_type.clone()));
+    prediction
+        .recompile_order
+        .sort_by_key(|r| (r.owner, r.name, r.object_type.clone()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plsql_core::{FileId, Position, Span, SymbolInterner};
     use plsql_core::{ObjectName, SchemaName, SymbolId};
+    use plsql_depgraph::{
+        DepGraph, Edge, EdgeId, EdgeKind, LogicalObjectId, Node, NodeId, NodeIdentityKind,
+        ObjectRevisionId, Provenance, QualifiedName, ResolutionStrategy,
+    };
+    use plsql_lineage::impact;
 
     fn billing_owner() -> SchemaName {
         SchemaName::new(SymbolId::new(1))
@@ -377,6 +620,146 @@ mod tests {
             file_paths: vec![],
             uncertainties: vec![],
         }
+    }
+
+    fn test_span() -> Span {
+        Span::new(
+            FileId::new(1),
+            Position::new(1, 1, 0),
+            Position::new(1, 1, 0),
+        )
+    }
+
+    fn test_provenance() -> Provenance {
+        Provenance::new(
+            FileId::new(1),
+            test_span(),
+            ResolutionStrategy::CatalogLookup,
+        )
+    }
+
+    fn graph_edge(id: u64, from: u64, to: u64) -> Edge {
+        Edge::new(
+            EdgeId::new(id),
+            NodeId::new(from),
+            NodeId::new(to),
+            EdgeKind::Reads,
+            Confidence::new(ConfidenceLevel::High, None),
+        )
+    }
+
+    fn object_type_for_kind(kind: NodeIdentityKind) -> &'static str {
+        match kind {
+            NodeIdentityKind::PackageSpecification
+            | NodeIdentityKind::PackageBody
+            | NodeIdentityKind::PackageProcedure
+            | NodeIdentityKind::PackageFunction => "PACKAGE",
+            NodeIdentityKind::StandaloneProcedure => "PROCEDURE",
+            NodeIdentityKind::StandaloneFunction => "FUNCTION",
+            NodeIdentityKind::Table => "TABLE",
+            NodeIdentityKind::View | NodeIdentityKind::EditioningView => "VIEW",
+            NodeIdentityKind::MaterializedView => "MATERIALIZED_VIEW",
+            NodeIdentityKind::Trigger => "TRIGGER",
+            NodeIdentityKind::Type
+            | NodeIdentityKind::TypeMethod
+            | NodeIdentityKind::TypeAttribute => "TYPE",
+            NodeIdentityKind::Synonym => "SYNONYM",
+            NodeIdentityKind::SchedulerJob => "JOB",
+            _ => "OBJECT",
+        }
+    }
+
+    fn insert_fixture_node(
+        graph: &mut DepGraph,
+        metadata: &mut BTreeMap<String, LineageObjectMetadata>,
+        interner: &mut SymbolInterner,
+        id: u64,
+        schema: SchemaName,
+        object: &str,
+        kind: NodeIdentityKind,
+    ) -> ObjectName {
+        let object_name = ObjectName::from(interner.intern(object).expect("object name interns"));
+        let logical_id = format!("BILLING.{object}");
+        graph.insert_node(Node::new(
+            NodeId::new(id),
+            LogicalObjectId::new(logical_id.clone()),
+            ObjectRevisionId::new(format!("sha256:{logical_id}")),
+            QualifiedName::new(Some(schema), object_name),
+            kind,
+        ));
+        metadata.insert(
+            logical_id,
+            LineageObjectMetadata::new(schema, object_name, object_type_for_kind(kind), true),
+        );
+        object_name
+    }
+
+    fn lineage_fixture() -> (DepGraph, BTreeMap<String, LineageObjectMetadata>, ChangeSet) {
+        let mut interner = SymbolInterner::new();
+        let schema = interner
+            .intern_schema_name("BILLING")
+            .expect("schema name interns");
+        let mut graph = DepGraph::new();
+        let mut metadata = BTreeMap::new();
+
+        let customers = insert_fixture_node(
+            &mut graph,
+            &mut metadata,
+            &mut interner,
+            1,
+            schema,
+            "CUSTOMERS",
+            NodeIdentityKind::Table,
+        );
+        insert_fixture_node(
+            &mut graph,
+            &mut metadata,
+            &mut interner,
+            2,
+            schema,
+            "REPORT_PKG",
+            NodeIdentityKind::PackageBody,
+        );
+        insert_fixture_node(
+            &mut graph,
+            &mut metadata,
+            &mut interner,
+            3,
+            schema,
+            "REPORT_VIEW",
+            NodeIdentityKind::View,
+        );
+        insert_fixture_node(
+            &mut graph,
+            &mut metadata,
+            &mut interner,
+            4,
+            schema,
+            "SUMMARY_JOB",
+            NodeIdentityKind::SchedulerJob,
+        );
+
+        // Engine convention: from=dependent -> to=dependency.
+        // Impact(CUSTOMERS) therefore walks incoming edges to
+        // REPORT_PKG -> REPORT_VIEW -> SUMMARY_JOB.
+        graph.insert_edge(graph_edge(1, 2, 1), test_provenance(), None);
+        graph.insert_edge(graph_edge(2, 3, 2), test_provenance(), None);
+        graph.insert_edge(graph_edge(3, 4, 3), test_provenance(), None);
+
+        let changeset = ChangeSet {
+            objects: vec![ChangedObject {
+                owner: schema,
+                name: customers,
+                kind: ChangedObjectKind::TableDestructiveDdl,
+                new_hash: None,
+                previous_hash: None,
+                file_paths: vec![],
+                uncertainties: vec![],
+            }],
+            ..ChangeSet::empty()
+        };
+
+        (graph, metadata, changeset)
     }
 
     #[test]
@@ -586,9 +969,77 @@ mod tests {
             assert_eq!(
                 row.distance, 1,
                 "predict only emits direct (single-hop) invalidations; \
-                 transitive distance>1 is not yet implemented (oracle-qm3q.17): {row:?}"
+                 transitive rows belong in predict_with_lineage (oracle-qm3q.17): {row:?}"
             );
         }
+    }
+
+    #[test]
+    fn predict_with_lineage_adds_full_transitive_impact_closure() {
+        let (graph, metadata, changeset) = lineage_fixture();
+        let impact_result = impact(&graph, &NodeId::new(1), None);
+        assert_eq!(impact_result.affected_nodes.len(), 3);
+
+        let prediction = predict_with_lineage(
+            &changeset,
+            PredictMode::CatalogAware,
+            &[impact_result],
+            |logical_id| metadata.get(logical_id).cloned(),
+        );
+
+        let mut distances = BTreeMap::new();
+        for (logical_id, meta) in &metadata {
+            if logical_id == "BILLING.CUSTOMERS" {
+                continue;
+            }
+            let row = prediction
+                .predicted_invalidations
+                .iter()
+                .find(|row| row.owner == meta.owner && row.name == meta.name)
+                .expect("transitive impact row emitted");
+            distances.insert(logical_id.as_str(), row.distance);
+        }
+
+        assert_eq!(distances.get("BILLING.REPORT_PKG"), Some(&1));
+        assert_eq!(distances.get("BILLING.REPORT_VIEW"), Some(&2));
+        assert_eq!(distances.get("BILLING.SUMMARY_JOB"), Some(&3));
+        assert_eq!(
+            prediction
+                .attributes
+                .get("lineage.transitive_invalidations"),
+            Some(&String::from("3"))
+        );
+        assert_eq!(prediction.recompile_order.len(), 3);
+    }
+
+    #[test]
+    fn predict_with_lineage_records_unresolved_impact_nodes_as_uncertainty() {
+        let impact_result = LineageResult {
+            affected_nodes: vec![AffectedNode {
+                logical_id: String::from("BILLING.MISSING_DEPENDENT"),
+                hops: 1,
+                path_confidence: LineageConfidence::Exact,
+            }],
+            ..LineageResult::default()
+        };
+
+        let prediction = predict_with_lineage(
+            &ChangeSet::empty(),
+            PredictMode::CatalogAware,
+            &[impact_result],
+            |_| None,
+        );
+
+        assert!(prediction.predicted_invalidations.is_empty());
+        assert_eq!(
+            prediction.attributes.get("lineage.unresolved_logical_ids"),
+            Some(&String::from("1"))
+        );
+        assert!(prediction.uncertainties.iter().any(|u| matches!(
+            u.reason,
+            UnknownReason::MissingCatalogObject
+        )
+            && u.description.contains("BILLING.MISSING_DEPENDENT")));
     }
 
     #[test]

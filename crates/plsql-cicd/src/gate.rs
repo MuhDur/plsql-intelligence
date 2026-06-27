@@ -328,12 +328,11 @@ fn build_pr_comment_body(decision: &GateDecision, headline: &str) -> String {
 /// `GateFailure` per rule (we collect them all so the operator sees
 /// every reason in one CI run rather than fixing-then-re-running).
 ///
-/// Scope note (oracle-qm3q.7 / .17): `max_invalidations` counts the
-/// rows in `prediction.predicted_invalidations`. Today `predict`
-/// emits only direct (`distance == 1`) invalidations — there is no
-/// transitive lineage walk — so this cap bounds *direct* invalidations
-/// only. If transitive (`distance > 1`) rows are introduced later they
-/// will be counted by the same length check.
+/// Scope note (oracle-qm3q.7 / .17): `max_invalidations` counts every
+/// row in `prediction.predicted_invalidations`. Plain `predict` emits
+/// direct (`distance == 1`) invalidations only; `predict_with_lineage`
+/// may include transitive (`distance > 1`) impact rows, and those are
+/// counted by the same length check.
 #[must_use]
 pub fn run_gate(prediction: &InvalidationPrediction, policy: &GatePolicy) -> GateDecision {
     let mut failures: Vec<GateFailure> = Vec::new();
@@ -677,9 +676,12 @@ mod tests {
         // The exact stale name from the pre-fix docstring.
         let toml = "blocking_unknown_reasons = [\"OpaqueDynamicSql\"]\n";
         let err = parse_policy(toml).unwrap_err();
-        let GateError::Parse(msg) = err else {
-            panic!("expected GateError::Parse, got {err:?}");
+        let parse_msg = match err {
+            GateError::Parse(msg) => Some(msg),
+            GateError::Io(_) => None,
         };
+        assert!(parse_msg.is_some(), "expected GateError::Parse");
+        let msg = parse_msg.unwrap_or_default();
         assert!(
             msg.contains("OpaqueDynamicSql"),
             "error should name the offending entry: {msg}"
@@ -705,8 +707,11 @@ mod tests {
     fn parse_policy_accepts_every_canonical_reason_name() {
         for name in ALL_REASON_NAMES {
             let toml = format!("blocking_unknown_reasons = [{name:?}]\n");
-            let policy = parse_policy(&toml)
-                .unwrap_or_else(|e| panic!("canonical reason {name:?} must parse: {e}"));
+            let policy = parse_policy(&toml).ok();
+            assert!(policy.is_some(), "canonical reason {name:?} must parse");
+            let Some(policy) = policy else {
+                continue;
+            };
             assert_eq!(policy.blocking_unknown_reasons, vec![(*name).to_string()]);
         }
     }

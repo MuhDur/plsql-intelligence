@@ -22,12 +22,16 @@ asupersync = "=0.3.4"
 getrandom = "0.3"
 plsql-catalog = { path = "../plsql-catalog" }
 plsql-core = { path = "../plsql-core" }
+plsql-lineage = { path = "../plsql-lineage" }
 plsql-output = { path = "../plsql-output" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 toml = "1.1"
 tracing.workspace = true
+
+[dev-dependencies]
+plsql-depgraph = { path = "../plsql-depgraph" }
 
 [lints]
 workspace = true

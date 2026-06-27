@@ -43,7 +43,7 @@ pub use post_pr_comment::{
     PrIntegrationDoctorReport, PrPosture, build_request as build_post_pr_comment_request,
     find_existing_comment, pr_integration_doctor,
 };
-pub use predict::predict;
+pub use predict::{LineageObjectMetadata, predict, predict_with_lineage};
 pub use verify::{
     ScratchSchemaGuard, StatementOutcome, VerifyChangeset, VerifyError, VerifyOptions,
     VerifyReport, VerifyReportRow, VerifyStatement, create_scratch_schema, is_scratch_schema,
@@ -464,11 +464,11 @@ mod tests {
         let kind = ChangedObjectKind::OtherKnownKind {
             object_type: String::from("DIRECTORY"),
         };
-        if let ChangedObjectKind::OtherKnownKind { object_type } = &kind {
-            assert_eq!(object_type, "DIRECTORY");
-        } else {
-            panic!("expected OtherKnownKind");
-        }
+        let object_type = match &kind {
+            ChangedObjectKind::OtherKnownKind { object_type } => Some(object_type.as_str()),
+            _ => None,
+        };
+        assert_eq!(object_type, Some("DIRECTORY"));
     }
 
     #[test]
