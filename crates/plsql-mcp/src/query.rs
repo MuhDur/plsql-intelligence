@@ -5,15 +5,20 @@
 //! injection markers per the K18 sanitization policy before the response
 //! is handed back to the agent.
 //!
-//! The tool is read-only by construction — it rejects any non-SELECT/WITH
-//! SQL using its own `is_read_only_sql` predicate (mirrors the CICD
-//! inspector's so the MCP crate doesn't take a dep on plsql-cicd).
+//! The tool is read-only by construction: it accepts only statements the
+//! published `oraclemcp-guard` classifier clears to `Safe`, then keeps the
+//! local lexical screen as defense in depth so this crate never becomes looser
+//! than its pre-classifier behavior.
 
 use oraclemcp_error::{ErrorClass, ErrorEnvelope, enrich_oracle_error};
+use oraclemcp_guard::{Classifier, DangerLevel};
 use plsql_catalog::{CatalogError, OracleBind, OracleConnection, OracleRow};
 use plsql_core::UnknownReason;
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 use thiserror::Error;
+
+static READ_ONLY_CLASSIFIER: LazyLock<Classifier> = LazyLock::new(Classifier::default);
 
 /// One value cell in a [`QueryRow`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -443,6 +448,12 @@ fn truncate(value: String, limit: Option<usize>) -> (String, bool) {
 
 #[must_use]
 fn is_read_only_sql(sql: &str) -> bool {
+    let decision = READ_ONLY_CLASSIFIER.classify(sql);
+    decision.danger == DangerLevel::Safe && legacy_read_only_sql(sql)
+}
+
+#[must_use]
+fn legacy_read_only_sql(sql: &str) -> bool {
     // Oracle treats both `/* … */` block comments and `-- … \n` line
     // comments as whitespace-equivalent token separators, including before
     // the leading keyword. `strip_sql_comments` neutralises *both* forms to a
@@ -879,8 +890,41 @@ mod tests {
         assert!(is_read_only_sql(
             "WITH cte AS (SELECT 1 FROM DUAL) SELECT * FROM cte"
         ));
+        assert!(is_read_only_sql(
+            "SELECT replace(name, 'a', 'b') FROM employees"
+        ));
         assert!(!is_read_only_sql("DELETE FROM logs"));
         assert!(!is_read_only_sql("BEGIN proc; END;"));
+    }
+
+    #[test]
+    fn read_only_predicate_uses_oraclemcp_guard_0_4_udf_baseline() {
+        // B.5 rebaseline: oraclemcp-guard 0.4.0 classifies schema-qualified
+        // routine calls as Guarded under the default UnknownOracle, including
+        // names that collide with SQL keywords or builtins. The old lexical
+        // SELECT/WITH predicate would have accepted them; the MCP query gate
+        // must now reject them rather than relaxing a denial.
+        for sql in [
+            "SELECT billing.purge_old_rows() FROM dual",
+            "SELECT billing.purge() FROM dual",
+            "SELECT app.merge(x) FROM dual",
+            "SELECT billing.replace(x) FROM dual",
+        ] {
+            let decision = READ_ONLY_CLASSIFIER.classify(sql);
+            assert_eq!(
+                decision.danger,
+                DangerLevel::Guarded,
+                "0.4.0 guard baseline shifted this query to Guarded: {sql:?}"
+            );
+            assert!(
+                legacy_read_only_sql(sql),
+                "the local lexical screen documents the old fail-open baseline: {sql:?}"
+            );
+            assert!(
+                !is_read_only_sql(sql),
+                "query must reject Guarded routine calls: {sql:?}"
+            );
+        }
     }
 
     #[test]
