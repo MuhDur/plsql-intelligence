@@ -23,12 +23,13 @@ pub struct OraclemcpCatalogConnection<C> {
 }
 
 impl<C> OraclemcpCatalogConnection<C> {
-    /// Wrap an existing upstream connection with default serialization caps.
+    /// Wrap an existing upstream connection with catalog-extraction
+    /// serialization options.
     #[must_use]
     pub fn new(inner: C) -> Self {
         Self {
             inner,
-            serialize_options: SerializeOptions::default(),
+            serialize_options: catalog_extraction_serialize_options(),
         }
     }
 
@@ -51,6 +52,22 @@ impl<C> OraclemcpCatalogConnection<C> {
     #[must_use]
     pub fn serialize_options(&self) -> &SerializeOptions {
         &self.serialize_options
+    }
+}
+
+/// Serialization options for catalog extraction queries.
+///
+/// `oraclemcp-db`'s defaults cap CLOBs and BLOBs for agent-facing query
+/// responses. Catalog extraction consumes `DBMS_METADATA.GET_DDL`,
+/// `ALL_SOURCE`, and similar metadata text where truncation corrupts the
+/// resulting snapshot, so the MCP-side catalog adapter asks upstream to read
+/// complete LOB locator values.
+#[must_use]
+pub fn catalog_extraction_serialize_options() -> SerializeOptions {
+    SerializeOptions {
+        max_lob_chars: usize::MAX,
+        max_blob_bytes: usize::MAX,
+        ..SerializeOptions::default()
     }
 }
 
@@ -196,9 +213,29 @@ fn map_db_error(err: oraclemcp_db::DbError) -> CatalogError {
 mod tests {
     use super::*;
     use asupersync::runtime::RuntimeBuilder;
+    use std::sync::Mutex;
 
-    #[derive(Debug)]
-    struct FakeDbConnection;
+    #[derive(Debug, Default)]
+    struct FakeDbConnection {
+        observed_serialize_options: Mutex<Option<SerializeOptions>>,
+    }
+
+    impl FakeDbConnection {
+        fn record_serialize_options(&self, serialize_options: &SerializeOptions) {
+            let mut observed = self
+                .observed_serialize_options
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *observed = Some(*serialize_options);
+        }
+
+        fn observed_serialize_options(&self) -> Option<SerializeOptions> {
+            *self
+                .observed_serialize_options
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+    }
 
     fn run_async<F, T>(f: F) -> T
     where
@@ -270,6 +307,17 @@ mod tests {
             }])
         }
 
+        async fn query_rows_with_serialize_options(
+            &self,
+            cx: &Cx,
+            sql: &str,
+            binds: &[oraclemcp_db::OracleBind],
+            serialize_opts: &SerializeOptions,
+        ) -> Result<Vec<oraclemcp_db::OracleRow>, oraclemcp_db::DbError> {
+            self.record_serialize_options(serialize_opts);
+            self.query_rows(cx, sql, binds).await
+        }
+
         async fn execute(
             &self,
             _cx: &Cx,
@@ -292,7 +340,7 @@ mod tests {
     fn adapter_maps_oraclemcp_rows_to_catalog_rows() {
         run_async(async {
             let cx = Cx::current().expect("test runtime installs Cx");
-            let adapter = OraclemcpCatalogConnection::new(FakeDbConnection);
+            let adapter = OraclemcpCatalogConnection::new(FakeDbConnection::default());
             let rows = adapter
                 .query_rows(
                     &cx,
@@ -307,7 +355,7 @@ mod tests {
                 .expect("query rows");
 
             assert_eq!(rows.len(), 1);
-            let row = &rows[0];
+            let row = rows.first().expect("adapter should return one row");
             assert_eq!(row.text("OWNER"), Some("BILLING"));
             assert_eq!(row.text("owner"), Some("BILLING"));
             assert_eq!(row.parse_u64("object_count").expect("count"), 42);
@@ -315,6 +363,14 @@ mod tests {
                 row.cell("source_text").expect("source cell").oracle_type,
                 "CLOB"
             );
+
+            let observed_options = adapter
+                .inner()
+                .observed_serialize_options()
+                .expect("adapter should pass serialize options to upstream query");
+            assert_eq!(observed_options.max_lob_chars, usize::MAX);
+            assert_eq!(observed_options.max_blob_bytes, usize::MAX);
+            assert!(observed_options.max_text_chars.is_none());
         });
     }
 
@@ -322,7 +378,7 @@ mod tests {
     fn adapter_maps_connection_metadata_to_catalog_shape() {
         run_async(async {
             let cx = Cx::current().expect("test runtime installs Cx");
-            let adapter = OraclemcpCatalogConnection::new(FakeDbConnection);
+            let adapter = OraclemcpCatalogConnection::new(FakeDbConnection::default());
             let info = adapter.describe(&cx).await.expect("describe");
 
             assert_eq!(info.backend, CatalogBackend::OracleRs);
@@ -336,13 +392,60 @@ mod tests {
     fn adapter_rejects_u64_binds_that_oraclemcp_db_cannot_represent() {
         run_async(async {
             let cx = Cx::current().expect("test runtime installs Cx");
-            let adapter = OraclemcpCatalogConnection::new(FakeDbConnection);
+            let adapter = OraclemcpCatalogConnection::new(FakeDbConnection::default());
             let err = adapter
                 .query_rows(&cx, "select :1 from dual", &[CatalogBind::U64(u64::MAX)])
                 .await
                 .expect_err("out-of-range u64 bind should be rejected");
 
             assert!(err.to_string().contains("u64 <= i64::MAX"));
+        });
+    }
+
+    #[test]
+    fn catalog_extraction_options_remove_oraclemcp_default_lob_caps() {
+        let upstream_defaults = SerializeOptions::default();
+        let catalog_options = catalog_extraction_serialize_options();
+
+        assert_eq!(catalog_options.max_lob_chars, usize::MAX);
+        assert_eq!(catalog_options.max_blob_bytes, usize::MAX);
+        assert!(catalog_options.max_lob_chars > upstream_defaults.max_lob_chars);
+        assert!(catalog_options.max_blob_bytes > upstream_defaults.max_blob_bytes);
+    }
+
+    #[test]
+    fn explicit_serialize_options_override_catalog_extraction_defaults() {
+        run_async(async {
+            let cx = Cx::current().expect("test runtime installs Cx");
+            let explicit_options = SerializeOptions {
+                max_lob_chars: 8,
+                max_blob_bytes: 16,
+                ..SerializeOptions::default()
+            };
+            let adapter = OraclemcpCatalogConnection::with_serialize_options(
+                FakeDbConnection::default(),
+                explicit_options,
+            );
+
+            let _ = adapter
+                .query_rows(
+                    &cx,
+                    "select :1, :2, :3 from dual",
+                    &[
+                        CatalogBind::from("BILLING"),
+                        CatalogBind::from(42_u64),
+                        CatalogBind::from(true),
+                    ],
+                )
+                .await
+                .expect("query rows");
+
+            let observed_options = adapter
+                .inner()
+                .observed_serialize_options()
+                .expect("adapter should pass explicit serialize options upstream");
+            assert_eq!(observed_options.max_lob_chars, 8);
+            assert_eq!(observed_options.max_blob_bytes, 16);
         });
     }
 }
