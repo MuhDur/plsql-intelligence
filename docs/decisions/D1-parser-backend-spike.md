@@ -1,7 +1,10 @@
 # D1: Parser Backend Selection — antlr4rust Codegen Spike
 
-> **Status:** SPIKE COMPLETE — 2026-05-13
-> **Decision:** [OPEN] — awaiting backend tournament (PLSQL-PARSE-000C)
+> **Status:** SUPERSEDED — 2026-05-18 by [`D2-backend-final.md`](D2-backend-final.md)
+> and by the 2026-06-28 Java-worker retirement.
+> **Decision:** Historical spike only. The operative backend is
+> `plsql-parser-antlr` (`antlr4rust`), with any future replacement requiring
+> a fresh decision and bead set.
 > **Spike author:** hermes_1 (mimo)
 > **Depends on:** PLSQL-PARSE-000 (ParseBackend trait)
 
@@ -117,9 +120,9 @@ issue. May resolve once the other blockers are fixed.
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
-| antlr4rust abandoned/unmaintained | Medium | High | Backend abstraction (R20) isolates this risk. Java ANTLR worker is the fallback. |
+| antlr4rust abandoned/unmaintained | Medium | High | Backend abstraction (R20) isolates this risk. A replacement backend requires a fresh decision and bead set. |
 | Grammar patches needed for Rust | High | Medium | All 3 blockers have known workarounds. Grammar forking is acceptable. |
-| Performance below expectations | Low | Medium | Benchmark during backend tournament (PARSE-000C). Java ANTLR is the perf fallback. |
+| Performance below expectations | Low | Medium | Benchmark under the current parser/perf beads; do not retain a hidden Java fallback. |
 | caseInsensitive never supported | Medium | Low | Post-lexer normalization pass is straightforward for PL/SQL. |
 
 ## 6. Recommendation
@@ -133,12 +136,11 @@ cause issues.
 1. PLSQL-PARSE-001: Vendor patched .g4 files into the repo (rename `fn`
    label, replace `this.` with `recog.` in embedded actions)
 2. PLSQL-PARSE-002: Author `build.rs` that runs codegen at build time
-3. PLSQL-PARSE-000B: Implement Java ANTLR worker as production fallback
-4. PLSQL-PARSE-000C: Backend tournament with explicit go/no-go criteria
+3. PLSQL-PARSE-000C / D2: Backend decision with explicit go/no-go criteria
 
-The backend tournament (PARSE-000C) is where the final go/no-go decision
-is made. This spike confirms that antlr4rust is worth entering into the
-tournament.
+The backend tournament (PARSE-000C) and D2 made the final go/no-go decision.
+This spike remains only as the historical record for why `antlr4rust` was
+worth evaluating.
 
 ## 7. Files produced
 

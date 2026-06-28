@@ -50,15 +50,20 @@ The user mandates the *best* choice on honest evidence. D1 said antlr4rust but i
 
 - [ ] Run `rustup run nightly cargo build -p plsql-parser-antlr --features antlr-codegen 2>&1 | tee /tmp/antlr4rust_errs.txt`; classify the 14 errors (generated-code bug class: missing trait impls / lifetime / `antlr-rust` beta API drift / grammar-action Rust syntax). Output: `docs/decisions/_spike/antlr4rust-errors.md` with the error taxonomy + an honest tractability verdict (bounded patch set vs. fundamental beta limitation), citing specific errors.
 
-### Task 0.2: Characterize the java-antlr path
+### Task 0.2: Retired java-antlr path
 
-- [ ] Build the ANTLR Java worker jar from `crates/plsql-parser-antlr/grammars/PlSql{Lexer,Parser}.g4` using the ANTLR tool + Java 17 (PARSE-000C). Confirm it parses 20 sampled private estate files (incl. an APEX `f*.sql`, a `.trg`, a `.pkg`) without error, measuring parse time. Output: `docs/decisions/_spike/java-antlr-evidence.md` with build steps, sample results, latency.
+This branch was retired on 2026-06-28. Do not build, preserve, or revive a
+Java worker jar from this plan; `docs/decisions/D2-backend-final.md` is the
+operative decision, and any future Java backend would require a fresh decision
+record and bead set.
 
 ### Task 0.3: Decide & record (D2)
 
-- [ ] Write `docs/decisions/D2-backend-final.md`: the chosen backend, with the evidence from 0.1/0.2 (which one can realistically reach the §0 correctness criterion over the private estate), the risk assessment, and the explicit re-open of D1. Update `D1-backend-tournament-result.md` with a "superseded by D2" banner. Optionally triangulate the decision via `/multi-model-triangulation` (high-stakes, the skill's intended use).
+- [ ] Write `docs/decisions/D2-backend-final.md`: the chosen backend, with the evidence from 0.1, the risk assessment, and the explicit re-open of D1. Update `D1-backend-tournament-result.md` with a "superseded by D2" banner. Optionally triangulate the decision via `/multi-model-triangulation` (high-stakes, the skill's intended use).
 
-> Heuristic, to be confirmed by evidence not assumed: the Java ANTLR reference target handles the 10K-line grammars-v4 Oracle grammar reliably (mainstream, battle-tested) where `antlr-rust 0.3.0-beta` (effectively unmaintained) is documented to struggle at that grammar size. If 0.1 shows the 14 errors are a small bounded patch, antlr4rust (pure-Rust, no JVM) is preferable. Pick on evidence.
+> Superseded heuristic: the old plan considered a Java ANTLR reference target
+> as a possible fallback. D2 and the 2026-06-28 retirement resolved this in
+> favor of the in-process `antlr4rust` backend.
 
 ---
 
