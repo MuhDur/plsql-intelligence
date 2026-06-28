@@ -516,7 +516,7 @@ fn enforce_oauth_scope_ceiling(
     ))
 }
 
-fn required_operating_level(tool: &str) -> Option<OperatingLevel> {
+pub(crate) fn required_operating_level(tool: &str) -> Option<OperatingLevel> {
     match tool {
         "enable_writes" => Some(OperatingLevel::ReadWrite),
         "set_safety_profile" | "patch_package" | "patch_view" | "create_or_replace"
@@ -525,7 +525,7 @@ fn required_operating_level(tool: &str) -> Option<OperatingLevel> {
     }
 }
 
-fn safety_profile_ceiling(profile: crate::SafetyProfile) -> OperatingLevel {
+pub(crate) fn safety_profile_ceiling(profile: crate::SafetyProfile) -> OperatingLevel {
     match profile {
         crate::SafetyProfile::StaticOnly | crate::SafetyProfile::InspectOnly => {
             OperatingLevel::ReadOnly
@@ -534,6 +534,28 @@ fn safety_profile_ceiling(profile: crate::SafetyProfile) -> OperatingLevel {
             OperatingLevel::Ddl
         }
     }
+}
+
+pub(crate) fn active_safety_profile(live_runtime: &LiveDbRuntime) -> crate::SafetyProfile {
+    live_runtime
+        .active_session()
+        .map(|session| session.safety().profile)
+        .unwrap_or_else(|_| live_runtime.default_safety_profile())
+}
+
+pub(crate) fn effective_oauth_scope_ceiling(
+    context: DispatchContext<'_>,
+    live_runtime: &LiveDbRuntime,
+) -> Option<OperatingLevel> {
+    let grant = context.scope_grant()?;
+    let max_level = live_runtime
+        .active_session()
+        .map(|session| safety_profile_ceiling(session.safety().profile))
+        .unwrap_or(OperatingLevel::Admin);
+    let mut scoped = SessionLevelState::new(max_level, false);
+    let scopes = grant.0.iter().map(String::as_str).collect::<Vec<_>>();
+    oraclemcp_auth::apply_oauth_scopes(&mut scoped, &scopes);
+    Some(scoped.effective_ceiling())
 }
 
 async fn run_connect(
@@ -1616,7 +1638,7 @@ fn db_connection_error_envelope(err: oraclemcp_db::DbError, tool: &str) -> Error
 
 fn db_error_envelope(err: oraclemcp_db::DbError, tool: &str) -> ErrorEnvelope {
     let envelope = err.into_envelope();
-    if envelope.error_class == ErrorClass::Timeout {
+    if matches!(envelope.error_class, ErrorClass::Timeout) {
         return envelope.with_next_step(format!(
             "The `{tool}` call exhausted its request budget or was cancelled; retry with a fresh \
              request budget or narrow the query."

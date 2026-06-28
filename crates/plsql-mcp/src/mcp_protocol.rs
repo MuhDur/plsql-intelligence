@@ -41,6 +41,7 @@ use thiserror::Error;
 use crate::live_runtime::LiveDbRuntime;
 use crate::safety::SafetyProfile;
 use crate::tools::{ToolDescriptor, ToolRegistry, ToolTier};
+use oraclemcp_guard::OperatingLevel;
 
 /// MCP protocol version this implementation negotiates. Clients
 /// that advertise a higher version receive a `version_mismatch`
@@ -273,11 +274,20 @@ pub fn handle_request(req: &JsonRpcRequest, registry: &ToolRegistry) -> Option<J
 
     match req.method.as_str() {
         "initialize" => Some(handle_initialize(id, req.params.as_ref())),
-        "tools/list" => Some(handle_tools_list(id, registry)),
+        "tools/list" => Some(handle_tools_list(
+            id,
+            registry,
+            ToolSurfaceContext::default(),
+        )),
         "tools/call" => Some(tools_call_requires_dispatch_context_response(id)),
         "resources/list" => Some(handle_resources_list(id)),
         "resources/templates/list" => Some(handle_resource_templates_list(id)),
-        "resources/read" => Some(handle_resource_read(id, req.params.as_ref(), registry)),
+        "resources/read" => Some(handle_resource_read(
+            id,
+            req.params.as_ref(),
+            registry,
+            ToolSurfaceContext::default(),
+        )),
         "ping" => Some(JsonRpcResponse::ok(id, Value::Object(Default::default()))),
         other => Some(JsonRpcResponse::err(
             id,
@@ -313,13 +323,31 @@ pub async fn handle_request_with_context(
 
     match req.method.as_str() {
         "initialize" => Some(handle_initialize(id, req.params.as_ref())),
-        "tools/list" => Some(handle_tools_list(id, registry)),
+        "tools/list" => Some(handle_tools_list(
+            id,
+            registry,
+            ToolSurfaceContext::from_live_runtime(live_runtime, context),
+        )),
         "tools/call" => Some(
-            handle_tools_call(id, req.params.as_ref(), registry, live_runtime, cx, context).await,
+            handle_tools_call(
+                id,
+                req.params.as_ref(),
+                registry,
+                live_runtime,
+                cx,
+                context,
+                ToolSurfaceContext::from_live_runtime(live_runtime, context),
+            )
+            .await,
         ),
         "resources/list" => Some(handle_resources_list(id)),
         "resources/templates/list" => Some(handle_resource_templates_list(id)),
-        "resources/read" => Some(handle_resource_read(id, req.params.as_ref(), registry)),
+        "resources/read" => Some(handle_resource_read(
+            id,
+            req.params.as_ref(),
+            registry,
+            ToolSurfaceContext::from_live_runtime(live_runtime, context),
+        )),
         "ping" => Some(JsonRpcResponse::ok(id, Value::Object(Default::default()))),
         other => Some(JsonRpcResponse::err(
             id,
@@ -386,8 +414,16 @@ fn handle_initialize(id: Value, params: Option<&Value>) -> JsonRpcResponse {
     JsonRpcResponse::ok(id, result)
 }
 
-fn handle_tools_list(id: Value, registry: &ToolRegistry) -> JsonRpcResponse {
-    let tools: Vec<Value> = registry.tools.iter().map(tool_to_mcp_value).collect();
+fn handle_tools_list(
+    id: Value,
+    registry: &ToolRegistry,
+    surface: ToolSurfaceContext,
+) -> JsonRpcResponse {
+    let tools: Vec<Value> = registry
+        .tools
+        .iter()
+        .map(|tool| tool_to_mcp_value(tool, surface))
+        .collect();
     JsonRpcResponse::ok(
         id,
         serde_json::json!({
@@ -435,6 +471,7 @@ fn handle_resource_read(
     id: Value,
     params: Option<&Value>,
     registry: &ToolRegistry,
+    surface: ToolSurfaceContext,
 ) -> JsonRpcResponse {
     let Some(Value::Object(params)) = params else {
         let envelope = oraclemcp_error::ErrorEnvelope::new(
@@ -477,7 +514,7 @@ fn handle_resource_read(
             );
         }
     };
-    match read_plsql_resource(&uri, registry) {
+    match read_plsql_resource(&uri, registry, surface) {
         Ok(contents) => JsonRpcResponse::ok(id, serde_json::json!({ "contents": [contents] })),
         Err(envelope) => JsonRpcResponse::err_with_data(
             id,
@@ -491,6 +528,7 @@ fn handle_resource_read(
 fn read_plsql_resource(
     uri: &ResourceUri,
     registry: &ToolRegistry,
+    surface: ToolSurfaceContext,
 ) -> Result<ResourceContents, Box<oraclemcp_error::ErrorEnvelope>> {
     match uri {
         ResourceUri::Capabilities => {
@@ -502,7 +540,11 @@ fn read_plsql_resource(
             })
         }
         ResourceUri::Tools => {
-            let tools = registry.tools.iter().map(tool_to_mcp_value).collect::<Vec<_>>();
+            let tools = registry
+                .tools
+                .iter()
+                .map(|tool| tool_to_mcp_value(tool, surface))
+                .collect::<Vec<_>>();
             Ok(ResourceContents {
                 uri: uri.to_uri(),
                 mime_type: "application/json".to_owned(),
@@ -545,46 +587,125 @@ fn resource_error_code(class: oraclemcp_error::ErrorClass) -> i32 {
 /// longer advertises ~37% of the surface as plainly callable when every such
 /// call would return RuntimeStateRequired or a profile refusal. The tool stays
 /// LISTED (discoverable, so an agent can still plan) but flagged `available:false`.
-fn tool_availability(
-    t: &ToolDescriptor,
+#[derive(Clone, Copy, Debug)]
+struct ToolSurfaceContext {
     live_db: bool,
     profile: SafetyProfile,
-) -> (bool, Option<String>) {
-    if matches!(t.tier, ToolTier::FoundationStatic) {
-        return (true, None);
+    operating_ceiling: Option<OperatingLevel>,
+}
+
+impl ToolSurfaceContext {
+    fn from_live_runtime(
+        live_runtime: &LiveDbRuntime,
+        context: DispatchContext<'_>,
+    ) -> ToolSurfaceContext {
+        Self {
+            live_db: cfg!(feature = "live-db"),
+            profile: crate::dispatch::active_safety_profile(live_runtime),
+            operating_ceiling: crate::dispatch::effective_oauth_scope_ceiling(
+                context,
+                live_runtime,
+            ),
+        }
     }
-    if !live_db {
-        return (
-            false,
-            Some("requires the `live-db` build feature (this build is static-only)".to_string()),
+}
+
+impl Default for ToolSurfaceContext {
+    fn default() -> Self {
+        Self {
+            live_db: cfg!(feature = "live-db"),
+            profile: SafetyProfile::default(),
+            operating_ceiling: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ToolAvailability {
+    available: bool,
+    reason: Option<String>,
+    suggested_tool: Option<&'static str>,
+    next_step: Option<String>,
+}
+
+impl ToolAvailability {
+    fn available() -> Self {
+        Self {
+            available: true,
+            reason: None,
+            suggested_tool: None,
+            next_step: None,
+        }
+    }
+
+    fn unavailable(
+        reason: String,
+        suggested_tool: Option<&'static str>,
+        next_step: impl Into<String>,
+    ) -> Self {
+        Self {
+            available: false,
+            reason: Some(reason),
+            suggested_tool,
+            next_step: Some(next_step.into()),
+        }
+    }
+}
+
+fn tool_availability(t: &ToolDescriptor, surface: ToolSurfaceContext) -> ToolAvailability {
+    if matches!(t.tier, ToolTier::FoundationStatic) {
+        return ToolAvailability::available();
+    }
+    if !surface.live_db {
+        return ToolAvailability::unavailable(
+            "requires the `live-db` build feature (this build is static-only)".to_string(),
+            Some("oracle_capabilities"),
+            "Restart plsql-mcp with the `live-db` feature enabled, then call oracle_capabilities and tools/list again.",
         );
     }
+    if let Some(ceiling) = surface.operating_ceiling {
+        if let Some(required) = crate::dispatch::required_operating_level(&t.name) {
+            if required > ceiling {
+                return ToolAvailability::unavailable(
+                    format!(
+                        "requires operating level {} but the authenticated request ceiling is {}",
+                        required.as_str(),
+                        ceiling.as_str()
+                    ),
+                    Some("oracle_capabilities"),
+                    "Retry with OAuth scopes that permit this operating level, or choose a read-only tool.",
+                );
+            }
+        }
+    }
     if t.destructive {
-        if profile.allows_ddl_preview() {
-            (true, None)
+        if surface.profile.allows_ddl_preview() {
+            ToolAvailability::available()
         } else {
-            (
-                false,
-                Some(format!(
-                    "requires a write-capable safety profile (current: {}); call set_safety_profile / enable_writes first",
-                    profile.as_str()
-                )),
+            ToolAvailability::unavailable(
+                format!(
+                    "requires a write-capable safety profile (current: {})",
+                    surface.profile.as_str()
+                ),
+                Some("set_safety_profile"),
+                "Call set_safety_profile with `profile=ddl_guarded`; use enable_writes only after a guarded preview mints an approval token.",
             )
         }
-    } else if profile.allows_read_only_live_tools() {
-        (true, None)
+    } else if surface.profile.allows_read_only_live_tools() {
+        ToolAvailability::available()
     } else {
-        (
-            false,
-            Some(format!(
+        ToolAvailability::unavailable(
+            format!(
                 "requires a live safety profile (current: {})",
-                profile.as_str()
-            )),
+                surface.profile.as_str()
+            ),
+            Some("set_safety_profile"),
+            "Switch to inspect_only or ddl_guarded before calling live-DB tools.",
         )
     }
 }
 
-fn tool_to_mcp_value(t: &ToolDescriptor) -> Value {
+fn tool_to_mcp_value(t: &ToolDescriptor, surface: ToolSurfaceContext) -> Value {
     // Advertise the tool's real argument schema when it has one, so an agent can
     // construct a valid call first-try instead of probing -32602 InvalidArguments
     // (oracle-da9j.1); fall back to the permissive object otherwise. Surface
@@ -600,14 +721,20 @@ fn tool_to_mcp_value(t: &ToolDescriptor) -> Value {
     // build does not present the live/write surface as plainly callable
     // (oracle-da9j.4). The tool stays listed; `available:false` + a reason tell
     // the agent why a call would be refused here.
-    let (available, reason) =
-        tool_availability(t, cfg!(feature = "live-db"), SafetyProfile::default());
+    let availability = tool_availability(t, surface);
     let mut annotations = serde_json::json!({
         "readOnlyHint": !t.destructive,
         "destructiveHint": t.destructive,
-        "available": available,
+        "available": availability.available,
+        "activeSafetyProfile": surface.profile.as_str(),
     });
-    if let Some(why) = reason {
+    if let Some(required) = crate::dispatch::required_operating_level(&t.name) {
+        annotations["requiredOperatingLevel"] = Value::String(required.as_str().to_owned());
+    }
+    if let Some(ceiling) = surface.operating_ceiling {
+        annotations["operatingLevelCeiling"] = Value::String(ceiling.as_str().to_owned());
+    }
+    if let Some(why) = availability.reason {
         annotations["unavailableReason"] = Value::String(why);
     }
     serde_json::json!({
@@ -625,6 +752,7 @@ async fn handle_tools_call(
     live_runtime: &mut LiveDbRuntime,
     cx: &Cx,
     context: DispatchContext<'_>,
+    surface: ToolSurfaceContext,
 ) -> JsonRpcResponse {
     use crate::dispatch::{PlsqlDispatchContext, dispatch_tool_with_runtime};
 
@@ -638,7 +766,7 @@ async fn handle_tools_call(
     // share `registry` as the single source of truth. On a miss, carry a
     // structured ErrorEnvelope with fuzzy "did you mean" candidates so a
     // misspelled name self-heals in one round (oracle-da9j.2).
-    if !registry.tools.iter().any(|t| t.name == name) {
+    let Some(descriptor) = registry.tools.iter().find(|t| t.name.as_str().eq(name)) else {
         let names: Vec<&str> = registry.tools.iter().map(|t| t.name.as_str()).collect();
         let envelope = oraclemcp_error::ErrorEnvelope::new(
             oraclemcp_error::ErrorClass::InvalidArguments,
@@ -654,7 +782,7 @@ async fn handle_tools_call(
             format!("tool not found: {name}"),
             envelope.to_json(),
         );
-    }
+    };
 
     // `arguments` is optional per MCP; a missing object means "no
     // arguments", which the per-tool Request types accept or reject
@@ -669,6 +797,13 @@ async fn handle_tools_call(
             -32602,
             envelope.message.clone(),
             envelope.to_json(),
+        );
+    }
+
+    if let Some(envelope) = unavailable_tool_envelope(descriptor, surface) {
+        return JsonRpcResponse::ok(
+            id,
+            tool_result(&envelope.message, true, Some(envelope.to_json())),
         );
     }
 
@@ -695,7 +830,10 @@ async fn handle_tools_call(
             JsonRpcResponse::ok(id, result)
         }
         Err(envelope)
-            if envelope.error_class == oraclemcp_error::ErrorClass::RuntimeStateRequired =>
+            if matches!(
+                envelope.error_class,
+                oraclemcp_error::ErrorClass::RuntimeStateRequired
+            ) =>
         {
             // Wired, arguments validated — but the runtime state is absent.
             // Honest error *result* (transport-level call succeeded; the tool
@@ -716,6 +854,39 @@ async fn handle_tools_call(
             JsonRpcResponse::err_with_data(id, -32602, envelope.message.clone(), envelope.to_json())
         }
     }
+}
+
+fn unavailable_tool_envelope(
+    descriptor: &ToolDescriptor,
+    surface: ToolSurfaceContext,
+) -> Option<oraclemcp_error::ErrorEnvelope> {
+    if !surface.live_db {
+        return None;
+    }
+    let availability = tool_availability(descriptor, surface);
+    if availability.available {
+        return None;
+    }
+    let mut envelope = oraclemcp_error::ErrorEnvelope::new(
+        oraclemcp_error::ErrorClass::OperatingLevelTooLow,
+        format!(
+            "tool `{}` is not available on the active MCP surface: {}",
+            descriptor.name,
+            availability
+                .reason
+                .as_deref()
+                .unwrap_or("surface gate refused the call")
+        ),
+    );
+    if let Some(tool) = availability.suggested_tool {
+        envelope = envelope.with_suggested_tool(tool);
+    }
+    if let Some(step) = availability.next_step {
+        envelope = envelope.with_next_step(step);
+    }
+    Some(envelope.with_next_step(
+        "Call tools/list to inspect the current activeSafetyProfile, operatingLevelCeiling, and availability annotations.",
+    ))
 }
 
 fn invalid_tools_call_params_response(id: Value, message: &'static str) -> JsonRpcResponse {
@@ -785,8 +956,10 @@ fn enrich_invalid_argument_envelope(
     tool_name: &str,
     envelope: oraclemcp_error::ErrorEnvelope,
 ) -> oraclemcp_error::ErrorEnvelope {
-    if envelope.error_class != oraclemcp_error::ErrorClass::InvalidArguments
-        || !envelope.fuzzy_matches.is_empty()
+    if !matches!(
+        envelope.error_class,
+        oraclemcp_error::ErrorClass::InvalidArguments
+    ) || !envelope.fuzzy_matches.is_empty()
     {
         return envelope;
     }
@@ -867,6 +1040,18 @@ fn next_actions_for(name: &str) -> Vec<&'static str> {
             "tools/list — read each tool's argument schema + readOnlyHint/destructiveHint",
             "analyze_project — load a project to enable the graph + analysis tools",
         ],
+        "connect" => vec![
+            "tools/list — refresh live-DB availability for the active session",
+            "current_database — inspect the active connection, catalog, and safety profile",
+        ],
+        "set_safety_profile" => vec![
+            "tools/list — refresh availability after the profile switch",
+            "current_safety_profile — verify the active profile and write posture",
+        ],
+        "enable_writes" => vec![
+            "tools/list — refresh destructive tool availability",
+            "execute_approved / deploy_ddl — run only the approved guarded-write operation",
+        ],
         "analyze_project" => vec![
             "plsql_analyze — routine/object inventory, lint findings, complexity",
             "find_callers / find_callees / get_dependencies — traverse the dependency graph",
@@ -936,6 +1121,14 @@ mod tests {
     fn server_response(registry: ToolRegistry, request: JsonRpcRequest) -> JsonRpcResponse {
         let mut server = PlsqlMcpServer::new(registry).expect("server runtime builds");
         server.handle_request(&request).expect("request response")
+    }
+
+    fn tool_by_name(tools: &[Value], name: &str) -> Value {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .expect("tool advertised")
+            .clone()
     }
 
     #[test]
@@ -1078,6 +1271,44 @@ mod tests {
             .expect("parse_file in tools resource");
         assert_eq!(parse_file["inputSchema"]["required"][0], "source");
         assert_eq!(parse_file["annotations"]["readOnlyHint"], Value::Bool(true));
+    }
+
+    #[test]
+    fn oracle_tools_resource_uses_active_surface_annotations() {
+        let registry = crate::default_tool_registry();
+        let contents = read_plsql_resource(
+            &ResourceUri::Tools,
+            &registry,
+            ToolSurfaceContext {
+                live_db: true,
+                profile: SafetyProfile::InspectOnly,
+                operating_ceiling: Some(OperatingLevel::ReadOnly),
+            },
+        )
+        .expect("oracle://tools renders");
+        let parsed: Value = serde_json::from_str(&contents.text).expect("tools JSON");
+        let tools = parsed["tools"].as_array().expect("tools array");
+        let deploy = tool_by_name(tools, "deploy_ddl");
+        assert_eq!(deploy["annotations"]["available"], Value::Bool(false));
+        assert_eq!(
+            deploy["annotations"]["activeSafetyProfile"],
+            Value::String(String::from("inspect_only"))
+        );
+        assert_eq!(
+            deploy["annotations"]["requiredOperatingLevel"],
+            Value::String(String::from("DDL"))
+        );
+        assert_eq!(
+            deploy["annotations"]["operatingLevelCeiling"],
+            Value::String(String::from("READ_ONLY"))
+        );
+        assert!(
+            deploy["annotations"]["unavailableReason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("operating level DDL"),
+            "scope ceiling reason should be explicit: {deploy}"
+        );
     }
 
     #[test]
@@ -1593,18 +1824,97 @@ mod tests {
         let write_live =
             ToolDescriptor::new("deploy_ddl", ToolTier::FoundationLiveDb, "w").destructive();
         // Static tools are always available.
-        assert!(tool_availability(&static_tool, false, SafetyProfile::StaticOnly).0);
+        assert!(
+            tool_availability(
+                &static_tool,
+                ToolSurfaceContext {
+                    live_db: false,
+                    profile: SafetyProfile::StaticOnly,
+                    operating_ceiling: None,
+                },
+            )
+            .available
+        );
         // No live-db feature → every live tool unavailable (with a reason).
-        let (avail, reason) =
-            tool_availability(&read_live, false, SafetyProfile::SessionWriteEnabled);
-        assert!(!avail && reason.is_some());
+        let unavailable = tool_availability(
+            &read_live,
+            ToolSurfaceContext {
+                live_db: false,
+                profile: SafetyProfile::SessionWriteEnabled,
+                operating_ceiling: None,
+            },
+        );
+        assert!(!unavailable.available && unavailable.reason.is_some());
         // live-db on + StaticOnly profile → even read-only live tools off.
-        assert!(!tool_availability(&read_live, true, SafetyProfile::StaticOnly).0);
+        assert!(
+            !tool_availability(
+                &read_live,
+                ToolSurfaceContext {
+                    live_db: true,
+                    profile: SafetyProfile::StaticOnly,
+                    operating_ceiling: None,
+                },
+            )
+            .available
+        );
         // live-db on + InspectOnly → read-only live available, writes not.
-        assert!(tool_availability(&read_live, true, SafetyProfile::InspectOnly).0);
-        assert!(!tool_availability(&write_live, true, SafetyProfile::InspectOnly).0);
+        assert!(
+            tool_availability(
+                &read_live,
+                ToolSurfaceContext {
+                    live_db: true,
+                    profile: SafetyProfile::InspectOnly,
+                    operating_ceiling: None,
+                },
+            )
+            .available
+        );
+        assert!(
+            !tool_availability(
+                &write_live,
+                ToolSurfaceContext {
+                    live_db: true,
+                    profile: SafetyProfile::InspectOnly,
+                    operating_ceiling: None,
+                },
+            )
+            .available
+        );
         // live-db on + DdlGuarded → write (preview) tools available.
-        assert!(tool_availability(&write_live, true, SafetyProfile::DdlGuarded).0);
+        assert!(
+            tool_availability(
+                &write_live,
+                ToolSurfaceContext {
+                    live_db: true,
+                    profile: SafetyProfile::DdlGuarded,
+                    operating_ceiling: None,
+                },
+            )
+            .available
+        );
+    }
+
+    #[test]
+    fn tool_availability_gates_by_operating_level_ceiling() {
+        let write_live =
+            ToolDescriptor::new("deploy_ddl", ToolTier::FoundationLiveDb, "w").destructive();
+        let availability = tool_availability(
+            &write_live,
+            ToolSurfaceContext {
+                live_db: true,
+                profile: SafetyProfile::DdlGuarded,
+                operating_ceiling: Some(OperatingLevel::ReadOnly),
+            },
+        );
+        assert!(!availability.available);
+        assert!(
+            availability
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("authenticated request ceiling is READ_ONLY"),
+            "operating ceiling should explain the refusal: {availability:?}"
+        );
     }
 
     #[test]
@@ -1630,6 +1940,56 @@ mod tests {
         assert_eq!(
             find("parse_file")["annotations"]["available"],
             Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn tools_call_refuses_unavailable_profile_surface_with_next_action() {
+        let registry = crate::default_tool_registry();
+        let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
+            .build()
+            .unwrap();
+        let mut live_runtime = LiveDbRuntime::new();
+        let params = serde_json::json!({
+            "name": "deploy_ddl",
+            "arguments": {
+                "job_name": "DEPLOY_APP",
+                "ddl_bytes": "CREATE OR REPLACE VIEW v AS SELECT 1 FROM dual"
+            }
+        });
+        let response = runtime.block_on(async {
+            let cx = Cx::current().expect("block_on installs a request Cx");
+            handle_tools_call(
+                serde_json::json!(77),
+                Some(&params),
+                &registry,
+                &mut live_runtime,
+                &cx,
+                DispatchContext::default(),
+                ToolSurfaceContext {
+                    live_db: true,
+                    profile: SafetyProfile::InspectOnly,
+                    operating_ceiling: None,
+                },
+            )
+            .await
+        });
+
+        assert!(response.error.is_none(), "surface refusal is a tool result");
+        let result = response.result.expect("tool result");
+        assert_eq!(result["isError"], Value::Bool(true));
+        let envelope = &result["structuredContent"];
+        assert_eq!(envelope["error_class"], "OPERATING_LEVEL_TOO_LOW");
+        assert_eq!(envelope["suggested_tool"], "set_safety_profile");
+        assert!(
+            envelope["next_steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step.as_str().unwrap_or("").contains("tools/list")),
+            "refusal should tell the agent to refresh the surface: {envelope}"
         );
     }
 
