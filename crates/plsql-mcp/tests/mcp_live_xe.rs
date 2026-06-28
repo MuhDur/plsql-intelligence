@@ -108,8 +108,10 @@ mod live {
     };
     use std::{
         future::Future,
+        io::{Read, Write},
+        process::{Command, Stdio},
         sync::atomic::{AtomicU32, Ordering},
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     // ─── Connection constants ─────────────────────────────────────────────────
@@ -163,6 +165,10 @@ mod live {
         std::env::var(name).expect("required live-XE credential env var is not set")
     }
 
+    fn bin() -> &'static str {
+        env!("CARGO_BIN_EXE_plsql-mcp")
+    }
+
     fn unique_suffix() -> String {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -209,6 +215,84 @@ mod live {
             .build()
             .expect("live-xe asupersync runtime")
             .block_on(future)
+    }
+
+    fn run_serve_stdio_session(
+        requests: &[serde_json::Value],
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let mut child = Command::new(bin())
+            .arg("serve")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| format!("spawn plsql-mcp serve failed: {err}"))?;
+
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| String::from("child stdin missing"))?;
+            for request in requests {
+                serde_json::to_writer(&mut stdin, request)
+                    .map_err(|err| format!("request serialization failed: {err}"))?;
+                stdin
+                    .write_all(b"\n")
+                    .map_err(|err| format!("write request newline failed: {err}"))?;
+            }
+        }
+
+        let mut status = None;
+        for _ in 0..1_800 {
+            if let Some(exit_status) = child
+                .try_wait()
+                .map_err(|err| format!("poll serve child failed: {err}"))?
+            {
+                status = Some(exit_status);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let Some(status) = status else {
+            let _ = child.kill();
+            let mut stderr = String::new();
+            if let Some(mut stderr_pipe) = child.stderr.take() {
+                let _ = stderr_pipe.read_to_string(&mut stderr);
+            }
+            let _ = child.wait();
+            return Err(format!(
+                "plsql-mcp serve did not exit within 90s; stderr={stderr:?}"
+            ));
+        };
+
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| String::from("child stdout missing"))?
+            .read_to_string(&mut stdout)
+            .map_err(|err| format!("read serve stdout failed: {err}"))?;
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .ok_or_else(|| String::from("child stderr missing"))?
+            .read_to_string(&mut stderr)
+            .map_err(|err| format!("read serve stderr failed: {err}"))?;
+        if !status.success() {
+            return Err(format!(
+                "serve should exit cleanly on stdin EOF; status={status:?}; stderr={stderr:?}"
+            ));
+        }
+
+        stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str(line)
+                    .map_err(|err| format!("serve stdout line is not JSON-RPC: {err}; {line}"))
+            })
+            .collect()
     }
 
     fn execute_sql<C: OracleConnection>(conn: &C, sql: &str) -> Result<u64, CatalogError> {
@@ -333,6 +417,138 @@ mod live {
         assert_eq!(
             resp.sanitized_cells, 0,
             "no injection markers expected in DUAL result"
+        );
+    }
+
+    /// Phase X joint acceptance: the shipping `plsql-mcp serve` stdio loop
+    /// opens a real `oraclemcp-db` thin session, runs a SELECT through JSON-RPC,
+    /// and exits cleanly on EOF.
+    #[test]
+    fn serve_stdio_connect_then_query_hits_oracle_over_json_rpc() {
+        let password = required_env("PLSQL_XE_SYSTEM_PASSWORD");
+        let requests = [
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": plsql_mcp::PROTOCOL_VERSION
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "connect",
+                    "arguments": {
+                        "name": "phase-x-live-serve",
+                        "connect_string": CONNECT_STRING,
+                        "username": SYSTEM_USER,
+                        "password": password,
+                        "description": "Phase X live serve JSON-RPC acceptance",
+                        "permanently_read_only": true
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "query",
+                    "arguments": {
+                        "sql": "SELECT 1 AS val FROM dual"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "current_database",
+                    "arguments": {}
+                }
+            }),
+        ];
+        let responses = run_serve_stdio_session(&requests)
+            .expect("serve stdio live JSON-RPC session should complete");
+
+        assert_eq!(
+            responses.len(),
+            4,
+            "initialize/connect/query/current_database should each respond"
+        );
+
+        assert_eq!(responses[0]["id"], 1);
+        assert!(
+            responses[0]["error"].is_null(),
+            "initialize should succeed: {}",
+            responses[0]
+        );
+
+        let connected = &responses[1];
+        assert_eq!(connected["id"], 2);
+        assert!(
+            connected["error"].is_null(),
+            "connect should open a real oraclemcp-db session: {connected}"
+        );
+        assert_eq!(connected["result"]["isError"], false);
+        assert_eq!(connected["result"]["structuredContent"]["connected"], true);
+        assert_eq!(
+            connected["result"]["structuredContent"]["active"],
+            "phase-x-live-serve"
+        );
+        assert_eq!(
+            connected["result"]["structuredContent"]["connected_count"],
+            1
+        );
+
+        let queried = &responses[2];
+        assert_eq!(queried["id"], 3);
+        assert!(
+            queried["error"].is_null(),
+            "query should run through the active live session: {queried}"
+        );
+        assert_eq!(queried["result"]["isError"], false);
+        assert_eq!(
+            queried["result"]["structuredContent"]["columns"][0]["name"],
+            "VAL"
+        );
+        assert_eq!(
+            queried["result"]["structuredContent"]["rows"][0]["cells"][0]["value"],
+            "1"
+        );
+
+        let current = &responses[3];
+        assert_eq!(current["id"], 4);
+        assert!(
+            current["error"].is_null(),
+            "current_database should still see the active live session: {current}"
+        );
+        assert_eq!(current["result"]["isError"], false);
+        assert_eq!(
+            current["result"]["structuredContent"]["active"]["name"],
+            "phase-x-live-serve"
+        );
+        assert_eq!(
+            current["result"]["structuredContent"]["active"]["permanently_read_only"],
+            true
+        );
+        assert_eq!(
+            current["result"]["structuredContent"]["active"]["catalog"]["current_schema"],
+            SYSTEM_USER
+        );
+        assert!(
+            current["result"]["structuredContent"]["active"]["catalog"]["server_version"]
+                .as_str()
+                .is_some_and(|version| version.contains("23")),
+            "live acceptance should run against Oracle 23ai: {current}"
+        );
+
+        eprintln!(
+            "[Phase X 15.1] serve stdio JSON-RPC connected, queried DUAL, described active Oracle session, and exited cleanly"
         );
     }
 

@@ -164,7 +164,12 @@ where
         cx: &Cx,
         key: &ObjectKey,
     ) -> Result<bool, CatalogError> {
+        // oraclemcp-db 0.4.0 currently decides query prefetch from the first
+        // SQL keyword. Keep the metadata probe SELECT-led while preserving the
+        // CTE shape Oracle accepts.
         let sql = "
+select *
+from (
 with resolved_objects as (
   select :1 as owner, :2 as name
   from dual
@@ -200,6 +205,7 @@ select
     else 0
   end as side_effecting
 from dual
+)
 ";
         let rows = self
             .query_rows(
