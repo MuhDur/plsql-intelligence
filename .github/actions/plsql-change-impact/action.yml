@@ -53,6 +53,14 @@ inputs:
     description: Token used to post or update pull request comments.
     required: false
     default: ""
+  github-api-url:
+    description: GitHub API root URL used for posting comments.
+    required: false
+    default: https://api.github.com
+  mock-comment-output:
+    description: Testing-only path. When set, write the comment POST request JSON here instead of calling the GitHub API.
+    required: false
+    default: ""
   comment-title:
     description: Markdown heading for the PR comment.
     required: false
@@ -206,6 +214,8 @@ runs:
       env:
         POST_COMMENT: ${{ inputs.post-comment }}
         GITHUB_TOKEN_INPUT: ${{ inputs.github-token }}
+        GITHUB_API_URL: ${{ inputs.github-api-url }}
+        MOCK_COMMENT_OUTPUT: ${{ inputs.mock-comment-output }}
         COMMENT_BODY: ${{ steps.render.outputs.comment_body }}
       run: |
         set -euo pipefail
@@ -236,7 +246,8 @@ runs:
         fi
 
         marker="<!-- plsql-cicd:change-impact v1 -->"
-        comments_url="https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${pr_number}/comments"
+        github_api_url="${GITHUB_API_URL%/}"
+        comments_url="${github_api_url}/repos/${GITHUB_REPOSITORY}/issues/${pr_number}/comments"
         headers=(
           -H "Authorization: Bearer ${GITHUB_TOKEN_INPUT}"
           -H "Accept: application/vnd.github+json"
@@ -244,6 +255,18 @@ runs:
         )
         body_json="${RUNNER_TEMP:-.}/plsql-change-impact-comment-request.json"
         jq -Rs '{body: .}' "$COMMENT_BODY" > "$body_json"
+
+        if [[ -n "$MOCK_COMMENT_OUTPUT" ]]; then
+          mkdir -p "$(dirname "$MOCK_COMMENT_OUTPUT")"
+          jq -n \
+            --arg html_url "mock://plsql-change-impact-comment" \
+            --arg comments_url "$comments_url" \
+            --slurpfile request "$body_json" \
+            '{html_url: $html_url, comments_url: $comments_url, request: $request[0]}' \
+            > "$MOCK_COMMENT_OUTPUT"
+          printf 'comment_url=%s\n' "mock://plsql-change-impact-comment" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
 
         existing_comment_id="$(
           curl -fsSL "${headers[@]}" "$comments_url?per_page=100" \
@@ -254,7 +277,7 @@ runs:
           response="$(
             curl -fsSL -X PATCH "${headers[@]}" \
               -d @"$body_json" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/comments/${existing_comment_id}"
+              "${github_api_url}/repos/${GITHUB_REPOSITORY}/issues/comments/${existing_comment_id}"
           )"
         else
           response="$(
