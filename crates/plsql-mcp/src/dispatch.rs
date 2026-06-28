@@ -2139,6 +2139,9 @@ struct DeployDdlArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::Budget;
+    use asupersync::lab::{DporExplorer, ExplorerConfig, LabRuntime};
+    use asupersync::types::CancelKind;
     use serde_json::json;
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
@@ -2233,6 +2236,170 @@ mod tests {
             permanently_read_only: false,
             dbtools_alias: None,
         }
+    }
+
+    fn active_recording_runtime() -> (LiveDbRuntime, RecordingOracleConnection) {
+        let mut live_runtime = LiveDbRuntime::new();
+        let connection =
+            RecordingOracleConnection::with_initial_timeout(Some(Duration::from_secs(30)));
+        let observed = connection.clone();
+        live_runtime
+            .insert_connected(live_profile("dev"), Box::new(connection))
+            .expect("stub session inserts");
+        dispatch_with_runtime_for_test("connect", json!({"name": "dev"}), &mut live_runtime)
+            .expect("connect activates existing live session");
+        (live_runtime, observed)
+    }
+
+    fn assert_live_session_reusable(
+        live_runtime: &mut LiveDbRuntime,
+        observed: &RecordingOracleConnection,
+    ) {
+        assert_eq!(live_runtime.len(), 1, "live session count leaked");
+        assert_eq!(live_runtime.active_name(), Some("dev"));
+        live_runtime
+            .active_session()
+            .expect("ready-or-dead invariant keeps session ready");
+        assert_eq!(
+            observed.current_timeout(),
+            Some(Duration::from_secs(30)),
+            "request-scoped timeout leaked into the live session"
+        );
+
+        let result = dispatch_with_runtime_for_test(
+            "query",
+            json!({"sql": "SELECT 1 AS val FROM dual"}),
+            live_runtime,
+        )
+        .expect("ready session remains reusable after cancellation/timeout/drop");
+        assert_eq!(result["rows"][0]["cells"][0]["value"], "1");
+        assert_eq!(live_runtime.len(), 1, "recovery query leaked a session");
+        assert_eq!(live_runtime.active_name(), Some("dev"));
+        assert_eq!(
+            observed.current_timeout(),
+            Some(Duration::from_secs(30)),
+            "recovery query must preserve the session timeout"
+        );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum LiveDispatchDrainScenario {
+        CancelBeforeDispatch,
+        TimeoutBeforeQuery,
+        DropUnpolledFuture,
+    }
+
+    impl LiveDispatchDrainScenario {
+        const ALL: [Self; 3] = [
+            Self::CancelBeforeDispatch,
+            Self::TimeoutBeforeQuery,
+            Self::DropUnpolledFuture,
+        ];
+
+        fn exercise(self) {
+            let (mut live_runtime, observed) = active_recording_runtime();
+            match self {
+                Self::CancelBeforeDispatch => {
+                    let cx = Cx::for_testing();
+                    cx.cancel_with(CancelKind::User, Some("deterministic live-dispatch cancel"));
+                    let err = dispatch_with_runtime_on_cx_for_test(
+                        &cx,
+                        "query",
+                        json!({"sql": "SELECT 1 AS val FROM dual"}),
+                        &mut live_runtime,
+                    )
+                    .unwrap_err();
+
+                    assert_eq!(err.error_class, ErrorClass::Timeout);
+                    assert!(
+                        observed.observed_queries().is_empty(),
+                        "cancelled request must not reach Oracle"
+                    );
+                    assert!(
+                        observed.observed_timeout_sets().is_empty(),
+                        "cancelled request must not mutate session call_timeout"
+                    );
+                }
+                Self::TimeoutBeforeQuery => {
+                    let err = dispatch_with_runtime_and_budget_for_test(
+                        "query",
+                        json!({"sql": "SELECT 1 AS val FROM dual"}),
+                        &mut live_runtime,
+                        |_| RequestBudget::from_budget(Budget::ZERO),
+                    )
+                    .unwrap_err();
+
+                    assert_eq!(err.error_class, ErrorClass::Timeout);
+                    assert!(
+                        observed.observed_queries().is_empty(),
+                        "exhausted budget must fail before touching Oracle"
+                    );
+                    assert!(
+                        observed.observed_timeout_sets().is_empty(),
+                        "exhausted budget must not mutate session call_timeout"
+                    );
+                }
+                Self::DropUnpolledFuture => {
+                    let cx = Cx::for_testing();
+                    let context = PlsqlDispatchContext::new(
+                        DispatchContext::default(),
+                        RequestBudget::from_budget(cx.budget()),
+                    );
+                    let future = dispatch_tool_with_runtime(
+                        &cx,
+                        context,
+                        &mut live_runtime,
+                        "query",
+                        json!({"sql": "SELECT 1 AS val FROM dual"}),
+                    );
+                    drop(future);
+
+                    assert!(
+                        observed.observed_queries().is_empty(),
+                        "dropping an unpolled dispatch future must not reach Oracle"
+                    );
+                    assert!(
+                        observed.observed_timeout_sets().is_empty(),
+                        "dropping an unpolled dispatch future must not mutate call_timeout"
+                    );
+                }
+            }
+
+            assert_live_session_reusable(&mut live_runtime, &observed);
+        }
+    }
+
+    fn run_live_dispatch_lab_probe(runtime: &mut LabRuntime) {
+        let root = runtime.state.create_root_region(Budget::INFINITE);
+        const CHECKPOINTS: [(&str, &str); 3] = [
+            (
+                "live-dispatch-drain-start-cancel",
+                "live-dispatch-drain-finish-cancel",
+            ),
+            (
+                "live-dispatch-drain-start-timeout",
+                "live-dispatch-drain-finish-timeout",
+            ),
+            (
+                "live-dispatch-drain-start-drop",
+                "live-dispatch-drain-finish-drop",
+            ),
+        ];
+        for (start, finish) in CHECKPOINTS {
+            let (task, _handle) = runtime
+                .state
+                .create_task(root, Budget::INFINITE, async move {
+                    let cx = Cx::current().expect("LabRuntime installs a task Cx");
+                    cx.checkpoint_with(start)
+                        .expect("lab probe starts uncancelled");
+                    cx.checkpoint_with(finish)
+                        .expect("lab probe drains uncancelled");
+                })
+                .expect("lab task creates");
+            runtime.scheduler.lock().schedule(task, 0);
+        }
+        runtime.run_until_quiescent();
+        assert!(runtime.is_quiescent(), "lab runtime must drain all tasks");
     }
 
     #[derive(Debug, Clone)]
@@ -3174,6 +3341,28 @@ mod tests {
             observed.observed_timeout_sets().is_empty(),
             "exhausted budget must not mutate session call timeout"
         );
+    }
+
+    #[test]
+    fn dpor_live_dispatch_cancel_timeout_drop_leave_session_reusable() {
+        let mut explorer = DporExplorer::new(
+            ExplorerConfig::new(0x5eed_1506, 8)
+                .worker_count(2)
+                .max_steps(10_000),
+        );
+        let report = explorer.explore(|runtime| {
+            run_live_dispatch_lab_probe(runtime);
+            for scenario in LiveDispatchDrainScenario::ALL {
+                scenario.exercise();
+            }
+        });
+
+        assert!(
+            !report.has_violations(),
+            "LabRuntime found invariant violations for seeds {:?}: {report:?}",
+            report.violation_seeds()
+        );
+        assert!(report.total_runs > 0, "DPOR explorer must execute a run");
     }
 
     #[test]
