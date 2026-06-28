@@ -120,6 +120,26 @@ fn write_graph() -> NamedTempFile {
 }
 
 #[test]
+fn version_flag_reports_release_version() {
+    let output = Command::new(env!("CARGO_BIN_EXE_plsql-depgraph"))
+        .arg("--version")
+        .output()
+        .expect("cli should run");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf-8");
+
+    assert!(
+        stdout.contains(env!("CARGO_PKG_VERSION")),
+        "--version must print the package version; got stdout={stdout:?}"
+    );
+}
+
+#[test]
 fn neighbors_query_robot_json_is_versioned_and_deterministic() {
     let graph_file = write_graph();
     let output = Command::new(env!("CARGO_BIN_EXE_plsql-depgraph"))

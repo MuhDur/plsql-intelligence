@@ -1,6 +1,6 @@
 [package]
 name = "plsql-mcp"
-version = "0.1.0"
+version = "0.5.0"
 description = "Foundation MCP adapter for the PL/SQL Intelligence engine (Apache-2.0 OR MIT)"
 edition.workspace = true
 license.workspace = true

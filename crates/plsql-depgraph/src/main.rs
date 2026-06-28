@@ -23,6 +23,7 @@ use thiserror::Error;
 
 #[derive(Debug, Parser)]
 #[command(name = "plsql-depgraph")]
+#[command(version)]
 #[command(about = "Query and diagnose plsql-intelligence dependency graph artifacts")]
 #[command(
     after_help = "DISCOVERY:\n  plsql-depgraph capabilities   machine-readable agent contract (JSON)\n  plsql-depgraph robot-docs     agent handbook — start here if you are an AI\n  plsql-depgraph --robot-triage one-shot bootstrap (capabilities + health + quick_ref)"
