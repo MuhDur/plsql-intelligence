@@ -2145,7 +2145,7 @@ mod tests {
     use serde_json::json;
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn dispatch_for_test(name: &str, args: Value) -> Result<Value, Box<ErrorEnvelope>> {
         let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
@@ -2583,13 +2583,23 @@ mod tests {
                     )],
                 }]);
             }
-            if let Some(delay) = self.query_delay {
-                std::thread::sleep(delay);
-            }
             self.queries
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(String::from(sql));
+            if let (Some(delay), Some(timeout), None) =
+                (self.query_delay, timeout, self.query_error.as_ref())
+            {
+                if timeout < delay {
+                    std::thread::sleep(timeout.saturating_add(Duration::from_millis(2)));
+                    return Err(oraclemcp_db::DbError::Query(String::from(
+                        "ORA-01013: user requested cancel of current operation",
+                    )));
+                }
+            }
+            if let Some(delay) = self.query_delay {
+                std::thread::sleep(delay);
+            }
             if let Some(err) = self.query_error.clone() {
                 return Err(err);
             }
@@ -3245,7 +3255,7 @@ mod tests {
         let mut live_runtime = LiveDbRuntime::new();
         let connection = RecordingOracleConnection::with_initial_timeout_and_query_delay(
             Some(Duration::from_secs(30)),
-            Some(Duration::from_millis(75)),
+            Some(Duration::from_millis(500)),
         );
         let observed = connection.clone();
         live_runtime
@@ -3254,6 +3264,7 @@ mod tests {
         dispatch_with_runtime_for_test("connect", json!({"name": "dev"}), &mut live_runtime)
             .expect("connect activates existing live session");
 
+        let started = Instant::now();
         let err = dispatch_with_runtime_and_budget_for_test(
             "query",
             json!({"sql": "SELECT 1 AS val FROM dual"}),
@@ -3261,8 +3272,13 @@ mod tests {
             |cx| RequestBudget::from_call_timeout(cx.now(), Some(Duration::from_millis(25))),
         )
         .unwrap_err();
+        let elapsed = started.elapsed();
 
         assert_eq!(err.error_class, ErrorClass::Timeout);
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "request budget should cut the simulated 500ms query, elapsed={elapsed:?}"
+        );
         assert_eq!(
             observed.observed_queries(),
             vec!["SELECT 1 AS val FROM dual"]
@@ -3278,6 +3294,7 @@ mod tests {
             .expect("budget installs a finite call timeout");
         assert!(applied > Duration::ZERO);
         assert!(applied <= Duration::from_millis(25));
+        assert_live_session_reusable(&mut live_runtime, &observed);
     }
 
     #[test]
