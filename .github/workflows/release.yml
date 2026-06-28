@@ -19,7 +19,7 @@ env:
   # Public binaries (i.e., those intended for end users). Internal-only
   # dev tools like `plan-lint` and `corpus-license-check` stay out of the
   # release archive.
-  RELEASE_BINS: "plsql-depgraph"
+  RELEASE_BINS: "plsql-depgraph plsql-mcp plsql"
 
 jobs:
   build:
@@ -94,8 +94,8 @@ jobs:
             esac
             src="target/${{ matrix.target }}/release/${bin}${ext}"
             if [[ ! -f "$src" ]]; then
-              echo "::warning::missing $src — skipping (binary not yet wired into workspace?)"
-              continue
+              echo "::error::missing expected release binary: $src"
+              exit 1
             fi
             dst="release-staging/${bin}-${{ matrix.target }}${ext}"
             cp "$src" "$dst"
@@ -105,7 +105,7 @@ jobs:
         with:
           name: plsql-intelligence-${{ matrix.target }}
           path: release-staging/*
-          if-no-files-found: warn
+          if-no-files-found: error
 
   publish:
     name: publish github release
