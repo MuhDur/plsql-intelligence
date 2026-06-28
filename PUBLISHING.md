@@ -14,7 +14,8 @@ This tree has been prepared for an open-source release:
   source-available or commercial-tier code; the MCP server is a single
   unified crate (`plsql-mcp`).
 - The whole workspace is `#![forbid(unsafe_code)]` and builds, tests, and
-  clippy-clean on stable Rust 1.85+.
+  clippy-clean on the pinned nightly toolchain documented in
+  `rust-toolchain.toml`.
 
 If this tree was assembled as a fresh repository, its git history begins
 at the initial commit and carries none of the above either:

@@ -66,6 +66,19 @@ jobs:
       - name: Prove planted violation fails
         run: scripts/plsql_mcp_boundary_lint.sh --self-test
 
+  # `oracle-plsql-converge-0lnu.15.13` — keep release-visible docs, package
+  # metadata, source docs, and workflow text from drifting back into stale
+  # overclaims after the truth-up pass.
+  plsql-mcp-honesty-grep:
+    name: plsql-mcp honesty grep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run honesty-grep gate
+        run: scripts/plsql_mcp_honesty_grep.sh
+      - name: Prove planted forbidden string fails
+        run: scripts/plsql_mcp_honesty_grep.sh --self-test
+
   # NOTE: the engine-free oraclemcp-* MCP spine classifier cargo-fuzz smoke moved
   # to the standalone MuhDur/oraclemcp repo in Phase-E. That CI job now lives
   # there; plsql-mcp consumes the published crates.

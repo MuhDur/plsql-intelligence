@@ -1,6 +1,6 @@
 # Security Policy — oraclemcp
 
-`oraclemcp` is a safe-by-default Oracle Database MCP server. This document
+`oraclemcp` is a governed, least-privilege Oracle Database MCP server. This document
 states the security model, what it does and does **not** guarantee, and how to
 report a vulnerability.
 

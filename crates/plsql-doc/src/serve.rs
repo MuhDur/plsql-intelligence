@@ -537,7 +537,7 @@ mod tests {
         ] {
             assert!(
                 !is_safe_bind(ip),
-                "RFC1918 {ip} must NOT be safe by default"
+                "RFC1918 {ip} must NOT be accepted by default"
             );
         }
     }
@@ -583,27 +583,13 @@ mod tests {
             ("172.16.0.1", 9000),
             ("192.168.1.10", 9000),
         ] {
-            let err = guard_bind(raw, false)
-                .unwrap_err_or_else_msg(|| format!("{raw:?} must be refused without override"));
             assert!(
-                matches!(err, BindGuardError::PublicBindRefused(_)),
-                "{raw:?} must be PublicBindRefused, got {err:?}"
+                matches!(
+                    guard_bind(raw, false),
+                    Err(BindGuardError::PublicBindRefused(_))
+                ),
+                "{raw:?} must be refused without override"
             );
-        }
-    }
-
-    // Tiny in-test helper: clearer panic than `.unwrap_err()` when
-    // the inner Result was unexpectedly Ok. Kept local to the test
-    // module so it never leaks into the public API.
-    trait UnwrapErrOrElse<T, E> {
-        fn unwrap_err_or_else_msg(self, msg: impl FnOnce() -> String) -> E;
-    }
-    impl<T: std::fmt::Debug, E> UnwrapErrOrElse<T, E> for Result<T, E> {
-        fn unwrap_err_or_else_msg(self, msg: impl FnOnce() -> String) -> E {
-            match self {
-                Err(e) => e,
-                Ok(v) => panic!("{} (got Ok({v:?}))", msg()),
-            }
         }
     }
 
@@ -631,8 +617,7 @@ mod tests {
             ("169.254.1.1", 9000),
             ("fc00::1", 9000),
         ] {
-            let bound = guard_bind(raw, true)
-                .unwrap_or_else(|e| panic!("{raw:?} should resolve with override: {e}"));
+            let bound = guard_bind(raw, true).expect("override should allow private bind address");
             assert!(!bound.ip().is_loopback());
         }
     }
