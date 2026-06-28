@@ -49,9 +49,26 @@ jobs:
       - run: cargo test --workspace --all-targets
       - run: cargo test --workspace --doc
 
-  # NOTE: the engine-free oraclemcp-* MCP spine (and its boundary lint + classifier
-  # cargo-fuzz smoke) moved to the standalone MuhDur/oraclemcp repo in Phase-E.
-  # Those CI jobs now live there; plsql-mcp consumes the published crates.
+  # `oracle-plsql-converge-0lnu.15.12` — keep the PL/SQL layer from reaching
+  # around the published oraclemcp-db adapter into Oracle drivers or async/server
+  # runtimes directly.
+  plsql-mcp-boundary-lint:
+    name: plsql-mcp boundary lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-05-11
+      - uses: Swatinem/rust-cache@v2
+      - name: Run forbidden dependency boundary lint
+        run: scripts/plsql_mcp_boundary_lint.sh
+      - name: Prove planted violation fails
+        run: scripts/plsql_mcp_boundary_lint.sh --self-test
+
+  # NOTE: the engine-free oraclemcp-* MCP spine classifier cargo-fuzz smoke moved
+  # to the standalone MuhDur/oraclemcp repo in Phase-E. That CI job now lives
+  # there; plsql-mcp consumes the published crates.
 
   # `oracle-qmwz.1.2` (P0-1) — supply-chain gates for the oraclemcp build.
   supply-chain:
