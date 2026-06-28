@@ -55,6 +55,7 @@ use oraclemcp_core::{
     DispatchContext, DispatchFuture, ReadPathCaps, RequestBudget, ToolDispatch, narrow_to_read_path,
 };
 use oraclemcp_error::{ErrorClass, ErrorEnvelope};
+use oraclemcp_guard::{OperatingLevel, SessionLevelState};
 
 use crate::{
     AnalyzeProjectRequest, CompileCheckRequest, CompletenessReportRequest, DocLookupRequest,
@@ -383,6 +384,7 @@ pub fn dispatch_tool_with_runtime<'a>(
 ) -> DispatchFuture<'a> {
     Box::pin(async move {
         checkpoint(cx, name).map_err(|err| *err)?;
+        enforce_oauth_scope_ceiling(context, live_runtime, name).map_err(|err| *err)?;
         match name {
             "connect" => run_connect(cx, live_runtime, &arguments)
                 .await
@@ -409,6 +411,65 @@ pub fn dispatch_tool_with_runtime<'a>(
             },
         }
     })
+}
+
+fn enforce_oauth_scope_ceiling(
+    context: PlsqlDispatchContext<'_>,
+    live_runtime: &LiveDbRuntime,
+    tool: &str,
+) -> Result<(), Box<ErrorEnvelope>> {
+    let Some(required) = required_operating_level(tool) else {
+        return Ok(());
+    };
+    let Some(grant) = context.core().scope_grant() else {
+        return Ok(());
+    };
+
+    let max_level = live_runtime
+        .active_session()
+        .map(|session| safety_profile_ceiling(session.safety().profile))
+        .unwrap_or(OperatingLevel::Admin);
+    let mut scoped = SessionLevelState::new(max_level, false);
+    let scopes = grant.0.iter().map(String::as_str).collect::<Vec<_>>();
+    oraclemcp_auth::apply_oauth_scopes(&mut scoped, &scopes);
+    let ceiling = scoped.effective_ceiling();
+    if required <= ceiling {
+        return Ok(());
+    }
+
+    Err(Box::new(
+        ErrorEnvelope::new(
+            ErrorClass::OperatingLevelTooLow,
+            format!(
+                "tool `{tool}` requires {} but the authenticated request's OAuth scope ceiling is {}",
+                required.as_str(),
+                ceiling.as_str()
+            ),
+        )
+        .with_next_step(
+            "Retry with an OAuth token carrying a sufficient oracle:* scope, or use a read-only tool.",
+        ),
+    ))
+}
+
+fn required_operating_level(tool: &str) -> Option<OperatingLevel> {
+    match tool {
+        "enable_writes" => Some(OperatingLevel::ReadWrite),
+        "set_safety_profile" | "patch_package" | "patch_view" | "create_or_replace"
+        | "execute_approved" | "deploy_ddl" => Some(OperatingLevel::Ddl),
+        _ => None,
+    }
+}
+
+fn safety_profile_ceiling(profile: crate::SafetyProfile) -> OperatingLevel {
+    match profile {
+        crate::SafetyProfile::StaticOnly | crate::SafetyProfile::InspectOnly => {
+            OperatingLevel::ReadOnly
+        }
+        crate::SafetyProfile::DdlGuarded | crate::SafetyProfile::SessionWriteEnabled => {
+            OperatingLevel::Ddl
+        }
+    }
 }
 
 async fn run_connect(
@@ -1083,6 +1144,22 @@ mod tests {
         live_runtime: &mut LiveDbRuntime,
         request_budget: impl FnOnce(&Cx) -> RequestBudget,
     ) -> Result<Value, Box<ErrorEnvelope>> {
+        dispatch_with_runtime_context_and_budget_for_test(
+            name,
+            args,
+            live_runtime,
+            DispatchContext::default(),
+            request_budget,
+        )
+    }
+
+    fn dispatch_with_runtime_context_and_budget_for_test<'a>(
+        name: &str,
+        args: Value,
+        live_runtime: &mut LiveDbRuntime,
+        core_context: DispatchContext<'a>,
+        request_budget: impl FnOnce(&Cx) -> RequestBudget,
+    ) -> Result<Value, Box<ErrorEnvelope>> {
         let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(reactor)
@@ -1090,8 +1167,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let cx = Cx::current().expect("block_on installs a request Cx");
-            let context =
-                PlsqlDispatchContext::new(DispatchContext::default(), request_budget(&cx));
+            let context = PlsqlDispatchContext::new(core_context, request_budget(&cx));
             dispatch_tool_with_runtime(&cx, context, live_runtime, name, args)
                 .await
                 .map_err(Box::new)
@@ -1631,6 +1707,111 @@ mod tests {
             "side-effecting metadata must block before the user query executes"
         );
         assert_eq!(observed.observed_metadata_queries().len(), 1);
+    }
+
+    #[test]
+    fn oauth_read_scope_blocks_write_capable_tool_before_runtime_state() {
+        let mut live_runtime = LiveDbRuntime::new();
+        let grant = oraclemcp_core::ScopeGrant(vec![String::from("oracle:read")]);
+        let err = dispatch_with_runtime_context_and_budget_for_test(
+            "deploy_ddl",
+            json!({"job_name": "DEPLOY_APP", "ddl_bytes": "CREATE OR REPLACE VIEW v AS SELECT 1 FROM dual"}),
+            &mut live_runtime,
+            DispatchContext::with_scope_grant(&grant),
+            |cx| RequestBudget::from_budget(cx.budget()),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.error_class, ErrorClass::OperatingLevelTooLow);
+        assert!(
+            err.message.contains("OAuth scope ceiling is READ_ONLY"),
+            "scope refusal must name the effective ceiling: {err:?}"
+        );
+    }
+
+    #[test]
+    fn oauth_ddl_scope_preserves_existing_runtime_state_gate() {
+        let mut live_runtime = LiveDbRuntime::new();
+        let grant = oraclemcp_core::ScopeGrant(vec![String::from("oracle:ddl")]);
+        let err = dispatch_with_runtime_context_and_budget_for_test(
+            "deploy_ddl",
+            json!({"job_name": "DEPLOY_APP", "ddl_bytes": "CREATE OR REPLACE VIEW v AS SELECT 1 FROM dual"}),
+            &mut live_runtime,
+            DispatchContext::with_scope_grant(&grant),
+            |cx| RequestBudget::from_budget(cx.budget()),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.error_class, ErrorClass::RuntimeStateRequired);
+        assert_eq!(err.suggested_tool.as_deref(), Some("connect"));
+    }
+
+    #[test]
+    fn oauth_execute_scope_allows_write_step_but_not_ddl_tool() {
+        let mut live_runtime = LiveDbRuntime::new();
+        let grant = oraclemcp_core::ScopeGrant(vec![String::from("oracle:execute")]);
+        let enable_err = dispatch_with_runtime_context_and_budget_for_test(
+            "enable_writes",
+            json!({}),
+            &mut live_runtime,
+            DispatchContext::with_scope_grant(&grant),
+            |cx| RequestBudget::from_budget(cx.budget()),
+        )
+        .unwrap_err();
+        assert_eq!(enable_err.error_class, ErrorClass::RuntimeStateRequired);
+
+        let ddl_err = dispatch_with_runtime_context_and_budget_for_test(
+            "deploy_ddl",
+            json!({"job_name": "DEPLOY_APP", "ddl_bytes": "CREATE OR REPLACE VIEW v AS SELECT 1 FROM dual"}),
+            &mut live_runtime,
+            DispatchContext::with_scope_grant(&grant),
+            |cx| RequestBudget::from_budget(cx.budget()),
+        )
+        .unwrap_err();
+        assert_eq!(ddl_err.error_class, ErrorClass::OperatingLevelTooLow);
+        assert!(
+            ddl_err
+                .message
+                .contains("OAuth scope ceiling is READ_WRITE"),
+            "execute scope must not authorize DDL: {ddl_err:?}"
+        );
+    }
+
+    #[test]
+    fn oauth_scope_cannot_raise_active_safety_profile_ceiling() {
+        let mut live_runtime = LiveDbRuntime::new();
+        live_runtime
+            .insert_connected(
+                live_profile("dev"),
+                Box::new(RecordingOracleConnection::new()),
+            )
+            .expect("test session inserts");
+        dispatch_with_runtime_for_test("connect", json!({"name": "dev"}), &mut live_runtime)
+            .expect("connect activates existing live session");
+        assert_eq!(
+            live_runtime
+                .active_session()
+                .expect("active session")
+                .safety()
+                .profile,
+            crate::SafetyProfile::InspectOnly
+        );
+
+        let grant = oraclemcp_core::ScopeGrant(vec![String::from("oracle:admin")]);
+        let err = dispatch_with_runtime_context_and_budget_for_test(
+            "deploy_ddl",
+            json!({"job_name": "DEPLOY_APP", "ddl_bytes": "CREATE OR REPLACE VIEW v AS SELECT 1 FROM dual"}),
+            &mut live_runtime,
+            DispatchContext::with_scope_grant(&grant),
+            |cx| RequestBudget::from_budget(cx.budget()),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.error_class, ErrorClass::OperatingLevelTooLow);
+        assert!(
+            err.message.contains("OAuth scope ceiling is READ_ONLY"),
+            "scope must not raise the active inspect-only safety profile: {err:?}"
+        );
     }
 
     #[test]

@@ -33,6 +33,7 @@ clap = { version = "4", features = ["derive"] }
 # MuhDur/oraclemcp repo + crates.io). plsql-mcp is the full superset that adds the
 # PL/SQL intelligence layer on top of this shared MCP spine.
 oraclemcp-audit = "=0.4.0"
+oraclemcp-auth = "=0.4.0"
 oraclemcp-core = "=0.4.0"
 oraclemcp-db = "=0.4.0"
 oraclemcp-error = "=0.4.0"
