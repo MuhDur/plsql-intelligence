@@ -8,7 +8,10 @@
 //!   `_meta.session.client_info` field).
 //! - Embed `/* plsql-mcp $tool $session-id $agent-model */` as a comment
 //!   on every emitted SQL statement.
-//! - Optionally append to an audit table when `audit_table` is configured.
+//! - For guarded writes, append a signed, hash-chained out-of-band
+//!   `oraclemcp-audit` record and fsync it before Oracle execution.
+//! - Optionally mirror non-proof metadata into an audit table when
+//!   `audit_table` is configured.
 //! - Doctor subcommand verifies the audit posture and reports it.
 //!
 //! This module exposes the helpers concrete live-DB tools call before
@@ -16,7 +19,16 @@
 //! per-tool code can plug it into whichever connection abstraction it
 //! chooses.
 
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use oraclemcp_audit::{
+    AuditDecision, AuditEntryDraft, AuditOutcome, AuditRecord, Auditor as UpstreamAuditor,
+    FileAuditSink, SigningKey,
+};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// Stable module name reported to Oracle via `DBMS_APPLICATION_INFO`.
 /// Matches the SQLcl MCP convention (`MODULE='SQLcl-MCP'`) so DBAs see a
@@ -48,6 +60,152 @@ impl AuditClient {
             session_id: session_id.into(),
         }
     }
+}
+
+/// Environment variable naming the append-only JSONL audit file used by
+/// guarded writes.
+pub const GUARDED_AUDIT_FILE_ENV: &str = "PLSQL_MCP_AUDIT_FILE";
+/// Environment variable carrying the HMAC key bytes for guarded-write audit
+/// records. The value is read as UTF-8 bytes; operators can provide a random
+/// high-entropy string from their secret manager.
+pub const GUARDED_AUDIT_KEY_ENV: &str = "PLSQL_MCP_AUDIT_KEY";
+/// Optional key id recorded with each HMAC signature.
+pub const GUARDED_AUDIT_KEY_ID_ENV: &str = "PLSQL_MCP_AUDIT_KEY_ID";
+
+/// Errors while installing or appending the durable guarded-write audit sink.
+#[derive(Debug, Error)]
+pub enum GuardedAuditError {
+    #[error(
+        "{GUARDED_AUDIT_FILE_ENV} is set but {GUARDED_AUDIT_KEY_ENV} is missing; guarded writes require both"
+    )]
+    MissingKeyForFile,
+    #[error(
+        "{GUARDED_AUDIT_KEY_ENV} is set but {GUARDED_AUDIT_FILE_ENV} is missing; guarded writes require both"
+    )]
+    MissingFileForKey,
+    #[error("guarded audit sink error: {0}")]
+    Sink(#[from] oraclemcp_audit::AuditError),
+}
+
+/// Signed, out-of-band audit writer for guarded writes and privilege
+/// escalations.
+///
+/// This is deliberately a narrow wrapper around `oraclemcp-audit`: it keeps
+/// `plsql-mcp`'s dispatch code focused on tool semantics while preserving the
+/// upstream fsync-before-execute contract for `durable=true` appends.
+#[derive(Clone)]
+pub struct GuardedAudit {
+    auditor: Arc<UpstreamAuditor>,
+}
+
+/// Local draft for one guarded-write audit append.
+pub struct GuardedAuditDraft<'a> {
+    pub client: &'a AuditClient,
+    pub tool_name: &'a str,
+    pub sql: &'a str,
+    pub danger_level: &'a str,
+    pub decision: AuditDecision,
+    pub outcome: AuditOutcome,
+    pub rows_affected: Option<u64>,
+}
+
+impl GuardedAudit {
+    /// Build a signed guarded-write auditor over an append-only file.
+    ///
+    /// The file is JSONL, one `oraclemcp-audit` [`AuditRecord`] per line.
+    pub fn file(
+        path: impl AsRef<Path>,
+        key_id: impl Into<String>,
+        key_bytes: impl Into<Vec<u8>>,
+    ) -> Result<Self, GuardedAuditError> {
+        let sink = FileAuditSink::open(path)?;
+        Ok(Self {
+            auditor: Arc::new(UpstreamAuditor::new(
+                Box::new(sink),
+                SigningKey::new(key_id, key_bytes),
+            )),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_sink_for_test(
+        sink: Box<dyn oraclemcp_audit::AuditSink>,
+        key_id: impl Into<String>,
+        key_bytes: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            auditor: Arc::new(UpstreamAuditor::new(
+                sink,
+                SigningKey::new(key_id, key_bytes),
+            )),
+        }
+    }
+
+    /// Build from the environment, returning `Ok(None)` when audit is simply
+    /// not configured. Supplying only one of file/key is a hard configuration
+    /// error because it would make guarded writes look auditable when they are
+    /// not.
+    pub fn from_env() -> Result<Option<Self>, GuardedAuditError> {
+        let file = std::env::var(GUARDED_AUDIT_FILE_ENV).ok();
+        let key = std::env::var(GUARDED_AUDIT_KEY_ENV).ok();
+        match (file, key) {
+            (None, None) => Ok(None),
+            (Some(_), None) => Err(GuardedAuditError::MissingKeyForFile),
+            (None, Some(_)) => Err(GuardedAuditError::MissingFileForKey),
+            (Some(path), Some(key)) => {
+                let key_id = std::env::var(GUARDED_AUDIT_KEY_ID_ENV)
+                    .unwrap_or_else(|_| String::from("plsql-mcp-env"));
+                Ok(Some(Self::file(path, key_id, key.into_bytes())?))
+            }
+        }
+    }
+
+    /// Append a signed, durable audit record. `durable=true` means the record
+    /// has been flushed and fsynced before this returns.
+    pub fn append(&self, draft: GuardedAuditDraft<'_>) -> Result<AuditRecord, GuardedAuditError> {
+        let upstream = AuditEntryDraft {
+            agent_identity: agent_identity(draft.client),
+            tool: draft.tool_name.to_string(),
+            sql: draft.sql.to_string(),
+            danger_level: draft.danger_level.to_string(),
+            decision: draft.decision,
+            rows_affected: draft.rows_affected,
+            outcome: draft.outcome,
+        };
+        Ok(self.auditor.append(&upstream, audit_timestamp(), true)?)
+    }
+}
+
+impl std::fmt::Debug for GuardedAudit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuardedAudit").finish_non_exhaustive()
+    }
+}
+
+fn agent_identity(client: &AuditClient) -> String {
+    format!(
+        "program={} model={} session={}",
+        blank_as_unknown(&client.program),
+        blank_as_unknown(&client.model),
+        blank_as_unknown(&client.session_id)
+    )
+}
+
+fn blank_as_unknown(value: &str) -> &str {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        "unknown"
+    } else {
+        trimmed
+    }
+}
+
+fn audit_timestamp() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs();
+    format!("unix:{secs}")
 }
 
 /// Optional sink that mirrors audit records into a customer-owned table.
@@ -226,7 +384,7 @@ fn is_simple_sql_name(s: &str) -> bool {
     if bytes.is_empty() || bytes.len() > 128 {
         return false;
     }
-    if !bytes[0].is_ascii_alphabetic() {
+    if !bytes.first().is_some_and(u8::is_ascii_alphabetic) {
         return false;
     }
     bytes
@@ -350,5 +508,76 @@ mod tests {
                 "malicious table name {attack:?} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn guarded_audit_appends_signed_durable_record() {
+        use oraclemcp_audit::{
+            AuditOutcome as UpstreamOutcome, BrokenReason, MemoryAuditSink, VerifyOutcome,
+            verify_records,
+        };
+        use std::sync::Arc;
+
+        struct SharedSink(Arc<MemoryAuditSink>);
+        impl oraclemcp_audit::AuditSink for SharedSink {
+            fn append(
+                &self,
+                record: &oraclemcp_audit::AuditRecord,
+            ) -> Result<(), oraclemcp_audit::AuditError> {
+                self.0.append(record)
+            }
+
+            fn flush(&self) -> Result<(), oraclemcp_audit::AuditError> {
+                self.0.flush()
+            }
+        }
+
+        let sink = Arc::new(MemoryAuditSink::new());
+        let audit = GuardedAudit::from_sink_for_test(
+            Box::new(SharedSink(Arc::clone(&sink))),
+            "k-test",
+            b"guarded-test-key".to_vec(),
+        );
+        let record = audit
+            .append(GuardedAuditDraft {
+                client: &fixture_client(),
+                tool_name: "execute_approved",
+                sql: "CREATE OR REPLACE VIEW V AS SELECT 1 FROM DUAL",
+                danger_level: "DDL",
+                decision: AuditDecision::Allowed,
+                outcome: UpstreamOutcome::Pending,
+                rows_affected: None,
+            })
+            .expect("append");
+
+        assert_eq!(sink.flush_count(), 1, "guarded append must fsync");
+        assert_eq!(record.seq, 1);
+        assert_eq!(record.tool, "execute_approved");
+        assert_eq!(record.key_id.as_deref(), Some("k-test"));
+        assert_eq!(
+            verify_records(
+                &sink.records(),
+                &[SigningKey::new("k-test", b"guarded-test-key".to_vec())],
+            ),
+            VerifyOutcome::Ok { records: 1 }
+        );
+
+        let mut tampered = sink.records();
+        tampered
+            .first_mut()
+            .expect("one audit record")
+            .sql_preview
+            .push_str(" -- tampered");
+        assert_eq!(
+            verify_records(
+                &tampered,
+                &[SigningKey::new("k-test", b"guarded-test-key".to_vec())],
+            ),
+            VerifyOutcome::Broken {
+                seq: 1,
+                index: 0,
+                reason: BrokenReason::HashMismatch,
+            }
+        );
     }
 }

@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    ConnectionProfile, EnableWritesToken, PreviewError, PreviewRegistry, PreviewedDdl,
-    SafetyProfile, SafetyProfileError, SessionSafetyState,
+    ConnectionProfile, EnableWritesToken, GuardedAudit, PreviewError, PreviewRegistry,
+    PreviewedDdl, SafetyProfile, SafetyProfileError, SessionSafetyState,
 };
 
 /// Boxed upstream Oracle connection used by the live runtime.
@@ -137,6 +137,7 @@ pub struct LiveDbRuntime {
     active_lease: Option<LiveSessionLease>,
     next_generation: u64,
     previews: PreviewRegistry,
+    guarded_audit: Option<GuardedAudit>,
 }
 
 impl LiveDbRuntime {
@@ -150,6 +151,7 @@ impl LiveDbRuntime {
             active_lease: None,
             next_generation: 0,
             previews: PreviewRegistry::new(),
+            guarded_audit: None,
         }
     }
 
@@ -164,6 +166,25 @@ impl LiveDbRuntime {
             default_safety_profile,
             ..Self::new()
         })
+    }
+
+    /// Build an empty runtime with a configured guarded-write auditor.
+    #[must_use]
+    pub fn with_guarded_audit(audit: GuardedAudit) -> Self {
+        let mut runtime = Self::new();
+        runtime.guarded_audit = Some(audit);
+        runtime
+    }
+
+    /// Install or replace the guarded-write auditor for this runtime.
+    pub fn install_guarded_audit(&mut self, audit: GuardedAudit) {
+        self.guarded_audit = Some(audit);
+    }
+
+    /// Configured guarded-write auditor, if any.
+    #[must_use]
+    pub fn guarded_audit(&self) -> Option<&GuardedAudit> {
+        self.guarded_audit.as_ref()
     }
 
     /// Default safety profile used for newly inserted sessions.
@@ -426,6 +447,7 @@ impl fmt::Debug for LiveDbRuntime {
             .field("active", &self.active)
             .field("active_lease", &self.active_lease)
             .field("preview_count", &self.previews.len())
+            .field("guarded_audit_configured", &self.guarded_audit.is_some())
             .finish_non_exhaustive()
     }
 }

@@ -26,6 +26,7 @@ path = "src/main.rs"
 async-trait = "0.1"
 asupersync = "=0.3.4"
 clap = { version = "4", features = ["derive"] }
+getrandom = "0.3"
 # Depend on the published engine-free oraclemcp core (extracted to the standalone
 # MuhDur/oraclemcp repo + crates.io). plsql-mcp is the full superset that adds the
 # PL/SQL intelligence layer on top of this shared MCP spine.

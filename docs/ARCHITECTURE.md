@@ -169,8 +169,10 @@ PL/SQL examples are vendored under `corpus/public/` with manifest entries
   invariant. Plug-in replacement backends (Java subprocess, tree-sitter)
   must implement `ParseBackend` only.
 - **R17 — no telemetry by default.** Every binary the project ships must
-  operate offline. `plsql-mcp` audit posture writes to `stdout` /
-  configured per-connection audit tables only; no outbound calls.
+  operate offline. `plsql-mcp` guarded-write audit writes to the local
+  `PLSQL_MCP_AUDIT_FILE` JSONL sink when paired with
+  `PLSQL_MCP_AUDIT_KEY`; no outbound calls. Without that signed sink,
+  guarded writes fail closed before Oracle execution.
 - **`permanently_read_only` is the hardest guard.** It overrides safety
   profile, session token, and `--dangerously-verify-in-place`. The doctor
   surfaces `MCP_PROD_DSN_WITHOUT_PERMANENTLY_READ_ONLY` warnings whenever a

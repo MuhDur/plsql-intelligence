@@ -239,7 +239,11 @@ pub fn register_query_tool(registry: &mut ToolRegistry) {
     );
 }
 
-pub use audit::{APPLICATION_MODULE, AuditClient, AuditPlan, AuditSink};
+pub use audit::{
+    APPLICATION_MODULE, AuditClient, AuditPlan, AuditSink, GUARDED_AUDIT_FILE_ENV,
+    GUARDED_AUDIT_KEY_ENV, GUARDED_AUDIT_KEY_ID_ENV, GuardedAudit, GuardedAuditDraft,
+    GuardedAuditError,
+};
 
 pub use connections::{
     ConnectionError, ConnectionListEntry, ConnectionProfile, ConnectionRegistry, DbToolsAlias,

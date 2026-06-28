@@ -51,6 +51,7 @@ use std::{sync::Arc, time::Duration};
 
 use asupersync::Cx;
 use asupersync::cx::SubsetOf;
+use oraclemcp_audit::{AuditDecision, AuditOutcome, AuditRecord};
 use oraclemcp_core::{
     DispatchContext, DispatchFuture, ReadPathCaps, RequestBudget, ToolDispatch, narrow_to_read_path,
 };
@@ -64,6 +65,7 @@ use crate::{
     run_dynamic_sql_evidence, run_get_symbol, run_inspect_profile, run_parse_file,
     run_plsql_analyze,
 };
+use crate::{AuditClient, AuditPlan, GuardedAuditDraft, SafetyProfileError};
 use crate::{ConnectionProfile, LiveDbRuntime, LiveRuntimeError, OraclemcpCatalogConnection};
 
 /// Why a dispatched tool could not run to completion in the pure
@@ -393,6 +395,16 @@ pub fn dispatch_tool_with_runtime<'a>(
             "current_database" => run_current_database(cx, context, live_runtime)
                 .await
                 .map_err(|err| *err),
+            "current_safety_profile" => {
+                run_current_safety_profile(cx, live_runtime).map_err(|err| *err)
+            }
+            "set_safety_profile" => {
+                run_set_safety_profile(cx, live_runtime, &arguments).map_err(|err| *err)
+            }
+            "enable_writes" => run_enable_writes(cx, live_runtime, &arguments)
+                .await
+                .map_err(|err| *err),
+            "disable_writes" => run_disable_writes(cx, live_runtime).map_err(|err| *err),
             "query" => run_query_live(
                 cx,
                 context,
@@ -402,6 +414,21 @@ pub fn dispatch_tool_with_runtime<'a>(
             )
             .await
             .map_err(|err| *err),
+            "patch_package" => run_patch_package_live(cx, live_runtime, &arguments)
+                .await
+                .map_err(|err| *err),
+            "patch_view" => run_patch_view_live(cx, live_runtime, &arguments)
+                .await
+                .map_err(|err| *err),
+            "create_or_replace" => run_create_or_replace_live(cx, live_runtime, &arguments)
+                .await
+                .map_err(|err| *err),
+            "execute_approved" => run_execute_approved_live(cx, live_runtime, &arguments)
+                .await
+                .map_err(|err| *err),
+            "deploy_ddl" => run_deploy_ddl_live(cx, live_runtime, &arguments)
+                .await
+                .map_err(|err| *err),
             _ => match dispatch_tool_outcome(name, &arguments) {
                 Ok(DispatchOutcome::Ran(value)) => Ok(value),
                 Ok(DispatchOutcome::RuntimeStateRequired(kind)) => {
@@ -763,6 +790,308 @@ async fn run_current_database(
     }))
 }
 
+fn run_current_safety_profile(
+    cx: &Cx,
+    live_runtime: &LiveDbRuntime,
+) -> Result<Value, Box<ErrorEnvelope>> {
+    checkpoint(cx, "current_safety_profile")?;
+    let session = live_runtime
+        .active_session()
+        .map_err(|err| Box::new(live_runtime_error_envelope(err, "current_safety_profile")))?;
+    Ok(safety_profile_json(session))
+}
+
+fn run_set_safety_profile(
+    cx: &Cx,
+    live_runtime: &mut LiveDbRuntime,
+    arguments: &Value,
+) -> Result<Value, Box<ErrorEnvelope>> {
+    checkpoint(cx, "set_safety_profile")?;
+    let args: SetSafetyProfileArgs =
+        parse_args("set_safety_profile", arguments).map_err(|err| Box::new(err.into_envelope()))?;
+    live_runtime
+        .set_active_safety_profile(args.profile)
+        .map_err(|err| Box::new(live_runtime_error_envelope(err, "set_safety_profile")))?;
+    let session = live_runtime
+        .active_session()
+        .map_err(|err| Box::new(live_runtime_error_envelope(err, "set_safety_profile")))?;
+    Ok(serde_json::json!({
+        "updated": true,
+        "safety": safety_profile_json(session),
+    }))
+}
+
+async fn run_enable_writes(
+    cx: &Cx,
+    live_runtime: &mut LiveDbRuntime,
+    arguments: &Value,
+) -> Result<Value, Box<ErrorEnvelope>> {
+    checkpoint(cx, "enable_writes")?;
+    let session = live_runtime
+        .active_session()
+        .map_err(|err| Box::new(live_runtime_error_envelope(err, "enable_writes")))?;
+    let args: EnableWritesArgs =
+        parse_args("enable_writes", arguments).map_err(|err| Box::new(err.into_envelope()))?;
+    let connection = session.profile().name.clone();
+    let operation_summary = session
+        .safety()
+        .active_token
+        .as_ref()
+        .map(|token| token.operation_summary.clone())
+        .unwrap_or_else(|| String::from("enable_writes"));
+    let audit_record = append_guarded_audit(
+        live_runtime,
+        "enable_writes",
+        &format!("enable_writes {connection}: {operation_summary}"),
+        "ESCALATION",
+    )?;
+    let now = unix_now_seconds();
+    live_runtime
+        .active_session_mut()
+        .map_err(|err| Box::new(live_runtime_error_envelope(err, "enable_writes")))?
+        .enable_writes(&args.token, now)
+        .map_err(|err| Box::new(safety_error_envelope(err, "enable_writes")))?;
+    checkpoint(cx, "enable_writes")?;
+    let session = live_runtime
+        .active_session()
+        .map_err(|err| Box::new(live_runtime_error_envelope(err, "enable_writes")))?;
+    Ok(serde_json::json!({
+        "enabled": true,
+        "safety": safety_profile_json(session),
+        "audit_record": audit_record,
+    }))
+}
+
+fn run_disable_writes(
+    cx: &Cx,
+    live_runtime: &mut LiveDbRuntime,
+) -> Result<Value, Box<ErrorEnvelope>> {
+    checkpoint(cx, "disable_writes")?;
+    let changed = match live_runtime
+        .active_session_mut()
+        .map_err(|err| Box::new(live_runtime_error_envelope(err, "disable_writes")))?
+        .disable_writes()
+    {
+        Ok(()) => true,
+        Err(SafetyProfileError::AlreadyReadOnly) => false,
+        Err(err) => return Err(Box::new(safety_error_envelope(err, "disable_writes"))),
+    };
+    let session = live_runtime
+        .active_session()
+        .map_err(|err| Box::new(live_runtime_error_envelope(err, "disable_writes")))?;
+    Ok(serde_json::json!({
+        "disabled": true,
+        "changed": changed,
+        "safety": safety_profile_json(session),
+    }))
+}
+
+async fn run_patch_package_live(
+    cx: &Cx,
+    live_runtime: &mut LiveDbRuntime,
+    arguments: &Value,
+) -> Result<Value, Box<ErrorEnvelope>> {
+    let req: crate::patch::PatchPackageRequest =
+        parse_args("patch_package", arguments).map_err(|err| Box::new(err.into_envelope()))?;
+    let token = mint_preview_token()?;
+    let response =
+        crate::patch::run_patch_package(live_runtime.preview_registry_mut(), req, move || token)
+            .map_err(|err| {
+                Box::new(invalid_arguments_envelope(
+                    "patch_package",
+                    &err.to_string(),
+                ))
+            })?;
+    match response {
+        dry_run @ crate::patch::PatchPackageResponse::DryRun { .. } => {
+            Ok(serde_json::to_value(dry_run).unwrap_or(Value::Object(Default::default())))
+        }
+        crate::patch::PatchPackageResponse::Apply {
+            connection,
+            ddl_bytes,
+            ddl_sha256,
+        } => {
+            let executed =
+                execute_guarded_sql(cx, live_runtime, &connection, "patch_package", &ddl_bytes)
+                    .await?;
+            live_runtime.preview_registry_mut().consume(&connection);
+            Ok(serde_json::json!({
+                "kind": "apply",
+                "connection": connection,
+                "ddl_bytes": ddl_bytes,
+                "ddl_sha256": ddl_sha256,
+                "rows_affected": executed.rows_affected,
+                "audit_record": executed.audit_record,
+            }))
+        }
+    }
+}
+
+async fn run_patch_view_live(
+    cx: &Cx,
+    live_runtime: &mut LiveDbRuntime,
+    arguments: &Value,
+) -> Result<Value, Box<ErrorEnvelope>> {
+    let req: crate::patch::PatchViewRequest =
+        parse_args("patch_view", arguments).map_err(|err| Box::new(err.into_envelope()))?;
+    let token = mint_preview_token()?;
+    let response =
+        crate::patch::run_patch_view(live_runtime.preview_registry_mut(), req, move || token)
+            .map_err(|err| Box::new(invalid_arguments_envelope("patch_view", &err.to_string())))?;
+    match response {
+        dry_run @ crate::patch::PatchViewResponse::DryRun { .. } => {
+            Ok(serde_json::to_value(dry_run).unwrap_or(Value::Object(Default::default())))
+        }
+        crate::patch::PatchViewResponse::Apply {
+            connection,
+            ddl_bytes,
+            ddl_sha256,
+        } => {
+            let executed =
+                execute_guarded_sql(cx, live_runtime, &connection, "patch_view", &ddl_bytes)
+                    .await?;
+            live_runtime.preview_registry_mut().consume(&connection);
+            Ok(serde_json::json!({
+                "kind": "apply",
+                "connection": connection,
+                "ddl_bytes": ddl_bytes,
+                "ddl_sha256": ddl_sha256,
+                "rows_affected": executed.rows_affected,
+                "audit_record": executed.audit_record,
+            }))
+        }
+    }
+}
+
+async fn run_create_or_replace_live(
+    cx: &Cx,
+    live_runtime: &mut LiveDbRuntime,
+    arguments: &Value,
+) -> Result<Value, Box<ErrorEnvelope>> {
+    let req: crate::create_or_replace::CreateOrReplaceRequest =
+        parse_args("create_or_replace", arguments).map_err(|err| Box::new(err.into_envelope()))?;
+    let token = mint_preview_token()?;
+    let response = crate::create_or_replace::run_create_or_replace(
+        live_runtime.preview_registry_mut(),
+        req,
+        move || token,
+    )
+    .map_err(|err| {
+        Box::new(invalid_arguments_envelope(
+            "create_or_replace",
+            &err.to_string(),
+        ))
+    })?;
+    match response {
+        dry_run @ crate::create_or_replace::CreateOrReplaceResponse::DryRun { .. } => {
+            Ok(serde_json::to_value(dry_run).unwrap_or(Value::Object(Default::default())))
+        }
+        crate::create_or_replace::CreateOrReplaceResponse::Apply {
+            connection,
+            object_kind,
+            ddl_bytes,
+            ddl_sha256,
+        } => {
+            let executed = execute_guarded_sql(
+                cx,
+                live_runtime,
+                &connection,
+                "create_or_replace",
+                &ddl_bytes,
+            )
+            .await?;
+            live_runtime.preview_registry_mut().consume(&connection);
+            Ok(serde_json::json!({
+                "kind": "apply",
+                "connection": connection,
+                "object_kind": object_kind,
+                "ddl_bytes": ddl_bytes,
+                "ddl_sha256": ddl_sha256,
+                "rows_affected": executed.rows_affected,
+                "audit_record": executed.audit_record,
+            }))
+        }
+    }
+}
+
+async fn run_execute_approved_live(
+    cx: &Cx,
+    live_runtime: &mut LiveDbRuntime,
+    arguments: &Value,
+) -> Result<Value, Box<ErrorEnvelope>> {
+    let req: crate::execute_approved::ExecuteApprovedRequest =
+        parse_args("execute_approved", arguments).map_err(|err| Box::new(err.into_envelope()))?;
+    let plan =
+        crate::execute_approved::run_execute_approved(live_runtime.preview_registry_mut(), req)
+            .map_err(|err| {
+                Box::new(invalid_arguments_envelope(
+                    "execute_approved",
+                    &err.to_string(),
+                ))
+            })?;
+    let executed = execute_guarded_sql(
+        cx,
+        live_runtime,
+        &plan.connection,
+        "execute_approved",
+        &plan.ddl_bytes,
+    )
+    .await?;
+    crate::execute_approved::consume_approved(live_runtime.preview_registry_mut(), &plan);
+    Ok(serde_json::json!({
+        "kind": "executed",
+        "plan": plan,
+        "rows_affected": executed.rows_affected,
+        "audit_record": executed.audit_record,
+    }))
+}
+
+async fn run_deploy_ddl_live(
+    cx: &Cx,
+    live_runtime: &mut LiveDbRuntime,
+    arguments: &Value,
+) -> Result<Value, Box<ErrorEnvelope>> {
+    let args: DeployDdlArgs =
+        parse_args("deploy_ddl", arguments).map_err(|err| Box::new(err.into_envelope()))?;
+    if args.job_name.trim().is_empty() {
+        return Err(Box::new(invalid_arguments_envelope(
+            "deploy_ddl",
+            "`job_name` must not be empty",
+        )));
+    }
+    if args.ddl_bytes.trim().is_empty() {
+        return Err(Box::new(invalid_arguments_envelope(
+            "deploy_ddl",
+            "`ddl_bytes` must not be empty",
+        )));
+    }
+    let connection = live_runtime
+        .active_name()
+        .ok_or_else(|| {
+            Box::new(live_runtime_error_envelope(
+                LiveRuntimeError::NoActiveConnection,
+                "deploy_ddl",
+            ))
+        })?
+        .to_string();
+    let plan = crate::execute_approved::build_deploy_plan(&args.job_name, &args.ddl_bytes);
+    let executed = execute_guarded_sql(
+        cx,
+        live_runtime,
+        &connection,
+        "deploy_ddl",
+        &plan.submit_block,
+    )
+    .await?;
+    Ok(serde_json::json!({
+        "kind": "submitted",
+        "connection": connection,
+        "plan": plan,
+        "rows_affected": executed.rows_affected,
+        "audit_record": executed.audit_record,
+    }))
+}
+
 async fn run_query_live(
     cx: &Cx,
     context: PlsqlDispatchContext<'_>,
@@ -843,6 +1172,196 @@ async fn run_query_live(
         args.lob_truncation_chars,
     ))
     .unwrap_or(Value::Object(Default::default())))
+}
+
+struct GuardedExecutionResult {
+    rows_affected: u64,
+    audit_record: AuditRecord,
+}
+
+async fn execute_guarded_sql(
+    cx: &Cx,
+    live_runtime: &LiveDbRuntime,
+    connection: &str,
+    tool_name: &str,
+    sql: &str,
+) -> Result<GuardedExecutionResult, Box<ErrorEnvelope>> {
+    let session = live_runtime
+        .session(connection)
+        .map_err(|err| Box::new(live_runtime_error_envelope(err, tool_name)))?;
+    if !session.safety().writes_allowed() {
+        return Err(Box::new(
+            ErrorEnvelope::new(
+                ErrorClass::OperatingLevelTooLow,
+                format!(
+                    "tool `{tool_name}` refused: connection `{connection}` is not write-enabled"
+                ),
+            )
+            .with_suggested_tool("enable_writes")
+            .with_next_step(
+                "Call enable_writes with a fresh operator confirmation token before executing DDL.",
+            ),
+        ));
+    }
+
+    let audit_record = append_guarded_audit(live_runtime, tool_name, sql, "DDL")?;
+    checkpoint(cx, tool_name)?;
+
+    let audit_plan = AuditPlan::for_tool(default_audit_client(), tool_name);
+    let connection_handle = session.connection();
+    run_audit_session_markers(cx, connection_handle, &audit_plan, tool_name).await?;
+    let annotated = audit_plan.annotate(sql);
+    let rows_affected = connection_handle
+        .execute(cx, &annotated, &[])
+        .await
+        .map_err(|err| Box::new(db_error_envelope(err, tool_name)))?;
+    connection_handle
+        .commit(cx)
+        .await
+        .map_err(|err| Box::new(db_error_envelope(err, tool_name)))?;
+    checkpoint(cx, tool_name)?;
+    Ok(GuardedExecutionResult {
+        rows_affected,
+        audit_record,
+    })
+}
+
+async fn run_audit_session_markers(
+    cx: &Cx,
+    connection: &dyn oraclemcp_db::OracleConnection,
+    audit_plan: &AuditPlan,
+    tool_name: &str,
+) -> Result<(), Box<ErrorEnvelope>> {
+    let (module_sql, module_params) = audit_plan.set_module_sql();
+    let module_binds = module_params
+        .into_iter()
+        .map(oraclemcp_db::OracleBind::String)
+        .collect::<Vec<_>>();
+    connection
+        .execute(cx, module_sql, &module_binds)
+        .await
+        .map_err(|err| Box::new(db_error_envelope(err, tool_name)))?;
+
+    let (action_sql, action_params) = audit_plan.set_action_sql();
+    let action_binds = action_params
+        .into_iter()
+        .map(oraclemcp_db::OracleBind::String)
+        .collect::<Vec<_>>();
+    connection
+        .execute(cx, action_sql, &action_binds)
+        .await
+        .map_err(|err| Box::new(db_error_envelope(err, tool_name)))?;
+    Ok(())
+}
+
+fn append_guarded_audit(
+    live_runtime: &LiveDbRuntime,
+    tool_name: &str,
+    sql: &str,
+    danger_level: &str,
+) -> Result<AuditRecord, Box<ErrorEnvelope>> {
+    let Some(audit) = live_runtime.guarded_audit() else {
+        return Err(Box::new(
+            ErrorEnvelope::new(
+                ErrorClass::OperatingLevelTooLow,
+                format!(
+                    "tool `{tool_name}` refused: guarded-write audit is not configured"
+                ),
+            )
+            .with_next_step(format!(
+                "Set `{}` and `{}` before starting plsql-mcp serve; guarded writes fail closed without a signed audit sink.",
+                crate::GUARDED_AUDIT_FILE_ENV,
+                crate::GUARDED_AUDIT_KEY_ENV
+            )),
+        ));
+    };
+    let client = default_audit_client();
+    audit
+        .append(GuardedAuditDraft {
+            client: &client,
+            tool_name,
+            sql,
+            danger_level,
+            decision: AuditDecision::Allowed,
+            outcome: AuditOutcome::Pending,
+            rows_affected: None,
+        })
+        .map_err(|err| {
+            Box::new(
+                ErrorEnvelope::new(
+                    ErrorClass::Internal,
+                    format!("guarded audit append failed before `{tool_name}` executed: {err}"),
+                )
+                .with_next_step(
+                    "Inspect the audit sink path/key configuration and rerun audit verification before retrying the write.",
+                ),
+            )
+        })
+}
+
+fn safety_profile_json(session: &crate::LiveDbSession) -> Value {
+    let safety = session.safety();
+    serde_json::json!({
+        "connection": session.profile().name.clone(),
+        "profile": safety.profile.as_str(),
+        "session_writes_enabled": safety.session_writes_enabled,
+        "permanently_read_only": safety.permanently_read_only,
+        "active_enable_writes_token": safety.active_token.as_ref().map(|token| {
+            serde_json::json!({
+                "operation_summary": token.operation_summary.clone(),
+                "issued_at": token.issued_at,
+                "ttl_seconds": token.ttl_seconds,
+                "expired": token.is_expired(),
+            })
+        }),
+    })
+}
+
+fn safety_error_envelope(err: SafetyProfileError, tool: &str) -> ErrorEnvelope {
+    let class = match &err {
+        SafetyProfileError::PermanentlyReadOnly { .. }
+        | SafetyProfileError::EnableWritesTokenMissing { .. }
+        | SafetyProfileError::EnableWritesTokenMismatch => ErrorClass::OperatingLevelTooLow,
+        SafetyProfileError::Unknown { .. } | SafetyProfileError::AlreadyReadOnly => {
+            ErrorClass::InvalidArguments
+        }
+    };
+    ErrorEnvelope::new(class, err.to_string()).with_next_step(format!(
+        "Inspect current_safety_profile, then retry `{tool}` with the required safety state."
+    ))
+}
+
+fn mint_preview_token() -> Result<String, Box<ErrorEnvelope>> {
+    let mut bytes = [0u8; 24];
+    getrandom::fill(&mut bytes).map_err(|err| {
+        Box::new(
+            ErrorEnvelope::new(
+                ErrorClass::Internal,
+                format!("failed to mint approval token: {err}"),
+            )
+            .with_next_step("Retry the dry-run after the OS random source is available."),
+        )
+    })?;
+    Ok(hex_bytes(&bytes))
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn default_audit_client() -> AuditClient {
+    AuditClient::new("mcp-client", "unknown-model", "local-session")
+}
+
+fn unix_now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1070,6 +1589,20 @@ struct QueryArgs {
     lob_truncation_chars: Option<usize>,
 }
 
+/// Argument shape for `set_safety_profile`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetSafetyProfileArgs {
+    profile: crate::SafetyProfile,
+}
+
+/// Argument shape for `enable_writes`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnableWritesArgs {
+    token: String,
+}
+
 /// Argument shape for `connect`.
 ///
 /// D.3 keeps this intentionally explicit: a name-only call re-activates an
@@ -1099,9 +1632,7 @@ struct ConnectArgs {
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DeployDdlArgs {
-    #[allow(dead_code)]
     job_name: String,
-    #[allow(dead_code)]
     ddl_bytes: String,
 }
 
@@ -1207,6 +1738,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct RecordingOracleConnection {
         queries: Arc<Mutex<Vec<String>>>,
+        executes: Arc<Mutex<Vec<String>>>,
         metadata_queries: Arc<Mutex<Vec<String>>>,
         query_timeouts: Arc<Mutex<Vec<Option<Duration>>>>,
         ambient_remote_seen: Arc<Mutex<Vec<Option<bool>>>>,
@@ -1240,6 +1772,7 @@ mod tests {
         ) -> Self {
             Self {
                 queries: Arc::new(Mutex::new(Vec::new())),
+                executes: Arc::new(Mutex::new(Vec::new())),
                 metadata_queries: Arc::new(Mutex::new(Vec::new())),
                 query_timeouts: Arc::new(Mutex::new(Vec::new())),
                 ambient_remote_seen: Arc::new(Mutex::new(Vec::new())),
@@ -1263,6 +1796,13 @@ mod tests {
 
         fn observed_queries(&self) -> Vec<String> {
             self.queries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        fn observed_executes(&self) -> Vec<String> {
+            self.executes
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone()
@@ -1397,10 +1937,14 @@ mod tests {
         async fn execute(
             &self,
             _cx: &Cx,
-            _sql: &str,
+            sql: &str,
             _binds: &[oraclemcp_db::OracleBind],
         ) -> Result<u64, oraclemcp_db::DbError> {
-            Ok(0)
+            self.executes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(String::from(sql));
+            Ok(1)
         }
 
         async fn commit(&self, _cx: &Cx) -> Result<(), oraclemcp_db::DbError> {
@@ -1679,6 +2223,166 @@ mod tests {
             vec!["SELECT 1 AS val FROM dual"]
         );
         assert_eq!(observed.observed_metadata_queries().len(), 1);
+    }
+
+    #[test]
+    fn guarded_create_or_replace_apply_audits_before_execute() {
+        use oraclemcp_audit::{MemoryAuditSink, SigningKey, VerifyOutcome, verify_records};
+
+        struct SharedSink(Arc<MemoryAuditSink>);
+        impl oraclemcp_audit::AuditSink for SharedSink {
+            fn append(
+                &self,
+                record: &oraclemcp_audit::AuditRecord,
+            ) -> Result<(), oraclemcp_audit::AuditError> {
+                self.0.append(record)
+            }
+
+            fn flush(&self) -> Result<(), oraclemcp_audit::AuditError> {
+                self.0.flush()
+            }
+        }
+
+        let sink = Arc::new(MemoryAuditSink::new());
+        let mut live_runtime =
+            LiveDbRuntime::with_guarded_audit(crate::GuardedAudit::from_sink_for_test(
+                Box::new(SharedSink(Arc::clone(&sink))),
+                "k-dispatch",
+                b"dispatch-audit-key".to_vec(),
+            ));
+        let connection = RecordingOracleConnection::new();
+        let observed = connection.clone();
+        live_runtime
+            .insert_connected(live_profile("dev"), Box::new(connection))
+            .expect("test session inserts");
+        dispatch_with_runtime_for_test("connect", json!({"name": "dev"}), &mut live_runtime)
+            .expect("connect activates existing live session");
+        dispatch_with_runtime_for_test(
+            "set_safety_profile",
+            json!({"profile": "ddl_guarded"}),
+            &mut live_runtime,
+        )
+        .expect("ddl_guarded profile enables previews");
+
+        let ddl = "CREATE OR REPLACE VIEW BILLING.V_AUDIT AS SELECT 1 AS id FROM dual";
+        let dry_run = dispatch_with_runtime_for_test(
+            "create_or_replace",
+            json!({
+                "connection": "dev",
+                "operation_summary": "replace BILLING.V_AUDIT",
+                "ddl_bytes": ddl,
+                "mode": {"mode": "dry_run"}
+            }),
+            &mut live_runtime,
+        )
+        .expect("dry-run mints approval token");
+        let approval_token = dry_run["token"].as_str().expect("approval token");
+
+        let write_token = live_runtime
+            .active_session_mut()
+            .expect("active session")
+            .mint_enable_writes_token("replace BILLING.V_AUDIT", "write-ok")
+            .expect("mint write token");
+        dispatch_with_runtime_for_test(
+            "enable_writes",
+            json!({"token": write_token.token}),
+            &mut live_runtime,
+        )
+        .expect("enable_writes is audited and succeeds");
+
+        let applied = dispatch_with_runtime_for_test(
+            "create_or_replace",
+            json!({
+                "connection": "dev",
+                "operation_summary": "replace BILLING.V_AUDIT",
+                "ddl_bytes": ddl,
+                "mode": {"mode": "apply", "token": approval_token}
+            }),
+            &mut live_runtime,
+        )
+        .expect("apply executes through guarded audit");
+
+        assert_eq!(applied["kind"], "apply");
+        assert_eq!(applied["audit_record"]["tool"], "create_or_replace");
+        assert_eq!(sink.flush_count(), 2, "enable + DDL both fsync");
+        assert_eq!(
+            verify_records(
+                &sink.records(),
+                &[SigningKey::new(
+                    "k-dispatch",
+                    b"dispatch-audit-key".to_vec()
+                )],
+            ),
+            VerifyOutcome::Ok { records: 2 }
+        );
+
+        let executes = observed.observed_executes();
+        assert!(
+            executes
+                .iter()
+                .any(|sql| sql.contains("dbms_application_info.set_module")),
+            "write path should set module/action markers: {executes:?}"
+        );
+        let ddl_exec = executes
+            .iter()
+            .find(|sql| sql.contains("CREATE OR REPLACE VIEW BILLING.V_AUDIT"))
+            .expect("DDL executed");
+        assert!(
+            ddl_exec.contains("/* plsql-mcp create_or_replace local-session unknown-model */"),
+            "DDL must carry the SQL audit marker: {ddl_exec}"
+        );
+    }
+
+    #[test]
+    fn guarded_write_without_audit_fails_before_execute() {
+        let mut live_runtime = LiveDbRuntime::new();
+        let connection = RecordingOracleConnection::new();
+        let observed = connection.clone();
+        live_runtime
+            .insert_connected(live_profile("dev"), Box::new(connection))
+            .expect("test session inserts");
+        dispatch_with_runtime_for_test("connect", json!({"name": "dev"}), &mut live_runtime)
+            .expect("connect activates existing live session");
+        {
+            let safety = live_runtime
+                .active_session_mut()
+                .expect("active session")
+                .safety_mut();
+            safety.profile = crate::SafetyProfile::SessionWriteEnabled;
+            safety.session_writes_enabled = true;
+        }
+        live_runtime
+            .preview_registry_mut()
+            .preview_sql(
+                "dev",
+                "replace view",
+                "CREATE OR REPLACE VIEW V_NO_AUDIT AS SELECT 1 FROM dual",
+                "tok-no-audit",
+            )
+            .expect("seed preview");
+
+        let err = dispatch_with_runtime_for_test(
+            "create_or_replace",
+            json!({
+                "connection": "dev",
+                "operation_summary": "replace view",
+                "ddl_bytes": "CREATE OR REPLACE VIEW V_NO_AUDIT AS SELECT 1 FROM dual",
+                "mode": {"mode": "apply", "token": "tok-no-audit"}
+            }),
+            &mut live_runtime,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.error_class, ErrorClass::OperatingLevelTooLow);
+        assert!(
+            err.message
+                .contains("guarded-write audit is not configured"),
+            "missing audit must be explicit: {err:?}"
+        );
+        assert!(
+            observed.observed_executes().is_empty(),
+            "no Oracle execute before durable audit is configured"
+        );
     }
 
     #[test]

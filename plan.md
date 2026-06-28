@@ -2235,8 +2235,8 @@ This means daemon mode (D17) is the natural backend for the MCP server. The MCP 
 - Tags the Oracle session via `DBMS_APPLICATION_INFO.SET_MODULE('plsql-mcp', $tool_name)`
 - Sets `V$SESSION.ACTION` to the agent model name (surfaced via MCP `_meta.session.client_info`)
 - Embeds `/* plsql-mcp $tool $session-id $agent-model */` as a comment on every emitted SQL statement
-- Optionally appends to an audit table when `audit_table` is configured per-connection (default: stdout structured log only)
-- Doctor subcommand verifies the audit posture is wired and reports it
+- For guarded writes / DDL / escalation, appends a signed, hash-chained out-of-band JSONL record through `oraclemcp-audit` before the Oracle execute call (`PLSQL_MCP_AUDIT_FILE` + `PLSQL_MCP_AUDIT_KEY`); without this signed sink the write path fails closed
+- Doctor subcommand reports the guarded-write audit posture and points operators at `oraclemcp audit verify <PLSQL_MCP_AUDIT_FILE>` / `verify_records(...)`
 
 Convention deliberately matches Oracle SQLcl MCP (`V$SESSION.MODULE='SQLcl-MCP'`) so DBAs reviewing audit logs see consistent vendor markers across MCP servers.
 

@@ -105,6 +105,14 @@ pub struct AuditPosture {
     pub audit_table_configured: bool,
     /// Configured audit-table identifier (or `None` if not configured).
     pub audit_table_name: Option<String>,
+    /// Whether the out-of-band guarded-write audit file is configured.
+    pub guarded_write_file_configured: bool,
+    /// Configured audit JSONL path from `PLSQL_MCP_AUDIT_FILE`, never the key.
+    pub guarded_write_audit_file: Option<String>,
+    /// Whether the HMAC key env var needed to sign guarded-write records is set.
+    pub guarded_write_key_configured: bool,
+    /// Proof path operators use to verify the signed JSONL chain.
+    pub guarded_write_verify_path: String,
     /// `comment_marker_template` shows the placeholder shape used by
     /// `AuditPlan::comment_marker` (the per-call substitution happens at
     /// tool-invocation time).
@@ -186,10 +194,16 @@ pub fn doctor_report_with_connections(
     let mut findings = Vec::new();
     let instant_client = detect_instant_client(live_db_feature_enabled);
     let oracle_connection_backend = describe_oracle_backend(live_db_feature_enabled);
+    let guarded_write_audit_file = std::env::var(crate::GUARDED_AUDIT_FILE_ENV).ok();
+    let guarded_write_key_configured = std::env::var(crate::GUARDED_AUDIT_KEY_ENV).is_ok();
     let audit_posture = AuditPosture {
         module_name: String::from(crate::audit::APPLICATION_MODULE),
         audit_table_configured: false,
         audit_table_name: None,
+        guarded_write_file_configured: guarded_write_audit_file.is_some(),
+        guarded_write_audit_file: guarded_write_audit_file.clone(),
+        guarded_write_key_configured,
+        guarded_write_verify_path: String::from("oraclemcp audit verify <PLSQL_MCP_AUDIT_FILE>"),
         comment_marker_template: String::from("/* plsql-mcp <tool> <session-id> <agent-model> */"),
     };
 
@@ -226,6 +240,20 @@ pub fn doctor_report_with_connections(
             ),
             remediation: Some(String::from(
                 "Create `~/.plsql-mcp/connections.toml` (template in `docs/integrations/live-db/`).",
+            )),
+        });
+    }
+    if guarded_write_audit_file.is_some() ^ guarded_write_key_configured {
+        findings.push(DoctorFinding {
+            code: String::from("MCP_GUARDED_AUDIT_ENV_INCOMPLETE"),
+            severity: DoctorSeverity::Blocker,
+            summary: format!(
+                "guarded-write audit is partially configured; set both `{}` and `{}` or neither.",
+                crate::GUARDED_AUDIT_FILE_ENV,
+                crate::GUARDED_AUDIT_KEY_ENV
+            ),
+            remediation: Some(String::from(
+                "Guarded writes fail closed without a signed audit sink. Provide both env vars before `plsql-mcp serve`, then verify the JSONL chain with `oraclemcp audit verify`.",
             )),
         });
     }

@@ -53,6 +53,8 @@ pub enum ServerInitError {
     Reactor(#[source] std::io::Error),
     #[error("failed to build Asupersync runtime for MCP dispatch")]
     Runtime(#[source] Box<asupersync::Error>),
+    #[error("failed to configure guarded-write audit: {0}")]
+    GuardedAudit(#[source] crate::GuardedAuditError),
 }
 
 /// Runtime-owned MCP server state shared by stdio and TCP transports.
@@ -69,7 +71,13 @@ pub struct PlsqlMcpServer {
 
 impl PlsqlMcpServer {
     pub fn new(registry: ToolRegistry) -> Result<Self, ServerInitError> {
-        Self::with_live_runtime(registry, LiveDbRuntime::new())
+        let mut live_runtime = LiveDbRuntime::new();
+        if let Some(audit) =
+            crate::GuardedAudit::from_env().map_err(ServerInitError::GuardedAudit)?
+        {
+            live_runtime.install_guarded_audit(audit);
+        }
+        Self::with_live_runtime(registry, live_runtime)
     }
 
     pub fn with_live_runtime(
