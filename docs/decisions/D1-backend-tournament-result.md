@@ -22,7 +22,7 @@
 | Backend | Crate | State in this repo |
 |---|---|---|
 | `antlr4rust` | `plsql-parser-antlr` | In-process; the working default. Drives lowering for the whole pipeline. |
-| `java-antlr` | `plsql-parser-java` | Retired on 2026-06-28 after the backend tournament loser was removed from the workspace. Historical notes below describe the removed fallback candidate. |
+| `java-antlr` | n/a (retired) | Retired on 2026-06-28 after the backend tournament loser was removed from the workspace. Historical notes below describe the removed fallback candidate. |
 
 Both implement the *same* `ParseBackend` trait (PARSE-000), so
 either can be slotted in without touching consumers.

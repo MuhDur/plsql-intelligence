@@ -4,9 +4,9 @@
 
 **Goal:** Make `plsql-intelligence` actually deliver its thesis on *real* Oracle PL/SQL: wire a real parser backend so semantic extraction is non-empty on a real estate (#1), make the completeness/Trust Block tell the truth (#2), make `plsql-mcp serve` reachable (#3), and prove correctness over the local private estate including edge cases (#4), fully, no milestones/deferrals.
 
-**Architecture:** A `ParseBackend` (trait already defined in `plsql-parser`) becomes the engine's real parse path, replacing the shallow text-scanner call at `plsql-engine/src/lib.rs:643`. The backend is chosen by evidence in Phase 0 (antlr4rust-fix vs java-antlr-complete). The completeness report is recomputed from real extraction signals. The serve loop reuses the existing `mcp_protocol::handle_request_line` + `tcp::serve`. Correctness is proven by a private estate harness asserting the *honest correctness criterion* below.
+**Architecture:** A `ParseBackend` (trait already defined in `plsql-parser`) becomes the engine's real parse path, replacing the shallow text-scanner call at `plsql-engine/src/lib.rs:643`. The backend is chosen by evidence in Phase 0; the Java fallback branch has since been retired, so the active path is the in-process `antlr4rust` backend. The completeness report is recomputed from real extraction signals. The serve loop reuses the existing `mcp_protocol::handle_request_line` + `tcp::serve`. Correctness is proven by a private estate harness asserting the *honest correctness criterion* below.
 
-**Tech Stack:** Rust (workspace, stable + nightly for fuzz), ANTLR4 (`.g4` grammars present), `antlr-rust 0.3.0-beta` and/or Java 17 ANTLR reference target, the existing `plsql-parser` / `plsql-parser-antlr` / `plsql-parser-java` crates.
+**Tech Stack:** Rust (workspace, stable + nightly for fuzz), ANTLR4 (`.g4` grammars present), `antlr-rust 0.3.0-beta`, and the existing `plsql-parser` / `plsql-parser-antlr` crates.
 
 ---
 
@@ -32,8 +32,6 @@ A *tolerant offline analyzer's* correctness is NOT "perfectly parse every APEX/d
 | `docs/decisions/D2-backend-final.md` (create) | Record the evidence-based final backend choice | 0 |
 | `crates/plsql-parser-antlr/build.rs` + generated glue (modify) | If antlr4rust wins: make codegen compile (the 14 errors) | 1A |
 | `crates/plsql-parser-antlr/src/backend.rs` (create) | `impl ParseBackend` over the antlr-rust parser → lossless tape + AST | 1A |
-| `crates/plsql-parser-java/grammars/` + jar build (create) | If java-antlr wins: PARSE-000C worker jar from `.g4` | 1B |
-| `crates/plsql-parser-java/src/wire.rs` (modify) | PARSE-000D: decode worker output → real `Ast`/CST + tape | 1B |
 | `crates/plsql-engine/src/lib.rs:~643` (modify) | Replace `lower_source(...)` with `parse_with_backend(chosen_backend, ...)`; map CST/AST into the IR pipeline | 1C |
 | `crates/plsql-core/src/lib.rs` (CompletenessReport) (modify) | Recompute from real signals; never false-clean | 2 |
 | `crates/plsql-engine/src/lib.rs` (completeness assembly) (modify) | Feed real diagnostic/unknown counts into the report + Trust Block | 2 |
@@ -72,9 +70,9 @@ Branch A (1A) **or** Branch B (1B) per the D2 decision; then 1C is common.
 - [ ] Fix the generated-code compile errors (patch `build.rs` post-processing and/or pin a working `antlr-rust` revision); `cargo build -p plsql-parser-antlr --features antlr-codegen` is green; commit per fixed error class with a regression test that the crate builds with the feature.
 - [ ] Implement `crates/plsql-parser-antlr/src/backend.rs`: `struct Antlr4RustBackend; impl ParseBackend`. Drive the generated lexer/parser, build the **lossless `token_tape`** (assert `reconstruct(tape) == input` in a unit test on ≥10 corpus fixtures), produce the `Ast`/CST the IR consumes, emit ≥1 diagnostic per syntax error, set `recovered`. TDD: failing round-trip test → impl → green.
 
-### 1B (if java-antlr): build the jar + implement the wire decode
-- [ ] PARSE-000C: a reproducible jar build (script + checked-in build recipe, jar gitignored) from the `.g4` grammars; `JavaAntlrConfig` resolves it; `JavaAntlrBackend` no longer auto-degrades when the jar is present.
-- [ ] PARSE-000D: implement `crates/plsql-parser-java/src/wire.rs` decode. The worker emits a neutral structured tree (no Java/ANTLR identifiers leaking, R20); decode into real `Ast`/CST + **lossless `token_tape`** (round-trip unit test) + diagnostics + `recovered`. TDD per the conformance contract.
+### 1B (retired): Java ANTLR fallback
+
+The Java ANTLR fallback branch is no longer an active workspace path. Do not recreate it for this plan; D2 keeps the in-process `antlr4rust` backend as the operative parser route.
 
 ### 1C (common): engine integration
 - [ ] Replace `crates/plsql-engine/src/lib.rs:~643` `let ast = plsql_parser_antlr::lower::lower_source(&source, file_id);` with the real `parse_with_backend(&chosen_backend, ...)`; map its CST/AST into the existing IR → symbols → facts → depgraph pipeline so dep_graph/fact_store populate. Keep `lower_source` available as an explicit fallback only when the backend degrades a file (honest, diagnosed).
