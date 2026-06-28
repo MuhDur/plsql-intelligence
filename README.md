@@ -51,10 +51,11 @@ repairs so coverage compounds with use.
 
 ### Two MCP servers: `oraclemcp` and `plsql-mcp`
 
-This repo ships the **full** PL/SQL Intelligence MCP server, **`plsql-mcp`** — live
-Oracle DB tools **plus** offline PL/SQL intelligence (parse/analyze, dependency
-graph, lineage, SAST) and guarded writes. Its engine-free core was extracted to a
-standalone, published sibling, [**`oraclemcp`**](https://github.com/MuhDur/oraclemcp):
+This repo ships the **full** PL/SQL Intelligence MCP server,
+**`plsql-mcp`** — live Oracle DB tools **plus** offline PL/SQL
+intelligence (parse/analyze, dependency graph, lineage, SAST) and
+guarded writes. Its engine-free core was extracted to a standalone,
+published sibling, [**`oraclemcp`**](https://github.com/MuhDur/oraclemcp):
 
 | | [`oraclemcp`](https://github.com/MuhDur/oraclemcp) | `plsql-mcp` (this repo) |
 |---|---|---|
@@ -63,12 +64,15 @@ standalone, published sibling, [**`oraclemcp`**](https://github.com/MuhDur/oracl
 | Install | `cargo install oraclemcp` · `docker run -i ghcr.io/muhdur/oraclemcp` | `cargo install --path crates/plsql-mcp` · `docker run -i ghcr.io/muhdur/plsql-mcp` |
 | MCP registry | `io.github.MuhDur/oraclemcp` | `io.github.MuhDur/plsql-mcp` |
 
-Reach for `oraclemcp` when an agent just needs governed database access; use
-`plsql-mcp` when you want deep PL/SQL code understanding (it includes everything
-`oraclemcp` does).
+Reach for `oraclemcp` when an agent just needs governed database
+access; use `plsql-mcp` when you want deep PL/SQL code understanding
+and the superset write surface. `plsql-mcp` is not presented as an
+intrinsically harmless server: destructive operations sit behind the
+shared guard ladder, operating levels, confirmations, and typed
+degradation responses inherited from the `oraclemcp-*` core.
 
 > _Independent open-source project; not affiliated with Oracle. The Docker images
-> ship the project binaries only; they do not bundle Oracle Instant Client._
+> ship the project binaries only; Oracle client libraries are not included._
 
 ### Why use it?
 
@@ -298,7 +302,7 @@ Tool binaries: `tools/usr-loop` (the USR Loop orchestrator),
 The MCP server (`plsql-mcp`) is a single binary built on the engine-free
 `oraclemcp-*` core. It completes the MCP handshake, advertises the full
 tool surface over `tools/list` — each tool carries a real argument
-JSON-Schema and read-only / destructive annotations — and dispatches
+JSON-Schema and risk annotations — and dispatches
 `tools/call` end-to-end: static-analysis and change-impact tools execute
 in-process; live-DB tools dispatch and degrade with a typed
 `RuntimeStateRequired` response (naming the tool to call next) when no
@@ -314,7 +318,7 @@ registry advertises has a dispatch arm.
 ## Installation
 
 The workspace builds and tests with the pinned nightly in
-`rust-toolchain.toml` (`nightly-2026-05-11`). There is no stable MSRV or
+`rust-toolchain.toml` (`nightly-2026-05-11`). There is no MSRV or
 `rust-version` floor while the live-DB convergence work depends on
 nightly-only `asupersync` features.
 
@@ -346,7 +350,7 @@ The MCP `live-db` feature uses the pure-Rust thin stack shared with
 `oraclemcp` (`oraclemcp-db` -> `oracledb`). The normal `plsql-mcp`
 container and live-DB tool path do not require Oracle Instant Client at
 runtime. See `docs/integrations/live-db/` for connection setup and
-safety posture.
+guard posture.
 
 ---
 
