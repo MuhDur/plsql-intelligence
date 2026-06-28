@@ -26,6 +26,21 @@ path = "../crates/plsql-ir"
 [dependencies.plsql-catalog]
 path = "../crates/plsql-catalog"
 
+[dependencies.plsql-mcp]
+path = "../crates/plsql-mcp"
+
+[dependencies.asupersync]
+version = "=0.3.4"
+
+[dependencies.async-trait]
+version = "0.1"
+
+[dependencies.oraclemcp-core]
+version = "=0.4.0"
+
+[dependencies.oraclemcp-db]
+version = "=0.4.0"
+
 [dependencies.serde_json]
 version = "1"
 
@@ -67,6 +82,27 @@ bench = false
 [[bin]]
 name = "catalog_snapshot_json"
 path = "fuzz_targets/catalog_snapshot_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mcp_async_dispatch"
+path = "fuzz_targets/mcp_async_dispatch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "catalog_async_loader"
+path = "fuzz_targets/catalog_async_loader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "live_runtime_ops"
+path = "fuzz_targets/live_runtime_ops.rs"
 test = false
 doc = false
 bench = false
