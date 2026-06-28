@@ -56,8 +56,9 @@ use oraclemcp_core::{
     CapabilitiesReport, DispatchContext, DispatchFuture, FeatureTiers, ReadPathCaps, RequestBudget,
     ToolDispatch, ToolRegistry, narrow_to_read_path,
 };
-use oraclemcp_error::{ErrorClass, ErrorEnvelope};
+use oraclemcp_error::{ErrorClass, ErrorEnvelope, enrich_oracle_error};
 use oraclemcp_guard::{OperatingLevel, SessionLevelState};
+use plsql_catalog::{CatalogError, OracleBind};
 
 use crate::{
     AnalyzeProjectRequest, CompileCheckRequest, CompletenessReportRequest, DocLookupRequest,
@@ -293,6 +294,14 @@ pub fn dispatch_table() -> &'static [&'static str] {
         "disable_writes",
         // ── live-DB tools — need an Oracle connection ──
         "query",
+        "list_objects",
+        "describe_table",
+        "describe_view",
+        "describe_trigger",
+        "describe_index",
+        "get_object_source",
+        "get_errors",
+        "get_clob",
         "patch_package",
         "patch_view",
         "create_or_replace",
@@ -451,6 +460,30 @@ pub fn dispatch_tool_with_runtime<'a>(
             )
             .await
             .map_err(|err| *err),
+            "list_objects" => run_list_objects_live(cx, live_runtime, &arguments)
+                .await
+                .map_err(|err| *err),
+            "describe_table" => run_describe_table_live(cx, live_runtime, &arguments)
+                .await
+                .map_err(|err| *err),
+            "describe_view" => run_describe_view_live(cx, live_runtime, &arguments)
+                .await
+                .map_err(|err| *err),
+            "describe_trigger" => run_describe_trigger_live(cx, live_runtime, &arguments)
+                .await
+                .map_err(|err| *err),
+            "describe_index" => run_describe_index_live(cx, live_runtime, &arguments)
+                .await
+                .map_err(|err| *err),
+            "get_object_source" => run_get_object_source_live(cx, live_runtime, &arguments)
+                .await
+                .map_err(|err| *err),
+            "get_errors" => run_get_errors_live(cx, live_runtime, &arguments)
+                .await
+                .map_err(|err| *err),
+            "get_clob" => run_get_clob_live(cx, live_runtime, &arguments)
+                .await
+                .map_err(|err| *err),
             "patch_package" => run_patch_package_live(cx, live_runtime, &arguments)
                 .await
                 .map_err(|err| *err),
@@ -740,6 +773,42 @@ fn dispatch_tool_outcome(name: &str, arguments: &Value) -> Result<DispatchOutcom
         // ── live-DB tools: arguments validated, then gated ───────
         "query" => {
             let _args: QueryArgs = parse_args(name, arguments)?;
+            Ok(DispatchOutcome::RuntimeStateRequired(
+                RuntimeKind::LiveConnection,
+            ))
+        }
+        "list_objects" => {
+            let _args: ListObjectsArgs = parse_args(name, arguments)?;
+            Ok(DispatchOutcome::RuntimeStateRequired(
+                RuntimeKind::LiveConnection,
+            ))
+        }
+        "describe_table" | "describe_trigger" | "describe_index" => {
+            let _args: OwnerNameArgs = parse_args(name, arguments)?;
+            Ok(DispatchOutcome::RuntimeStateRequired(
+                RuntimeKind::LiveConnection,
+            ))
+        }
+        "describe_view" => {
+            let _args: DescribeViewArgs = parse_args(name, arguments)?;
+            Ok(DispatchOutcome::RuntimeStateRequired(
+                RuntimeKind::LiveConnection,
+            ))
+        }
+        "get_object_source" => {
+            let _args: GetObjectSourceArgs = parse_args(name, arguments)?;
+            Ok(DispatchOutcome::RuntimeStateRequired(
+                RuntimeKind::LiveConnection,
+            ))
+        }
+        "get_errors" => {
+            let _args: GetErrorsArgs = parse_args(name, arguments)?;
+            Ok(DispatchOutcome::RuntimeStateRequired(
+                RuntimeKind::LiveConnection,
+            ))
+        }
+        "get_clob" => {
+            let _args: GetClobArgs = parse_args(name, arguments)?;
             Ok(DispatchOutcome::RuntimeStateRequired(
                 RuntimeKind::LiveConnection,
             ))
@@ -1198,6 +1267,206 @@ async fn run_deploy_ddl_live(
     }))
 }
 
+fn live_read_session<'a>(
+    live_runtime: &'a LiveDbRuntime,
+    tool: &str,
+    connection: Option<&str>,
+) -> Result<&'a crate::LiveDbSession, Box<ErrorEnvelope>> {
+    match connection.map(str::trim) {
+        Some("") => Err(Box::new(invalid_arguments_envelope(
+            tool,
+            "`connection`, when supplied, must not be empty",
+        ))),
+        Some(connection) => live_runtime
+            .session(connection)
+            .map_err(|err| Box::new(live_runtime_error_envelope(err, tool))),
+        None => live_runtime
+            .active_session()
+            .map_err(|err| Box::new(live_runtime_error_envelope(err, tool))),
+    }
+}
+
+fn serialize_live_response<T: serde::Serialize>(tool: &str, response: T) -> Value {
+    serde_json::to_value(response).unwrap_or_else(|err| {
+        serde_json::json!({
+            "serialization_error": format!("tool `{tool}` response could not be serialized: {err}")
+        })
+    })
+}
+
+async fn run_list_objects_live(
+    cx: &Cx,
+    live_runtime: &LiveDbRuntime,
+    arguments: &Value,
+) -> Result<Value, Box<ErrorEnvelope>> {
+    let args: ListObjectsArgs =
+        parse_args("list_objects", arguments).map_err(|err| Box::new(err.into_envelope()))?;
+    let session = live_read_session(live_runtime, "list_objects", args.connection.as_deref())?;
+    let adapter =
+        OraclemcpCatalogConnection::new(BorrowedOracleConnection::new(session.connection()));
+    checkpoint(cx, "list_objects")?;
+    let response = crate::list_objects::run_list_objects(cx, &adapter, &args.into_request())
+        .await
+        .map_err(|err| Box::new(list_objects_error_envelope(err, "list_objects")))?;
+    checkpoint(cx, "list_objects")?;
+    Ok(serialize_live_response("list_objects", response))
+}
+
+async fn run_describe_table_live(
+    cx: &Cx,
+    live_runtime: &LiveDbRuntime,
+    arguments: &Value,
+) -> Result<Value, Box<ErrorEnvelope>> {
+    let args: OwnerNameArgs =
+        parse_args("describe_table", arguments).map_err(|err| Box::new(err.into_envelope()))?;
+    let session = live_read_session(live_runtime, "describe_table", args.connection.as_deref())?;
+    let adapter =
+        OraclemcpCatalogConnection::new(BorrowedOracleConnection::new(session.connection()));
+    checkpoint(cx, "describe_table")?;
+    let response = crate::describe::run_describe_table(cx, &adapter, &args.owner, &args.name)
+        .await
+        .map_err(|err| Box::new(err.to_envelope(&[])))?;
+    checkpoint(cx, "describe_table")?;
+    Ok(serialize_live_response("describe_table", response))
+}
+
+async fn run_describe_view_live(
+    cx: &Cx,
+    live_runtime: &LiveDbRuntime,
+    arguments: &Value,
+) -> Result<Value, Box<ErrorEnvelope>> {
+    let args: DescribeViewArgs =
+        parse_args("describe_view", arguments).map_err(|err| Box::new(err.into_envelope()))?;
+    let session = live_read_session(live_runtime, "describe_view", args.connection.as_deref())?;
+    let adapter =
+        OraclemcpCatalogConnection::new(BorrowedOracleConnection::new(session.connection()));
+    checkpoint(cx, "describe_view")?;
+    let response = crate::describe::run_describe_view(
+        cx,
+        &adapter,
+        &args.owner,
+        &args.name,
+        args.text_preview_chars,
+    )
+    .await
+    .map_err(|err| Box::new(err.to_envelope(&[])))?;
+    checkpoint(cx, "describe_view")?;
+    Ok(serialize_live_response("describe_view", response))
+}
+
+async fn run_describe_trigger_live(
+    cx: &Cx,
+    live_runtime: &LiveDbRuntime,
+    arguments: &Value,
+) -> Result<Value, Box<ErrorEnvelope>> {
+    let args: OwnerNameArgs =
+        parse_args("describe_trigger", arguments).map_err(|err| Box::new(err.into_envelope()))?;
+    let session = live_read_session(live_runtime, "describe_trigger", args.connection.as_deref())?;
+    let adapter =
+        OraclemcpCatalogConnection::new(BorrowedOracleConnection::new(session.connection()));
+    checkpoint(cx, "describe_trigger")?;
+    let response = crate::describe::run_describe_trigger(cx, &adapter, &args.owner, &args.name)
+        .await
+        .map_err(|err| Box::new(err.to_envelope(&[])))?;
+    checkpoint(cx, "describe_trigger")?;
+    Ok(serialize_live_response("describe_trigger", response))
+}
+
+async fn run_describe_index_live(
+    cx: &Cx,
+    live_runtime: &LiveDbRuntime,
+    arguments: &Value,
+) -> Result<Value, Box<ErrorEnvelope>> {
+    let args: OwnerNameArgs =
+        parse_args("describe_index", arguments).map_err(|err| Box::new(err.into_envelope()))?;
+    let session = live_read_session(live_runtime, "describe_index", args.connection.as_deref())?;
+    let adapter =
+        OraclemcpCatalogConnection::new(BorrowedOracleConnection::new(session.connection()));
+    checkpoint(cx, "describe_index")?;
+    let response = crate::describe::run_describe_index(cx, &adapter, &args.owner, &args.name)
+        .await
+        .map_err(|err| Box::new(err.to_envelope(&[])))?;
+    checkpoint(cx, "describe_index")?;
+    Ok(serialize_live_response("describe_index", response))
+}
+
+async fn run_get_object_source_live(
+    cx: &Cx,
+    live_runtime: &LiveDbRuntime,
+    arguments: &Value,
+) -> Result<Value, Box<ErrorEnvelope>> {
+    let args: GetObjectSourceArgs =
+        parse_args("get_object_source", arguments).map_err(|err| Box::new(err.into_envelope()))?;
+    let session = live_read_session(
+        live_runtime,
+        "get_object_source",
+        args.connection.as_deref(),
+    )?;
+    let adapter =
+        OraclemcpCatalogConnection::new(BorrowedOracleConnection::new(session.connection()));
+    checkpoint(cx, "get_object_source")?;
+    let response = crate::source::run_get_object_source(
+        cx,
+        &adapter,
+        &args.owner,
+        &args.object_name,
+        &args.object_type,
+    )
+    .await
+    .map_err(|err| Box::new(source_tool_error_envelope(err, "get_object_source")))?;
+    checkpoint(cx, "get_object_source")?;
+    Ok(serialize_live_response("get_object_source", response))
+}
+
+async fn run_get_errors_live(
+    cx: &Cx,
+    live_runtime: &LiveDbRuntime,
+    arguments: &Value,
+) -> Result<Value, Box<ErrorEnvelope>> {
+    let args: GetErrorsArgs =
+        parse_args("get_errors", arguments).map_err(|err| Box::new(err.into_envelope()))?;
+    let session = live_read_session(live_runtime, "get_errors", args.connection.as_deref())?;
+    let adapter =
+        OraclemcpCatalogConnection::new(BorrowedOracleConnection::new(session.connection()));
+    let owner = args.owner.unwrap_or_default();
+    checkpoint(cx, "get_errors")?;
+    let response = crate::source::run_get_errors(cx, &adapter, &owner, &args.object_name)
+        .await
+        .map_err(|err| Box::new(source_tool_error_envelope(err, "get_errors")))?;
+    checkpoint(cx, "get_errors")?;
+    Ok(serialize_live_response("get_errors", response))
+}
+
+async fn run_get_clob_live(
+    cx: &Cx,
+    live_runtime: &LiveDbRuntime,
+    arguments: &Value,
+) -> Result<Value, Box<ErrorEnvelope>> {
+    let args: GetClobArgs =
+        parse_args("get_clob", arguments).map_err(|err| Box::new(err.into_envelope()))?;
+    crate::query::ensure_read_only_query(&args.sql)
+        .map_err(|err| Box::new(query_error_envelope(&err)))?;
+    let session = live_read_session(live_runtime, "get_clob", args.connection.as_deref())?;
+    let adapter =
+        OraclemcpCatalogConnection::new(BorrowedOracleConnection::new(session.connection()));
+    let recorder = Arc::new(crate::query::StatementObjectRecorder::default());
+    crate::query::ensure_read_only_query_with_oracle(&args.sql, recorder.clone())
+        .map_err(|err| Box::new(query_error_envelope(&err)))?;
+    let side_effect_oracle = adapter
+        .side_effect_oracle(cx, &recorder.base_objects())
+        .await
+        .map_err(|err| Box::new(catalog_error_envelope(err, "get_clob")))?;
+    crate::query::ensure_read_only_query_with_oracle(&args.sql, Arc::new(side_effect_oracle))
+        .map_err(|err| Box::new(query_error_envelope(&err)))?;
+    let params = args.params.as_deref().unwrap_or(&[]);
+    checkpoint(cx, "get_clob")?;
+    let response = crate::source::run_get_clob(cx, &adapter, &args.sql, params, args.max_chars)
+        .await
+        .map_err(|err| Box::new(source_tool_error_envelope(err, "get_clob")))?;
+    checkpoint(cx, "get_clob")?;
+    Ok(serialize_live_response("get_clob", response))
+}
+
 async fn run_query_live(
     cx: &Cx,
     context: PlsqlDispatchContext<'_>,
@@ -1600,7 +1869,18 @@ fn checkpoint(cx: &Cx, tool: &str) -> Result<(), Box<ErrorEnvelope>> {
 fn live_runtime_error_envelope(err: LiveRuntimeError, tool: &str) -> ErrorEnvelope {
     match err {
         LiveRuntimeError::NoActiveConnection | LiveRuntimeError::UnknownConnection { .. } => {
-            let kind = if matches!(tool, "query") {
+            let kind = if matches!(
+                tool,
+                "query"
+                    | "list_objects"
+                    | "describe_table"
+                    | "describe_view"
+                    | "describe_trigger"
+                    | "describe_index"
+                    | "get_object_source"
+                    | "get_errors"
+                    | "get_clob"
+            ) {
                 RuntimeKind::LiveConnection
             } else {
                 RuntimeKind::SessionState
@@ -1651,6 +1931,39 @@ fn query_error_envelope(err: &QueryError) -> ErrorEnvelope {
     err.to_envelope(None, &[])
 }
 
+fn list_objects_error_envelope(
+    err: crate::list_objects::ListObjectsError,
+    tool: &str,
+) -> ErrorEnvelope {
+    match err {
+        crate::list_objects::ListObjectsError::InvalidCursor { .. } => {
+            invalid_arguments_envelope(tool, &err.to_string())
+        }
+        crate::list_objects::ListObjectsError::Backend(err) => catalog_error_envelope(err, tool),
+    }
+}
+
+fn source_tool_error_envelope(err: crate::source::SourceToolError, tool: &str) -> ErrorEnvelope {
+    match err {
+        crate::source::SourceToolError::Backend(err) => catalog_error_envelope(err, tool),
+    }
+}
+
+fn catalog_error_envelope(err: CatalogError, tool: &str) -> ErrorEnvelope {
+    let message = err.to_string();
+    match err {
+        CatalogError::OracleBackendError { message, .. } => enrich_oracle_error(&message, None, &[])
+            .with_next_step(format!(
+                "The `{tool}` dictionary read failed in Oracle; verify the object name, schema, and current user's dictionary privileges."
+            )),
+        _ => ErrorEnvelope::new(
+            ErrorClass::Internal,
+            format!("tool `{tool}` failed while reading Oracle dictionary metadata: {message}"),
+        )
+        .with_next_step("Retry after narrowing the request or reconnecting to the target database."),
+    }
+}
+
 fn runtime_state_envelope(kind: RuntimeKind, tool: &str) -> ErrorEnvelope {
     let msg = kind.message(tool);
     ErrorEnvelope::new(ErrorClass::RuntimeStateRequired, msg.clone())
@@ -1693,6 +2006,87 @@ struct QueryArgs {
     connection: Option<String>,
     #[serde(default)]
     lob_truncation_chars: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListObjectsArgs {
+    #[serde(default)]
+    connection: Option<String>,
+    #[serde(default)]
+    object_type: Option<String>,
+    #[serde(default)]
+    name_pattern: Option<String>,
+    #[serde(default)]
+    schema: Option<String>,
+    #[serde(default)]
+    page_size: Option<usize>,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+impl ListObjectsArgs {
+    fn into_request(self) -> crate::ListObjectsRequest {
+        crate::ListObjectsRequest {
+            object_type: self.object_type,
+            name_pattern: self.name_pattern,
+            schema: self.schema,
+            page_size: self.page_size,
+            cursor: self.cursor,
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerNameArgs {
+    #[serde(default)]
+    connection: Option<String>,
+    owner: String,
+    name: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DescribeViewArgs {
+    #[serde(default)]
+    connection: Option<String>,
+    owner: String,
+    name: String,
+    #[serde(default)]
+    text_preview_chars: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetObjectSourceArgs {
+    #[serde(default)]
+    connection: Option<String>,
+    owner: String,
+    object_name: String,
+    object_type: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetErrorsArgs {
+    #[serde(default)]
+    connection: Option<String>,
+    #[serde(default)]
+    owner: Option<String>,
+    object_name: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetClobArgs {
+    sql: String,
+    #[serde(default)]
+    connection: Option<String>,
+    #[serde(default)]
+    params: Option<Vec<OracleBind>>,
+    #[serde(default)]
+    max_chars: Option<usize>,
 }
 
 /// Argument shape for `set_safety_profile`.

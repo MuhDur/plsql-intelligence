@@ -108,9 +108,13 @@ mod live {
     };
     use std::{
         future::Future,
-        io::{Read, Write},
-        process::{Command, Stdio},
-        sync::atomic::{AtomicU32, Ordering},
+        io::{BufRead, BufReader, Read, Write},
+        process::{Child, ChildStdin, Command, Stdio},
+        sync::{
+            atomic::{AtomicU32, Ordering},
+            mpsc,
+        },
+        thread::JoinHandle,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
@@ -293,6 +297,147 @@ mod live {
                     .map_err(|err| format!("serve stdout line is not JSON-RPC: {err}; {line}"))
             })
             .collect()
+    }
+
+    struct ServeStdioSession {
+        child: Child,
+        stdin: Option<ChildStdin>,
+        stdout_rx: mpsc::Receiver<Result<serde_json::Value, String>>,
+        stderr_rx: mpsc::Receiver<String>,
+        stdout_join: Option<JoinHandle<()>>,
+        stderr_join: Option<JoinHandle<()>>,
+    }
+
+    impl ServeStdioSession {
+        fn start() -> Result<Self, String> {
+            let mut child = Command::new(bin())
+                .arg("serve")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|err| format!("spawn plsql-mcp serve failed: {err}"))?;
+
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| String::from("child stdin missing"))?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| String::from("child stdout missing"))?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| String::from("child stderr missing"))?;
+
+            let (stdout_tx, stdout_rx) = mpsc::channel();
+            let stdout_join = std::thread::spawn(move || {
+                let reader = BufReader::new(stdout);
+                for line_result in reader.lines() {
+                    let line = match line_result {
+                        Ok(line) => line,
+                        Err(err) => {
+                            let _ = stdout_tx.send(Err(format!("read serve stdout failed: {err}")));
+                            return;
+                        }
+                    };
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let parsed = serde_json::from_str(&line)
+                        .map_err(|err| format!("serve stdout line is not JSON-RPC: {err}; {line}"));
+                    if stdout_tx.send(parsed).is_err() {
+                        return;
+                    }
+                }
+            });
+
+            let (stderr_tx, stderr_rx) = mpsc::channel();
+            let stderr_join = std::thread::spawn(move || {
+                let mut stderr_text = String::new();
+                let _ = BufReader::new(stderr).read_to_string(&mut stderr_text);
+                let _ = stderr_tx.send(stderr_text);
+            });
+
+            Ok(Self {
+                child,
+                stdin: Some(stdin),
+                stdout_rx,
+                stderr_rx,
+                stdout_join: Some(stdout_join),
+                stderr_join: Some(stderr_join),
+            })
+        }
+
+        fn call(&mut self, request: serde_json::Value) -> Result<serde_json::Value, String> {
+            let stdin = self
+                .stdin
+                .as_mut()
+                .ok_or_else(|| String::from("serve stdin already closed"))?;
+            serde_json::to_writer(&mut *stdin, &request)
+                .map_err(|err| format!("request serialization failed: {err}"))?;
+            stdin
+                .write_all(b"\n")
+                .map_err(|err| format!("write request newline failed: {err}"))?;
+            stdin
+                .flush()
+                .map_err(|err| format!("flush request failed: {err}"))?;
+            self.stdout_rx
+                .recv_timeout(Duration::from_secs(90))
+                .map_err(|err| format!("serve did not emit a response within 90s: {err}"))?
+        }
+
+        fn finish(mut self) -> Result<(), String> {
+            drop(self.stdin.take());
+            let mut status = None;
+            for _ in 0..1_800 {
+                if let Some(exit_status) = self
+                    .child
+                    .try_wait()
+                    .map_err(|err| format!("poll serve child failed: {err}"))?
+                {
+                    status = Some(exit_status);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let Some(status) = status else {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                return Err(String::from("plsql-mcp serve did not exit within 90s"));
+            };
+            let stderr = self
+                .stderr_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap_or_default();
+            if !status.success() {
+                return Err(format!(
+                    "serve should exit cleanly on stdin EOF; status={status:?}; stderr={stderr:?}"
+                ));
+            }
+            if let Some(join) = self.stdout_join.take() {
+                let _ = join.join();
+            }
+            if let Some(join) = self.stderr_join.take() {
+                let _ = join.join();
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for ServeStdioSession {
+        fn drop(&mut self) {
+            drop(self.stdin.take());
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            if let Some(join) = self.stdout_join.take() {
+                let _ = join.join();
+            }
+            if let Some(join) = self.stderr_join.take() {
+                let _ = join.join();
+            }
+        }
     }
 
     fn execute_sql<C: OracleConnection>(conn: &C, sql: &str) -> Result<u64, CatalogError> {
@@ -549,6 +694,300 @@ mod live {
 
         eprintln!(
             "[Phase X 15.1] serve stdio JSON-RPC connected, queried DUAL, described active Oracle session, and exited cleanly"
+        );
+    }
+
+    fn assert_jsonrpc_success<'a>(
+        response: &'a serde_json::Value,
+        id: u64,
+        label: &str,
+    ) -> &'a serde_json::Value {
+        assert_eq!(
+            response["id"], id,
+            "{label} response id mismatch: {response}"
+        );
+        assert!(
+            response["error"].is_null(),
+            "{label} should not return a JSON-RPC error: {response}"
+        );
+        response
+            .get("result")
+            .expect("successful JSON-RPC response should include result")
+    }
+
+    fn assert_tool_success<'a>(
+        response: &'a serde_json::Value,
+        id: u64,
+        label: &str,
+    ) -> &'a serde_json::Value {
+        let result = assert_jsonrpc_success(response, id, label);
+        assert_eq!(
+            result["isError"], false,
+            "{label} reported tool error: {response}"
+        );
+        result
+            .get("structuredContent")
+            .expect("successful tool response should include structuredContent")
+    }
+
+    /// Phase X.1 acceptance: exercise the live-DB surface through the shipping
+    /// `plsql-mcp serve` JSON-RPC loop, not direct in-process helper calls.
+    ///
+    /// This intentionally proves the guarded-write posture without executing
+    /// DDL: a dry-run mints the per-operation approval token over the wire, then
+    /// `execute_approved` verifies that token and refuses execution because no
+    /// operator `enable_writes` token was consumed.
+    #[test]
+    fn serve_stdio_live_surface_e2e_skips_without_oracle() {
+        let Ok(password) = std::env::var("PLSQL_XE_SYSTEM_PASSWORD") else {
+            eprintln!(
+                "[Phase X 15.2 SKIP] PLSQL_XE_SYSTEM_PASSWORD is not set; no Oracle XE live credential available"
+            );
+            return;
+        };
+
+        let connection_name = format!("phase-x-live-wire-{}", unique_suffix());
+        let view_name = format!("MCP_WIRE_{}", unique_suffix());
+        let ddl = format!("CREATE OR REPLACE VIEW SYSTEM.{view_name} AS SELECT 1 AS ID FROM dual");
+        let mut serve =
+            ServeStdioSession::start().expect("serve stdio live JSON-RPC session should start");
+
+        let initialized = serve
+            .call(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": plsql_mcp::PROTOCOL_VERSION
+                }
+            }))
+            .expect("initialize response");
+        assert_jsonrpc_success(&initialized, 1, "initialize");
+
+        let listed = serve
+            .call(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list"
+            }))
+            .expect("tools/list response");
+        let tools = assert_jsonrpc_success(&listed, 2, "tools/list")["tools"]
+            .as_array()
+            .expect("tools/list result must carry tools array");
+        for expected in [
+            "connect",
+            "query",
+            "list_objects",
+            "describe_table",
+            "get_object_source",
+            "create_or_replace",
+            "execute_approved",
+        ] {
+            assert!(
+                tools
+                    .iter()
+                    .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+                    .any(|name| name.eq(expected)),
+                "tools/list must advertise {expected}; got: {tools:?}"
+            );
+        }
+
+        let connected = serve
+            .call(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "connect",
+                    "arguments": {
+                        "name": connection_name,
+                        "connect_string": CONNECT_STRING,
+                        "username": SYSTEM_USER,
+                        "password": password,
+                        "description": "Phase X.1 live serve surface e2e",
+                        "permanently_read_only": false
+                    }
+                }
+            }))
+            .expect("connect response");
+        let connected = assert_tool_success(&connected, 3, "connect");
+        assert_eq!(connected["active"], connection_name);
+        assert_eq!(connected["connected"], true);
+
+        let listed_objects = serve
+            .call(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "list_objects",
+                    "arguments": {
+                        "connection": connection_name,
+                        "schema": "DEMO",
+                        "object_type": "PACKAGE",
+                        "page_size": 100
+                    }
+                }
+            }))
+            .expect("list_objects response");
+        let listed_objects = assert_tool_success(&listed_objects, 4, "list_objects");
+        assert!(
+            listed_objects["entries"]
+                .as_array()
+                .expect("list_objects entries array")
+                .iter()
+                .any(|entry| entry["owner"] == "DEMO" && entry["name"] == "PKG_AUTONOMOUS"),
+            "list_objects over serve should see DEMO.PKG_AUTONOMOUS: {listed_objects}"
+        );
+
+        let source = serve
+            .call(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_object_source",
+                    "arguments": {
+                        "connection": connection_name,
+                        "owner": "DEMO",
+                        "object_name": "PKG_AUTONOMOUS",
+                        "object_type": "PACKAGE"
+                    }
+                }
+            }))
+            .expect("get_object_source response");
+        let source = assert_tool_success(&source, 5, "get_object_source");
+        assert_eq!(source["owner"], "DEMO");
+        assert!(
+            source["source"].as_str().is_some_and(|text| text
+                .trim_start()
+                .to_ascii_uppercase()
+                .starts_with("PACKAGE")),
+            "get_object_source should return package source over serve: {source}"
+        );
+
+        let described = serve
+            .call(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {
+                    "name": "describe_table",
+                    "arguments": {
+                        "connection": connection_name,
+                        "owner": "SYS",
+                        "name": "DUAL"
+                    }
+                }
+            }))
+            .expect("describe_table response");
+        let described = assert_tool_success(&described, 6, "describe_table");
+        assert_eq!(described["owner"], "SYS");
+        assert_eq!(described["name"], "DUAL");
+        assert!(
+            described["columns"]
+                .as_array()
+                .expect("describe_table columns array")
+                .iter()
+                .any(|column| column["name"] == "DUMMY"),
+            "describe_table over serve should describe SYS.DUAL.DUMMY: {described}"
+        );
+
+        let safety = serve
+            .call(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "current_safety_profile",
+                    "arguments": {}
+                }
+            }))
+            .expect("current_safety_profile response");
+        let safety = assert_tool_success(&safety, 7, "current_safety_profile");
+        assert_eq!(safety["profile"], "inspect_only");
+        assert_eq!(safety["session_writes_enabled"], false);
+
+        let profile = serve
+            .call(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {
+                    "name": "set_safety_profile",
+                    "arguments": {
+                        "profile": "ddl_guarded"
+                    }
+                }
+            }))
+            .expect("set_safety_profile response");
+        let profile = assert_tool_success(&profile, 8, "set_safety_profile");
+        assert_eq!(profile["safety"]["profile"], "ddl_guarded");
+        assert_eq!(profile["safety"]["session_writes_enabled"], false);
+
+        let dry_run = serve
+            .call(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_or_replace",
+                    "arguments": {
+                        "connection": connection_name,
+                        "operation_summary": format!("replace SYSTEM.{view_name}"),
+                        "ddl_bytes": ddl,
+                        "mode": {
+                            "mode": "dry_run"
+                        }
+                    }
+                }
+            }))
+            .expect("create_or_replace dry_run response");
+        let dry_run = assert_tool_success(&dry_run, 9, "create_or_replace dry_run");
+        assert_eq!(dry_run["kind"], "dry_run");
+        assert_eq!(dry_run["object_kind"], "VIEW");
+        assert_eq!(dry_run["ddl_bytes"], ddl);
+        let approval_token = dry_run["token"]
+            .as_str()
+            .expect("dry_run should mint approval token")
+            .to_owned();
+
+        let refused = serve
+            .call(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tools/call",
+                "params": {
+                    "name": "execute_approved",
+                    "arguments": {
+                        "connection": connection_name,
+                        "token": approval_token,
+                        "ddl_bytes": ddl,
+                        "principal_schema": "SYSTEM",
+                        "target_schema": "SYSTEM",
+                        "operator_typed_schema": null
+                    }
+                }
+            }))
+            .expect("execute_approved refusal response");
+        assert_eq!(refused["id"], 10);
+        assert_eq!(refused["error"]["code"], -32602);
+        assert_eq!(
+            refused["error"]["data"]["error_class"],
+            "OPERATING_LEVEL_TOO_LOW"
+        );
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("not write-enabled")),
+            "execute_approved should refuse before DDL execution without enable_writes: {refused}"
+        );
+
+        serve
+            .finish()
+            .expect("serve stdio JSON-RPC session should exit cleanly");
+        eprintln!(
+            "[Phase X 15.2] serve stdio JSON-RPC exercised tools/list, connect, list_objects, get_object_source, describe_table, guarded dry_run, and write-refusal against Oracle 23ai"
         );
     }
 

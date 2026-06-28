@@ -246,6 +246,58 @@ pub fn register_query_tool(registry: &mut ToolRegistry) {
     );
 }
 
+/// Register read-only live dictionary inspection tool descriptors.
+pub fn register_live_inspection_tools(registry: &mut ToolRegistry) {
+    let descriptors = [
+        (
+            "list_objects",
+            "List visible Oracle objects from USER_OBJECTS / ALL_OBJECTS with schema, type, name-pattern, and cursor paging filters.",
+            list_objects_input_schema(),
+        ),
+        (
+            "describe_table",
+            "Describe one visible table: columns, constraints, indexes, comments, and partition summary from Oracle dictionary views.",
+            describe_object_input_schema(),
+        ),
+        (
+            "describe_view",
+            "Describe one visible view: columns, read-only flag, comments, and a sanitized query preview.",
+            describe_view_input_schema(),
+        ),
+        (
+            "describe_trigger",
+            "Describe one visible trigger: timing/event, base object, status, and sanitized WHEN clause.",
+            describe_object_input_schema(),
+        ),
+        (
+            "describe_index",
+            "Describe one visible index: table, uniqueness, type, status, and indexed columns.",
+            describe_object_input_schema(),
+        ),
+        (
+            "get_object_source",
+            "Fetch PL/SQL source from ALL_SOURCE for one object; source text is K18-sanitized before it reaches the agent.",
+            get_object_source_input_schema(),
+        ),
+        (
+            "get_errors",
+            "Fetch structured USER_ERRORS / ALL_ERRORS rows for one object; free-text fields are K18-sanitized.",
+            get_errors_input_schema(),
+        ),
+        (
+            "get_clob",
+            "Fetch the first cell from a read-only SELECT intended to project a CLOB; text is K18-sanitized and optionally truncated.",
+            get_clob_input_schema(),
+        ),
+    ];
+    for (name, summary, schema) in descriptors {
+        registry.register(
+            ToolDescriptor::new(name, ToolTier::FoundationLiveDb, summary)
+                .with_input_schema(schema),
+        );
+    }
+}
+
 pub use audit::{
     APPLICATION_MODULE, AuditClient, AuditPlan, AuditSink, GUARDED_AUDIT_FILE_ENV,
     GUARDED_AUDIT_KEY_ENV, GUARDED_AUDIT_KEY_ID_ENV, GuardedAudit, GuardedAuditDraft,
@@ -395,6 +447,111 @@ fn deploy_ddl_input_schema() -> serde_json::Value {
     })
 }
 
+fn optional_connection_property() -> serde_json::Value {
+    nullable_string_property(
+        "Optional named connection profile; defaults to the active connection.",
+    )
+}
+
+fn list_objects_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "connection": optional_connection_property(),
+            "object_type": nullable_string_property("Optional Oracle object type filter such as TABLE, VIEW, PACKAGE, or PACKAGE BODY."),
+            "name_pattern": nullable_string_property("Optional case-insensitive Oracle LIKE pattern matched against OBJECT_NAME."),
+            "schema": nullable_string_property("Optional owner/schema filter. Omit to use USER_OBJECTS for the connected schema."),
+            "page_size": {
+                "type": ["integer", "null"],
+                "minimum": 1,
+                "maximum": MAX_PAGE_SIZE,
+                "description": "Maximum objects to return in this page.",
+            },
+            "cursor": nullable_string_property("Opaque cursor from a previous list_objects response."),
+        },
+    })
+}
+
+fn describe_object_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["owner", "name"],
+        "properties": {
+            "connection": optional_connection_property(),
+            "owner": string_property("Oracle schema owner for the object."),
+            "name": string_property("Oracle object name to describe."),
+        },
+    })
+}
+
+fn describe_view_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["owner", "name"],
+        "properties": {
+            "connection": optional_connection_property(),
+            "owner": string_property("Oracle schema owner for the view."),
+            "name": string_property("Oracle view name to describe."),
+            "text_preview_chars": {
+                "type": ["integer", "null"],
+                "minimum": 0,
+                "description": "Optional char limit for the sanitized view-query preview.",
+            },
+        },
+    })
+}
+
+fn get_object_source_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["owner", "object_name", "object_type"],
+        "properties": {
+            "connection": optional_connection_property(),
+            "owner": string_property("Oracle schema owner for the source object."),
+            "object_name": string_property("Oracle source object name."),
+            "object_type": string_property("Oracle source type as stored in ALL_SOURCE, such as PACKAGE or PACKAGE BODY."),
+        },
+    })
+}
+
+fn get_errors_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["object_name"],
+        "properties": {
+            "connection": optional_connection_property(),
+            "owner": nullable_string_property("Oracle schema owner. Omit or pass an empty string to query USER_ERRORS."),
+            "object_name": string_property("Oracle object name whose compile errors should be returned."),
+        },
+    })
+}
+
+fn get_clob_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sql"],
+        "properties": {
+            "connection": optional_connection_property(),
+            "sql": string_property("Read-only SELECT / WITH statement that projects the CLOB/text value in its first row."),
+            "params": {
+                "type": ["array", "null"],
+                "description": "Optional positional binds using the plsql-catalog OracleBind JSON shape.",
+            },
+            "max_chars": {
+                "type": ["integer", "null"],
+                "minimum": 0,
+                "description": "Optional char limit for the returned text.",
+            },
+        },
+    })
+}
+
 fn connection_tool_input_schema(name: &str) -> serde_json::Value {
     match name {
         "connect" => serde_json::json!({
@@ -503,6 +660,7 @@ pub fn default_tool_registry() -> ToolRegistry {
     register_connection_tools(&mut r);
     register_safety_tools(&mut r);
     register_query_tool(&mut r);
+    register_live_inspection_tools(&mut r);
     register_patch_package_tool(&mut r);
     register_patch_view_tool(&mut r);
     register_create_or_replace_tool(&mut r);
