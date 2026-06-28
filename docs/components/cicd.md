@@ -21,11 +21,37 @@ questions and surfaces them as a `DeploymentPlan` consumers can act on.
 
 ## Robot JSON Contract
 
-`plsql cicd predict --robot-json` emits the
+`plsql predict --robot-json <changeset-source>` emits the
 `plsql.cicd.change_impact` schema at version `1.0.0`. The public Rust
 builder is `change_impact_envelope(prediction, compile_error_flags)`;
 the frozen contract is covered by
 `crates/plsql-cicd/tests/golden/change_impact_payload.json`.
+
+The CLI is a thin wrapper over the library pipeline:
+
+- changeset construction from a source directory, unified diff, standalone
+  script, serialized `ChangeSet` JSON, `--before/--after`, or `--git-range`.
+- direct prediction via `predict`.
+- transitive prediction via `predict_with_lineage` when
+  `--lineage-impact` JSON and `--lineage-metadata` are supplied.
+
+Offline lineage metadata is explicit by design. `LineageResult` carries
+graph-native logical IDs, while the change-impact schema carries interned
+symbols. The metadata file maps those logical IDs to object metadata:
+
+```json
+{
+  "objects": [
+    {
+      "logical_id": "BILLING.REPORT_PKG",
+      "owner_symbol": 0,
+      "name_symbol": 2,
+      "object_type": "PACKAGE",
+      "force_compile": true
+    }
+  ]
+}
+```
 
 Stable top-level payload sections:
 

@@ -29,8 +29,8 @@ ship with the repo.
 ## Stage 1 — predict invalidations
 
 ```sh
-cargo run --release -p plsql-cicd -- predict \
-    --changeset corpus/lab/hero_diff/change.diff \
+cargo run --release -p plsql-cicd --bin plsql -- predict \
+    --source-kind diff corpus/lab/hero_diff/change.diff \
     --robot-json > /tmp/predict.json
 ```
 
@@ -40,6 +40,21 @@ recompile guidance, compile-error flags, lineage notes,
 uncertainties, and the completeness posture. The schema is frozen at
 version `1.0.0` by
 `crates/plsql-cicd/tests/golden/change_impact_payload.json`.
+
+When a fixture already has an offline lineage impact artifact, pass it
+through the transitive wrapper:
+
+```sh
+cargo run --release -p plsql-cicd --bin plsql -- predict \
+    --robot-json \
+    --source-kind changeset-json corpus/lab/hero_diff/changeset.json \
+    --lineage-impact corpus/lab/hero_diff/impact.json \
+    --lineage-metadata corpus/lab/hero_diff/lineage-metadata.json \
+    > /tmp/predict.json
+```
+
+`--lineage-metadata` is the explicit logical-id-to-object map used to
+lower `LineageResult` rows into the stable numeric-symbol payload.
 
 ## Stage 2 — plan recompile order
 

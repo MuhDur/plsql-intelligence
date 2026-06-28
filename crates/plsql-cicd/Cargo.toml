@@ -19,6 +19,7 @@ live-xe = ["oracle-driver"]
 [dependencies]
 async-trait = "0.1"
 asupersync = "=0.3.4"
+clap = { version = "4.5", features = ["derive"] }
 getrandom = "0.3"
 plsql-catalog = { path = "../plsql-catalog" }
 plsql-core = { path = "../plsql-core" }
@@ -32,6 +33,10 @@ tracing.workspace = true
 
 [dev-dependencies]
 plsql-depgraph = { path = "../plsql-depgraph" }
+
+[[bin]]
+name = "plsql"
+path = "src/bin/plsql.rs"
 
 [lints]
 workspace = true
