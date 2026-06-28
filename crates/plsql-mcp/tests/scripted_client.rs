@@ -17,6 +17,9 @@ use plsql_mcp::{
     PlsqlMcpServer, ToolRegistry, default_tool_registry, register_analyze_project_tool,
     register_foundation_tools, register_graph_tools,
 };
+use serde_json::{Value, json};
+
+const AGENT_UX_SURFACE_GOLDEN: &str = include_str!("golden/agent_ux_surface.json");
 
 /// The foundation tool surface a scripted client should see.
 const EXPECTED_TOOLS: &[&str] = &[
@@ -273,6 +276,66 @@ fn tools_call_bad_arguments_returns_invalid_params_over_the_wire() {
 }
 
 #[test]
+fn agent_ux_surface_wire_golden_matches_snapshot() {
+    let mut server = server(default_tool_registry());
+
+    let tools_list = call_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 80,
+            "method": "tools/list",
+            "params": {}
+        }),
+    );
+    let capabilities = call_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 81,
+            "method": "tools/call",
+            "params": {
+                "name": "oracle_capabilities",
+                "arguments": {}
+            }
+        }),
+    );
+    let forced_error = call_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 82,
+            "method": "tools/call",
+            "params": {
+                "name": "parse_fil",
+                "arguments": {}
+            }
+        }),
+    );
+    let resources_list = call_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 83,
+            "method": "resources/list",
+            "params": {}
+        }),
+    );
+
+    let actual = json!({
+        "schema_id": "plsql.mcp.agent_ux_surface_wire_golden",
+        "schema_version": "1.0.0",
+        "frames": [
+            summarize_tools_list(&tools_list),
+            summarize_capabilities(&capabilities),
+            summarize_forced_error(&forced_error),
+            summarize_resources_list(&resources_list),
+        ],
+    });
+    assert_json_snapshot(&actual, AGENT_UX_SURFACE_GOLDEN);
+}
+
+#[test]
 fn every_registered_tool_is_discoverable_and_described() {
     let mut server = server(foundation_registry());
     let list = call(
@@ -290,4 +353,217 @@ fn every_registered_tool_is_discoverable_and_described() {
             .unwrap_or("");
         assert!(!desc.is_empty(), "tool {} has no description", t["name"]);
     }
+}
+
+fn assert_json_snapshot(actual: &Value, expected: &str) {
+    let actual = format!(
+        "{}\n",
+        serde_json::to_string_pretty(actual).expect("snapshot serializes")
+    );
+    assert_eq!(actual, expected);
+}
+
+fn summarize_tools_list(response: &Value) -> Value {
+    let result = field(response, "result");
+    let tools = array_field(result, "tools");
+    let selected_tools = [
+        "oracle_capabilities",
+        "parse_file",
+        "query",
+        "set_safety_profile",
+        "create_or_replace",
+        "deploy_ddl",
+    ]
+    .into_iter()
+    .map(|name| summarize_tool(tool_by_name(tools, name)))
+    .collect::<Vec<_>>();
+
+    json!({
+        "request": "tools/list",
+        "response": ok_response_summary(response),
+        "tool_count": tools.len(),
+        "selected_tools": selected_tools,
+    })
+}
+
+fn summarize_tool(tool: &Value) -> Value {
+    let input_schema = field(tool, "inputSchema");
+    let annotations = field(tool, "annotations");
+    json!({
+        "name": str_field(tool, "name"),
+        "properties": property_keys(input_schema),
+        "required": optional_string_array_field(input_schema, "required"),
+        "annotations": {
+            "readOnlyHint": bool_field(annotations, "readOnlyHint"),
+            "destructiveHint": bool_field(annotations, "destructiveHint"),
+            "available": bool_field(annotations, "available"),
+            "activeSafetyProfile": str_field(annotations, "activeSafetyProfile"),
+            "requiredOperatingLevel": optional_value_field(annotations, "requiredOperatingLevel"),
+            "unavailableReason": optional_value_field(annotations, "unavailableReason"),
+        },
+    })
+}
+
+fn summarize_capabilities(response: &Value) -> Value {
+    let result = field(response, "result");
+    let structured = field(result, "structuredContent");
+    let features = field(structured, "features");
+    json!({
+        "request": "tools/call oracle_capabilities",
+        "response": ok_response_summary(response),
+        "isError": bool_field(result, "isError"),
+        "server_name": str_field(structured, "server_name"),
+        "protocol_version": str_field(structured, "protocol_version"),
+        "tool_count": u64_field(structured, "tool_count"),
+        "features": {
+            "engine": bool_field(features, "engine"),
+            "http_transport": bool_field(features, "http_transport"),
+            "live_db": bool_field(features, "live_db"),
+        },
+        "resources": string_array_field(structured, "resources"),
+        "next_actions": string_array_field(structured, "next_actions"),
+    })
+}
+
+fn summarize_forced_error(response: &Value) -> Value {
+    let error = field(response, "error");
+    let data = field(error, "data");
+    json!({
+        "request": "tools/call parse_fil",
+        "response": error_response_summary(response),
+        "message": str_field(error, "message"),
+        "error_class": str_field(data, "error_class"),
+        "fuzzy_matches": string_array_field(data, "fuzzy_matches"),
+        "next_steps": string_array_field(data, "next_steps"),
+    })
+}
+
+fn summarize_resources_list(response: &Value) -> Value {
+    let result = field(response, "result");
+    let resources = array_field(result, "resources")
+        .iter()
+        .map(|resource| {
+            json!({
+                "uri": str_field(resource, "uri"),
+                "name": str_field(resource, "name"),
+                "mimeType": str_field(resource, "mimeType"),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "request": "resources/list",
+        "response": ok_response_summary(response),
+        "resources": resources,
+    })
+}
+
+fn ok_response_summary(response: &Value) -> Value {
+    json!({
+        "jsonrpc": str_field(response, "jsonrpc"),
+        "id": field(response, "id").clone(),
+        "has_trust_block": has_trust_block(response),
+    })
+}
+
+fn error_response_summary(response: &Value) -> Value {
+    let error = field(response, "error");
+    json!({
+        "jsonrpc": str_field(response, "jsonrpc"),
+        "id": field(response, "id").clone(),
+        "code": i64_field(error, "code"),
+        "has_trust_block": has_trust_block(response),
+    })
+}
+
+fn has_trust_block(response: &Value) -> bool {
+    response
+        .get("result")
+        .and_then(|result| result.get("meta"))
+        .and_then(|meta| meta.get("trust_block"))
+        .and_then(|trust| trust.get("schema_id"))
+        .and_then(Value::as_str)
+        .is_some_and(|schema_id| schema_id == "plsql.mcp.trust_block")
+}
+
+fn tool_by_name<'a>(tools: &'a [Value], name: &str) -> &'a Value {
+    tools
+        .iter()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+        .expect("selected tool must be advertised")
+}
+
+fn field<'a>(value: &'a Value, key: &str) -> &'a Value {
+    value.get(key).expect("expected JSON field")
+}
+
+fn array_field<'a>(value: &'a Value, key: &str) -> &'a [Value] {
+    field(value, key)
+        .as_array()
+        .map(Vec::as_slice)
+        .expect("expected JSON array field")
+}
+
+fn str_field(value: &Value, key: &str) -> String {
+    field(value, key)
+        .as_str()
+        .expect("expected JSON string field")
+        .to_owned()
+}
+
+fn bool_field(value: &Value, key: &str) -> bool {
+    field(value, key)
+        .as_bool()
+        .expect("expected JSON bool field")
+}
+
+fn u64_field(value: &Value, key: &str) -> u64 {
+    field(value, key).as_u64().expect("expected JSON u64 field")
+}
+
+fn i64_field(value: &Value, key: &str) -> i64 {
+    field(value, key).as_i64().expect("expected JSON i64 field")
+}
+
+fn optional_value_field(value: &Value, key: &str) -> Value {
+    value.get(key).cloned().unwrap_or(Value::Null)
+}
+
+fn string_array_field(value: &Value, key: &str) -> Vec<String> {
+    array_field(value, key)
+        .iter()
+        .map(|entry| {
+            entry
+                .as_str()
+                .expect("expected JSON string array entry")
+                .to_owned()
+        })
+        .collect()
+}
+
+fn optional_string_array_field(value: &Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| {
+                    entry
+                        .as_str()
+                        .expect("expected JSON string array entry")
+                        .to_owned()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn property_keys(input_schema: &Value) -> Vec<String> {
+    let mut keys = input_schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    keys.sort();
+    keys
 }

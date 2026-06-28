@@ -1,0 +1,190 @@
+{
+  "frames": [
+    {
+      "request": "tools/list",
+      "response": {
+        "has_trust_block": true,
+        "id": 80,
+        "jsonrpc": "2.0"
+      },
+      "selected_tools": [
+        {
+          "annotations": {
+            "activeSafetyProfile": "inspect_only",
+            "available": true,
+            "destructiveHint": false,
+            "readOnlyHint": true,
+            "requiredOperatingLevel": null,
+            "unavailableReason": null
+          },
+          "name": "oracle_capabilities",
+          "properties": [],
+          "required": []
+        },
+        {
+          "annotations": {
+            "activeSafetyProfile": "inspect_only",
+            "available": true,
+            "destructiveHint": false,
+            "readOnlyHint": true,
+            "requiredOperatingLevel": null,
+            "unavailableReason": null
+          },
+          "name": "parse_file",
+          "properties": [
+            "source"
+          ],
+          "required": [
+            "source"
+          ]
+        },
+        {
+          "annotations": {
+            "activeSafetyProfile": "inspect_only",
+            "available": true,
+            "destructiveHint": false,
+            "readOnlyHint": true,
+            "requiredOperatingLevel": null,
+            "unavailableReason": null
+          },
+          "name": "query",
+          "properties": [
+            "connection",
+            "lob_truncation_chars",
+            "sql"
+          ],
+          "required": [
+            "sql"
+          ]
+        },
+        {
+          "annotations": {
+            "activeSafetyProfile": "inspect_only",
+            "available": true,
+            "destructiveHint": false,
+            "readOnlyHint": true,
+            "requiredOperatingLevel": "DDL",
+            "unavailableReason": null
+          },
+          "name": "set_safety_profile",
+          "properties": [
+            "profile"
+          ],
+          "required": [
+            "profile"
+          ]
+        },
+        {
+          "annotations": {
+            "activeSafetyProfile": "inspect_only",
+            "available": false,
+            "destructiveHint": true,
+            "readOnlyHint": false,
+            "requiredOperatingLevel": "DDL",
+            "unavailableReason": "requires a write-capable safety profile (current: inspect_only)"
+          },
+          "name": "create_or_replace",
+          "properties": [
+            "connection",
+            "ddl_bytes",
+            "mode",
+            "operation_summary"
+          ],
+          "required": [
+            "connection",
+            "operation_summary",
+            "ddl_bytes",
+            "mode"
+          ]
+        },
+        {
+          "annotations": {
+            "activeSafetyProfile": "inspect_only",
+            "available": false,
+            "destructiveHint": true,
+            "readOnlyHint": false,
+            "requiredOperatingLevel": "DDL",
+            "unavailableReason": "requires a write-capable safety profile (current: inspect_only)"
+          },
+          "name": "deploy_ddl",
+          "properties": [
+            "ddl_bytes",
+            "job_name"
+          ],
+          "required": [
+            "job_name",
+            "ddl_bytes"
+          ]
+        }
+      ],
+      "tool_count": 44
+    },
+    {
+      "features": {
+        "engine": true,
+        "http_transport": false,
+        "live_db": true
+      },
+      "isError": false,
+      "next_actions": [
+        "Call resources/list to discover the oracle:// resources.",
+        "Call resources/read with oracle://capabilities for this report as a resource.",
+        "Call tools/list to read each tool's argument inputSchema and readOnlyHint/destructiveHint.",
+        "Static analysis needs no connection: start with analyze_project, then graph tools.",
+        "For any live-DB tool, call connect first."
+      ],
+      "protocol_version": "2025-06-18",
+      "request": "tools/call oracle_capabilities",
+      "resources": [
+        "oracle://capabilities",
+        "oracle://tools"
+      ],
+      "response": {
+        "has_trust_block": true,
+        "id": 81,
+        "jsonrpc": "2.0"
+      },
+      "server_name": "plsql-mcp",
+      "tool_count": 44
+    },
+    {
+      "error_class": "INVALID_ARGUMENTS",
+      "fuzzy_matches": [
+        "parse_file"
+      ],
+      "message": "tool not found: parse_fil",
+      "next_steps": [
+        "Call tools/list to see the exact tool names, then retry with one of them."
+      ],
+      "request": "tools/call parse_fil",
+      "response": {
+        "code": -32601,
+        "has_trust_block": false,
+        "id": 82,
+        "jsonrpc": "2.0"
+      }
+    },
+    {
+      "request": "resources/list",
+      "resources": [
+        {
+          "mimeType": "application/json",
+          "name": "capabilities",
+          "uri": "oracle://capabilities"
+        },
+        {
+          "mimeType": "application/json",
+          "name": "tools",
+          "uri": "oracle://tools"
+        }
+      ],
+      "response": {
+        "has_trust_block": true,
+        "id": 83,
+        "jsonrpc": "2.0"
+      }
+    }
+  ],
+  "schema_id": "plsql.mcp.agent_ux_surface_wire_golden",
+  "schema_version": "1.0.0"
+}
