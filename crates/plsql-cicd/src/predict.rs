@@ -16,13 +16,281 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use plsql_core::{Confidence, ConfidenceLevel, ObjectName, SchemaName, UnknownReason};
+use plsql_core::{
+    CompletenessReport, Confidence, ConfidenceLevel, ObjectName, SchemaName, UnknownReason,
+};
 use plsql_lineage::{AffectedNode, Confidence as LineageConfidence, LineageResult, UnknownEdge};
+use plsql_output::{RobotJsonEnvelope, SchemaDescriptor, SchemaVersion};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     ChangeSet, ChangedObject, ChangedObjectKind, InvalidationPrediction, InvalidationReason,
     PredictMode, PredictedInvalidation, RecompileItem, UncertaintyRecord,
 };
+
+pub const CHANGE_IMPACT_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+    id: "plsql.cicd.change_impact",
+    version: SchemaVersion::new(1, 0, 0),
+    description: "Stable change-impact payload emitted by plsql cicd predict --robot-json",
+};
+
+pub type ChangeImpactEnvelope = RobotJsonEnvelope<ChangeImpactPayload>;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChangeImpactPayload {
+    pub summary: ChangeImpactSummary,
+    pub invalidated_objects_by_kind: Vec<ChangeImpactKindCount>,
+    pub invalidations: Vec<ChangeImpactInvalidation>,
+    pub recompile_plan: Vec<ChangeImpactRecompileItem>,
+    pub compile_error_flags: Vec<ChangeImpactCompileErrorFlag>,
+    pub lineage_notes: Vec<ChangeImpactLineageNote>,
+    pub uncertainties: Vec<ChangeImpactUncertainty>,
+    pub completeness: CompletenessReport,
+    pub attributes: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChangeImpactSummary {
+    pub mode: PredictMode,
+    pub invalidation_count: usize,
+    pub recompile_count: usize,
+    pub uncertainty_count: usize,
+    pub compile_error_flag_count: usize,
+    pub max_distance: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChangeImpactKindCount {
+    pub object_type: String,
+    pub count: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChangeImpactInvalidation {
+    pub owner_symbol: u64,
+    pub name_symbol: u64,
+    pub object_type: String,
+    pub reason_code: String,
+    pub reason_detail: String,
+    pub confidence: String,
+    pub confidence_explanation: Option<String>,
+    pub distance: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChangeImpactRecompileItem {
+    pub owner_symbol: u64,
+    pub name_symbol: u64,
+    pub object_type: String,
+    pub force_compile: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChangeImpactCompileErrorFlag {
+    pub owner_symbol: u64,
+    pub name_symbol: u64,
+    pub object_type: String,
+    pub flag: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChangeImpactLineageNote {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChangeImpactUncertainty {
+    pub reason: String,
+    pub affected_owner_symbol: Option<u64>,
+    pub affected_name_symbol: Option<u64>,
+    pub description: String,
+}
+
+#[must_use]
+pub fn change_impact_payload(
+    prediction: &InvalidationPrediction,
+    compile_error_flags: Vec<ChangeImpactCompileErrorFlag>,
+) -> ChangeImpactPayload {
+    ChangeImpactPayload {
+        summary: ChangeImpactSummary {
+            mode: prediction.mode,
+            invalidation_count: prediction.predicted_invalidations.len(),
+            recompile_count: prediction.recompile_order.len(),
+            uncertainty_count: prediction.uncertainties.len(),
+            compile_error_flag_count: compile_error_flags.len(),
+            max_distance: prediction
+                .predicted_invalidations
+                .iter()
+                .map(|row| row.distance)
+                .max()
+                .unwrap_or(0),
+        },
+        invalidated_objects_by_kind: invalidated_objects_by_kind(prediction),
+        invalidations: prediction
+            .predicted_invalidations
+            .iter()
+            .map(change_impact_invalidation)
+            .collect(),
+        recompile_plan: prediction
+            .recompile_order
+            .iter()
+            .map(change_impact_recompile_item)
+            .collect(),
+        compile_error_flags,
+        lineage_notes: lineage_notes(prediction),
+        uncertainties: prediction
+            .uncertainties
+            .iter()
+            .map(change_impact_uncertainty)
+            .collect(),
+        completeness: prediction.completeness.clone(),
+        attributes: prediction.attributes.clone(),
+    }
+}
+
+#[must_use]
+pub fn change_impact_envelope(
+    prediction: &InvalidationPrediction,
+    compile_error_flags: Vec<ChangeImpactCompileErrorFlag>,
+) -> RobotJsonEnvelope<ChangeImpactPayload> {
+    RobotJsonEnvelope::new(
+        CHANGE_IMPACT_SCHEMA,
+        change_impact_payload(prediction, compile_error_flags),
+    )
+}
+
+fn invalidated_objects_by_kind(prediction: &InvalidationPrediction) -> Vec<ChangeImpactKindCount> {
+    let mut counts = BTreeMap::<String, u32>::new();
+    for row in &prediction.predicted_invalidations {
+        counts
+            .entry(row.object_type.clone())
+            .and_modify(|count| *count = count.saturating_add(1))
+            .or_insert(1);
+    }
+    counts
+        .into_iter()
+        .map(|(object_type, count)| ChangeImpactKindCount { object_type, count })
+        .collect()
+}
+
+fn change_impact_invalidation(row: &PredictedInvalidation) -> ChangeImpactInvalidation {
+    let (reason_code, reason_detail) = invalidation_reason_parts(&row.reason);
+    ChangeImpactInvalidation {
+        owner_symbol: row.owner.symbol().get(),
+        name_symbol: row.name.symbol().get(),
+        object_type: row.object_type.clone(),
+        reason_code: reason_code.into(),
+        reason_detail,
+        confidence: confidence_level_code(row.confidence.level).into(),
+        confidence_explanation: row.confidence.explanation.clone(),
+        distance: row.distance,
+    }
+}
+
+fn change_impact_recompile_item(row: &RecompileItem) -> ChangeImpactRecompileItem {
+    ChangeImpactRecompileItem {
+        owner_symbol: row.owner.symbol().get(),
+        name_symbol: row.name.symbol().get(),
+        object_type: row.object_type.clone(),
+        force_compile: row.force_compile,
+    }
+}
+
+fn change_impact_uncertainty(row: &UncertaintyRecord) -> ChangeImpactUncertainty {
+    ChangeImpactUncertainty {
+        reason: unknown_reason_code(row.reason).into(),
+        affected_owner_symbol: row.affected_owner.map(|owner| owner.symbol().get()),
+        affected_name_symbol: row.affected_name.map(|name| name.symbol().get()),
+        description: row.description.clone(),
+    }
+}
+
+fn lineage_notes(prediction: &InvalidationPrediction) -> Vec<ChangeImpactLineageNote> {
+    prediction
+        .attributes
+        .iter()
+        .filter(|(key, _value)| key.starts_with("lineage."))
+        .map(|(key, value)| ChangeImpactLineageNote {
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .collect()
+}
+
+fn confidence_level_code(level: ConfidenceLevel) -> &'static str {
+    match level {
+        ConfidenceLevel::High => "high",
+        ConfidenceLevel::Medium => "medium",
+        ConfidenceLevel::Low => "low",
+        ConfidenceLevel::Opaque => "opaque",
+    }
+}
+
+fn invalidation_reason_parts(reason: &InvalidationReason) -> (&'static str, String) {
+    match reason {
+        InvalidationReason::PackageSpecChanged { .. } => (
+            "package_spec_changed",
+            "dependent of changed package specification".into(),
+        ),
+        InvalidationReason::RoutineSignatureChanged { .. } => (
+            "routine_signature_changed",
+            "dependent of changed standalone routine signature".into(),
+        ),
+        InvalidationReason::TableAdditive { .. } => (
+            "table_additive_ddl",
+            "table additive DDL may require dependent checks".into(),
+        ),
+        InvalidationReason::TableDestructive { .. } => (
+            "table_destructive_ddl",
+            "table destructive DDL can invalidate dependents".into(),
+        ),
+        InvalidationReason::TypeEvolution { .. } => (
+            "type_evolution",
+            "object type evolution can invalidate structural dependents".into(),
+        ),
+        InvalidationReason::SynonymRetargeted { .. } => (
+            "synonym_retargeted",
+            "synonym now resolves to a different target".into(),
+        ),
+        InvalidationReason::PrivilegeChange => (
+            "privilege_change",
+            "grant or revoke can affect dependent object authorization".into(),
+        ),
+        InvalidationReason::MaterializedViewRefreshAffected { .. } => (
+            "materialized_view_refresh_affected",
+            "materialized view refresh semantics may be affected".into(),
+        ),
+        InvalidationReason::EditionedObjectChange => (
+            "editioned_object_change",
+            "editioned object change affects the active edition".into(),
+        ),
+        InvalidationReason::SourceOnlyHeuristic => (
+            "source_only_heuristic",
+            "source-only prediction without catalog confirmation".into(),
+        ),
+        InvalidationReason::Other { description } => ("other", description.clone()),
+    }
+}
+
+fn unknown_reason_code(reason: UnknownReason) -> &'static str {
+    match reason {
+        UnknownReason::DynamicSqlOpaque => "DynamicSqlOpaque",
+        UnknownReason::DbLinkRemoteObject => "DbLinkRemoteObject",
+        UnknownReason::WrappedSource => "WrappedSource",
+        UnknownReason::MissingCatalogObject => "MissingCatalogObject",
+        UnknownReason::MissingPackageBody => "MissingPackageBody",
+        UnknownReason::ConditionalCompilationBranch => "ConditionalCompilationBranch",
+        UnknownReason::EditionedObject => "EditionedObject",
+        UnknownReason::InvokerRightsRuntimeResolution => "InvokerRightsRuntimeResolution",
+        UnknownReason::RuntimeGrantOrRole => "RuntimeGrantOrRole",
+        UnknownReason::UnsupportedDialectFeature => "UnsupportedDialectFeature",
+        UnknownReason::ParserRecoveryRegion => "ParserRecoveryRegion",
+        UnknownReason::AnalysisRecursionLimit => "AnalysisRecursionLimit",
+        UnknownReason::ResponseSanitized => "ResponseSanitized",
+    }
+}
 
 /// Metadata needed to lower a lineage logical id into the CI/CD prediction
 /// surface.
@@ -524,10 +792,13 @@ fn prediction_row_is_stronger(
     candidate: &PredictedInvalidation,
     existing: &PredictedInvalidation,
 ) -> bool {
-    candidate.distance < existing.distance
-        || (candidate.distance == existing.distance
-            && confidence_rank(candidate.confidence.level)
-                > confidence_rank(existing.confidence.level))
+    match candidate.distance.cmp(&existing.distance) {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Equal => {
+            confidence_rank(candidate.confidence.level) > confidence_rank(existing.confidence.level)
+        }
+        std::cmp::Ordering::Greater => false,
+    }
 }
 
 fn confidence_rank(level: ConfidenceLevel) -> u8 {
@@ -822,7 +1093,10 @@ mod tests {
         };
         let prediction = predict(&changeset, PredictMode::CatalogAware);
         assert_eq!(prediction.predicted_invalidations.len(), 1);
-        let row = &prediction.predicted_invalidations[0];
+        let row = prediction
+            .predicted_invalidations
+            .first()
+            .expect("package spec fixture emits one invalidation");
         assert!(matches!(
             row.reason,
             InvalidationReason::PackageSpecChanged { .. }
@@ -851,7 +1125,12 @@ mod tests {
         let prediction = predict(&changeset, PredictMode::SourceOnly);
         assert_eq!(prediction.predicted_invalidations.len(), 1);
         assert_eq!(
-            prediction.predicted_invalidations[0].confidence.level,
+            prediction
+                .predicted_invalidations
+                .first()
+                .expect("source-only fixture emits one invalidation")
+                .confidence
+                .level,
             ConfidenceLevel::Low
         );
         assert!(
@@ -869,8 +1148,12 @@ mod tests {
             ..ChangeSet::empty()
         };
         let prediction = predict(&changeset, PredictMode::CatalogAware);
+        let first = prediction
+            .predicted_invalidations
+            .first()
+            .expect("destructive table fixture emits one invalidation");
         assert!(matches!(
-            prediction.predicted_invalidations[0].reason,
+            first.reason,
             InvalidationReason::TableDestructive { .. }
         ));
     }
@@ -954,7 +1237,10 @@ mod tests {
         let objects: Vec<ChangedObject> = emitting_kinds
             .into_iter()
             .enumerate()
-            .map(|(i, kind)| changed(kind, 500 + i as u64))
+            .map(|(i, kind)| {
+                let offset = u64::try_from(i).unwrap_or(u64::MAX);
+                changed(kind, 500_u64.saturating_add(offset))
+            })
             .collect();
         let changeset = ChangeSet {
             objects,
@@ -1040,6 +1326,67 @@ mod tests {
             UnknownReason::MissingCatalogObject
         )
             && u.description.contains("BILLING.MISSING_DEPENDENT")));
+    }
+
+    fn change_impact_fixture_prediction() -> InvalidationPrediction {
+        let (graph, metadata, changeset) = lineage_fixture();
+        let impact_result = impact(&graph, &NodeId::new(1), None);
+        predict_with_lineage(
+            &changeset,
+            PredictMode::CatalogAware,
+            &[impact_result],
+            |logical_id| metadata.get(logical_id).cloned(),
+        )
+    }
+
+    fn compile_error_flag() -> ChangeImpactCompileErrorFlag {
+        ChangeImpactCompileErrorFlag {
+            owner_symbol: 0,
+            name_symbol: 2,
+            object_type: String::from("PACKAGE"),
+            flag: String::from("compile_error_detected"),
+            message: String::from("ORA-04063: package body has errors"),
+        }
+    }
+
+    #[test]
+    fn change_impact_payload_sections_are_stable() {
+        let prediction = change_impact_fixture_prediction();
+        let envelope = change_impact_envelope(&prediction, vec![compile_error_flag()]);
+
+        assert!(envelope.matches_schema(CHANGE_IMPACT_SCHEMA));
+        let payload = &envelope.payload;
+        assert_eq!(payload.summary.invalidation_count, 4);
+        assert_eq!(payload.summary.recompile_count, 3);
+        assert_eq!(payload.summary.compile_error_flag_count, 1);
+        assert_eq!(payload.summary.max_distance, 3);
+        assert_eq!(
+            payload
+                .invalidated_objects_by_kind
+                .iter()
+                .map(|row| (row.object_type.as_str(), row.count))
+                .collect::<Vec<_>>(),
+            vec![("JOB", 1), ("PACKAGE", 1), ("TABLE", 1), ("VIEW", 1)]
+        );
+        assert_eq!(payload.lineage_notes.len(), 3);
+        assert_eq!(
+            payload
+                .compile_error_flags
+                .first()
+                .expect("fixture carries one compile-error flag")
+                .flag,
+            "compile_error_detected"
+        );
+    }
+
+    #[test]
+    fn change_impact_payload_matches_golden_snapshot() {
+        let prediction = change_impact_fixture_prediction();
+        let envelope = change_impact_envelope(&prediction, vec![compile_error_flag()]);
+        let actual = serde_json::to_string_pretty(&envelope).expect("serialize golden payload");
+        let expected = include_str!("../tests/golden/change_impact_payload.json").trim_end();
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

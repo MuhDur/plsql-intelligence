@@ -49,7 +49,12 @@ pub use post_pr_comment::{
     PrIntegrationDoctorReport, PrPosture, build_request as build_post_pr_comment_request,
     find_existing_comment, pr_integration_doctor,
 };
-pub use predict::{LineageObjectMetadata, predict, predict_with_lineage};
+pub use predict::{
+    CHANGE_IMPACT_SCHEMA, ChangeImpactCompileErrorFlag, ChangeImpactEnvelope,
+    ChangeImpactInvalidation, ChangeImpactKindCount, ChangeImpactLineageNote, ChangeImpactPayload,
+    ChangeImpactRecompileItem, ChangeImpactSummary, ChangeImpactUncertainty, LineageObjectMetadata,
+    change_impact_envelope, change_impact_payload, predict, predict_with_lineage,
+};
 pub use verify::{
     ScratchSchemaGuard, StatementOutcome, VerifyChangeset, VerifyError, VerifyOptions,
     VerifyReport, VerifyReportRow, VerifyStatement, create_scratch_schema, is_scratch_schema,

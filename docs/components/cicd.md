@@ -19,6 +19,31 @@ questions and surfaces them as a `DeploymentPlan` consumers can act on.
 | `DeploymentPlan` | Topologically ordered recompile plan + caveats |
 | `RecompileMode` | `source-only`, `catalog-aware`, `live-snapshot` |
 
+## Robot JSON Contract
+
+`plsql cicd predict --robot-json` emits the
+`plsql.cicd.change_impact` schema at version `1.0.0`. The public Rust
+builder is `change_impact_envelope(prediction, compile_error_flags)`;
+the frozen contract is covered by
+`crates/plsql-cicd/tests/golden/change_impact_payload.json`.
+
+Stable top-level payload sections:
+
+- `summary` — mode, invalidation count, recompile count, uncertainty
+  count, compile-error flag count, and maximum lineage distance.
+- `invalidated_objects_by_kind` — deterministic object-type counts for
+  CI summaries and PR badges.
+- `invalidations` — one row per predicted invalidation, with stable
+  reason code, confidence, and hop distance.
+- `recompile_plan` — object-level recompile guidance in deterministic
+  order.
+- `compile_error_flags` — verification/compile failure flags that the
+  CLI or Action can render without changing the schema.
+- `lineage_notes` — `lineage.*` attributes such as number of impact
+  results, transitive rows, and unresolved logical ids.
+- `uncertainties` and `completeness` — R13 blind spots and the
+  evidence posture that produced the prediction.
+
 ## Modes
 
 - **`source-only`** — no catalog input; best-effort heuristic over source diffs.

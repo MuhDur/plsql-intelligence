@@ -1,0 +1,162 @@
+{
+  "format": "plsql-robot-json",
+  "schema_id": "plsql.cicd.change_impact",
+  "schema_version": {
+    "major": 1,
+    "minor": 0,
+    "patch": 0
+  },
+  "payload": {
+    "summary": {
+      "mode": "CatalogAware",
+      "invalidation_count": 4,
+      "recompile_count": 3,
+      "uncertainty_count": 0,
+      "compile_error_flag_count": 1,
+      "max_distance": 3
+    },
+    "invalidated_objects_by_kind": [
+      {
+        "object_type": "JOB",
+        "count": 1
+      },
+      {
+        "object_type": "PACKAGE",
+        "count": 1
+      },
+      {
+        "object_type": "TABLE",
+        "count": 1
+      },
+      {
+        "object_type": "VIEW",
+        "count": 1
+      }
+    ],
+    "invalidations": [
+      {
+        "owner_symbol": 0,
+        "name_symbol": 1,
+        "object_type": "TABLE",
+        "reason_code": "table_destructive_ddl",
+        "reason_detail": "table destructive DDL can invalidate dependents",
+        "confidence": "high",
+        "confidence_explanation": "catalog-aware predict",
+        "distance": 1
+      },
+      {
+        "owner_symbol": 0,
+        "name_symbol": 2,
+        "object_type": "PACKAGE",
+        "reason_code": "other",
+        "reason_detail": "lineage impact from `BILLING.CUSTOMERS` reaches `BILLING.REPORT_PKG`",
+        "confidence": "high",
+        "confidence_explanation": "lineage impact path exact",
+        "distance": 1
+      },
+      {
+        "owner_symbol": 0,
+        "name_symbol": 3,
+        "object_type": "VIEW",
+        "reason_code": "other",
+        "reason_detail": "lineage impact from `BILLING.CUSTOMERS` reaches `BILLING.REPORT_VIEW`",
+        "confidence": "high",
+        "confidence_explanation": "lineage impact path exact",
+        "distance": 2
+      },
+      {
+        "owner_symbol": 0,
+        "name_symbol": 4,
+        "object_type": "JOB",
+        "reason_code": "other",
+        "reason_detail": "lineage impact from `BILLING.CUSTOMERS` reaches `BILLING.SUMMARY_JOB`",
+        "confidence": "high",
+        "confidence_explanation": "lineage impact path exact",
+        "distance": 3
+      }
+    ],
+    "recompile_plan": [
+      {
+        "owner_symbol": 0,
+        "name_symbol": 2,
+        "object_type": "PACKAGE",
+        "force_compile": true
+      },
+      {
+        "owner_symbol": 0,
+        "name_symbol": 3,
+        "object_type": "VIEW",
+        "force_compile": true
+      },
+      {
+        "owner_symbol": 0,
+        "name_symbol": 4,
+        "object_type": "JOB",
+        "force_compile": true
+      }
+    ],
+    "compile_error_flags": [
+      {
+        "owner_symbol": 0,
+        "name_symbol": 2,
+        "object_type": "PACKAGE",
+        "flag": "compile_error_detected",
+        "message": "ORA-04063: package body has errors"
+      }
+    ],
+    "lineage_notes": [
+      {
+        "key": "lineage.impact_results",
+        "value": "1"
+      },
+      {
+        "key": "lineage.transitive_invalidations",
+        "value": "3"
+      },
+      {
+        "key": "lineage.unresolved_logical_ids",
+        "value": "0"
+      }
+    ],
+    "uncertainties": [],
+    "completeness": {
+      "files_total": 0,
+      "files_parsed_cleanly": 0,
+      "files_recovered": 0,
+      "skipped_token_ratio": 0.0,
+      "objects_total": 1,
+      "objects_with_source": 0,
+      "objects_catalog_only": 0,
+      "wrapped_units": {
+        "unmeasured": true
+      },
+      "missing_package_bodies": {
+        "unmeasured": true
+      },
+      "dynamic_sql_sites": {
+        "unmeasured": true
+      },
+      "opaque_dynamic_sql_sites": {
+        "unmeasured": true
+      },
+      "db_link_edges": {
+        "unmeasured": true
+      },
+      "unresolved_references": {
+        "unmeasured": true
+      },
+      "diagnostics_total": 0,
+      "objects_unrecognized": 0,
+      "objects_with_extracted_semantics": 1,
+      "extracted_semantics_ratio": 1.0,
+      "posture": "Clean",
+      "catalog_available": true,
+      "plscope_available": false
+    },
+    "attributes": {
+      "lineage.impact_results": "1",
+      "lineage.transitive_invalidations": "3",
+      "lineage.unresolved_logical_ids": "0"
+    }
+  }
+}

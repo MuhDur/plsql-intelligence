@@ -34,11 +34,12 @@ cargo run --release -p plsql-cicd -- predict \
     --robot-json > /tmp/predict.json
 ```
 
-`/tmp/predict.json` contains the `plsql.cicd.invalidation_prediction`
-envelope: one entry per object the gate predicts will invalidate
-when the diff lands. For the hero diff this is `pkg_employee_mgmt`
-(`PackageBodyChange`, `distance=0`, `confidence=High`) plus every
-caller using named notation.
+`/tmp/predict.json` contains the `plsql.cicd.change_impact`
+envelope: summary counts, invalidations by kind, invalidation rows,
+recompile guidance, compile-error flags, lineage notes,
+uncertainties, and the completeness posture. The schema is frozen at
+version `1.0.0` by
+`crates/plsql-cicd/tests/golden/change_impact_payload.json`.
 
 ## Stage 2 — plan recompile order
 
