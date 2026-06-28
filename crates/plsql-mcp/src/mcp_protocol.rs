@@ -939,7 +939,11 @@ fn validate_advertised_argument_names(
     property_names.sort();
     let mut unknown = args
         .keys()
-        .filter(|key| !property_names.iter().any(|known| known == *key))
+        .filter(|key| {
+            !property_names
+                .iter()
+                .any(|known| known.as_str().eq(key.as_str()))
+        })
         .cloned()
         .collect::<Vec<_>>();
     unknown.sort();
@@ -1004,7 +1008,7 @@ fn advertised_argument_schema<'a>(
     registry
         .tools
         .iter()
-        .find(|tool| tool.name == tool_name)?
+        .find(|tool| tool.name.eq(tool_name))?
         .input_schema
         .as_ref()
 }
@@ -1123,10 +1127,33 @@ mod tests {
         server.handle_request(&request).expect("request response")
     }
 
+    fn direct_dispatch_for_test(
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, Box<oraclemcp_error::ErrorEnvelope>> {
+        let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().expect("block_on installs a request Cx");
+            let context =
+                crate::dispatch::PlsqlDispatchContext::from_cx(&cx, DispatchContext::default());
+            crate::dispatch::dispatch_tool(&cx, context, name, arguments)
+                .await
+                .map_err(Box::new)
+        })
+    }
+
+    fn value_str_eq(value: &Value, expected: &str) -> bool {
+        value.as_str().is_some_and(|actual| actual.eq(expected))
+    }
+
     fn tool_by_name(tools: &[Value], name: &str) -> Value {
         tools
             .iter()
-            .find(|tool| tool["name"] == name)
+            .find(|tool| value_str_eq(&tool["name"], name))
             .expect("tool advertised")
             .clone()
     }
@@ -1177,7 +1204,7 @@ mod tests {
         let resp = handle_request(&req(3, "tools/list", None), &r).unwrap();
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert!(tools.iter().any(|t| t["name"] == "query"));
+        assert!(tools.iter().any(|t| value_str_eq(&t["name"], "query")));
     }
 
     #[test]
@@ -1192,11 +1219,13 @@ mod tests {
         assert!(
             resources
                 .iter()
-                .any(|r| r["uri"] == "oracle://capabilities"),
+                .any(|r| value_str_eq(&r["uri"], "oracle://capabilities")),
             "resources/list should advertise oracle://capabilities: {resources:?}"
         );
         assert!(
-            resources.iter().any(|r| r["uri"] == "oracle://tools"),
+            resources
+                .iter()
+                .any(|r| value_str_eq(&r["uri"], "oracle://tools")),
             "resources/list should advertise oracle://tools: {resources:?}"
         );
     }
@@ -1215,7 +1244,7 @@ mod tests {
         assert!(
             templates
                 .iter()
-                .any(|t| t["uriTemplate"] == "oracle://object/{owner}/{type}/{name}"),
+                .any(|t| value_str_eq(&t["uriTemplate"], "oracle://object/{owner}/{type}/{name}")),
             "resourceTemplates should expose object URI template: {templates:?}"
         );
     }
@@ -1267,7 +1296,7 @@ mod tests {
         let tools = catalog["tools"].as_array().expect("tools array");
         let parse_file = tools
             .iter()
-            .find(|tool| tool["name"] == "parse_file")
+            .find(|tool| value_str_eq(&tool["name"], "parse_file"))
             .expect("parse_file in tools resource");
         assert_eq!(parse_file["inputSchema"]["required"][0], "source");
         assert_eq!(parse_file["annotations"]["readOnlyHint"], Value::Bool(true));
@@ -1516,41 +1545,229 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum StaticDispatchExpectation {
+        Runs,
+        NeedsDependencyGraph,
+    }
+
+    #[derive(Debug)]
+    struct StaticDispatchCase {
+        name: &'static str,
+        arguments: Value,
+        expectation: StaticDispatchExpectation,
+    }
+
+    fn static_dispatch_regression_cases() -> Vec<StaticDispatchCase> {
+        let source = "CREATE OR REPLACE PACKAGE p AS PROCEDURE q; END p;\n/\n";
+        let missing_root = "";
+        vec![
+            StaticDispatchCase {
+                name: "oracle_capabilities",
+                arguments: serde_json::json!({}),
+                expectation: StaticDispatchExpectation::Runs,
+            },
+            StaticDispatchCase {
+                name: "parse_file",
+                arguments: serde_json::json!({ "source": source }),
+                expectation: StaticDispatchExpectation::Runs,
+            },
+            StaticDispatchCase {
+                name: "get_symbol",
+                arguments: serde_json::json!({ "source": source, "symbol": "P" }),
+                expectation: StaticDispatchExpectation::Runs,
+            },
+            StaticDispatchCase {
+                name: "compile_check",
+                arguments: serde_json::json!({ "source": source }),
+                expectation: StaticDispatchExpectation::Runs,
+            },
+            StaticDispatchCase {
+                name: "inspect_profile",
+                arguments: serde_json::json!({}),
+                expectation: StaticDispatchExpectation::Runs,
+            },
+            StaticDispatchCase {
+                name: "analyze_project",
+                arguments: serde_json::json!({ "project_root": missing_root }),
+                expectation: StaticDispatchExpectation::Runs,
+            },
+            StaticDispatchCase {
+                name: "plsql_analyze",
+                arguments: serde_json::json!({ "project_root": missing_root }),
+                expectation: StaticDispatchExpectation::Runs,
+            },
+            StaticDispatchCase {
+                name: "dynamic_sql_evidence",
+                arguments: serde_json::json!({
+                    "call_text": "EXECUTE IMMEDIATE 'SELECT 1 FROM dual'",
+                    "site": "p.q:1"
+                }),
+                expectation: StaticDispatchExpectation::Runs,
+            },
+            StaticDispatchCase {
+                name: "completeness_report",
+                arguments: serde_json::json!({ "project_root": missing_root }),
+                expectation: StaticDispatchExpectation::Runs,
+            },
+            StaticDispatchCase {
+                name: "doc_lookup",
+                arguments: serde_json::json!({
+                    "source": "--%summary Package docs\nCREATE OR REPLACE PACKAGE p AS END p;\n/\n",
+                    "query": "summary"
+                }),
+                expectation: StaticDispatchExpectation::Runs,
+            },
+            StaticDispatchCase {
+                name: "find_callers",
+                arguments: serde_json::json!({ "target": "pkg.proc/1" }),
+                expectation: StaticDispatchExpectation::NeedsDependencyGraph,
+            },
+            StaticDispatchCase {
+                name: "find_callees",
+                arguments: serde_json::json!({ "target": "pkg.proc/1" }),
+                expectation: StaticDispatchExpectation::NeedsDependencyGraph,
+            },
+            StaticDispatchCase {
+                name: "get_dependencies",
+                arguments: serde_json::json!({ "target": "pkg.proc/1" }),
+                expectation: StaticDispatchExpectation::NeedsDependencyGraph,
+            },
+            StaticDispatchCase {
+                name: "what_breaks",
+                arguments: serde_json::json!({}),
+                expectation: StaticDispatchExpectation::NeedsDependencyGraph,
+            },
+            StaticDispatchCase {
+                name: "recompile_plan",
+                arguments: serde_json::json!({}),
+                expectation: StaticDispatchExpectation::NeedsDependencyGraph,
+            },
+            StaticDispatchCase {
+                name: "classify_change",
+                arguments: serde_json::json!({}),
+                expectation: StaticDispatchExpectation::NeedsDependencyGraph,
+            },
+            StaticDispatchCase {
+                name: "compare_oracle_deps",
+                arguments: serde_json::json!({}),
+                expectation: StaticDispatchExpectation::NeedsDependencyGraph,
+            },
+            StaticDispatchCase {
+                name: "release_gate",
+                arguments: serde_json::json!({}),
+                expectation: StaticDispatchExpectation::NeedsDependencyGraph,
+            },
+            StaticDispatchCase {
+                name: "sarif_scan",
+                arguments: serde_json::json!({}),
+                expectation: StaticDispatchExpectation::NeedsDependencyGraph,
+            },
+            StaticDispatchCase {
+                name: "orphan_candidates",
+                arguments: serde_json::json!({}),
+                expectation: StaticDispatchExpectation::NeedsDependencyGraph,
+            },
+            StaticDispatchCase {
+                name: "explain_lifecycle",
+                arguments: serde_json::json!({ "target": "pkg.proc/1" }),
+                expectation: StaticDispatchExpectation::NeedsDependencyGraph,
+            },
+        ]
+    }
+
     #[test]
     fn post_async_dispatch_regression_preserves_offline_tool_behavior() {
-        let resp = server_response(
-            crate::default_tool_registry(),
-            req(
-                16,
-                "tools/call",
-                Some(serde_json::json!({
-                    "name": "parse_file",
-                    "arguments": {
-                        "source": "CREATE OR REPLACE PROCEDURE p IS BEGIN NULL; END;\n/\n"
-                    }
-                })),
-            ),
+        let cases = static_dispatch_regression_cases();
+        let registry = crate::default_tool_registry();
+        let mut static_names = registry
+            .tools
+            .iter()
+            .filter(|tool| tool.tier == ToolTier::FoundationStatic)
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        static_names.sort_unstable();
+        let mut case_names = cases.iter().map(|case| case.name).collect::<Vec<_>>();
+        case_names.sort_unstable();
+        assert_eq!(
+            case_names, static_names,
+            "post-async regression cases must cover the full FoundationStatic surface"
         );
 
-        assert!(
-            resp.error.is_none(),
-            "offline tool call should not be a JSON-RPC error"
-        );
-        let result = resp.result.expect("ok result");
-        assert_eq!(result["isError"], Value::Bool(false));
-        let structured = &result["structuredContent"];
-        assert!(
-            structured["declaration_count"].as_u64().unwrap() >= 1,
-            "async dispatch still reaches the real parser: {structured:?}"
-        );
-        assert!(
-            result["next_actions"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|s| s.as_str().unwrap_or("").contains("get_symbol")),
-            "parse_file follow-up hints must survive async dispatch: {result:?}"
-        );
+        for (request_id, case) in (1600_i64..).zip(cases.iter()) {
+            let direct = direct_dispatch_for_test(case.name, case.arguments.clone());
+            let resp = server_response(
+                crate::default_tool_registry(),
+                req(
+                    request_id,
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": case.name,
+                        "arguments": case.arguments
+                    })),
+                ),
+            );
+            assert!(
+                resp.error.is_none(),
+                "static tool `{}` should not be a JSON-RPC error: {resp:?}",
+                case.name
+            );
+            let result = resp.result.expect("tools/call result");
+
+            match (case.expectation, direct) {
+                (StaticDispatchExpectation::Runs, Ok(structured)) => {
+                    assert_eq!(
+                        result["isError"],
+                        Value::Bool(false),
+                        "runnable static tool `{}` must stay successful",
+                        case.name
+                    );
+                    assert_eq!(
+                        result["structuredContent"], structured,
+                        "async tools/call changed `{}` structured payload",
+                        case.name
+                    );
+                }
+                (StaticDispatchExpectation::NeedsDependencyGraph, Err(envelope)) => {
+                    assert_eq!(
+                        envelope.error_class,
+                        oraclemcp_error::ErrorClass::RuntimeStateRequired,
+                        "graph-backed static tool `{}` should gate on dependency graph",
+                        case.name
+                    );
+                    assert_eq!(
+                        result["isError"],
+                        Value::Bool(true),
+                        "graph-backed static tool `{}` must remain an honest tool error result",
+                        case.name
+                    );
+                    assert_eq!(
+                        result["structuredContent"],
+                        envelope.to_json(),
+                        "async tools/call changed `{}` gating envelope",
+                        case.name
+                    );
+                }
+                (StaticDispatchExpectation::Runs, Err(envelope)) => {
+                    let expected_error = None;
+                    let actual_error = Some(envelope.error_class);
+                    assert_eq!(
+                        actual_error, expected_error,
+                        "runnable static tool `{}` unexpectedly errored: {envelope:?}",
+                        case.name
+                    );
+                }
+                (StaticDispatchExpectation::NeedsDependencyGraph, Ok(structured)) => {
+                    let expected_structured: Option<&Value> = None;
+                    let actual_structured = Some(&structured);
+                    assert_eq!(
+                        actual_structured, expected_structured,
+                        "graph-backed static tool `{}` unexpectedly ran: {structured:?}",
+                        case.name
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1594,7 +1811,7 @@ mod tests {
         let by = |name: &str| -> Value {
             tools
                 .iter()
-                .find(|t| t["name"] == name)
+                .find(|t| value_str_eq(&t["name"], name))
                 .expect("tool advertised")
                 .clone()
         };
@@ -1634,7 +1851,7 @@ mod tests {
                 .as_array()
                 .expect("tool has a required[] array");
             assert!(
-                req_arr.iter().any(|v| v == field),
+                req_arr.iter().any(|v| value_str_eq(v, field)),
                 "{name} inputSchema.required must contain {field}: {t}"
             );
         }
@@ -1706,7 +1923,7 @@ mod tests {
             .as_array()
             .expect("fuzzy_matches present");
         assert!(
-            fuzzy.iter().any(|v| v == "parse_file"),
+            fuzzy.iter().any(|v| value_str_eq(v, "parse_file")),
             "fuzzy_matches should suggest parse_file: {data}"
         );
     }
@@ -1739,7 +1956,7 @@ mod tests {
             .as_array()
             .expect("fuzzy_matches present");
         assert!(
-            fuzzy.iter().any(|v| v == "source"),
+            fuzzy.iter().any(|v| value_str_eq(v, "source")),
             "fuzzy_matches should suggest source: {data}"
         );
     }
@@ -1769,7 +1986,7 @@ mod tests {
         // oracle-da9j.3: the shipping registry advertises a zero-arg discovery
         // tool that runs over the wire and reports feature flags + next_actions.
         let r = crate::default_tool_registry();
-        assert!(r.tools.iter().any(|t| t.name == "oracle_capabilities"));
+        assert!(r.tools.iter().any(|t| t.name.eq("oracle_capabilities")));
         let resp = server_response(
             r,
             req(
@@ -1928,7 +2145,7 @@ mod tests {
         let find = |n: &str| {
             tools
                 .iter()
-                .find(|t| t["name"] == n)
+                .find(|t| value_str_eq(&t["name"], n))
                 .expect("tool listed")
                 .clone()
         };
@@ -2283,7 +2500,7 @@ mod tests {
         assert_eq!(obj["meta"]["trust_block"]["tier"], "foundation");
         // The only key besides the injected `meta` is nothing —
         // ping contributes no payload of its own.
-        let non_meta: Vec<&String> = obj.keys().filter(|k| k.as_str() != "meta").collect();
+        let non_meta: Vec<&String> = obj.keys().filter(|k| !k.as_str().eq("meta")).collect();
         assert!(
             non_meta.is_empty(),
             "ping payload stays empty: {non_meta:?}"
@@ -2297,7 +2514,10 @@ mod tests {
             let resp = handle_request(&req(1, method, None), &r).unwrap();
             let result = resp.result.expect("ok response");
             assert!(
-                result["meta"]["trust_block"]["schema_id"] == crate::trust::TRUST_BLOCK_SCHEMA_ID,
+                value_str_eq(
+                    &result["meta"]["trust_block"]["schema_id"],
+                    crate::trust::TRUST_BLOCK_SCHEMA_ID
+                ),
                 "{method} response missing trust block"
             );
         }
