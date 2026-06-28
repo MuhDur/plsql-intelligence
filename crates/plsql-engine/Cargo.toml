@@ -4,18 +4,20 @@ version = "0.1.0"
 description = "Canonical analysis orchestration for plsql-intelligence"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
-plsql-catalog = { path = "../plsql-catalog" }
-plsql-core = { path = "../plsql-core" }
-plsql-depgraph = { path = "../plsql-depgraph" }
-plsql-ir = { path = "../plsql-ir" }
-plsql-output = { path = "../plsql-output" }
-plsql-parser = { path = "../plsql-parser" }
-plsql-parser-antlr = { path = "../plsql-parser-antlr", features = ["antlr-codegen"] }
-plsql-project = { path = "../plsql-project" }
-plsql-store = { path = "../plsql-store" }
-plsql-symbols = { path = "../plsql-symbols" }
+plsql-catalog = { path = "../plsql-catalog", version = "0.1.0" }
+plsql-core = { path = "../plsql-core", version = "0.1.0" }
+plsql-depgraph = { path = "../plsql-depgraph", version = "0.6.0" }
+plsql-ir = { path = "../plsql-ir", version = "0.1.0" }
+plsql-output = { path = "../plsql-output", version = "0.1.0" }
+plsql-parser = { path = "../plsql-parser", version = "0.1.0" }
+plsql-parser-antlr = { path = "../plsql-parser-antlr", version = "0.1.0", features = ["antlr-codegen"] }
+plsql-project = { path = "../plsql-project", version = "0.1.0" }
+plsql-store = { path = "../plsql-store", version = "0.1.0" }
+plsql-symbols = { path = "../plsql-symbols", version = "0.1.0" }
 clap = { version = "4.5", features = ["derive"] }
 miette = { workspace = true }
 serde = { workspace = true }

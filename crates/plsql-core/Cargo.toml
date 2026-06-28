@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Shared core types for the plsql-intelligence workspace"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 miette.workspace = true

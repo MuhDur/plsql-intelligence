@@ -4,9 +4,11 @@ version = "0.1.0"
 description = "PL/SQL parser frontend: ParseBackend trait, token tape, CST, AST types"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
-plsql-core = { path = "../plsql-core" }
+plsql-core = { path = "../plsql-core", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

@@ -10,8 +10,8 @@ name = "corpus-bench"
 path = "src/main.rs"
 
 [dependencies]
-plsql-core = { path = "../../crates/plsql-core" }
-plsql-parser-antlr = { path = "../../crates/plsql-parser-antlr" }
+plsql-core = { path = "../../crates/plsql-core", version = "0.1.0" }
+plsql-parser-antlr = { path = "../../crates/plsql-parser-antlr", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 walkdir = "2"

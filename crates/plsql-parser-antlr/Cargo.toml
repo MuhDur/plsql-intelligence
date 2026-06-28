@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "ANTLR4-based PL/SQL parser backend (grammar + codegen)"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 # The .g4 grammar files are included as data for the build.rs codegen step.
 # They are NOT compiled directly — ANTLR generates Rust source from them.
@@ -23,8 +25,8 @@ default = []
 antlr-codegen = ["antlr-rust"]
 
 [dependencies]
-plsql-core = { path = "../plsql-core" }
-plsql-parser = { path = "../plsql-parser" }
+plsql-core = { path = "../plsql-core", version = "0.1.0" }
+plsql-parser = { path = "../plsql-parser", version = "0.1.0" }
 # antlr-rust runtime — only used when antlr-codegen feature is enabled.
 antlr-rust = { version = "0.3.0-beta", optional = true }
 

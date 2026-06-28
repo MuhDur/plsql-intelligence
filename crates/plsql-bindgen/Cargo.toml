@@ -3,6 +3,8 @@ name = "plsql-bindgen"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Type-safe Rust bindings generation for PL/SQL packages and tables."
 
 [[bin]]
@@ -10,7 +12,7 @@ name = "plsql-bindgen"
 path = "src/main.rs"
 
 [dependencies]
-plsql-core = { path = "../plsql-core" }
+plsql-core = { path = "../plsql-core", version = "0.1.0" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 

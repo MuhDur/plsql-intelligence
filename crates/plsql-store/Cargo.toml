@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "SQLite-backed content-addressed cache for plsql-intelligence"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 rusqlite = { version = "0.39.0", features = ["bundled"] }

@@ -3,10 +3,12 @@ name = "plsql-project"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Project model + file discovery for plsql-intelligence (PLSQL-WS-007)"
 
 [dependencies]
-plsql-core = { path = "../plsql-core" }
+plsql-core = { path = "../plsql-core", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -1,7 +1,7 @@
 # `plsql-mcp` vs Oracle SQLcl MCP — compatibility matrix
 
-> **Snapshot date:** 2026-06-27
-> **`plsql-mcp` version:** 0.5.0 convergence branch (HEAD)
+> **Snapshot date:** 2026-06-28
+> **`plsql-mcp` version:** 0.6.0 release line (HEAD)
 > **SQLcl MCP version:** Oracle SQLcl 24.4 / 25.x preview (Oracle's general
 > availability cadence — verify the exact build at oracle.com/sqlcl before
 > quoting public claims).
@@ -20,7 +20,7 @@ prefix across MCP servers.
 | Capability                              | SQLcl MCP                                  | `plsql-mcp`                                         |
 |-----------------------------------------|--------------------------------------------|-----------------------------------------------------|
 | stdio transport                         | ✅ default                                 | ✅ default (`PLSQL-MCP-001`)                        |
-| TCP transport                           | (operator-controlled)                      | reserved — `--listen 127.0.0.1:<port>` (planned)    |
+| TCP transport                           | (operator-controlled)                      | ✅ `--listen 127.0.0.1:<port>`                       |
 | `tools/list` discovery                  | ✅                                         | ✅ via `ToolRegistry` (`PLSQL-MCP-001`)              |
 | `DBMS_APPLICATION_INFO.SET_MODULE`      | `MODULE='SQLcl-MCP'`                       | `MODULE='plsql-mcp'` (`PLSQL-MCP-LIVE-003`)         |
 | `V$SESSION.ACTION` set per call         | ✅                                         | ✅ (from agent model identifier)                    |

@@ -40,6 +40,7 @@ venv/
 # Agent state (never commit)
 .claude/
 .ntm/
+.doctor/
 
 # Beads compliance audit dir (managed by /beads-compliance-and-completion-verification skill)
 /beads_compliance_audit/

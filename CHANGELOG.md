@@ -9,6 +9,30 @@ work.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-28
+
+- **Trio stack-doctor parity.** `plsql-mcp doctor` now follows the
+  same agent-facing shape as the lower stack rungs: stable JSON, ordered
+  checks, summary counts, explicit exit codes, local run artifacts,
+  `doctor health`, `doctor capabilities`, `doctor robot-docs`, `doctor ls`,
+  `doctor diff`, and `doctor undo`. `--json` is a visible alias for
+  `--robot-json`.
+- **Publication hardening.** Release-facing crates are bumped to the
+  `0.6.0` line where appropriate, internal `plsql-*` path dependencies now
+  carry crates.io version requirements, and the MCP/GHCR workflow defaults
+  point at `0.6.0`.
+- **Upstream driver gaps filed from `plsql-mcp`.** The remaining driver
+  work is tracked upstream instead of being reimplemented here:
+  `rust-oracledb#13` for OUT / IN OUT bind ergonomics,
+  `oraclemcp#2` for routine execution through `oraclemcp-db`, and
+  `oraclemcp#3` for typed or explicitly non-lossy catalog/value
+  serialization.
+- **Known live-XE timeout gap.** The CI live-wire Oracle 23ai test passed,
+  but the broader local live-XE suite exposed an adapter timeout gap now
+  tracked as `oraclemcp#4` and local bead `oracle-tdgx`: a thin connection
+  can hang instead of returning a typed TNS timeout after Oracle reports
+  `TNS-12535`.
+
 ### Hardening, MCP agent-UX, and reality-check (2026-06)
 
 A multi-pass remediation sweep across the whole workspace. The suite stayed

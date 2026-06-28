@@ -6,14 +6,20 @@
 
 #![forbid(unsafe_code)]
 
+use std::fs;
 use std::io::{BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 
 use plsql_mcp::config::McpConfig;
 use plsql_mcp::default_tool_registry;
-use plsql_mcp::doctor::{DoctorReport, DoctorSeverity, doctor_report};
+use plsql_mcp::doctor::{
+    DOCTOR_CONTRACT_VERSION, DOCTOR_SCHEMA_VERSION, DOCTOR_VERSION, DoctorReport, DoctorSeverity,
+    doctor_report,
+};
 use plsql_mcp::mcp_protocol::PlsqlMcpServer;
 use plsql_mcp::tcp;
 
@@ -29,7 +35,7 @@ use plsql_mcp::tcp;
 )]
 struct Cli {
     /// Emit a single JSON object on stdout instead of human text.
-    #[arg(long, global = true)]
+    #[arg(long, visible_alias = "json", global = true)]
     robot_json: bool,
 
     /// Emit a single JSON mega-object combining capabilities, health, and
@@ -59,8 +65,8 @@ enum Command {
         #[arg(long)]
         allow_public_bind: bool,
     },
-    /// Print a diagnostic report and exit non-zero if any blocker is found.
-    Doctor,
+    /// Print a diagnostic report and operate on doctor run artifacts.
+    Doctor(DoctorArgs),
     /// Print build information (version, enabled features) and exit.
     Info,
     /// Print the machine-readable agent contract (version, transports,
@@ -71,6 +77,61 @@ enum Command {
     /// how to drive it, the transport model, exit-code dictionary, and
     /// explicit pointers to `capabilities` + `doctor`.
     RobotDocs,
+}
+
+#[derive(Args, Debug, Default)]
+struct DoctorArgs {
+    /// Attempt safe fixers. No plsql-mcp fixer mutates state yet; this reports
+    /// the dry-run/no-op action plan through the same contract.
+    #[arg(long)]
+    fix: bool,
+    /// With --fix, report the action plan without applying mutations.
+    #[arg(long)]
+    dry_run: bool,
+    /// Run only quick offline checks.
+    #[arg(long)]
+    quick: bool,
+    /// Permit checks that may require online/live services.
+    #[arg(long)]
+    online: bool,
+    /// Restrict checks by name or numeric id. Repeat or comma-separate.
+    #[arg(long, value_delimiter = ',')]
+    only: Vec<String>,
+    #[command(subcommand)]
+    command: Option<DoctorCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+enum DoctorCommand {
+    /// Run diagnostics. This is also the default when no doctor subcommand is given.
+    Diagnose,
+    /// Emit the compact health block only.
+    Health,
+    /// Emit the doctor-specific machine contract.
+    Capabilities,
+    /// Emit the doctor-specific agent handbook.
+    RobotDocs,
+    /// List local doctor run artifacts.
+    Ls,
+    /// Show the action diff recorded for a run artifact.
+    Diff {
+        /// Run id from `plsql-mcp doctor ls`.
+        run_id: String,
+    },
+    /// Undo a run's recorded actions. Current plsql-mcp runs are diagnose-only.
+    Undo {
+        /// Run id from `plsql-mcp doctor ls`.
+        run_id: String,
+    },
+    /// Garbage-collect local doctor run artifacts.
+    Gc {
+        /// Accepted value today: `all`. Date filtering can be added without changing the command.
+        #[arg(long)]
+        before: String,
+        /// Required confirmation for deleting local `.doctor/runs/*` artifacts.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// Stable contract version for the `capabilities` payload. Bump only on a
@@ -88,25 +149,35 @@ fn capabilities_json() -> serde_json::Value {
         "binary": "plsql-mcp",
         "contract_version": CAPABILITIES_CONTRACT_VERSION,
         "version": env!("CARGO_PKG_VERSION"),
+        "doctor_contract_version": DOCTOR_CONTRACT_VERSION,
+        "doctor_schema_version": DOCTOR_SCHEMA_VERSION,
         "mcp_protocol_version": plsql_mcp::mcp_protocol::PROTOCOL_VERSION,
         "transports": ["stdio", "tcp"],
         "features": {
             "live-db": cfg!(feature = "live-db")
         },
         "global_flags": {
-            "--robot-json": "emit a single machine-readable JSON object on stdout instead of human text"
+            "--robot-json": "emit a single machine-readable JSON object on stdout instead of human text",
+            "--json": "visible alias for --robot-json",
+            "--robot-triage": "emit {capabilities, health, quick_ref} and exit"
         },
         "commands": {
             "serve": "start the real MCP JSON-RPC 2.0 server loop (stdio default; --listen <host:port> for TCP); blocks until stdin EOF (stdio) or the listener is closed (TCP)",
-            "doctor": "print a diagnostic report; exit 2 if any blocker is found",
+            "doctor": "run diagnostics; subcommands: diagnose, health, capabilities, robot-docs, ls, diff, undo, gc",
             "info": "print build version + enabled features",
-            "capabilities": "print this contract document"
+            "capabilities": "print this contract document",
+            "robot-docs": "print the agent handbook"
         },
         "exit_codes": {
             "0": "success",
             "1": "runtime failure: doctor found a blocker, or the serve transport hit a fatal I/O error",
-            "2": "safety-block: a blocker was found (doctor) or an invalid --listen target was supplied (serve)"
+            "2": "safety-block: --robot-triage found a blocker or serve got an invalid --listen target",
+            "4": "unsafe/refused doctor operation",
+            "64": "usage error",
+            "73": "doctor could not create a required local artifact",
+            "74": "doctor I/O failure"
         },
+        "doctor": doctor_capabilities_json(),
         "stdout_contract": "stdout is data only; all diagnostics go to stderr"
     })
 }
@@ -145,7 +216,7 @@ fn main() -> ExitCode {
             listen,
             allow_public_bind,
         } => run_serve(listen, allow_public_bind, robot_json),
-        Command::Doctor => run_doctor(robot_json),
+        Command::Doctor(args) => run_doctor(args, robot_json),
         Command::Info => run_info(robot_json),
         Command::Capabilities => run_capabilities(robot_json),
         Command::RobotDocs => {
@@ -365,18 +436,7 @@ fn run_robot_triage() -> ExitCode {
         .iter()
         .any(|f| matches!(f.severity, DoctorSeverity::Blocker));
 
-    let blocker_count = report
-        .findings
-        .iter()
-        .filter(|f| matches!(f.severity, DoctorSeverity::Blocker))
-        .count();
-
-    let health = serde_json::json!({
-        "binary_version": report.binary_version,
-        "registered_tool_count": report.registered_tool_count,
-        "blocker_count": blocker_count,
-        "findings": report.findings,
-    });
+    let health = doctor_health_json(&report);
 
     let quick_ref = serde_json::json!([
         {
@@ -389,7 +449,11 @@ fn run_robot_triage() -> ExitCode {
         },
         {
             "description": "machine-readable health check",
-            "invocation": "plsql-mcp doctor --robot-json"
+            "invocation": "plsql-mcp --json doctor"
+        },
+        {
+            "description": "doctor-specific agent contract",
+            "invocation": "plsql-mcp --json doctor capabilities"
         },
         {
             "description": "start MCP server (stdio)",
@@ -430,13 +494,53 @@ fn run_capabilities(robot_json: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_doctor(robot_json: bool) -> ExitCode {
+fn run_doctor(args: DoctorArgs, robot_json: bool) -> ExitCode {
+    match args.command.as_ref() {
+        Some(DoctorCommand::Health) => run_doctor_health(robot_json),
+        Some(DoctorCommand::Capabilities) => run_doctor_capabilities(robot_json),
+        Some(DoctorCommand::RobotDocs) => {
+            print!("{}", doctor_robot_docs_text());
+            ExitCode::SUCCESS
+        }
+        Some(DoctorCommand::Ls) => run_doctor_ls(robot_json),
+        Some(DoctorCommand::Diff { run_id }) => run_doctor_diff(run_id, robot_json),
+        Some(DoctorCommand::Undo { run_id }) => run_doctor_undo(run_id, robot_json),
+        Some(DoctorCommand::Gc { before, yes }) => run_doctor_gc(before, *yes, robot_json),
+        Some(DoctorCommand::Diagnose) | None => run_doctor_diagnose(args, robot_json),
+    }
+}
+
+fn run_doctor_diagnose(args: DoctorArgs, robot_json: bool) -> ExitCode {
     let config = McpConfig::default();
     // Diagnose the registry `serve` actually exposes — an empty
     // `ToolRegistry::new()` would falsely report zero tools and fire the
     // stale "bead skeleton" finding now that the surface is wired.
     let registry = default_tool_registry();
     let report = doctor_report(&config, &registry);
+    let report = match persist_doctor_run(report, &args) {
+        Ok(report) => report,
+        Err(err) => {
+            if robot_json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "schema_version": DOCTOR_SCHEMA_VERSION,
+                        "tool": "plsql-mcp",
+                        "ok": false,
+                        "exit_code": 73,
+                        "error": {
+                            "code": "MCP_DOCTOR_ARTIFACT_CREATE_FAILED",
+                            "message": err.to_string()
+                        }
+                    }))
+                    .unwrap()
+                );
+            } else {
+                eprintln!("plsql-mcp doctor: could not create run artifact: {err}");
+            }
+            return ExitCode::from(73);
+        }
+    };
 
     if robot_json {
         let json = serde_json::to_string(&report).expect("doctor report serializes");
@@ -445,14 +549,401 @@ fn run_doctor(robot_json: bool) -> ExitCode {
         print_doctor_human(&report);
     }
 
-    if report
-        .findings
-        .iter()
-        .any(|f| matches!(f.severity, DoctorSeverity::Blocker))
-    {
-        ExitCode::from(1)
+    ExitCode::from(report.exit_code)
+}
+
+fn run_doctor_health(robot_json: bool) -> ExitCode {
+    let config = McpConfig::default();
+    let registry = default_tool_registry();
+    let report = doctor_report(&config, &registry);
+    let health = doctor_health_json(&report);
+    if robot_json {
+        println!("{}", serde_json::to_string(&health).unwrap());
     } else {
-        ExitCode::SUCCESS
+        println!("{}", serde_json::to_string_pretty(&health).unwrap());
+    }
+    ExitCode::from(report.exit_code)
+}
+
+fn run_doctor_capabilities(robot_json: bool) -> ExitCode {
+    let doc = doctor_capabilities_json();
+    if robot_json {
+        println!("{}", serde_json::to_string(&doc).unwrap());
+    } else {
+        println!("{}", serde_json::to_string_pretty(&doc).unwrap());
+    }
+    ExitCode::SUCCESS
+}
+
+fn doctor_health_json(report: &DoctorReport) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": DOCTOR_SCHEMA_VERSION,
+        "tool": &report.tool,
+        "tool_version": &report.tool_version,
+        "doctor_version": &report.doctor_version,
+        "doctor_contract_version": report.doctor_contract_version,
+        "ok": report.ok,
+        "exit_code": report.exit_code,
+        "run_id": &report.run_id,
+        "run_dir": &report.run_dir,
+        "binary_version": &report.binary_version,
+        "registered_tool_count": report.registered_tool_count,
+        "blocker_count": report.summary.blocker_count,
+        "warning_count": report.summary.warning_count,
+        "checks": &report.checks,
+        "summary": &report.summary,
+        "findings": &report.findings,
+    })
+}
+
+fn doctor_capabilities_json() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": DOCTOR_SCHEMA_VERSION,
+        "tool": "plsql-mcp",
+        "tool_version": env!("CARGO_PKG_VERSION"),
+        "doctor_version": DOCTOR_VERSION,
+        "doctor_contract_version": DOCTOR_CONTRACT_VERSION,
+        "commands": {
+            "doctor": "diagnose and write a local run artifact",
+            "doctor diagnose": "explicit diagnose alias",
+            "doctor health": "compact machine health",
+            "doctor capabilities": "doctor-specific machine contract",
+            "doctor robot-docs": "doctor-specific handbook",
+            "doctor ls": "list local .doctor run artifacts",
+            "doctor diff <run-id>": "show recorded action diff for a run",
+            "doctor undo <run-id>": "undo recorded actions; current runs are diagnose-only",
+            "doctor gc --before all --yes": "delete local doctor run artifacts"
+        },
+        "flags": {
+            "--json": "alias for --robot-json",
+            "--robot-json": "single-line JSON on stdout",
+            "--fix": "run safe fixers; currently no plsql-mcp fixer mutates state",
+            "--dry-run --fix": "show fixer plan without applying mutations",
+            "--quick": "quick offline checks only",
+            "--online": "permit online/live checks",
+            "--only": "restrict checks by name or id"
+        },
+        "exit_codes": {
+            "0": "healthy / no failing doctor checks",
+            "1": "one or more failing doctor checks",
+            "2": "partial fix; reserved for future mutating fixers",
+            "3": "fix failed and rolled back; reserved for future mutating fixers",
+            "4": "unsafe/refused operation",
+            "5": "concurrency conflict; reserved",
+            "6": "online required; reserved",
+            "64": "usage error",
+            "66": "requested run artifact not found",
+            "73": "could not create required artifact",
+            "74": "I/O error"
+        },
+        "detectors": [
+            "oracle_live_backend",
+            "mcp_tool_registry",
+            "mcp_transport",
+            "audit_guarded_writes",
+            "connection_profiles",
+            "analysis_profile"
+        ],
+        "fixers": [],
+        "artifact_root": DOCTOR_RUNS_DIR,
+        "stdout_contract": "stdout is data only; diagnostics go to stderr"
+    })
+}
+
+fn doctor_robot_docs_text() -> String {
+    format!(
+        r#"# plsql-mcp doctor handbook
+plsql-mcp doctor is the stack-orientation command for the PL/SQL MCP rung.
+It mirrors the oraclemcp doctor style: ordered checks, stable JSON, actionable
+fix text, and a process exit code derived from failing checks.
+
+Core commands:
+  plsql-mcp --json doctor
+  plsql-mcp --json doctor health
+  plsql-mcp --json doctor capabilities
+  plsql-mcp doctor robot-docs
+  plsql-mcp doctor ls
+  plsql-mcp doctor diff <run-id>
+  plsql-mcp doctor undo <run-id>
+
+Current fixer posture:
+  No plsql-mcp doctor fixer mutates project state yet. --fix and --dry-run
+  are accepted so agents can use one contract across the trio, but the action
+  list is empty until a future typed fixer is added.
+
+Run artifacts:
+  Diagnose writes {runs_dir}/<run-id>/report.json with the report and the
+  empty action list. These files are local operator artifacts, not release
+  artifacts.
+
+Exit codes:
+  0 healthy / no failing checks
+  1 one or more failing checks
+  4 unsafe or refused operation
+  66 requested run artifact not found
+  73 artifact creation failed
+  74 I/O failure
+"#,
+        runs_dir = DOCTOR_RUNS_DIR,
+    )
+}
+
+const DOCTOR_RUNS_DIR: &str = ".doctor/runs";
+
+fn persist_doctor_run(report: DoctorReport, args: &DoctorArgs) -> std::io::Result<DoctorReport> {
+    let run_id = new_run_id();
+    let dir = Path::new(DOCTOR_RUNS_DIR).join(&run_id);
+    fs::create_dir_all(&dir)?;
+    let report = report.with_run(run_id.clone(), dir.display().to_string());
+    let payload = serde_json::json!({
+        "schema_version": DOCTOR_SCHEMA_VERSION,
+        "tool": "plsql-mcp",
+        "run_id": run_id,
+        "mode": {
+            "fix": args.fix,
+            "dry_run": args.dry_run,
+            "quick": args.quick,
+            "online": args.online,
+            "only": &args.only,
+        },
+        "actions": [],
+        "report": &report,
+    });
+    write_json_create_new(&dir.join("report.json"), &payload)?;
+    Ok(report)
+}
+
+fn write_json_create_new(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    let json = serde_json::to_string_pretty(value).map_err(std::io::Error::other)?;
+    file.write_all(json.as_bytes())?;
+    file.write_all(b"\n")
+}
+
+fn new_run_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format!(
+        "run-{}-{}-{}",
+        now.as_secs(),
+        now.subsec_nanos(),
+        std::process::id()
+    )
+}
+
+fn run_doctor_ls(robot_json: bool) -> ExitCode {
+    match list_doctor_runs() {
+        Ok(runs) => {
+            if robot_json {
+                println!("{}", serde_json::to_string(&runs).unwrap());
+            } else if runs.is_empty() {
+                println!("no doctor runs");
+            } else {
+                for run in runs {
+                    println!("{} {}", run["run_id"], run["report_path"]);
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            emit_doctor_io_error(robot_json, "MCP_DOCTOR_LS_FAILED", err);
+            ExitCode::from(74)
+        }
+    }
+}
+
+fn list_doctor_runs() -> std::io::Result<Vec<serde_json::Value>> {
+    let root = Path::new(DOCTOR_RUNS_DIR);
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut runs = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let run_id = entry.file_name().to_string_lossy().into_owned();
+        runs.push(serde_json::json!({
+            "run_id": run_id,
+            "report_path": entry.path().join("report.json").display().to_string(),
+        }));
+    }
+    runs.sort_by(|a, b| a["run_id"].as_str().cmp(&b["run_id"].as_str()));
+    Ok(runs)
+}
+
+fn run_doctor_diff(run_id: &str, robot_json: bool) -> ExitCode {
+    let Some(path) = doctor_run_report_path(run_id) else {
+        return emit_doctor_not_found(run_id, robot_json);
+    };
+    if !path.exists() {
+        return emit_doctor_not_found(run_id, robot_json);
+    }
+    let value = serde_json::json!({
+        "schema_version": DOCTOR_SCHEMA_VERSION,
+        "tool": "plsql-mcp",
+        "run_id": run_id,
+        "actions": [],
+        "diff": [],
+        "message": "diagnose-only run; no actions were recorded",
+    });
+    if robot_json {
+        println!("{}", serde_json::to_string(&value).unwrap());
+    } else {
+        println!("doctor diff {run_id}: no recorded actions");
+    }
+    ExitCode::SUCCESS
+}
+
+fn run_doctor_undo(run_id: &str, robot_json: bool) -> ExitCode {
+    let Some(path) = doctor_run_report_path(run_id) else {
+        return emit_doctor_not_found(run_id, robot_json);
+    };
+    if !path.exists() {
+        return emit_doctor_not_found(run_id, robot_json);
+    }
+    let value = serde_json::json!({
+        "schema_version": DOCTOR_SCHEMA_VERSION,
+        "tool": "plsql-mcp",
+        "run_id": run_id,
+        "undone": [],
+        "message": "diagnose-only run; no actions to undo",
+    });
+    if robot_json {
+        println!("{}", serde_json::to_string(&value).unwrap());
+    } else {
+        println!("doctor undo {run_id}: no recorded actions");
+    }
+    ExitCode::SUCCESS
+}
+
+fn run_doctor_gc(before: &str, yes: bool, robot_json: bool) -> ExitCode {
+    if !yes {
+        let value = serde_json::json!({
+            "schema_version": DOCTOR_SCHEMA_VERSION,
+            "tool": "plsql-mcp",
+            "ok": false,
+            "exit_code": 4,
+            "error": {
+                "code": "MCP_DOCTOR_GC_CONFIRMATION_REQUIRED",
+                "message": "doctor gc deletes local .doctor run artifacts; pass --yes to confirm"
+            }
+        });
+        if robot_json {
+            println!("{}", serde_json::to_string(&value).unwrap());
+        } else {
+            eprintln!("plsql-mcp doctor gc: refusing without --yes");
+        }
+        return ExitCode::from(4);
+    }
+    if before != "all" {
+        let value = serde_json::json!({
+            "schema_version": DOCTOR_SCHEMA_VERSION,
+            "tool": "plsql-mcp",
+            "ok": false,
+            "exit_code": 64,
+            "error": {
+                "code": "MCP_DOCTOR_GC_UNSUPPORTED_BEFORE",
+                "message": "this release accepts only --before all"
+            }
+        });
+        if robot_json {
+            println!("{}", serde_json::to_string(&value).unwrap());
+        } else {
+            eprintln!("plsql-mcp doctor gc: this release accepts only --before all");
+        }
+        return ExitCode::from(64);
+    }
+    match gc_all_doctor_runs() {
+        Ok(deleted) => {
+            let value = serde_json::json!({
+                "schema_version": DOCTOR_SCHEMA_VERSION,
+                "tool": "plsql-mcp",
+                "ok": true,
+                "deleted": deleted,
+            });
+            if robot_json {
+                println!("{}", serde_json::to_string(&value).unwrap());
+            } else {
+                println!("deleted {deleted} doctor run artifact(s)");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            emit_doctor_io_error(robot_json, "MCP_DOCTOR_GC_FAILED", err);
+            ExitCode::from(74)
+        }
+    }
+}
+
+fn gc_all_doctor_runs() -> std::io::Result<usize> {
+    let root = Path::new(DOCTOR_RUNS_DIR);
+    if !root.exists() {
+        return Ok(0);
+    }
+    let mut deleted = 0usize;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
+}
+
+fn doctor_run_report_path(run_id: &str) -> Option<PathBuf> {
+    if !run_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return None;
+    }
+    Some(Path::new(DOCTOR_RUNS_DIR).join(run_id).join("report.json"))
+}
+
+fn emit_doctor_not_found(run_id: &str, robot_json: bool) -> ExitCode {
+    let value = serde_json::json!({
+        "schema_version": DOCTOR_SCHEMA_VERSION,
+        "tool": "plsql-mcp",
+        "ok": false,
+        "exit_code": 66,
+        "error": {
+            "code": "MCP_DOCTOR_RUN_NOT_FOUND",
+            "message": format!("doctor run `{run_id}` was not found")
+        }
+    });
+    if robot_json {
+        println!("{}", serde_json::to_string(&value).unwrap());
+    } else {
+        eprintln!("plsql-mcp doctor: run `{run_id}` not found");
+    }
+    ExitCode::from(66)
+}
+
+fn emit_doctor_io_error(robot_json: bool, code: &str, err: std::io::Error) {
+    if robot_json {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "schema_version": DOCTOR_SCHEMA_VERSION,
+                "tool": "plsql-mcp",
+                "ok": false,
+                "exit_code": 74,
+                "error": {
+                    "code": code,
+                    "message": err.to_string()
+                }
+            }))
+            .unwrap()
+        );
+    } else {
+        eprintln!("plsql-mcp doctor: {code}: {err}");
     }
 }
 
@@ -1057,6 +1548,65 @@ mod tests {
                 "robot-json stdout must contain only JSON; got tag `{tag}` in {stdout:?}"
             );
         }
+    }
+
+    #[test]
+    fn doctor_robot_json_records_run_artifact() {
+        use std::process::Command as PCommand;
+        let out = PCommand::new(bin())
+            .args(["--json", "doctor"])
+            .output()
+            .expect("run plsql-mcp --json doctor");
+        assert!(out.status.success(), "doctor should pass on default config");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let parsed: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("doctor JSON parses");
+        assert_eq!(parsed["tool"], "plsql-mcp");
+        assert_eq!(parsed["doctor_contract_version"], DOCTOR_CONTRACT_VERSION);
+        assert!(
+            parsed["checks"]
+                .as_array()
+                .is_some_and(|checks| !checks.is_empty())
+        );
+        let run_dir = parsed["run_dir"]
+            .as_str()
+            .expect("doctor report carries run_dir");
+        assert!(
+            std::path::Path::new(run_dir).join("report.json").is_file(),
+            "doctor run artifact should exist under {run_dir}"
+        );
+    }
+
+    #[test]
+    fn doctor_capabilities_and_health_subcommands_are_json_contracts() {
+        use std::process::Command as PCommand;
+
+        let caps = PCommand::new(bin())
+            .args(["--json", "doctor", "capabilities"])
+            .output()
+            .expect("run doctor capabilities");
+        assert!(caps.status.success());
+        let cap_json: serde_json::Value =
+            serde_json::from_slice(&caps.stdout).expect("doctor capabilities JSON");
+        assert_eq!(cap_json["tool"], "plsql-mcp");
+        assert_eq!(cap_json["doctor_contract_version"], DOCTOR_CONTRACT_VERSION);
+        assert!(cap_json["commands"]["doctor health"].is_string());
+        assert!(cap_json["exit_codes"]["73"].is_string());
+
+        let health = PCommand::new(bin())
+            .args(["--json", "doctor", "health"])
+            .output()
+            .expect("run doctor health");
+        assert!(health.status.success());
+        let health_json: serde_json::Value =
+            serde_json::from_slice(&health.stdout).expect("doctor health JSON");
+        assert_eq!(health_json["tool"], "plsql-mcp");
+        assert_eq!(health_json["ok"], true);
+        assert!(
+            health_json["checks"]
+                .as_array()
+                .is_some_and(|checks| !checks.is_empty())
+        );
     }
 
     /// Every Unix-style CLI accepts `--version`. clap auto-derives it from

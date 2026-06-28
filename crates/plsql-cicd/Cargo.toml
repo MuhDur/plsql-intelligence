@@ -1,9 +1,11 @@
 [package]
 name = "plsql-cicd"
-version = "0.5.0"
+version = "0.6.0"
 description = "CI/CD recompilation cascade types and operations for plsql-intelligence"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [features]
 default = []
@@ -17,10 +19,10 @@ async-trait = "0.1"
 asupersync = "=0.3.4"
 clap = { version = "4.5", features = ["derive"] }
 getrandom = "0.3"
-plsql-catalog = { path = "../plsql-catalog" }
-plsql-core = { path = "../plsql-core" }
-plsql-lineage = { path = "../plsql-lineage" }
-plsql-output = { path = "../plsql-output" }
+plsql-catalog = { path = "../plsql-catalog", version = "0.1.0" }
+plsql-core = { path = "../plsql-core", version = "0.1.0" }
+plsql-lineage = { path = "../plsql-lineage", version = "0.1.0" }
+plsql-output = { path = "../plsql-output", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -28,7 +30,7 @@ toml = "1.1"
 tracing.workspace = true
 
 [dev-dependencies]
-plsql-depgraph = { path = "../plsql-depgraph" }
+plsql-depgraph = { path = "../plsql-depgraph", version = "0.6.0" }
 
 [[bin]]
 name = "plsql"

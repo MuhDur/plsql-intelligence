@@ -3,10 +3,12 @@ name = "plsql-support"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Support-bundle exporter with strict redaction manifest (PLSQL-SUPPORT-001)"
 
 [dependencies]
-plsql-core = { path = "../plsql-core" }
+plsql-core = { path = "../plsql-core", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

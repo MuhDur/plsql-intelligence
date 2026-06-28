@@ -10,9 +10,9 @@ name = "usr-loop"
 path = "src/main.rs"
 
 [dependencies]
-plsql-accretion = { path = "../../crates/plsql-accretion" }
-plsql-engine = { path = "../../crates/plsql-engine" }
-plsql-output = { path = "../../crates/plsql-output" }
+plsql-accretion = { path = "../../crates/plsql-accretion", version = "0.1.0" }
+plsql-engine = { path = "../../crates/plsql-engine", version = "0.1.0" }
+plsql-output = { path = "../../crates/plsql-output", version = "0.1.0" }
 clap = { version = "4.5", features = ["derive"] }
 serde_json = { workspace = true }
 

@@ -61,7 +61,7 @@ published sibling, [**`oraclemcp`**](https://github.com/MuhDur/oraclemcp):
 |---|---|---|
 | Scope | Guarded live **Oracle DB** access | The superset: DB access **+** PL/SQL **intelligence** + guarded writes |
 | Build | Engine-free, lean, fast | Full pure-Rust ANTLR engine |
-| Install | `cargo install oraclemcp` · `docker run -i ghcr.io/muhdur/oraclemcp` | `cargo install --path crates/plsql-mcp` · `docker run -i ghcr.io/muhdur/plsql-mcp` |
+| Install | `cargo install oraclemcp` · `docker run -i ghcr.io/muhdur/oraclemcp` | `cargo install plsql-mcp` · `docker run -i ghcr.io/muhdur/plsql-mcp` |
 | MCP registry | `io.github.MuhDur/oraclemcp` | `io.github.MuhDur/plsql-mcp` |
 
 Reach for `oraclemcp` when an agent just needs governed database
@@ -100,14 +100,16 @@ degradation responses inherited from the `oraclemcp-*` core.
 
 ## Status
 
-The `v0.5.0` release is published. The project is still pre-1.0, so APIs
-can change before the 1.0 line. `plan.md` remains the authoritative
-specification and `docs/ARCHITECTURE.md` is the technical architecture
-snapshot.
+The latest completed release is `v0.6.0`, the line for trio stack-doctor
+parity and publication hardening. The project is still pre-1.0, so APIs can
+change before the 1.0 line. `plan.md`
+remains the authoritative specification and `docs/ARCHITECTURE.md` is the
+technical architecture snapshot.
 
-- Current `main` is one closeout commit past the `v0.5.0` tag. GitHub CI
-  and `usr-loop` both passed on that closeout commit
-  (`f3ebc1326551b5155ee3408dd6b843066b0d2cc6`).
+- The `v0.6.0` line adds the `plsql-mcp` doctor contract needed for
+  stack-wide parity with `oraclemcp` and `rust-oracledb`: `doctor`,
+  `doctor health`, `doctor capabilities`, `doctor robot-docs`,
+  `doctor ls`, `doctor diff`, `doctor undo`, and guarded `doctor gc`.
 - The Cargo workspace has 26 members: 21 `plsql-*` engine and analysis
   crates plus 5 tool crates (`crates/`, `tools/`). Release binaries are
   produced for `plsql`, `plsql-depgraph`, and `plsql-mcp`.
@@ -128,10 +130,15 @@ snapshot.
   `plsql-accretion` library, the `usr-loop` tool, the sha-pinned
   conformance gate, the monotone tripwire, and the re-runnable acceptance
   proof `scripts/usr_acceptance.sh`.
-- Beads currently has no open, in-progress, blocked, or ready work. The
-  remaining tracked work is deferred fast-follow scope: optional crates.io
-  publishing for the full `plsql-*` line, Trio stack-doctor parity, and
-  upstream driver gaps to `rust-oracledb`.
+- The post-`v0.5.0` fast-follow lane is closed in `v0.6.0`: upstream
+  driver gaps needed by `plsql-mcp` are filed as
+  [`rust-oracledb#13`](https://github.com/MuhDur/rust-oracledb/issues/13),
+  [`oraclemcp#2`](https://github.com/MuhDur/oraclemcp/issues/2), and
+  [`oraclemcp#3`](https://github.com/MuhDur/oraclemcp/issues/3). The live
+  timeout adapter gap found during release testing is tracked as
+  [`oraclemcp#4`](https://github.com/MuhDur/oraclemcp/issues/4). The
+  `plsql-*` crates are published on crates.io with explicit versioned
+  internal dependencies.
 - `AGENTS.md` describes how automated agents work in this repo.
 
 ---
@@ -187,6 +194,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 # Inspect the MCP server and its machine-readable contract
 cargo run -p plsql-mcp -- info
 cargo run -p plsql-mcp -- --robot-json capabilities
+cargo run -p plsql-mcp -- --json doctor
+cargo run -p plsql-mcp -- --json doctor health
 
 # Drive the USR Loop against an estate (read in place, nothing copied out)
 cargo run -p usr-loop -- scan    /path/to/estate
@@ -362,7 +371,10 @@ active Oracle connection is configured. A zero-argument
 agent can orient before its first call, and failed calls return a
 structured error envelope with a machine-readable class and a fuzzy
 "did you mean" suggestion. A lockstep test enforces that every tool the
-registry advertises has a dispatch arm.
+registry advertises has a dispatch arm. The `doctor` surface uses the
+same stack-orientation shape as the lower rungs: ordered checks, stable
+JSON, exit-code-derived health, local run artifacts, and a doctor-specific
+capability contract.
 
 ---
 
@@ -432,6 +444,11 @@ Exit codes for `gate`/`land`: `0` accepted/landed, `3` rejected/quarantined
 ```sh
 plsql-mcp info                       # server identity and tool tiers
 plsql-mcp --robot-json capabilities  # machine-readable agent contract
+plsql-mcp --json doctor              # stack-orientation health report
+plsql-mcp --json doctor health       # compact health block
+plsql-mcp --json doctor capabilities # doctor-specific contract
+plsql-mcp doctor robot-docs          # agent handbook
+plsql-mcp doctor ls                  # local doctor run artifacts
 plsql-mcp serve                      # stdio MCP loop
 plsql-mcp serve --listen ADDR        # TCP MCP loop
 ```

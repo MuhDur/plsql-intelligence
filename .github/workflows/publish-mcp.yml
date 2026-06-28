@@ -12,9 +12,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "MCP registry version/image tag to publish (e.g. 0.5.0)"
+        description: "MCP registry version/image tag to publish (e.g. 0.6.0)"
         required: true
-        default: "0.5.0"
+        default: "0.6.0"
 
 jobs:
   publish:

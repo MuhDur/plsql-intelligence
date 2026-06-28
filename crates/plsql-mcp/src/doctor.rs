@@ -16,6 +16,15 @@ use crate::tools::ToolRegistry;
 /// Top-level doctor report.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DoctorReport {
+    pub schema_version: u32,
+    pub tool: String,
+    pub tool_version: String,
+    pub doctor_version: String,
+    pub doctor_contract_version: u32,
+    pub ok: bool,
+    pub exit_code: u8,
+    pub run_id: Option<String>,
+    pub run_dir: Option<String>,
     pub binary_name: String,
     pub binary_version: String,
     pub live_db_feature_enabled: bool,
@@ -35,7 +44,73 @@ pub struct DoctorReport {
     pub connection_write_posture: Vec<ConnectionWritePostureRow>,
     /// Protocol / transport / engine-cache / profile health.
     pub mcp_health: McpHealth,
+    /// oraclemcp-style check list for trio-stack parity.
+    pub checks: Vec<DoctorCheck>,
+    pub summary: DoctorSummary,
     pub findings: Vec<DoctorFinding>,
+}
+
+pub const DOCTOR_CONTRACT_VERSION: u32 = 1;
+pub const DOCTOR_SCHEMA_VERSION: u32 = 1;
+pub const DOCTOR_VERSION: &str = "plsql-mcp-doctor-1";
+
+/// oraclemcp-style check outcome.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorCheckStatus {
+    Pass,
+    Warn,
+    Fail,
+    Skip,
+}
+
+/// One diagnostic check result.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DoctorCheck {
+    pub id: u8,
+    pub name: String,
+    pub status: DoctorCheckStatus,
+    pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix: Option<String>,
+}
+
+impl DoctorCheck {
+    #[must_use]
+    pub fn new(
+        id: u8,
+        name: impl Into<String>,
+        status: DoctorCheckStatus,
+        detail: impl Into<String>,
+    ) -> Self {
+        DoctorCheck {
+            id,
+            name: name.into(),
+            status,
+            detail: detail.into(),
+            fix: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_fix(mut self, fix: impl Into<String>) -> Self {
+        self.fix = Some(fix.into());
+        self
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DoctorSummary {
+    pub pass: usize,
+    pub warn: usize,
+    pub fail: usize,
+    pub skip: usize,
+    pub blocker_count: usize,
+    pub warning_count: usize,
+    pub info_count: usize,
+    pub finding_count: usize,
+    pub fixers_available: usize,
+    pub actions_applied: usize,
 }
 
 /// MCP-010 health block: the four checks an agent needs before
@@ -172,6 +247,15 @@ pub struct DoctorFinding {
     pub remediation: Option<String>,
 }
 
+impl DoctorReport {
+    #[must_use]
+    pub fn with_run(mut self, run_id: impl Into<String>, run_dir: impl Into<String>) -> Self {
+        self.run_id = Some(run_id.into());
+        self.run_dir = Some(run_dir.into());
+        self
+    }
+}
+
 /// Build the doctor report from the active configuration and tool registry.
 ///
 /// Convenience wrapper around [`doctor_report_with_connections`] that runs
@@ -274,24 +358,6 @@ pub fn doctor_report_with_connections(
         }
     }
 
-    let ok = findings.iter().all(|f| {
-        !matches!(
-            f.severity,
-            DoctorSeverity::Blocker | DoctorSeverity::Warning
-        )
-    });
-    if ok {
-        findings.insert(
-            0,
-            DoctorFinding {
-                code: String::from("MCP_DOCTOR_OK"),
-                severity: DoctorSeverity::Ok,
-                summary: String::from("plsql-mcp doctor: no blockers detected."),
-                remediation: None,
-            },
-        );
-    }
-
     let transport_kind = match config.transport {
         crate::config::TransportConfig::Stdio => String::from("stdio"),
         crate::config::TransportConfig::Tcp { ref listen } => format!("tcp:{listen}"),
@@ -353,7 +419,43 @@ pub fn doctor_report_with_connections(
         analysis_profile_sane,
     };
 
+    let checks = build_checks(
+        live_db_feature_enabled,
+        registry,
+        &transport_kind,
+        transport_healthy,
+        &oracle_connection_backend,
+        &audit_posture,
+        &mcp_health,
+        connections,
+        &findings,
+    );
+    let mut summary = summarize(&checks, &findings);
+    let ok = summary.fail == 0;
+    let exit_code = u8::from(!ok);
+    if ok && !findings.iter().any(|f| f.severity == DoctorSeverity::Ok) {
+        findings.insert(
+            0,
+            DoctorFinding {
+                code: String::from("MCP_DOCTOR_OK"),
+                severity: DoctorSeverity::Ok,
+                summary: String::from("plsql-mcp doctor: no blockers detected."),
+                remediation: None,
+            },
+        );
+        summary = summarize(&checks, &findings);
+    }
+
     DoctorReport {
+        schema_version: DOCTOR_SCHEMA_VERSION,
+        tool: String::from("plsql-mcp"),
+        tool_version: String::from(env!("CARGO_PKG_VERSION")),
+        doctor_version: String::from(DOCTOR_VERSION),
+        doctor_contract_version: DOCTOR_CONTRACT_VERSION,
+        ok,
+        exit_code,
+        run_id: None,
+        run_dir: None,
         binary_name: String::from("plsql-mcp"),
         binary_version: String::from(env!("CARGO_PKG_VERSION")),
         live_db_feature_enabled,
@@ -365,8 +467,169 @@ pub fn doctor_report_with_connections(
         audit_posture,
         connection_write_posture: derive_write_posture(connections),
         mcp_health,
+        checks,
+        summary,
         findings,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_checks(
+    live_db_feature_enabled: bool,
+    registry: &ToolRegistry,
+    transport_kind: &str,
+    transport_healthy: bool,
+    oracle_connection_backend: &OracleConnectionBackendInfo,
+    audit_posture: &AuditPosture,
+    mcp_health: &McpHealth,
+    connections: &ConnectionRegistry,
+    findings: &[DoctorFinding],
+) -> Vec<DoctorCheck> {
+    let live_status = if live_db_feature_enabled {
+        DoctorCheckStatus::Pass
+    } else {
+        DoctorCheckStatus::Skip
+    };
+    let mut live = DoctorCheck::new(
+        1,
+        "Oracle live backend",
+        live_status,
+        oracle_connection_backend.notes.clone(),
+    );
+    if !live_db_feature_enabled {
+        live = live.with_fix(
+            "install the default-feature plsql-mcp build or rebuild with --features live-db",
+        );
+    }
+
+    let registry_status = if registry.is_empty() {
+        DoctorCheckStatus::Warn
+    } else {
+        DoctorCheckStatus::Pass
+    };
+    let mut registry_check = DoctorCheck::new(
+        2,
+        "MCP tool registry",
+        registry_status,
+        format!("registered_tool_count={}", registry.len()),
+    );
+    if registry.is_empty() {
+        registry_check =
+            registry_check.with_fix("build the registry via plsql_mcp::default_tool_registry()");
+    }
+
+    let mut transport = DoctorCheck::new(
+        3,
+        "MCP transport",
+        if transport_healthy {
+            DoctorCheckStatus::Pass
+        } else {
+            DoctorCheckStatus::Warn
+        },
+        format!(
+            "transport={transport_kind}, protocol={}",
+            mcp_health.protocol_version
+        ),
+    );
+    if !transport_healthy {
+        transport = transport.with_fix("set a valid host:port such as 127.0.0.1:7070");
+    }
+
+    let guarded_partial = findings
+        .iter()
+        .any(|finding| finding.code == "MCP_GUARDED_AUDIT_ENV_INCOMPLETE");
+    let mut audit = DoctorCheck::new(
+        4,
+        "Audit and guarded writes",
+        if guarded_partial {
+            DoctorCheckStatus::Fail
+        } else {
+            DoctorCheckStatus::Pass
+        },
+        format!(
+            "module={}, audit_file_configured={}, signing_key_configured={}",
+            audit_posture.module_name,
+            audit_posture.guarded_write_file_configured,
+            audit_posture.guarded_write_key_configured
+        ),
+    );
+    if guarded_partial {
+        audit = audit.with_fix(format!(
+            "set both {} and {} or neither",
+            crate::GUARDED_AUDIT_FILE_ENV,
+            crate::GUARDED_AUDIT_KEY_ENV
+        ));
+    }
+
+    let config_loaded = connections.profiles().next().is_some();
+    let connection_check = if config_loaded {
+        DoctorCheck::new(
+            5,
+            "Connection profiles",
+            DoctorCheckStatus::Pass,
+            format!(
+                "profiles={}, active={}",
+                connections.profiles().count(),
+                connections
+                    .current()
+                    .map(|p| p.name.as_str())
+                    .unwrap_or("<none>")
+            ),
+        )
+    } else {
+        DoctorCheck::new(
+            5,
+            "Connection profiles",
+            DoctorCheckStatus::Skip,
+            "no connections.toml loaded; offline and foundation tools still work",
+        )
+        .with_fix("create ~/.plsql-mcp/connections.toml for named live-db profiles")
+    };
+
+    let mut analysis = DoctorCheck::new(
+        6,
+        "Analysis profile",
+        if mcp_health.analysis_profile_sane {
+            DoctorCheckStatus::Pass
+        } else {
+            DoctorCheckStatus::Warn
+        },
+        mcp_health.analysis_profile_summary.clone(),
+    );
+    if !mcp_health.analysis_profile_sane {
+        analysis = analysis.with_fix("lower compatibility to <= oracle_version");
+    }
+
+    vec![
+        live,
+        registry_check,
+        transport,
+        audit,
+        connection_check,
+        analysis,
+    ]
+}
+
+fn summarize(checks: &[DoctorCheck], findings: &[DoctorFinding]) -> DoctorSummary {
+    let mut summary = DoctorSummary::default();
+    for check in checks {
+        match check.status {
+            DoctorCheckStatus::Pass => summary.pass += 1,
+            DoctorCheckStatus::Warn => summary.warn += 1,
+            DoctorCheckStatus::Fail => summary.fail += 1,
+            DoctorCheckStatus::Skip => summary.skip += 1,
+        }
+    }
+    for finding in findings {
+        match finding.severity {
+            DoctorSeverity::Ok => {}
+            DoctorSeverity::Info => summary.info_count += 1,
+            DoctorSeverity::Warning => summary.warning_count += 1,
+            DoctorSeverity::Blocker => summary.blocker_count += 1,
+        }
+    }
+    summary.finding_count = findings.len();
+    summary
 }
 
 fn derive_write_posture(registry: &ConnectionRegistry) -> Vec<ConnectionWritePostureRow> {

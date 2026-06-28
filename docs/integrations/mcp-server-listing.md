@@ -67,7 +67,7 @@ license gate.
 - [ ] Public source URL is live.
 - [ ] README has an install + MCP-client config section (see
       [`mcp-clients.md`](mcp-clients.md)).
-- [ ] `plsql-mcp doctor --robot-json` output pasted into the PR as
+- [ ] `plsql-mcp --json doctor` output pasted into the PR as
       proof the server starts and lists its tools.
 - [ ] LICENSE files present (Apache-2.0 OR MIT for `plsql-mcp`).
 - [ ] Entry added to `modelcontextprotocol/servers` via PR.

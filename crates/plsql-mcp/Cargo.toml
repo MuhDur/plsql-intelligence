@@ -1,9 +1,11 @@
 [package]
 name = "plsql-mcp"
-version = "0.5.0"
+version = "0.6.0"
 description = "Foundation MCP adapter for the PL/SQL Intelligence engine (Apache-2.0 OR MIT)"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [features]
 default = ["live-db"]
@@ -36,18 +38,18 @@ oraclemcp-core = "=0.4.0"
 oraclemcp-db = "=0.4.0"
 oraclemcp-error = "=0.4.0"
 oraclemcp-guard = "=0.4.0"
-plsql-catalog = { path = "../plsql-catalog" }
-plsql-cicd = { path = "../plsql-cicd" }
-plsql-core = { path = "../plsql-core" }
-plsql-depgraph = { path = "../plsql-depgraph" }
-plsql-doc = { path = "../plsql-doc" }
-plsql-engine = { path = "../plsql-engine" }
-plsql-ir = { path = "../plsql-ir" }
-plsql-lineage = { path = "../plsql-lineage" }
-plsql-parser-antlr = { path = "../plsql-parser-antlr" }
-plsql-sast = { path = "../plsql-sast" }
-plsql-symbols = { path = "../plsql-symbols" }
-plsql-output = { path = "../plsql-output" }
+plsql-catalog = { path = "../plsql-catalog", version = "0.1.0" }
+plsql-cicd = { path = "../plsql-cicd", version = "0.6.0" }
+plsql-core = { path = "../plsql-core", version = "0.1.0" }
+plsql-depgraph = { path = "../plsql-depgraph", version = "0.6.0" }
+plsql-doc = { path = "../plsql-doc", version = "0.1.0" }
+plsql-engine = { path = "../plsql-engine", version = "0.1.0" }
+plsql-ir = { path = "../plsql-ir", version = "0.1.0" }
+plsql-lineage = { path = "../plsql-lineage", version = "0.1.0" }
+plsql-parser-antlr = { path = "../plsql-parser-antlr", version = "0.1.0" }
+plsql-sast = { path = "../plsql-sast", version = "0.1.0" }
+plsql-symbols = { path = "../plsql-symbols", version = "0.1.0" }
+plsql-output = { path = "../plsql-output", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
