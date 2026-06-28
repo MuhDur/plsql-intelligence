@@ -299,14 +299,10 @@ fn changed_object_from_record(
             hash_before.map(Hash::new),
             vec![UnknownReason::MissingCatalogObject],
         ),
-        ChangeRecord::Signature(change) => changed_object(
-            interner,
-            &change.object_id,
-            ChangedObjectKind::StandaloneRoutineSignature,
-            None,
-            None,
-            vec![],
-        ),
+        ChangeRecord::Signature(change) => {
+            let target = signature_change_target(&change.object_id);
+            changed_object(interner, &target.object_id, target.kind, None, None, vec![])
+        }
         ChangeRecord::Privilege(change) => changed_object(
             interner,
             &change.object_id,
@@ -395,6 +391,29 @@ fn changed_object(
         file_paths: vec![],
         uncertainties,
     })
+}
+
+struct SignatureChangeTarget {
+    object_id: String,
+    kind: ChangedObjectKind,
+}
+
+fn signature_change_target(object_id: &str) -> SignatureChangeTarget {
+    let mut parts = object_id
+        .split('.')
+        .map(str::trim)
+        .filter(|part| !part.is_empty());
+    if let (Some(owner), Some(package), Some(_member)) = (parts.next(), parts.next(), parts.next())
+    {
+        return SignatureChangeTarget {
+            object_id: format!("{owner}.{package}"),
+            kind: ChangedObjectKind::PackageSpec,
+        };
+    }
+    SignatureChangeTarget {
+        object_id: object_id.to_string(),
+        kind: ChangedObjectKind::StandaloneRoutineSignature,
+    }
 }
 
 fn split_logical_object_id(object_id: &str) -> (String, String, bool) {
@@ -924,6 +943,23 @@ mod tests {
     }
 
     #[test]
+    fn package_member_signature_targets_package_spec() {
+        let package_member = signature_change_target("billing.billing_api.process_payment");
+        assert_eq!(package_member.object_id, "billing.billing_api");
+        assert!(matches!(
+            package_member.kind,
+            ChangedObjectKind::PackageSpec
+        ));
+
+        let standalone = signature_change_target("billing.reprice_invoice");
+        assert_eq!(standalone.object_id, "billing.reprice_invoice");
+        assert!(matches!(
+            standalone.kind,
+            ChangedObjectKind::StandaloneRoutineSignature
+        ));
+    }
+
+    #[test]
     fn changeset_from_unified_diff_builds_structural_objects() {
         let diff = "diff --git a/billing/pkg_api.pkb b/billing/pkg_api.pkb\n--- a/billing/pkg_api.pkb\n+++ b/billing/pkg_api.pkb\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/billing/new_pkg.pks b/billing/new_pkg.pks\n--- /dev/null\n+++ b/billing/new_pkg.pks\n@@ -0,0 +1 @@\n+CREATE PACKAGE new_pkg AS END;\ndiff --git a/billing/old_pkg.sql b/billing/old_pkg.sql\n--- a/billing/old_pkg.sql\n+++ /dev/null\n@@ -1 +0,0 @@\n-DROP ME\ndiff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-a\n+b\n";
 
@@ -1070,6 +1106,110 @@ mod tests {
                 .iter()
                 .any(|kind| matches!(kind, ChangedObjectKind::IndexChange))
         );
+    }
+
+    struct SourceEditFixture {
+        label: &'static str,
+        before_source: &'static str,
+        after_source: &'static str,
+        semantic: SemanticChangeSet,
+        expected_kind: ChangedObjectKind,
+    }
+
+    fn package_spec_source_edit_fixture() -> SourceEditFixture {
+        let before_source = r#"
+CREATE OR REPLACE PACKAGE billing.billing_api AS
+  PROCEDURE process_payment(p_id NUMBER);
+END billing_api;
+"#;
+        let after_source = r#"
+CREATE OR REPLACE PACKAGE billing.billing_api AS
+  PROCEDURE process_payment(p_id NUMBER, p_amount NUMBER);
+END billing_api;
+"#;
+        let mut semantic = SemanticChangeSet::new();
+        semantic.push(ChangeRecord::Signature(plsql_lineage::SignatureChange {
+            object_id: "billing.billing_api.process_payment".into(),
+            old_signature: Some("process_payment(p_id NUMBER)".into()),
+            new_signature: Some("process_payment(p_id NUMBER, p_amount NUMBER)".into()),
+        }));
+        SourceEditFixture {
+            label: "package-spec-signature",
+            before_source,
+            after_source,
+            semantic,
+            expected_kind: ChangedObjectKind::PackageSpec,
+        }
+    }
+
+    fn column_type_source_edit_fixture() -> SourceEditFixture {
+        let before_source = r#"
+CREATE TABLE billing.customers (
+  customer_id NUMBER PRIMARY KEY,
+  credit_limit NUMBER(9,2)
+);
+"#;
+        let after_source = r#"
+CREATE TABLE billing.customers (
+  customer_id NUMBER PRIMARY KEY,
+  credit_limit VARCHAR2(20)
+);
+"#;
+        let mut semantic = SemanticChangeSet::new();
+        semantic.push(ChangeRecord::Column(plsql_lineage::ColumnChange {
+            object_id: "billing.customers".into(),
+            column_name: "credit_limit".into(),
+            change: ColumnChangeDetail::TypeChanged {
+                old_type: Some("NUMBER(9,2)".into()),
+                new_type: Some("VARCHAR2(20)".into()),
+            },
+        }));
+        SourceEditFixture {
+            label: "column-type-change",
+            before_source,
+            after_source,
+            semantic,
+            expected_kind: ChangedObjectKind::TableDestructiveDdl,
+        }
+    }
+
+    #[test]
+    fn source_edit_semantic_fixtures_map_to_expected_changesets() {
+        assert_source_edit_fixture_maps(package_spec_source_edit_fixture());
+        assert_source_edit_fixture_maps(column_type_source_edit_fixture());
+    }
+
+    fn assert_source_edit_fixture_maps(fixture: SourceEditFixture) {
+        assert_ne!(fixture.before_source, fixture.after_source);
+        assert!(fixture.before_source.contains("CREATE"));
+        assert!(fixture.after_source.contains("CREATE"));
+
+        let before_path = PathBuf::from(format!("fixtures/{}/before", fixture.label));
+        let after_path = PathBuf::from(format!("fixtures/{}/after", fixture.label));
+        let changeset = ChangeSet::from_semantic_changes(
+            Some(ChangeSetOrigin::BeforeAfterDirectories {
+                before: before_path.clone(),
+                after: after_path.clone(),
+            }),
+            fixture.semantic,
+        )
+        .expect("source-edit semantic fixture should lower to a ChangeSet");
+
+        assert!(matches!(
+            &changeset.origin,
+            Some(ChangeSetOrigin::BeforeAfterDirectories { before, after })
+                if before == &before_path && after == &after_path
+        ));
+        assert_eq!(changeset.objects.len(), 1, "{}", fixture.label);
+        let object = changeset
+            .objects
+            .first()
+            .expect("fixture should produce one changed object");
+        assert_eq!(object.kind, fixture.expected_kind, "{}", fixture.label);
+        assert_eq!(object.owner.symbol().get(), 0, "{}", fixture.label);
+        assert_eq!(object.name.symbol().get(), 1, "{}", fixture.label);
+        assert!(object.uncertainties.is_empty(), "{}", fixture.label);
+        assert!(changeset.unclassified_files.is_empty(), "{}", fixture.label);
     }
 
     #[test]
