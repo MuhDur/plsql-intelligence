@@ -8,7 +8,7 @@ unblocks that work and is recorded as a separate file here.
 
 | D# | Title | Status | Filename |
 |----|-------|--------|----------|
-| D1 | Parser backend selection (antlr-rust vs Java ANTLR worker) | Closed | [D1-backend-tournament-result.md](D1-backend-tournament-result.md) — GO `antlr4rust`; `java-antlr` fallback NO-GO until flip-criteria met (PLSQL-PARSE-000C) |
+| D1 | Parser backend selection (antlr-rust vs retired Java ANTLR spike) | Closed | [D1-backend-tournament-result.md](D1-backend-tournament-result.md) — GO `antlr4rust`; `java-antlr` retired from the active workspace (PLSQL-PARSE-000C) |
 | D8 | License model for paid tiers (FSL vs BSL vs permissive-plus-services) | Open | — |
 | D11 | Customer-defined SAST rule SDK exposure timing | Closed | "Not in first release" (plan §2.3) |
 | D19 | Pre-GA `0.x.y` release cadence | Closed | "GA is 1.0, 0.x permitted for foundation-OSS adoption" (plan §1.4) |

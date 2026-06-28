@@ -2,8 +2,8 @@
 
 > **Decision: GO `antlr4rust`** (in-process, `plsql-parser-antlr`). Confirms
 > D1's direction, now backed by spike evidence that its blocker is a
-> **bounded** fix, not a fundamental wall. `java-antlr` remains a documented
-> fallback only.
+> **bounded** fix, not a fundamental wall. The former `java-antlr` spike was
+> retired from the active workspace on 2026-06-28.
 >
 > **Date:** 2026-05-18 · **Supersedes:** the "measured without a built jar"
 > caveat in `D1-backend-tournament-result.md` (which is hereby annotated
@@ -20,7 +20,7 @@ evidence (`docs/decisions/_spike/`).
 
 ## Evidence
 
-| | `antlr4rust` (chosen) | `java-antlr` (fallback) |
+| | `antlr4rust` (chosen) | `java-antlr` (retired spike) |
 |---|---|---|
 | Spike | `_spike/antlr4rust-errors.md` (commit 5aca071) | `_spike/java-antlr-evidence.md` (commit ef5b89f) |
 | Blocker verdict | **BOUNDED**: 14(+~5) errors = 4 mechanical `build.rs` post-process patches; no antlr-rust-beta size limitation found | **VIABLE-WITH-DEGRADATION**: parses the private estate well but needs jar build + JVM + unbuilt PARSE-000D wire decode |
@@ -51,4 +51,5 @@ green `--features antlr-codegen` build → `Antlr4RustBackend: ParseBackend`
 (lossless tape) → wire `plsql-engine` off `lower_source` onto
 `parse_with_backend`. The shared SQL*Plus-preprocessor + grammar-patch
 workstream lifts the parse rate for the §0 / Phase-4 private estate proof.
-`java-antlr` (PARSE-000B/C/D) stays NO-GO, documented, untouched.
+`java-antlr` (PARSE-000B/C/D) stays NO-GO and has been removed from the
+active workspace; reviving it requires a new decision record and bead set.

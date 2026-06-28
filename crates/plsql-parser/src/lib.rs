@@ -180,14 +180,14 @@ impl ParseResult {
 
 /// Backend-independent parser interface (R2 / R20).
 ///
-/// Every parser backend (antlr4rust, Java ANTLR subprocess, tree-sitter, etc.)
-/// implements this trait.  Backend-internal types (ANTLR parse trees, grammar
-/// rule names) are strictly private to the implementing crate.
+/// Parser backends implement this trait behind the R20 isolation boundary.
+/// Backend-internal types (ANTLR parse trees, grammar rule names) are strictly
+/// private to the implementing crate.
 ///
 /// The conformance test suite in `tests/conformance.rs` validates that all
 /// backends behave identically on a canonical fixture set.
 pub trait ParseBackend: Send + Sync {
-    /// Human-readable backend name (e.g. `"antlr4rust"`, `"java-antlr"`).
+    /// Human-readable backend name (e.g. `"antlr4rust"`).
     fn name(&self) -> &'static str;
 
     /// Parse the given source text and return a [`BackendParseResult`].

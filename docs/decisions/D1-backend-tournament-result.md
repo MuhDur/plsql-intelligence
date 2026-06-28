@@ -9,9 +9,8 @@
 
 > **Status:** DECIDED — 2026-05-16 (PLSQL-PARSE-000C)
 > **Decision:** **GO `antlr4rust`** as the production parser backend.
-> **`java-antlr`:** NO-GO *for now* — accepted as a documented
-> production *fallback candidate*; conditionally promotable once
-> its build prerequisites are met (criteria below).
+> **`java-antlr`:** RETIRED — it is no longer an active fallback
+> candidate after the 2026-06-28 workspace removal.
 > **Depends on:** PLSQL-PARSE-000 (trait + conformance suite),
 > PLSQL-PARSE-000A (antlr4rust backend), PLSQL-PARSE-000B (Java
 > subprocess backend), PLSQL-PARSE-000D (neutral wire protocol).
@@ -24,14 +23,16 @@
 | `antlr4rust` | `plsql-parser-antlr` | In-process; the working default. Drives lowering for the whole pipeline. |
 | `java-antlr` | n/a (retired) | Retired on 2026-06-28 after the backend tournament loser was removed from the workspace. Historical notes below describe the removed fallback candidate. |
 
-Both implement the *same* `ParseBackend` trait (PARSE-000), so
-either can be slotted in without touching consumers.
+The current workspace contains only the `antlr4rust` implementation. The
+historical Java worker spike used the same `ParseBackend` boundary, but it
+is no longer shipped or selectable.
 
 ## 2. Go/No-Go matrix
 
 Honest reporting (R13): dimensions are marked **measured** (from
 committed, re-runnable test evidence), or **deferred** (cannot be
-measured here without a built Java jar — *not* fabricated).
+measured here without a built Java jar — *not* fabricated). The `java-antlr`
+column is historical pre-retirement evidence, not an active release path.
 
 | Dimension | `antlr4rust` | `java-antlr` |
 |---|---|---|
@@ -52,13 +53,11 @@ end-to-end parse path in-tree, has zero measured panic-rate on
 adversarial input, and keeps backend internals off the public
 API. Every downstream crate already consumes it.
 
-**`java-antlr` is NO-GO for now**, accepted as a *fallback
-candidate*. Its Rust integration (subprocess plumbing,
-PARSE-000B) and the neutral wire contract (PARSE-000D) are
-shipped, tested, and R20-clean — so promotion is a build/bench
-exercise, not a redesign. It is **not** production-eligible until
-all of the following hold; this is the explicit flip-criteria
-checklist a future tournament re-run must satisfy:
+**`java-antlr` is retired.** Its former Rust integration and neutral wire
+contract were useful spike evidence, but the crate is removed from the
+workspace and the backend is not selectable. A future revival would require
+a new decision and new beads; it is **not** production-eligible until all of
+the following historical flip criteria are re-established:
 
 - [ ] A Java ANTLR PL/SQL grammar worker jar is built and
       committed/distributable (Apache-2.0-compatible grammar).
@@ -81,9 +80,7 @@ tournament/revival decision, not a hidden configuration switch.
 
 ## 4. Why this is safe to decide now
 
-The `ParseBackend` trait + PARSE-000D wire protocol mean the
-tournament outcome is **reversible without API churn**: if a
-future `java-antlr` jar wins the flip-criteria, swapping the
-default is a configuration change, not a refactor. Deciding GO
-`antlr4rust` now unblocks the release line (PLSQL-RELEASE-001)
-without foreclosing the fallback.
+The `ParseBackend` trait keeps backend internals isolated: if a future
+backend is approved, consumers should not need API churn. Deciding GO
+`antlr4rust` now unblocks the release line (PLSQL-RELEASE-001) without
+carrying the retired Java worker as hidden product surface.

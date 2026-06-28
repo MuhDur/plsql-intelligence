@@ -975,7 +975,7 @@ Performance:
 
 Per R2 + R20 — implement the `ParseBackend` trait first, then implement `AntlrRustBackend` as the first backend candidate. Keep generated ANTLR types **private to the backend crate**. The public parser surface is our lossless CST/token tape plus typed AST — never an ANTLR parse-tree or rule-name.
 
-Author `crates/plsql-parser/build.rs` to generate the Rust ANTLR code at build time inside the backend module. Wrap the generated parser with the high-level API that returns the public types. A second backend (Java ANTLR via subprocess, or tree-sitter, or ZPA-derived) lives behind the same trait for differential testing and fallback.
+Author `crates/plsql-parser/build.rs` to generate the Rust ANTLR code at build time inside the backend module. Wrap the generated parser with the high-level API that returns the public types. D2 selects the in-process `antlr4rust` backend as the current production route; the former Java ANTLR subprocess spike was retired on 2026-06-28 and is not an active fallback or workspace crate.
 
 Layered structure within `plsql-parser`:
 
@@ -1007,9 +1007,9 @@ plsql-parser/
 |------|-------|---------|--------|
 | `PLSQL-PARSE-000` | Define `ParseBackend` trait + backend conformance test suite (every backend must pass the same fixture set) | Layer 0 | S |
 | `PLSQL-PARSE-000A` | Spike `antlr-rust` codegen against full PL/SQL grammar; record blockers (parse-time, panics, missing features); decision artifact at `docs/decisions/D1-parser-backend-spike.md` | PARSE-000 | M |
-| `PLSQL-PARSE-000B` | Add Java ANTLR backend (subprocess-based) implementing `ParseBackend` — production fallback candidate, not just a reference | PARSE-000 | M |
-| `PLSQL-PARSE-000C` | Parser backend tournament: antlr4rust vs Java ANTLR worker; produce go/no-go matrix with perf, memory, panic-rate, span stability, build, and portability results; close decision artifact at `docs/decisions/D1-backend-tournament-result.md` | PARSE-000A + PARSE-000B | L |
-| `PLSQL-PARSE-000D` | Define stable parser-backend wire protocol so the Java worker can ship as production without leaking Java/ANTLR types into Rust API | PARSE-000B | M |
+| `PLSQL-PARSE-000B` | **Retired 2026-06-28:** former Java ANTLR subprocess spike; removed from the workspace after D2 selected `antlr4rust` | PARSE-000 | M |
+| `PLSQL-PARSE-000C` | Parser backend tournament: record the `antlr4rust` decision and no-go/retirement evidence for the Java ANTLR spike; close decision artifact at `docs/decisions/D1-backend-tournament-result.md` | PARSE-000A + PARSE-000B | L |
+| `PLSQL-PARSE-000D` | **Retired 2026-06-28:** former neutral wire-protocol sketch for the Java worker; no active implementation path remains | PARSE-000B | M |
 | `PLSQL-PARSE-001` | Vendor antlr/grammars-v4 PL/SQL `.g4` files into the antlr-rust backend crate with attribution + license preserved | PARSE-000A | S |
 | `PLSQL-PARSE-002` | Author `build.rs` that invokes `antlr-rust` codegen (inside backend crate, NOT public) | PARSE-001 | M |
 | `PLSQL-PARSE-003` | Define public `Ast` + `ConcreteSyntaxTree` + `TokenTape` + `TriviaTable` node hierarchies | Layer 0 | M |
@@ -3057,15 +3057,16 @@ A `corpus/adversarial/` directory holds inputs that historically panicked the pa
 
 ### 20.2 Parser backend packaging
 
-If the Java ANTLR worker wins the tournament (D1) or ships as production fallback:
+The current release line packages only the in-process Rust parser backend (`plsql-parser-antlr`). The retired Java ANTLR worker is not built, bundled, downloaded on first run, exposed as a CLI option, or kept as an active fallback.
 
-- `plsql` must detect Java availability in `doctor` and report a clear remediation path if missing
-- Release artifacts must state whether the Java worker is bundled with the binary, downloaded separately on first run, or replaced by a GraalVM native-image build
-- CI images must include the selected backend runtime so reproducibility holds
-- `--parser-backend antlr-java` must fail with an actionable diagnostic (not a panic) if runtime prerequisites are missing
-- **No Java/ANTLR parse-tree types may cross the `ParseBackend` boundary** — the Rust side sees only our public AST / CST / token tape (R20)
+Packaging requirements:
 
-If the Rust backend wins, this section becomes a no-op but stays in the plan to keep the architectural option open.
+- `plsql doctor` reports the selected parser backend and must not imply a JVM or worker jar is required.
+- Release artifacts must remain self-contained for the selected Rust backend.
+- Unsupported backend selections such as `--parser-backend antlr-java` fail with an actionable diagnostic, not a panic.
+- **No ANTLR parse-tree types may cross the `ParseBackend` boundary** — consumers see only our public AST / CST / token tape (R20).
+
+Reintroducing a subprocess backend requires a new decision record and new beads; it is not a hidden configuration switch.
 
 ### 20.3 Naming
 
@@ -3155,28 +3156,20 @@ Where possible, run our tool's output against a reference:
 
 ## 23. Open decisions
 
-### D1 — Parser implementation strategy `[OPEN, backend tournament with kill criteria]`
+### D1 / D2 — Parser implementation strategy `[CLOSED, antlr4rust selected]`
 
-Per R2 + R20, the architecture is backend-agnostic. Treating any single backend as "the plan" is too optimistic — `antlr-rust` is a third-party runtime with known issues, and the PL/SQL ANTLR grammar is ~10K parser lines + ~2.6K lexer lines. The decision rule is a **backend tournament** with explicit kill criteria.
+Per R2 + R20, the public architecture remains backend-isolated, but the active implementation route is no longer a tournament. `docs/decisions/D2-backend-final.md` selects the in-process `antlr4rust` backend (`plsql-parser-antlr`) as the production parser path. The former Java ANTLR subprocess spike was retired on 2026-06-28 and removed from the workspace.
 
-**Candidates:**
+Current production eligibility criteria:
 
-- **Candidate A:** `antlr4rust` generated parser. Fully in-process Rust.
-- **Candidate B:** Java ANTLR parser worker, using the same grammar, called from Rust via a small stdin/stdout protocol or local socket. Heavier deployment but a battle-tested ANTLR runtime.
-- **Candidate C:** tree-sitter or handwritten island parser. Only if A and B both fail.
+- Generated parser builds on Linux x86_64, macOS aarch64, Windows x86_64.
+- No panic on adversarial corpus.
+- Parse-quality metrics in §7.5 met.
+- 10K-line package parse budget met or justified.
+- Stable source spans and token identity across runs.
+- Memory budget measured against §18.8.
 
-**Production eligibility criteria (mandatory):**
-
-- Generated parser builds on Linux x86_64, macOS aarch64, Windows x86_64
-- No panic on adversarial corpus
-- Parse-quality metrics in §7.5 met
-- 10K-line package parse budget met or justified
-- Stable source spans and token identity across runs
-- Memory budget measured against §18.8
-
-**Tournament rule:** if `antlr4rust` misses any production eligibility criterion at the spike checkpoint, the Java ANTLR worker (Candidate B) becomes the production backend until the Rust backend is repaired. **Rust purity is not allowed to block product correctness.** The Java worker is invoked behind the same `ParseBackend` trait (R20), so downstream code is unaffected by the choice.
-
-Tree-sitter and handwritten options stay as Candidate C — only reached if both A and B fail, which would force a project-wide replan.
+Future parser alternatives require a fresh decision record and bead set. They are not active fallbacks and must not leak backend-internal ANTLR types across the `ParseBackend` boundary.
 
 ### D2 — Workspace vs polyrepo `[CLOSED, single workspace]`
 
@@ -3354,7 +3347,7 @@ This keeps the LSP door open without distracting GA work.
 
 | R# | Risk | Probability | Impact | Mitigation |
 |----|------|-------------|--------|------------|
-| K1 | `antlr-rust` proves unworkable in practice (panics, perf, runtime missing features) | Medium | High | Parser backend tournament (D1) with explicit production-eligibility criteria. **Java ANTLR worker becomes the production backend** behind the `ParseBackend` trait if the Rust backend misses any criterion. Tree-sitter or handwritten parser only if both primary candidates fail (would force project-wide replan). |
+| K1 | `antlr-rust` proves unworkable in practice (panics, perf, runtime missing features) | Medium | High | D2 selected `antlr4rust` with explicit production-eligibility criteria and backend isolation. If it fails those criteria, the mitigation is a new parser decision and bead set, not a retained Java fallback. |
 | K2 | Parser coverage stalls below 95% on real-world corpus | Medium | High | Front-load corpus testing; agents continuously author edge-case patterns; weekly corpus-coverage report. |
 | K3 | Symbol resolution complexity exceeds estimates (synonyms + DB links + dynamic SQL) | Medium | Medium | Each strategy is independently shippable; ship resolution incrementally with confidence markers. |
 | K4 | False-positive rate on SAST rules drives customer churn | Medium | Medium | Per-rule positive + negative corpora; FPR measured as acceptance criterion; baseline mode for incremental adoption. |
@@ -3542,16 +3535,16 @@ Use the `beads-workflow` skill to convert this plan to beads in one pass. After 
   - **plan-lint enhanced**: whitelists quoted historical changelog blocks for banned-language scanning; adds component coverage matrix check; added PLAN-003 normalization bead for residual heading-number drift.
   - **v0.2 changelog entry sanitized** to remove residual "alpha/beta release wedge" language while preserving the historical note.
   - **D19 reworded** from "pre-1.0 until Layer 4 ships to a paying customer" to "GA is 1.0". The earlier wording implied customer-facing delivery before the full product existed, which contradicts §5's one-public-release principle.
-  - **K1 mitigation refreshed**: explicit parser-backend tournament reference, Java ANTLR worker as production fallback (not tree-sitter or ZPA JNI as the v0.5 text still said).
+  - **K1 mitigation refreshed**: explicit parser-backend tournament reference; this historical Java ANTLR fallback language was superseded by the 2026-06-28 retirement.
   - **K7 mitigation refreshed**: removed timeline hack ("ship Layer 4 within 4 months"); replaced with substantive differentiation (evidence quality, dynamic-SQL uncertainty, compiler/dictionary cross-checks, reproducible artifacts).
-  - **§18.4 parser-backend packaging policy added**: operational details for if/when the Java ANTLR worker ships as production backend.
+  - **§18.4 parser-backend packaging policy added**: historical operational details later superseded by the 2026-06-28 single-backend packaging decision.
   - **DBMS_ASSERT reclassified as sanitizer family**: renamed `dbms_assert_usage` to `sanitizer_usage`; added explicit classification (`SIMPLE_SQL_NAME`, `QUALIFIED_SQL_NAME`, `SCHEMA_NAME`, `ENQUOTE_LITERAL`, `SQL_OBJECT_NAME`, regexp/allowlist, numeric coercion, unknown); spelled out that presence is evidence, not safety proof.
 - **2026-05-11 (round 3)** — **v0.5 DRAFT** — Third refinement round integrated from GPT Pro. Changes:
   - **Architectural bug fix:** `plsql-engine` moved from Layer 0 to Layer 2.5 (skeleton in Layer 0, implementation in Layer 2.5). Layer 0 cannot finish first if it contains a crate depending on parser+catalog+IR+symbols+privileges+sqlsem+depgraph.
   - **Added `plsql-facts`** (Layer 2): normalized fact store consumed by all product surfaces. Prevents drift across SAST/lineage/docs/bindgen that would inevitably appear if each re-walked raw IR independently.
   - **Added `plsql-flow`** (Layer 2): value flow, taint, constants, value sets, string shapes. Required for evidence-based SAST and credible dynamic-SQL analysis.
   - **Internal convergence gates** (§5): parser gate, catalog gate, semantic gate, graph gate, product-surface gate, GA gate. These are engineering quality checkpoints, NOT public release wedges. There is exactly one public release.
-  - **Parser strategy as tournament** (D1): antlr4rust + Java ANTLR worker compete on production eligibility criteria; if Rust misses any criterion, Java worker becomes production via the `ParseBackend` trait. Rust purity is not allowed to block product correctness.
+  - **Parser strategy as tournament** (D1): historical tournament framing; superseded by D2 and the 2026-06-28 retirement of the Java ANTLR spike.
   - **Oracle dialect feature registry**: `OracleFeature` enum + `FeaturePolicy` in `AnalysisProfile`. Version-gated handling of SQL BOOLEAN (23ai), VECTOR / SPARSE VECTOR / vector arithmetic (23ai/26ai), `PACKAGE RESETTABLE` (26ai), JSON-Relational Duality (23ai), SQL Macros, etc.
   - **PL/Scope tightening**: framed as compiler-derived comparison source, not a hidden prerequisite. Doctor explains compile/storage overhead implications.
   - **SQL Developer parser differential testing removed**: replaced with black-box Oracle compilation testing via `USER_ERRORS`, `ALL_DEPENDENCIES`, PL/Scope, and `DBMS_METADATA`.

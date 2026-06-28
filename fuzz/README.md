@@ -8,11 +8,10 @@ sanitizer build never perturbs the main workspace lockfile or CI gate).
 Drives the **real text-scanning pre-parser** that the whole IR / SAST /
 lineage stack consumes — `plsql_parser_antlr::lower::lower_source` — and
 chains it into `plsql_ir::lower_top_level` for pipeline-depth coverage.
-This is the narrowest untrusted-input boundary *in active use* (the deep
-ANTLR `ParseBackend` is Java-gated and not yet wired; `plsql-parser`
-itself exposes no `&str` surface without a registered backend, which is
-why the crate-local `plsql-parser/tests/fuzz_corpus_derived.rs` smoke
-harness can only exercise the backend-free surface).
+This is the narrowest untrusted-input boundary *in active use*. The deeper
+ANTLR `ParseBackend` has its own crate-local regression coverage; this
+detached fuzz target stays focused on the backend-free surface exposed to
+the rest of the pipeline.
 
 **Oracle.** The pre-parser is *tolerant* by contract, so the harness
 asserts two things, never `let _ =`-swallowing a panic:

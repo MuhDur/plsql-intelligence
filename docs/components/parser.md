@@ -62,7 +62,7 @@ strictly private to the implementing crate.
 
 ```rust
 pub trait ParseBackend: Send + Sync {
-    /// Human-readable backend name (e.g. "antlr4rust", "java-antlr").
+    /// Human-readable backend name (e.g. "antlr4rust").
     fn name(&self) -> &'static str;
 
     /// Parse source text and return a BackendParseResult.
