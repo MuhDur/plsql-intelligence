@@ -12,11 +12,11 @@
 
 use asupersync::Cx;
 use oraclemcp_error::{ErrorClass, ErrorEnvelope, enrich_oracle_error};
-use oraclemcp_guard::{Classifier, DangerLevel};
+use oraclemcp_guard::{Classifier, DangerLevel, ObjectRef, Purity, SideEffectOracle};
 use plsql_catalog::{CatalogError, OracleBind, OracleConnection, OracleRow};
 use plsql_core::UnknownReason;
 use serde::{Deserialize, Serialize};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex};
 use thiserror::Error;
 
 static READ_ONLY_CLASSIFIER: LazyLock<Classifier> = LazyLock::new(Classifier::default);
@@ -131,7 +131,22 @@ pub async fn run_query<C: OracleConnection>(
 }
 
 pub(crate) fn ensure_read_only_query(sql: &str) -> Result<(), QueryError> {
-    if is_read_only_sql(sql) {
+    ensure_read_only_query_with_classifier(sql, &READ_ONLY_CLASSIFIER)
+}
+
+pub(crate) fn ensure_read_only_query_with_oracle(
+    sql: &str,
+    oracle: Arc<dyn SideEffectOracle>,
+) -> Result<(), QueryError> {
+    let classifier = Classifier::default().with_oracle(oracle);
+    ensure_read_only_query_with_classifier(sql, &classifier)
+}
+
+fn ensure_read_only_query_with_classifier(
+    sql: &str,
+    classifier: &Classifier,
+) -> Result<(), QueryError> {
+    if is_read_only_sql_with_classifier(sql, classifier) {
         return Ok(());
     }
     Err(QueryError::NotReadOnly {
@@ -461,9 +476,40 @@ fn truncate(value: String, limit: Option<usize>) -> (String, bool) {
 }
 
 #[must_use]
+#[cfg(test)]
 fn is_read_only_sql(sql: &str) -> bool {
-    let decision = READ_ONLY_CLASSIFIER.classify(sql);
+    is_read_only_sql_with_classifier(sql, &READ_ONLY_CLASSIFIER)
+}
+
+#[must_use]
+fn is_read_only_sql_with_classifier(sql: &str, classifier: &Classifier) -> bool {
+    let decision = classifier.classify(sql);
     decision.danger == DangerLevel::Safe && legacy_read_only_sql(sql)
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct StatementObjectRecorder {
+    base_objects: Mutex<Vec<ObjectRef>>,
+}
+
+impl StatementObjectRecorder {
+    #[must_use]
+    pub(crate) fn base_objects(&self) -> Vec<ObjectRef> {
+        self.base_objects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+impl SideEffectOracle for StatementObjectRecorder {
+    fn statement_purity(&self, base_objects: &[ObjectRef]) -> Purity {
+        *self
+            .base_objects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = base_objects.to_vec();
+        Purity::Unknown
+    }
 }
 
 #[must_use]

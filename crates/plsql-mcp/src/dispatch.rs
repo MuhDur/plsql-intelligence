@@ -47,7 +47,7 @@
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use asupersync::Cx;
 use asupersync::cx::SubsetOf;
@@ -743,6 +743,16 @@ async fn run_query_live(
         // the live read.
         let _read_path_guard = read_cx.set_current_restricted();
         checkpoint(cx, "query")?;
+        let recorder = Arc::new(crate::query::StatementObjectRecorder::default());
+        crate::query::ensure_read_only_query_with_oracle(&args.sql, recorder.clone())
+            .map_err(|err| Box::new(query_error_envelope(&err)))?;
+        let side_effect_oracle = adapter
+            .side_effect_oracle(cx, &recorder.base_objects())
+            .await
+            .map_err(|err| Box::new(query_error_envelope(&QueryError::Backend(err))))?;
+        crate::query::ensure_read_only_query_with_oracle(&args.sql, Arc::new(side_effect_oracle))
+            .map_err(|err| Box::new(query_error_envelope(&err)))?;
+        checkpoint(cx, "query")?;
         let rows = match adapter.query_rows(cx, &args.sql, &[]).await {
             Ok(rows) => rows,
             Err(err) => {
@@ -1038,6 +1048,7 @@ struct DeployDdlArgs {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1120,10 +1131,12 @@ mod tests {
     #[derive(Debug, Clone)]
     struct RecordingOracleConnection {
         queries: Arc<Mutex<Vec<String>>>,
+        metadata_queries: Arc<Mutex<Vec<String>>>,
         query_timeouts: Arc<Mutex<Vec<Option<Duration>>>>,
         ambient_remote_seen: Arc<Mutex<Vec<Option<bool>>>>,
         current_timeout: Arc<Mutex<Option<Duration>>>,
         timeout_sets: Arc<Mutex<Vec<Option<Duration>>>>,
+        side_effecting_objects: Arc<Mutex<HashSet<(String, String)>>>,
         query_delay: Option<Duration>,
         query_error: Option<oraclemcp_db::DbError>,
     }
@@ -1151,17 +1164,36 @@ mod tests {
         ) -> Self {
             Self {
                 queries: Arc::new(Mutex::new(Vec::new())),
+                metadata_queries: Arc::new(Mutex::new(Vec::new())),
                 query_timeouts: Arc::new(Mutex::new(Vec::new())),
                 ambient_remote_seen: Arc::new(Mutex::new(Vec::new())),
                 current_timeout: Arc::new(Mutex::new(timeout)),
                 timeout_sets: Arc::new(Mutex::new(Vec::new())),
+                side_effecting_objects: Arc::new(Mutex::new(HashSet::new())),
                 query_delay,
                 query_error,
             }
         }
 
+        fn with_side_effecting_object(owner: &str, name: &str) -> Self {
+            let connection = Self::new();
+            connection
+                .side_effecting_objects
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert((owner.to_ascii_uppercase(), name.to_ascii_uppercase()));
+            connection
+        }
+
         fn observed_queries(&self) -> Vec<String> {
             self.queries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        fn observed_metadata_queries(&self) -> Vec<String> {
+            self.metadata_queries
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone()
@@ -1226,7 +1258,7 @@ mod tests {
             &self,
             _cx: &Cx,
             sql: &str,
-            _binds: &[oraclemcp_db::OracleBind],
+            binds: &[oraclemcp_db::OracleBind],
         ) -> Result<Vec<oraclemcp_db::OracleRow>, oraclemcp_db::DbError> {
             let timeout = self.current_timeout();
             self.query_timeouts
@@ -1237,6 +1269,37 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(Cx::current().map(|cx| cx.has_remote()));
+            if sql.contains("from all_policies") {
+                self.metadata_queries
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(String::from(sql));
+                let (owner, name) = match binds {
+                    [
+                        oraclemcp_db::OracleBind::String(owner),
+                        oraclemcp_db::OracleBind::String(name),
+                    ] => (owner.to_ascii_uppercase(), name.to_ascii_uppercase()),
+                    _ => {
+                        return Err(oraclemcp_db::DbError::Query(String::from(
+                            "side-effect query expected owner/name string binds",
+                        )));
+                    }
+                };
+                let side_effecting = self
+                    .side_effecting_objects
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .contains(&(owner, name));
+                return Ok(vec![oraclemcp_db::OracleRow {
+                    columns: vec![(
+                        String::from("SIDE_EFFECTING"),
+                        oraclemcp_db::OracleCell::new(
+                            "NUMBER",
+                            Some(if side_effecting { "1" } else { "0" }.to_string()),
+                        ),
+                    )],
+                }]);
+            }
             if let Some(delay) = self.query_delay {
                 std::thread::sleep(delay);
             }
@@ -1331,7 +1394,7 @@ mod tests {
         let observed = connection.clone();
         live_runtime
             .insert_connected(live_profile("dev"), Box::new(connection))
-            .expect("stub session inserts");
+            .expect("test session inserts");
         dispatch_with_runtime_for_test("connect", json!({"name": "dev"}), &mut live_runtime)
             .expect("connect activates existing live session");
 
@@ -1361,7 +1424,7 @@ mod tests {
         assert_eq!(query["rows"][0]["cells"][0]["value"], "1");
         assert_eq!(
             observed.observed_ambient_remote_seen(),
-            vec![Some(false), Some(false)],
+            vec![Some(false), Some(false), Some(false), Some(false)],
             "catalog read loaders must hide remote capability from ambient Cx lookups"
         );
     }
@@ -1519,7 +1582,7 @@ mod tests {
         let observed = connection.clone();
         live_runtime
             .insert_connected(live_profile("dev"), Box::new(connection))
-            .expect("stub session inserts");
+            .expect("test session inserts");
 
         let connected =
             dispatch_with_runtime_for_test("connect", json!({"name": "dev"}), &mut live_runtime)
@@ -1539,6 +1602,35 @@ mod tests {
             observed.observed_queries(),
             vec!["SELECT 1 AS val FROM dual"]
         );
+        assert_eq!(observed.observed_metadata_queries().len(), 1);
+    }
+
+    #[test]
+    fn query_side_effect_oracle_blocks_before_user_sql() {
+        let mut live_runtime = LiveDbRuntime::new();
+        let connection =
+            RecordingOracleConnection::with_side_effecting_object("SYSTEM", "AUDIT_LOG");
+        let observed = connection.clone();
+        live_runtime
+            .insert_connected(live_profile("dev"), Box::new(connection))
+            .expect("test session inserts");
+        dispatch_with_runtime_for_test("connect", json!({"name": "dev"}), &mut live_runtime)
+            .expect("connect activates existing live session");
+
+        let err = dispatch_with_runtime_for_test(
+            "query",
+            json!({"sql": "SELECT id FROM audit_log"}),
+            &mut live_runtime,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.error_class, ErrorClass::ForbiddenStatement);
+        assert_eq!(
+            observed.observed_queries(),
+            Vec::<String>::new(),
+            "side-effecting metadata must block before the user query executes"
+        );
+        assert_eq!(observed.observed_metadata_queries().len(), 1);
     }
 
     #[test]
@@ -1575,8 +1667,9 @@ mod tests {
         assert!(applied <= Duration::from_millis(250));
 
         let query_timeouts = observed.observed_query_timeouts();
-        assert_eq!(query_timeouts.len(), 1);
+        assert_eq!(query_timeouts.len(), 2);
         assert_eq!(query_timeouts[0], Some(applied));
+        assert_eq!(query_timeouts[1], Some(applied));
     }
 
     #[test]

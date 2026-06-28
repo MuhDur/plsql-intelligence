@@ -8,11 +8,13 @@
 
 use asupersync::Cx;
 use oraclemcp_db::SerializeOptions;
+use oraclemcp_guard::{ObjectRef, Purity, SideEffectOracle};
 use plsql_catalog::{
     CatalogError, OracleBackend as CatalogBackend, OracleBind as CatalogBind,
     OracleCell as CatalogCell, OracleConnection as CatalogOracleConnection,
     OracleConnectionInfo as CatalogConnectionInfo, OracleRow as CatalogRow,
 };
+use std::collections::HashSet;
 
 /// MCP-side adapter over an `oraclemcp-db` connection.
 #[derive(Debug)]
@@ -135,6 +137,87 @@ where
             .await
             .map_err(map_db_error)
     }
+
+    /// Build a synchronous guard oracle from live dictionary facts for the
+    /// objects the upstream classifier resolved from the statement.
+    pub async fn side_effect_oracle(
+        &self,
+        cx: &Cx,
+        base_objects: &[ObjectRef],
+    ) -> Result<CatalogSideEffectOracle, CatalogError> {
+        let current_schema = self
+            .describe(cx)
+            .await?
+            .current_schema
+            .map(|schema| normalize_dictionary_identifier(&schema));
+        let mut oracle = CatalogSideEffectOracle::default();
+        oracle.set_default_schema(current_schema.clone());
+        for key in resolved_object_keys(base_objects, current_schema.as_deref()) {
+            oracle.mark_checked(key.clone());
+            if self.object_has_live_side_effect_fact(cx, &key).await? {
+                oracle.mark_side_effecting(key);
+            }
+        }
+        Ok(oracle)
+    }
+
+    async fn object_has_live_side_effect_fact(
+        &self,
+        cx: &Cx,
+        key: &ObjectKey,
+    ) -> Result<bool, CatalogError> {
+        let sql = "
+with resolved_objects as (
+  select :1 as owner, :2 as name
+  from dual
+  union
+  select upper(table_owner) as owner, upper(table_name) as name
+  from all_synonyms
+  where upper(synonym_name) = :2
+    and upper(owner) in (:1, 'PUBLIC')
+    and table_owner is not null
+    and table_name is not null
+)
+select
+  case
+    when exists (
+      select 1
+      from all_policies
+      where (upper(object_owner), upper(object_name)) in (
+        select owner, name from resolved_objects
+      )
+        and upper(enable) in ('Y', 'YES', 'TRUE', '1')
+        and upper(sel) in ('Y', 'YES', 'TRUE', '1')
+    )
+    or exists (
+      select 1
+      from all_triggers
+      where (upper(table_owner), upper(table_name)) in (
+        select owner, name from resolved_objects
+      )
+        and upper(status) = 'ENABLED'
+        and base_object_type in ('TABLE', 'VIEW')
+    )
+    then 1
+    else 0
+  end as side_effecting
+from dual
+";
+        let rows = self
+            .query_rows(
+                cx,
+                sql,
+                &[
+                    CatalogBind::from(key.owner.clone()),
+                    CatalogBind::from(key.name.clone()),
+                ],
+            )
+            .await?;
+        let Some(row) = rows.first() else {
+            return Ok(false);
+        };
+        row.parse_u64("SIDE_EFFECTING").map(|count| count > 0)
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -244,6 +327,103 @@ fn map_db_error(err: oraclemcp_db::DbError) -> CatalogError {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CatalogSideEffectOracle {
+    default_schema: Option<String>,
+    checked_objects: HashSet<ObjectKey>,
+    side_effecting_objects: HashSet<ObjectKey>,
+}
+
+impl CatalogSideEffectOracle {
+    fn set_default_schema(&mut self, schema: Option<String>) {
+        self.default_schema = schema;
+    }
+
+    fn mark_checked(&mut self, key: ObjectKey) {
+        self.checked_objects.insert(key);
+    }
+
+    fn mark_side_effecting(&mut self, key: ObjectKey) {
+        self.side_effecting_objects.insert(key);
+    }
+
+    #[must_use]
+    pub fn has_side_effecting_object(&self) -> bool {
+        !self.side_effecting_objects.is_empty()
+    }
+}
+
+impl SideEffectOracle for CatalogSideEffectOracle {
+    fn statement_purity(&self, base_objects: &[ObjectRef]) -> Purity {
+        let mut all_checked = !base_objects.is_empty();
+        for object in base_objects {
+            let Some(key) = ObjectKey::from_ref(object, self.default_schema.as_deref()) else {
+                all_checked = false;
+                continue;
+            };
+            if self.side_effecting_objects.contains(&key) {
+                return Purity::ProvenSideEffecting;
+            }
+            if !self.checked_objects.contains(&key) {
+                all_checked = false;
+            }
+        }
+        if all_checked {
+            Purity::ProvenReadOnly
+        } else {
+            Purity::Unknown
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ObjectKey {
+    owner: String,
+    name: String,
+}
+
+impl ObjectKey {
+    fn from_ref(object: &ObjectRef, default_schema: Option<&str>) -> Option<Self> {
+        let owner = object.schema.as_deref().or(default_schema)?;
+        let name = normalize_dictionary_identifier(&object.name);
+        (!owner.trim().is_empty() && !name.is_empty()).then(|| Self {
+            owner: normalize_dictionary_identifier(owner),
+            name,
+        })
+    }
+}
+
+fn resolved_object_keys(
+    base_objects: &[ObjectRef],
+    current_schema: Option<&str>,
+) -> Vec<ObjectKey> {
+    let mut seen = HashSet::new();
+    let mut keys = Vec::new();
+    for object in base_objects {
+        let owner = object
+            .schema
+            .as_deref()
+            .or(current_schema)
+            .map(normalize_dictionary_identifier);
+        let name = normalize_dictionary_identifier(&object.name);
+        let Some(owner) = owner else {
+            continue;
+        };
+        if owner.is_empty() || name.is_empty() {
+            continue;
+        }
+        let key = ObjectKey { owner, name };
+        if seen.insert(key.clone()) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
+fn normalize_dictionary_identifier(value: &str) -> String {
+    value.trim().to_ascii_uppercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,9 +433,24 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakeDbConnection {
         observed_serialize_options: Mutex<Option<SerializeOptions>>,
+        observed_sql: Mutex<Vec<String>>,
+        side_effecting_objects: Mutex<HashSet<(String, String)>>,
     }
 
     impl FakeDbConnection {
+        fn with_side_effecting_object(owner: &str, name: &str) -> Self {
+            let connection = Self::default();
+            connection
+                .side_effecting_objects
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert((
+                    normalize_dictionary_identifier(owner),
+                    normalize_dictionary_identifier(name),
+                ));
+            connection
+        }
+
         fn record_serialize_options(&self, serialize_options: &SerializeOptions) {
             let mut observed = self
                 .observed_serialize_options
@@ -269,6 +464,13 @@ mod tests {
                 .observed_serialize_options
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn observed_sql(&self) -> Vec<String> {
+            self.observed_sql
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
         }
     }
 
@@ -315,6 +517,40 @@ mod tests {
             sql: &str,
             binds: &[oraclemcp_db::OracleBind],
         ) -> Result<Vec<oraclemcp_db::OracleRow>, oraclemcp_db::DbError> {
+            self.observed_sql
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(String::from(sql));
+            if sql.contains("from all_policies") {
+                let (owner, name) = match binds {
+                    [
+                        oraclemcp_db::OracleBind::String(owner),
+                        oraclemcp_db::OracleBind::String(name),
+                    ] => (
+                        normalize_dictionary_identifier(owner),
+                        normalize_dictionary_identifier(name),
+                    ),
+                    _ => {
+                        return Err(oraclemcp_db::DbError::Query(String::from(
+                            "side-effect query expected owner/name string binds",
+                        )));
+                    }
+                };
+                let side_effecting = self
+                    .side_effecting_objects
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .contains(&(owner, name));
+                return Ok(vec![oraclemcp_db::OracleRow {
+                    columns: vec![(
+                        String::from("SIDE_EFFECTING"),
+                        oraclemcp_db::OracleCell::new(
+                            "NUMBER",
+                            Some(if side_effecting { "1" } else { "0" }.to_string()),
+                        ),
+                    )],
+                }]);
+            }
             assert_eq!(sql, "select :1, :2, :3 from dual");
             assert_eq!(
                 binds,
@@ -481,6 +717,59 @@ mod tests {
                 .expect("adapter should pass explicit serialize options upstream");
             assert_eq!(observed_options.max_lob_chars, 8);
             assert_eq!(observed_options.max_blob_bytes, 16);
+        });
+    }
+
+    #[test]
+    fn side_effect_oracle_marks_live_dictionary_hit_side_effecting() {
+        run_async(async {
+            let cx = Cx::current().expect("test runtime installs Cx");
+            let connection = FakeDbConnection::with_side_effecting_object("billing", "invoices");
+            let adapter = OraclemcpCatalogConnection::new(connection);
+            let oracle = adapter
+                .side_effect_oracle(&cx, &[ObjectRef::new(None, "invoices")])
+                .await
+                .expect("side-effect oracle");
+
+            assert!(oracle.has_side_effecting_object());
+            assert_eq!(
+                oracle.statement_purity(&[ObjectRef::new(None, "invoices")]),
+                Purity::ProvenSideEffecting
+            );
+            assert!(
+                adapter
+                    .inner()
+                    .observed_sql()
+                    .iter()
+                    .any(|sql| sql.contains("from all_policies")),
+                "live dictionary query must consult VPD policy facts"
+            );
+            assert!(
+                adapter
+                    .inner()
+                    .observed_sql()
+                    .iter()
+                    .any(|sql| sql.contains("from all_synonyms")),
+                "live dictionary query must account for synonym targets"
+            );
+        });
+    }
+
+    #[test]
+    fn side_effect_oracle_marks_checked_clean_object_read_only() {
+        run_async(async {
+            let cx = Cx::current().expect("test runtime installs Cx");
+            let adapter = OraclemcpCatalogConnection::new(FakeDbConnection::default());
+            let oracle = adapter
+                .side_effect_oracle(&cx, &[ObjectRef::new(None, "invoices")])
+                .await
+                .expect("side-effect oracle");
+
+            assert!(!oracle.has_side_effecting_object());
+            assert_eq!(
+                oracle.statement_purity(&[ObjectRef::new(None, "invoices")]),
+                Purity::ProvenReadOnly
+            );
         });
     }
 }
