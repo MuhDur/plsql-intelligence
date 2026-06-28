@@ -22,7 +22,7 @@ self-healing coverage flywheel.
 > Know what breaks before you change Oracle PL/SQL.
 
 ```sh
-# Build the whole workspace and run every test
+# Build the workspace and run the default test profile
 git clone https://github.com/MuhDur/plsql-intelligence
 cd plsql-intelligence
 cargo build --workspace && cargo test --workspace
@@ -52,7 +52,7 @@ repairs so coverage compounds with use.
 ### Two MCP servers: `oraclemcp` and `plsql-mcp`
 
 This repo ships the **full** PL/SQL Intelligence MCP server,
-**`plsql-mcp`** — live Oracle DB tools **plus** offline PL/SQL
+**`plsql-mcp`**: live Oracle DB tools **plus** offline PL/SQL
 intelligence (parse/analyze, dependency graph, lineage, SAST) and
 guarded writes. Its engine-free core was extracted to a standalone,
 published sibling, [**`oraclemcp`**](https://github.com/MuhDur/oraclemcp):
@@ -100,35 +100,84 @@ degradation responses inherited from the `oraclemcp-*` core.
 
 ## Status
 
-This is pre-1.0 software under active development. `plan.md` is the
-authoritative specification; `docs/ARCHITECTURE.md` is the technical
-architecture snapshot.
+The `v0.5.0` release is published. The project is still pre-1.0, so APIs
+can change before the 1.0 line. `plan.md` remains the authoritative
+specification and `docs/ARCHITECTURE.md` is the technical architecture
+snapshot.
 
-- The Cargo workspace ships 22 `plsql-*` engine and analysis crates plus 5
-  tool binaries (`crates/`, `tools/`). The engine-free MCP server core (8
-  `oraclemcp-*` crates: protocol, tool registry, the fail-closed SQL guard,
-  audit sink, auth, telemetry, config, error envelope) was extracted to the
-  standalone, published [`oraclemcp`](https://github.com/MuhDur/oraclemcp) repo;
-  `plsql-mcp` now consumes them from crates.io. The one-way boundary
-  (`oraclemcp-*` never imports a `plsql-*` engine crate) holds by construction
-  and is enforced in the oraclemcp repo's CI. The foundation and
-  product layers are implemented; live Oracle catalog extraction, the
-  `verify`/CI-cascade path, and the live-DB MCP tool surface are
-  feature-gated and exercised against a containerized Oracle 23ai
-  (`live-xe` suites, `make demo-oracle-xe-ci`).
+- Current `main` is one closeout commit past the `v0.5.0` tag. GitHub CI
+  and `usr-loop` both passed on that closeout commit
+  (`f3ebc1326551b5155ee3408dd6b843066b0d2cc6`).
+- The Cargo workspace has 26 members: 21 `plsql-*` engine and analysis
+  crates plus 5 tool crates (`crates/`, `tools/`). Release binaries are
+  produced for `plsql`, `plsql-depgraph`, and `plsql-mcp`.
+- The engine-free MCP server core lives in the standalone, published
+  [`oraclemcp`](https://github.com/MuhDur/oraclemcp) repo. `plsql-mcp`
+  consumes the published `oraclemcp-*` crates from crates.io instead of
+  reimplementing that core locally. The PL/SQL layer adds the parser,
+  semantic model, dependency graph, lineage, SAST, change-impact, and USR
+  Loop surfaces.
+- The one-way boundary holds: `oraclemcp-*` never imports a `plsql-*`
+  engine crate. This repo also gates the PL/SQL layer so it does not reach
+  around the published `oraclemcp-db` adapter into Oracle drivers or
+  async/server runtimes directly.
+- The old Java parser crate is not part of the workspace or release path.
+  Parser work goes through the backend-independent `plsql-parser` surface
+  and the pure-Rust `antlr4rust` backend in `plsql-parser-antlr`.
 - The **USR Loop** (Layer 5) is implemented end to end: the
   `plsql-accretion` library, the `usr-loop` tool, the sha-pinned
   conformance gate, the monotone tripwire, and the re-runnable acceptance
   proof `scripts/usr_acceptance.sh`.
-- The API can change before 1.0.
+- Beads currently has no open, in-progress, blocked, or ready work. The
+  remaining tracked work is deferred fast-follow scope: optional crates.io
+  publishing for the full `plsql-*` line, Trio stack-doctor parity, and
+  upstream driver gaps to `rust-oracledb`.
 - `AGENTS.md` describes how automated agents work in this repo.
+
+---
+
+## Testing and Verification
+
+The default local test profile is green on current `main` through GitHub
+Actions, including:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace --all-targets`
+- `cargo test --workspace --doc`
+- `cargo bench --workspace --no-run`
+- `cargo deny check`
+- `plan-lint`, corpus license checks, parse-success checks, lab goldens,
+  demo-no-db, honesty grep, boundary lint, and the `oraclemcp-*` pin guard.
+
+Live Oracle coverage is not hidden inside the default `cargo test` run.
+It is a separate feature-gated path: CI starts Oracle Free 23ai with
+`make demo-oracle-xe-ci` and runs the `plsql-mcp` JSON-RPC live-wire test
+under `--features live-xe`. The live catalog snapshot tests are wired the
+same way for developer or orchestrated runs with the container available.
+
+Do not read this as "there are no test doubles anywhere." The repo
+contains deliberate test stubs and mocks where they pin a boundary: the
+feature-off live-XE sentinels, GitHub Action posting self-tests,
+fail-closed bindgen wrappers for invalid identifiers, hermetic Oracle
+connection doubles, and the deterministic USR proposer path. Those are
+not unfinished production placeholders. The production `plsql-mcp serve`
+surface has a drift guard that rejects "unimplemented" and "not wired"
+claims from the agent-facing contract; the release-visible docs also pass
+the broader honesty-grep gate.
+
+The private-estate Definition of Done is honest about its boundary. When
+`PLSQL_PRIVATE_ESTATE` is absent, `scripts/usr_acceptance.sh` exits
+successfully with an `estate-absent` banner and does not claim the full
+estate proof. The nightly workflow keeps that script exercised up to the
+estate boundary; the binding full proof requires an estate-bearing host.
 
 ---
 
 ## Quick Example
 
 ```sh
-# Build the workspace and run the full test suite
+# Build the workspace and run the default test profile
 cargo build --workspace
 cargo test --workspace
 
@@ -303,8 +352,8 @@ Tool binaries: `tools/usr-loop` (the USR Loop orchestrator),
 
 The MCP server (`plsql-mcp`) is a single binary built on the engine-free
 `oraclemcp-*` core. It completes the MCP handshake, advertises the full
-tool surface over `tools/list` — each tool carries a real argument
-JSON-Schema and risk annotations — and dispatches
+tool surface over `tools/list`; each tool carries a real argument
+JSON-Schema and risk annotations, and dispatches
 `tools/call` end-to-end: static-analysis and change-impact tools execute
 in-process; live-DB tools dispatch and degrade with a typed
 `RuntimeStateRequired` response (naming the tool to call next) when no
@@ -456,7 +505,7 @@ cargo run -p plan-lint -- --doctor     # health summary
 - Live-DB MCP tools dispatch over `tools/call` but require an active
   Oracle connection to execute; without one they return a typed
   `RuntimeStateRequired` response naming the missing runtime state, by
-  design — agents can plan a session against the full advertised
+  design. Agents can plan a session against the full advertised
   surface without an Oracle being attached.
 - The USR Loop proposer does not auto-merge. It produces proven
   candidates; the proof is automatic and complete, the landing decision is
@@ -529,6 +578,6 @@ conditions.
 
 ### Work with me
 
-I help enterprises with the hard parts — databases at scale, systems modernization, and AI in production, vendor-neutral (cloud or self-hosted). Building something hard in databases, Rust / C++, or AI? Reach out.
+I help enterprises with the hard parts: databases at scale, systems modernization, and AI in production, vendor-neutral (cloud or self-hosted). Building something hard in databases, Rust / C++, or AI? Reach out.
 
 → **[durakovic.ai](https://durakovic.ai)** · hello@durakovic.ai
