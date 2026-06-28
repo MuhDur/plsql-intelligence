@@ -13,8 +13,9 @@ use std::process::ExitCode;
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use plsql_cicd::{
-    CHANGE_IMPACT_SCHEMA, ChangeImpactEnvelope, ChangeSet, CicdError, LineageObjectMetadata,
-    PredictMode, change_impact_envelope, doctor_report, predict, predict_with_lineage,
+    CHANGE_IMPACT_SCHEMA, ChangeImpactCompileErrorFlag, ChangeImpactEnvelope, ChangeSet, CicdError,
+    LineageObjectMetadata, PredictMode, change_impact_envelope, doctor_report, predict,
+    predict_with_lineage,
 };
 use plsql_core::{ObjectName, SchemaName, SymbolId, SymbolInterner};
 use plsql_lineage::LineageResult;
@@ -92,6 +93,10 @@ struct PredictArgs {
     /// CI/CD object metadata. Required when --lineage-impact is used.
     #[arg(long, value_name = "PATH")]
     lineage_metadata: Option<PathBuf>,
+    /// Read compile-error flags to include in the robot-json payload. Accepts
+    /// either an array of flag rows or an object with compile_error_flags.
+    #[arg(long, value_name = "PATH")]
+    compile_error_flags: Option<PathBuf>,
 }
 
 #[derive(Debug, Args, Default)]
@@ -268,7 +273,11 @@ fn run_predict(args: PredictArgs, robot_json: bool) -> Result<ExitCode, CliError
             metadata.get(logical_id).cloned()
         })
     };
-    let envelope = change_impact_envelope(&prediction, Vec::new());
+    let compile_error_flags = match args.compile_error_flags {
+        Some(path) => load_compile_error_flags(&path)?,
+        None => Vec::new(),
+    };
+    let envelope = change_impact_envelope(&prediction, compile_error_flags);
     if robot_json {
         println!("{}", serialize_compact(&envelope)?);
     } else {
@@ -356,7 +365,7 @@ fn run_robot_triage(robot_json: bool) -> Result<ExitCode, CliError> {
         },
         {
             "description": "predict with offline lineage impact JSON",
-            "invocation": "plsql predict --robot-json --lineage-impact impact.json --lineage-metadata metadata.json --source-kind changeset-json changeset.json"
+            "invocation": "plsql predict --robot-json --lineage-impact impact.json --lineage-metadata metadata.json --compile-error-flags compile-errors.json --source-kind changeset-json changeset.json"
         },
         {
             "description": "machine-readable health check",
@@ -403,6 +412,11 @@ fn capabilities_json() -> Value {
             "before_after": "use --before DIR --after DIR",
             "git_range": "use --git-range FROM..TO [--repo DIR]"
         },
+        "predict_inputs": {
+            "--lineage-impact PATH": "optional plsql.lineage.impact LineageResult JSON; repeatable",
+            "--lineage-metadata PATH": "required when --lineage-impact is supplied; maps logical IDs to object symbols and object types",
+            "--compile-error-flags PATH": "optional JSON array, or object with compile_error_flags, copied into payload.compile_error_flags"
+        },
         "schemas": {
             "change_impact": {
                 "id": CHANGE_IMPACT_SCHEMA.id,
@@ -439,6 +453,9 @@ CANONICAL INVOCATIONS
   plsql predict --robot-json --git-range main..HEAD --repo .
   plsql predict --robot-json --source-kind changeset-json changeset.json \
       --lineage-impact impact.json --lineage-metadata metadata.json
+  plsql predict --robot-json --source-kind changeset-json changeset.json \
+      --lineage-impact impact.json --lineage-metadata metadata.json \
+      --compile-error-flags compile-errors.json
   plsql doctor --robot-json
   plsql --robot-triage
 
@@ -613,6 +630,42 @@ fn parse_lineage_result(raw: &str) -> Result<LineageResult, serde_json::Error> {
         return Ok(envelope.payload);
     }
     serde_json::from_str(raw)
+}
+
+#[derive(Debug, Deserialize)]
+struct CompileErrorFlagsDocument {
+    compile_error_flags: Vec<ChangeImpactCompileErrorFlag>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompileErrorFlagsEnvelope {
+    payload: CompileErrorFlagsDocument,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CompileErrorFlagsInput {
+    Rows(Vec<ChangeImpactCompileErrorFlag>),
+    Document(CompileErrorFlagsDocument),
+    Envelope(CompileErrorFlagsEnvelope),
+}
+
+fn load_compile_error_flags(path: &Path) -> Result<Vec<ChangeImpactCompileErrorFlag>, CliError> {
+    let raw = std::fs::read_to_string(path).map_err(|err| {
+        CliError::new("compile_error_flags_read_failed", err.to_string())
+            .with_path(path)
+            .with_exit_code(2)
+    })?;
+    let input: CompileErrorFlagsInput = serde_json::from_str(&raw).map_err(|err| {
+        CliError::new("compile_error_flags_json_invalid", err.to_string())
+            .with_path(path)
+            .with_exit_code(2)
+    })?;
+    Ok(match input {
+        CompileErrorFlagsInput::Rows(rows) => rows,
+        CompileErrorFlagsInput::Document(document) => document.compile_error_flags,
+        CompileErrorFlagsInput::Envelope(envelope) => envelope.payload.compile_error_flags,
+    })
 }
 
 #[derive(Debug, Deserialize)]

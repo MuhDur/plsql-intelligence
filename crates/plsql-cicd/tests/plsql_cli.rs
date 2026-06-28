@@ -192,6 +192,145 @@ fn predict_robot_json_composes_offline_lineage_impacts() {
 }
 
 #[test]
+fn predict_robot_json_matches_change_impact_golden_snapshot() {
+    let root = fixture_root("golden");
+    std::fs::create_dir_all(&root).expect("fixture root");
+    let changeset = root.join("changeset.json");
+    let impact = root.join("impact.json");
+    let metadata = root.join("metadata.json");
+    let compile_errors = root.join("compile-errors.json");
+
+    std::fs::write(
+        &changeset,
+        r#"{
+  "origin": null,
+  "objects": [
+    {
+      "owner": 0,
+      "name": 1,
+      "kind": "TableDestructiveDdl",
+      "new_hash": null,
+      "previous_hash": null,
+      "file_paths": [],
+      "uncertainties": []
+    }
+  ],
+  "unclassified_files": []
+}
+"#,
+    )
+    .expect("write changeset");
+    std::fs::write(
+        &impact,
+        r#"{
+  "query": {
+    "anchor": "BILLING.CUSTOMERS",
+    "direction": "downstream",
+    "max_depth": null,
+    "min_confidence": null
+  },
+  "edges": [],
+  "unknown_edges": [],
+  "affected_nodes": [
+    {
+      "logical_id": "BILLING.REPORT_PKG",
+      "hops": 1,
+      "path_confidence": "exact"
+    },
+    {
+      "logical_id": "BILLING.REPORT_VIEW",
+      "hops": 2,
+      "path_confidence": "exact"
+    },
+    {
+      "logical_id": "BILLING.SUMMARY_JOB",
+      "hops": 3,
+      "path_confidence": "exact"
+    }
+  ]
+}
+"#,
+    )
+    .expect("write impact");
+    std::fs::write(
+        &metadata,
+        r#"{
+  "objects": [
+    {
+      "logical_id": "BILLING.REPORT_PKG",
+      "owner_symbol": 0,
+      "name_symbol": 2,
+      "object_type": "PACKAGE",
+      "force_compile": true
+    },
+    {
+      "logical_id": "BILLING.REPORT_VIEW",
+      "owner_symbol": 0,
+      "name_symbol": 3,
+      "object_type": "VIEW",
+      "force_compile": true
+    },
+    {
+      "logical_id": "BILLING.SUMMARY_JOB",
+      "owner_symbol": 0,
+      "name_symbol": 4,
+      "object_type": "JOB",
+      "force_compile": true
+    }
+  ]
+}
+"#,
+    )
+    .expect("write metadata");
+    std::fs::write(
+        &compile_errors,
+        r#"[
+  {
+    "owner_symbol": 0,
+    "name_symbol": 2,
+    "object_type": "PACKAGE",
+    "flag": "compile_error_detected",
+    "message": "ORA-04063: package body has errors"
+  }
+]
+"#,
+    )
+    .expect("write compile errors");
+
+    let out = Command::new(bin())
+        .args([
+            "predict",
+            "--robot-json",
+            "--source-kind",
+            "changeset-json",
+            "--lineage-impact",
+            impact.to_str().expect("utf8 impact"),
+            "--lineage-metadata",
+            metadata.to_str().expect("utf8 metadata"),
+            "--compile-error-flags",
+            compile_errors.to_str().expect("utf8 compile errors"),
+            changeset.to_str().expect("utf8 changeset"),
+        ])
+        .output()
+        .expect("run plsql predict");
+
+    assert!(out.status.success(), "predict exits 0");
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    let trimmed = stdout.trim_end();
+    assert!(
+        !trimmed.contains('\n'),
+        "robot-json stdout must be single-line: {trimmed:?}"
+    );
+    let actual: serde_json::Value = serde_json::from_str(trimmed).expect("json stdout");
+    let expected: serde_json::Value = serde_json::from_str(&repo_file(
+        "crates/plsql-cicd/tests/golden/change_impact_payload.json",
+    ))
+    .expect("golden json");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn doctor_robot_json_is_single_json_object() {
     let out = Command::new(bin())
         .args(["doctor", "--robot-json"])
