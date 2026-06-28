@@ -57,6 +57,14 @@ inputs:
     description: GitHub API root URL used for posting comments.
     required: false
     default: https://api.github.com
+  event-path:
+    description: GitHub event JSON path used to discover the pull request number. Defaults to GITHUB_EVENT_PATH.
+    required: false
+    default: ""
+  repository:
+    description: GitHub repository in owner/name form. Defaults to GITHUB_REPOSITORY.
+    required: false
+    default: ""
   mock-comment-output:
     description: Testing-only path. When set, write the comment POST request JSON here instead of calling the GitHub API.
     required: false
@@ -215,6 +223,8 @@ runs:
         POST_COMMENT: ${{ inputs.post-comment }}
         GITHUB_TOKEN_INPUT: ${{ inputs.github-token }}
         GITHUB_API_URL: ${{ inputs.github-api-url }}
+        GITHUB_EVENT_PATH_INPUT: ${{ inputs.event-path }}
+        GITHUB_REPOSITORY_INPUT: ${{ inputs.repository }}
         MOCK_COMMENT_OUTPUT: ${{ inputs.mock-comment-output }}
         COMMENT_BODY: ${{ steps.render.outputs.comment_body }}
       run: |
@@ -230,16 +240,18 @@ runs:
           echo "::error::github-token is required when post-comment is true"
           exit 2
         fi
-        if [[ -z "${GITHUB_EVENT_PATH:-}" || ! -f "$GITHUB_EVENT_PATH" ]]; then
+        event_path="${GITHUB_EVENT_PATH_INPUT:-${GITHUB_EVENT_PATH:-}}"
+        repository="${GITHUB_REPOSITORY_INPUT:-${GITHUB_REPOSITORY:-}}"
+        if [[ -z "$event_path" || ! -f "$event_path" ]]; then
           echo "::error::GITHUB_EVENT_PATH is required when post-comment is true"
           exit 2
         fi
-        if [[ -z "${GITHUB_REPOSITORY:-}" ]]; then
+        if [[ -z "$repository" ]]; then
           echo "::error::GITHUB_REPOSITORY is required when post-comment is true"
           exit 2
         fi
 
-        pr_number="$(jq -r '.pull_request.number // empty' "$GITHUB_EVENT_PATH")"
+        pr_number="$(jq -r '.pull_request.number // empty' "$event_path")"
         if [[ -z "$pr_number" ]]; then
           echo "::error::PL/SQL change-impact comments can only be posted for pull_request events"
           exit 2
@@ -247,7 +259,7 @@ runs:
 
         marker="<!-- plsql-cicd:change-impact v1 -->"
         github_api_url="${GITHUB_API_URL%/}"
-        comments_url="${github_api_url}/repos/${GITHUB_REPOSITORY}/issues/${pr_number}/comments"
+        comments_url="${github_api_url}/repos/${repository}/issues/${pr_number}/comments"
         headers=(
           -H "Authorization: Bearer ${GITHUB_TOKEN_INPUT}"
           -H "Accept: application/vnd.github+json"

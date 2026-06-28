@@ -387,10 +387,10 @@ fn github_change_impact_action_matches_predict_cli_contract() {
     assert!(action.contains("--lineage-impact"));
     assert!(action.contains("--lineage-metadata"));
     assert!(action.contains("plsql.cicd.change_impact"));
-    assert!(
-        action
-            .contains("${github_api_url}/repos/${GITHUB_REPOSITORY}/issues/${pr_number}/comments")
-    );
+    assert!(action.contains("event-path:"));
+    assert!(action.contains("repository:"));
+    assert!(action.contains("repository=\"${GITHUB_REPOSITORY_INPUT:-${GITHUB_REPOSITORY:-}}\""));
+    assert!(action.contains("${github_api_url}/repos/${repository}/issues/${pr_number}/comments"));
     assert!(action.contains("mock-comment-output"));
     assert!(action.contains("mock://plsql-change-impact-comment"));
     assert!(action.contains("plsql-cicd:change-impact v1"));
@@ -407,6 +407,8 @@ fn github_change_impact_selftest_runs_action_with_mocked_posting() {
     assert!(workflow.contains("uses: ./.github/actions/plsql-change-impact"));
     assert!(workflow.contains("post-comment: \"true\""));
     assert!(workflow.contains("github-token: fixture-token"));
+    assert!(workflow.contains("event-path: ${{ runner.temp }}/plsql-change-impact-event.json"));
+    assert!(workflow.contains("repository: acme/billing"));
     assert!(workflow.contains("mock-comment-output"));
     assert!(workflow.contains("plsql-change-impact-event.json"));
     assert!(workflow.contains("plsql-change-impact-post.json"));
