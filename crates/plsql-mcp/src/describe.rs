@@ -13,6 +13,7 @@ use plsql_core::UnknownReason;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::identifier::normalize_identifier;
 use crate::query::sanitize;
 
 /// Route a DB-controlled free-text field through the K18 sanitizer,
@@ -188,26 +189,6 @@ impl DescribeError {
                 env
             }
         }
-    }
-}
-
-/// Normalize a user-supplied Oracle identifier to the form the data dictionary
-/// stores: an UNQUOTED name folds to upper-case (Oracle's default for
-/// `ALL_OBJECTS.OWNER` / `OBJECT_NAME`), a double-quoted `"..."` name keeps its
-/// inner case verbatim (Oracle case-sensitive quoting). Applied at every
-/// describe / list_objects binding site so an agent that copies
-/// `billing.invoices` from lowercase source resolves against `BILLING.INVOICES`
-/// instead of getting a spurious NotFound / empty page (oracle-da9j.5).
-#[must_use]
-pub(crate) fn normalize_identifier(raw: &str) -> String {
-    let t = raw.trim();
-    let bytes = t.as_bytes();
-    if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
-        // Quoted: strip the surrounding quotes, keep the inner case verbatim
-        // (collapsing the `""` escape to a single `"`).
-        t[1..t.len() - 1].replace("\"\"", "\"")
-    } else {
-        t.to_ascii_uppercase()
     }
 }
 

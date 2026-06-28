@@ -17,7 +17,8 @@ use plsql_core::UnknownReason;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::source::{ObjectError, run_get_errors};
+use crate::identifier::{IdentifierError, SqlIdentifier, parse_sql_identifier};
+use crate::source::{ObjectError, run_get_errors_dictionary_names};
 
 /// Severity bucket the warning falls into per Oracle's PLW range docs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -77,6 +78,11 @@ pub enum CompileToolError {
     Backend(#[from] CatalogError),
     #[error("oracle backend error during compile: {0}")]
     BackendCompile(String),
+    #[error("invalid Oracle identifier for {field}: {message}")]
+    Identifier {
+        field: &'static str,
+        message: String,
+    },
     #[error("source-tool error while fetching post-compile errors: {0}")]
     Source(#[from] crate::source::SourceToolError),
 }
@@ -100,8 +106,8 @@ pub async fn run_compile_with_warnings<C: OracleConnection>(
     object_name: &str,
     object_type: &str,
 ) -> Result<CompileWithWarningsResponse, CompileToolError> {
-    validate_identifier(owner)?;
-    validate_identifier(object_name)?;
+    let owner = compile_identifier("owner", owner)?;
+    let object_name = compile_identifier("object_name", object_name)?;
     let normalized_type = normalize_object_type(object_type)?;
 
     conn.execute(cx, "alter session set plsql_warnings = 'ENABLE:ALL'", &[])
@@ -111,8 +117,8 @@ pub async fn run_compile_with_warnings<C: OracleConnection>(
     let compile_sql = format!(
         "alter {kind} {owner}.{name} compile plsql_warnings = 'ENABLE:ALL'",
         kind = normalized_type.statement_kind,
-        owner = owner,
-        name = object_name,
+        owner = owner.sql(),
+        name = object_name.sql(),
     );
     let mut success = true;
     let mut unknown_reasons = Vec::new();
@@ -128,7 +134,13 @@ pub async fn run_compile_with_warnings<C: OracleConnection>(
         );
     }
 
-    let errors_response = run_get_errors(cx, conn, owner, object_name).await?;
+    let errors_response = run_get_errors_dictionary_names(
+        cx,
+        conn,
+        Some(owner.dictionary_name()),
+        object_name.dictionary_name(),
+    )
+    .await?;
     // Propagate the K18 sanitization signal: if `run_get_errors` scrubbed
     // any free-text field on any row, the compile response must also flag
     // `ResponseSanitized` so the agent sees the same honesty marker. Avoid
@@ -139,8 +151,8 @@ pub async fn run_compile_with_warnings<C: OracleConnection>(
         }
     }
     let mut response = CompileWithWarningsResponse {
-        owner: owner.to_string(),
-        object_name: object_name.to_string(),
+        owner: owner.dictionary_name().to_string(),
+        object_name: object_name.dictionary_name().to_string(),
         object_type: normalized_type.statement_kind.to_string(),
         success,
         severe: Vec::new(),
@@ -165,35 +177,15 @@ pub async fn run_compile_with_warnings<C: OracleConnection>(
     Ok(response)
 }
 
-/// Validate an Oracle identifier — letters / digits / underscore / dollar /
-/// pound; cannot start with a digit; max 128 chars (23ai limit). The MCP
-/// transport must reject anything that fails this check before reaching
-/// the DDL string.
-fn validate_identifier(identifier: &str) -> Result<(), CompileToolError> {
-    if identifier.is_empty() || identifier.len() > 128 {
-        return Err(CompileToolError::BackendCompile(format!(
-            "rejected identifier (length): `{identifier}`"
-        )));
+fn compile_identifier(field: &'static str, raw: &str) -> Result<SqlIdentifier, CompileToolError> {
+    parse_sql_identifier(raw).map_err(|err| identifier_error(field, err))
+}
+
+fn identifier_error(field: &'static str, err: IdentifierError) -> CompileToolError {
+    CompileToolError::Identifier {
+        field,
+        message: err.to_string(),
     }
-    let mut chars = identifier.chars();
-    let Some(first) = chars.next() else {
-        return Err(CompileToolError::BackendCompile(String::from(
-            "identifier is empty",
-        )));
-    };
-    if !first.is_ascii_alphabetic() {
-        return Err(CompileToolError::BackendCompile(format!(
-            "rejected identifier (must start with a letter): `{identifier}`"
-        )));
-    }
-    for c in chars {
-        if !(c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '#') {
-            return Err(CompileToolError::BackendCompile(format!(
-                "rejected identifier (illegal char `{c}`): `{identifier}`"
-            )));
-        }
-    }
-    Ok(())
 }
 
 struct NormalizedObjectType {
@@ -231,6 +223,7 @@ mod tests {
     struct CompileStubConn {
         error_rows: Vec<OracleRow>,
         executes: Mutex<Vec<String>>,
+        error_query_binds: Mutex<Vec<Vec<OracleBind>>>,
         fail_compile: bool,
     }
 
@@ -266,6 +259,10 @@ mod tests {
             _params: &[OracleBind],
         ) -> Result<Vec<OracleRow>, CatalogError> {
             let _ = cx;
+            self.error_query_binds
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(_params.to_vec());
             Ok(self.error_rows.clone())
         }
         async fn execute(
@@ -393,19 +390,21 @@ mod tests {
 
     #[test]
     fn validate_identifier_accepts_typical_names() {
-        assert!(validate_identifier("BILLING_PKG").is_ok());
-        assert!(validate_identifier("APP$NAME").is_ok());
-        assert!(validate_identifier("PKG#1").is_ok());
-        assert!(validate_identifier("PKG_2026").is_ok());
+        assert!(compile_identifier("identifier", "BILLING_PKG").is_ok());
+        assert!(compile_identifier("identifier", "APP$NAME").is_ok());
+        assert!(compile_identifier("identifier", "PKG#1").is_ok());
+        assert!(compile_identifier("identifier", "PKG_2026").is_ok());
+        assert!(compile_identifier("identifier", "\"Mixed Case\"").is_ok());
+        assert!(compile_identifier("identifier", "\"Pkg\"\"Body\"").is_ok());
     }
 
     #[test]
     fn validate_identifier_rejects_dangerous_patterns() {
-        assert!(validate_identifier("").is_err());
-        assert!(validate_identifier("1STARTS_WITH_DIGIT").is_err());
-        assert!(validate_identifier("HAS SPACE").is_err());
-        assert!(validate_identifier("BAD;DROP_TABLE").is_err());
-        assert!(validate_identifier(&"X".repeat(200)).is_err());
+        assert!(compile_identifier("identifier", "").is_err());
+        assert!(compile_identifier("identifier", "1STARTS_WITH_DIGIT").is_err());
+        assert!(compile_identifier("identifier", "HAS SPACE").is_err());
+        assert!(compile_identifier("identifier", "BAD;DROP_TABLE").is_err());
+        assert!(compile_identifier("identifier", &"X".repeat(200)).is_err());
     }
 
     #[test]
@@ -432,6 +431,7 @@ mod tests {
         let stub = CompileStubConn {
             error_rows: vec![],
             executes: Mutex::new(Vec::new()),
+            error_query_binds: Mutex::new(Vec::new()),
             fail_compile: false,
         };
         let response =
@@ -452,6 +452,38 @@ mod tests {
     }
 
     #[test]
+    fn compile_preserves_quoted_identifier_case_in_sql_and_error_lookup() {
+        let stub = CompileStubConn {
+            error_rows: vec![],
+            executes: Mutex::new(Vec::new()),
+            error_query_binds: Mutex::new(Vec::new()),
+            fail_compile: false,
+        };
+        let response = run_compile_with_warnings_for_test(
+            &stub,
+            "\"MixedOwner\"",
+            "\"Billing\"\"Pkg\"",
+            "package body",
+        )
+        .unwrap();
+
+        assert_eq!(response.owner, "MixedOwner");
+        assert_eq!(response.object_name, "Billing\"Pkg");
+        let executes = stub.executes.lock().unwrap();
+        assert!(executes.iter().any(|sql| {
+            sql.contains("alter PACKAGE BODY \"MixedOwner\".\"Billing\"\"Pkg\" compile")
+        }));
+        let binds = stub.error_query_binds.lock().unwrap();
+        assert_eq!(
+            binds[0],
+            vec![
+                OracleBind::from("MixedOwner"),
+                OracleBind::from("Billing\"Pkg"),
+            ]
+        );
+    }
+
+    #[test]
     fn compile_returns_categorized_errors_when_present() {
         let stub = CompileStubConn {
             error_rows: vec![
@@ -460,6 +492,7 @@ mod tests {
                 error_row(9, "WARNING", 7203, "PLW-07203: parameter 'p_id'"),
             ],
             executes: Mutex::new(Vec::new()),
+            error_query_binds: Mutex::new(Vec::new()),
             fail_compile: false,
         };
         let response =
@@ -503,6 +536,7 @@ mod tests {
         let stub = CompileStubConn {
             error_rows: vec![error_row(1, "ERROR", 201, &tainted_text)],
             executes: Mutex::new(Vec::new()),
+            error_query_binds: Mutex::new(Vec::new()),
             fail_compile: false,
         };
         let response =
@@ -528,6 +562,7 @@ mod tests {
         let stub = CompileStubConn {
             error_rows: vec![error_row(1, "ERROR", 201, "PLS-00201")],
             executes: Mutex::new(Vec::new()),
+            error_query_binds: Mutex::new(Vec::new()),
             fail_compile: true,
         };
         let response =

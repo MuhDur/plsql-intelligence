@@ -16,6 +16,8 @@ use plsql_catalog::{
 };
 use std::collections::HashSet;
 
+use crate::identifier::normalize_identifier;
+
 /// MCP-side adapter over an `oraclemcp-db` connection.
 #[derive(Debug)]
 pub struct OraclemcpCatalogConnection<C> {
@@ -145,11 +147,7 @@ where
         cx: &Cx,
         base_objects: &[ObjectRef],
     ) -> Result<CatalogSideEffectOracle, CatalogError> {
-        let current_schema = self
-            .describe(cx)
-            .await?
-            .current_schema
-            .map(|schema| normalize_dictionary_identifier(&schema));
+        let current_schema = self.describe(cx).await?.current_schema;
         let mut oracle = CatalogSideEffectOracle::default();
         oracle.set_default_schema(current_schema.clone());
         for key in resolved_object_keys(base_objects, current_schema.as_deref()) {
@@ -171,10 +169,10 @@ with resolved_objects as (
   select :1 as owner, :2 as name
   from dual
   union
-  select upper(table_owner) as owner, upper(table_name) as name
+  select table_owner as owner, table_name as name
   from all_synonyms
-  where upper(synonym_name) = :2
-    and upper(owner) in (:1, 'PUBLIC')
+  where synonym_name = :2
+    and owner in (:1, 'PUBLIC')
     and table_owner is not null
     and table_name is not null
 )
@@ -183,7 +181,7 @@ select
     when exists (
       select 1
       from all_policies
-      where (upper(object_owner), upper(object_name)) in (
+      where (object_owner, object_name) in (
         select owner, name from resolved_objects
       )
         and upper(enable) in ('Y', 'YES', 'TRUE', '1')
@@ -192,7 +190,7 @@ select
     or exists (
       select 1
       from all_triggers
-      where (upper(table_owner), upper(table_name)) in (
+      where (table_owner, table_name) in (
         select owner, name from resolved_objects
       )
         and upper(status) = 'ENABLED'
@@ -384,12 +382,12 @@ struct ObjectKey {
 
 impl ObjectKey {
     fn from_ref(object: &ObjectRef, default_schema: Option<&str>) -> Option<Self> {
-        let owner = object.schema.as_deref().or(default_schema)?;
-        let name = normalize_dictionary_identifier(&object.name);
-        (!owner.trim().is_empty() && !name.is_empty()).then(|| Self {
-            owner: normalize_dictionary_identifier(owner),
-            name,
-        })
+        let owner = match object.schema.as_deref() {
+            Some(schema) => normalize_identifier(schema),
+            None => default_schema?.to_string(),
+        };
+        let name = normalize_identifier(&object.name);
+        (!owner.is_empty() && !name.is_empty()).then_some(Self { owner, name })
     }
 }
 
@@ -400,12 +398,11 @@ fn resolved_object_keys(
     let mut seen = HashSet::new();
     let mut keys = Vec::new();
     for object in base_objects {
-        let owner = object
-            .schema
-            .as_deref()
-            .or(current_schema)
-            .map(normalize_dictionary_identifier);
-        let name = normalize_dictionary_identifier(&object.name);
+        let owner = match object.schema.as_deref() {
+            Some(schema) => Some(normalize_identifier(schema)),
+            None => current_schema.map(ToString::to_string),
+        };
+        let name = normalize_identifier(&object.name);
         let Some(owner) = owner else {
             continue;
         };
@@ -418,10 +415,6 @@ fn resolved_object_keys(
         }
     }
     keys
-}
-
-fn normalize_dictionary_identifier(value: &str) -> String {
-    value.trim().to_ascii_uppercase()
 }
 
 #[cfg(test)]
@@ -444,10 +437,7 @@ mod tests {
                 .side_effecting_objects
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert((
-                    normalize_dictionary_identifier(owner),
-                    normalize_dictionary_identifier(name),
-                ));
+                .insert((normalize_identifier(owner), normalize_identifier(name)));
             connection
         }
 
@@ -526,10 +516,7 @@ mod tests {
                     [
                         oraclemcp_db::OracleBind::String(owner),
                         oraclemcp_db::OracleBind::String(name),
-                    ] => (
-                        normalize_dictionary_identifier(owner),
-                        normalize_dictionary_identifier(name),
-                    ),
+                    ] => (owner.clone(), name.clone()),
                     _ => {
                         return Err(oraclemcp_db::DbError::Query(String::from(
                             "side-effect query expected owner/name string binds",
@@ -752,6 +739,35 @@ mod tests {
                     .any(|sql| sql.contains("from all_synonyms")),
                 "live dictionary query must account for synonym targets"
             );
+        });
+    }
+
+    #[test]
+    fn side_effect_oracle_preserves_quoted_identifier_case() {
+        run_async(async {
+            let cx = Cx::current().expect("test runtime installs Cx");
+            let connection = FakeDbConnection::with_side_effecting_object(
+                "\"MixedOwner\"",
+                "\"Billing\"\"Pkg\"",
+            );
+            let adapter = OraclemcpCatalogConnection::new(connection);
+            let object = ObjectRef::new(Some(String::from("\"MixedOwner\"")), "\"Billing\"\"Pkg\"");
+            let oracle = adapter
+                .side_effect_oracle(&cx, std::slice::from_ref(&object))
+                .await
+                .expect("side-effect oracle");
+
+            assert!(oracle.has_side_effecting_object());
+            assert_eq!(
+                oracle.statement_purity(&[object]),
+                Purity::ProvenSideEffecting
+            );
+            let observed_sql = adapter.inner().observed_sql().join("\n");
+            assert!(!observed_sql.contains("upper(object_owner)"));
+            assert!(!observed_sql.contains("upper(object_name)"));
+            assert!(!observed_sql.contains("upper(table_owner)"));
+            assert!(!observed_sql.contains("upper(table_name)"));
+            assert!(!observed_sql.contains("upper(synonym_name)"));
         });
     }
 

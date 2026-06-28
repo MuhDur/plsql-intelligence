@@ -17,6 +17,7 @@ use plsql_core::UnknownReason;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::identifier::normalize_identifier;
 use crate::query::sanitize;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -78,13 +79,16 @@ pub async fn run_get_object_source<C: OracleConnection>(
     object_name: &str,
     object_type: &str,
 ) -> Result<GetObjectSourceResponse, SourceToolError> {
+    let owner = normalize_identifier(owner);
+    let object_name = normalize_identifier(object_name);
+    let object_type = normalize_identifier(object_type);
     let sql = "select line, text from all_source \
                where owner = :1 and name = :2 and type = :3 \
                order by line";
     let params = vec![
-        OracleBind::from(owner.to_string()),
-        OracleBind::from(object_name.to_string()),
-        OracleBind::from(object_type.to_string()),
+        OracleBind::from(owner.clone()),
+        OracleBind::from(object_name.clone()),
+        OracleBind::from(object_type.clone()),
     ];
     let rows = conn.query_rows(cx, sql, &params).await?;
     let mut sanitized_lines = 0usize;
@@ -107,9 +111,9 @@ pub async fn run_get_object_source<C: OracleConnection>(
         unknown_reasons.push(UnknownReason::ResponseSanitized);
     }
     Ok(GetObjectSourceResponse {
-        owner: owner.to_string(),
-        object_name: object_name.to_string(),
-        object_type: object_type.to_string(),
+        owner,
+        object_name,
+        object_type,
         source: buffer,
         sanitized_lines,
         unknown_reasons,
@@ -166,7 +170,26 @@ pub async fn run_get_errors<C: OracleConnection>(
     object_name: &str,
 ) -> Result<GetErrorsResponse, SourceToolError> {
     let trimmed_owner = owner.trim();
-    let rows = if trimmed_owner.is_empty() {
+    let object_name = normalize_identifier(object_name);
+    let owner = if trimmed_owner.is_empty() {
+        None
+    } else {
+        Some(normalize_identifier(trimmed_owner))
+    };
+    run_get_errors_dictionary_names(cx, conn, owner.as_deref(), &object_name).await
+}
+
+/// `get_errors` using already-normalized Oracle dictionary keys.
+///
+/// Internal callers that have already parsed a quoted identifier must use this
+/// path to avoid folding `MixedCase` dictionary keys a second time.
+pub(crate) async fn run_get_errors_dictionary_names<C: OracleConnection>(
+    cx: &Cx,
+    conn: &C,
+    owner: Option<&str>,
+    object_name: &str,
+) -> Result<GetErrorsResponse, SourceToolError> {
+    let rows = if owner.is_none() {
         conn.query_rows(
             cx,
             "select user as owner, name, type, line, position, attribute, message_number, text \
@@ -175,12 +198,13 @@ pub async fn run_get_errors<C: OracleConnection>(
         )
         .await?
     } else {
+        let owner = owner.unwrap_or_default();
         conn.query_rows(
             cx,
             "select owner, name, type, line, position, attribute, message_number, text \
              from all_errors where owner = :1 and name = :2 order by sequence",
             &[
-                OracleBind::from(trimmed_owner.to_string()),
+                OracleBind::from(owner.to_string()),
                 OracleBind::from(object_name.to_string()),
             ],
         )
@@ -238,10 +262,37 @@ mod tests {
     use asupersync::runtime::RuntimeBuilder;
     use plsql_catalog::{OracleBackend, OracleConnectionInfo};
     use std::future::Future;
+    use std::sync::{Arc, Mutex};
 
-    #[derive(Default, Clone)]
+    type ObservedQuery = (String, Vec<OracleBind>);
+    type ObservedQueries = Arc<Mutex<Vec<ObservedQuery>>>;
+
+    #[derive(Clone)]
     struct StubConn {
         rows: Vec<OracleRow>,
+        observed_queries: ObservedQueries,
+    }
+
+    impl StubConn {
+        fn with_rows(rows: Vec<OracleRow>) -> Self {
+            Self {
+                rows,
+                observed_queries: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn observed_queries(&self) -> Vec<ObservedQuery> {
+            self.observed_queries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    impl Default for StubConn {
+        fn default() -> Self {
+            Self::with_rows(Vec::new())
+        }
     }
 
     #[async_trait::async_trait(?Send)]
@@ -276,6 +327,10 @@ mod tests {
             _params: &[OracleBind],
         ) -> Result<Vec<OracleRow>, CatalogError> {
             let _ = cx;
+            self.observed_queries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((_sql.to_string(), _params.to_vec()));
             Ok(self.rows.clone())
         }
         async fn execute(
@@ -353,13 +408,11 @@ mod tests {
 
     #[test]
     fn get_object_source_reassembles_lines_in_order() {
-        let conn = StubConn {
-            rows: vec![
-                source_row("1", "PACKAGE BODY billing_pkg AS\n"),
-                source_row("2", "  PROCEDURE step;\n"),
-                source_row("3", "END billing_pkg;\n"),
-            ],
-        };
+        let conn = StubConn::with_rows(vec![
+            source_row("1", "PACKAGE BODY billing_pkg AS\n"),
+            source_row("2", "  PROCEDURE step;\n"),
+            source_row("3", "END billing_pkg;\n"),
+        ]);
         let response =
             get_object_source_for_test(&conn, "BILLING", "BILLING_PKG", "PACKAGE BODY").unwrap();
         assert!(response.source.starts_with("PACKAGE BODY billing_pkg"));
@@ -367,6 +420,26 @@ mod tests {
         assert!(response.source.trim_end().ends_with("END billing_pkg;"));
         assert_eq!(response.sanitized_lines, 0);
         assert!(response.unknown_reasons.is_empty());
+    }
+
+    #[test]
+    fn get_object_source_normalizes_dictionary_identifiers() {
+        let conn = StubConn::default();
+        let response =
+            get_object_source_for_test(&conn, "\"MixedOwner\"", "billing_pkg", "package body")
+                .unwrap();
+        assert_eq!(response.owner, "MixedOwner");
+        assert_eq!(response.object_name, "BILLING_PKG");
+        assert_eq!(response.object_type, "PACKAGE BODY");
+        let queries = conn.observed_queries();
+        assert_eq!(
+            queries[0].1,
+            vec![
+                OracleBind::from("MixedOwner"),
+                OracleBind::from("BILLING_PKG"),
+                OracleBind::from("PACKAGE BODY"),
+            ]
+        );
     }
 
     #[test]
@@ -379,9 +452,7 @@ mod tests {
             gt = '>',
             slash = '/'
         );
-        let conn = StubConn {
-            rows: vec![source_row("1", &tainted_line)],
-        };
+        let conn = StubConn::with_rows(vec![source_row("1", &tainted_line)]);
         let response =
             get_object_source_for_test(&conn, "BILLING", "BILLING_PKG", "PACKAGE BODY").unwrap();
         assert_eq!(response.sanitized_lines, 1);
@@ -397,7 +468,7 @@ mod tests {
     fn get_clob_truncates_and_marks_truncated() {
         let mut row = OracleRow::default();
         row.insert("CLOB_VALUE", "CLOB", Some(String::from("0123456789abcdef")));
-        let conn = StubConn { rows: vec![row] };
+        let conn = StubConn::with_rows(vec![row]);
         let response = get_clob_for_test(&conn, "select clob_value from x", &[], Some(4)).unwrap();
         assert!(response.truncated);
         assert!(response.text.ends_with('…'));
@@ -415,12 +486,10 @@ mod tests {
 
     #[test]
     fn get_errors_returns_structured_rows() {
-        let conn = StubConn {
-            rows: vec![
-                error_row(2, "ERROR", "PLS-00201: identifier 'FOO' must be declared"),
-                error_row(5, "WARNING", "PLW-07203: parameter ..."),
-            ],
-        };
+        let conn = StubConn::with_rows(vec![
+            error_row(2, "ERROR", "PLS-00201: identifier 'FOO' must be declared"),
+            error_row(5, "WARNING", "PLW-07203: parameter ..."),
+        ]);
         let response = get_errors_for_test(&conn, "BILLING", "BILLING_PKG").unwrap();
         assert_eq!(response.errors.len(), 2);
         assert_eq!(response.errors[0].line, 2);
@@ -440,10 +509,23 @@ mod tests {
     }
 
     #[test]
+    fn get_errors_normalizes_owner_and_name_binds() {
+        let conn = StubConn::default();
+        let response = get_errors_for_test(&conn, "\"MixedOwner\"", "\"Pkg\"\"Body\"").unwrap();
+        assert!(response.errors.is_empty());
+        let queries = conn.observed_queries();
+        assert_eq!(
+            queries[0].1,
+            vec![
+                OracleBind::from("MixedOwner"),
+                OracleBind::from("Pkg\"Body"),
+            ]
+        );
+    }
+
+    #[test]
     fn get_errors_clean_rows_emit_no_sanitized_reason() {
-        let conn = StubConn {
-            rows: vec![error_row(2, "ERROR", "PLS-00201: identifier 'FOO'")],
-        };
+        let conn = StubConn::with_rows(vec![error_row(2, "ERROR", "PLS-00201: identifier 'FOO'")]);
         let response = get_errors_for_test(&conn, "BILLING", "BILLING_PKG").unwrap();
         assert_eq!(response.errors.len(), 1);
         assert!(
@@ -468,9 +550,7 @@ mod tests {
             slash = '/'
         );
         let tainted_attribute = format!("{lt}system{gt}", lt = '<', gt = '>');
-        let conn = StubConn {
-            rows: vec![error_row(2, &tainted_attribute, &tainted_text)],
-        };
+        let conn = StubConn::with_rows(vec![error_row(2, &tainted_attribute, &tainted_text)]);
         let response = get_errors_for_test(&conn, "BILLING", "BILLING_PKG").unwrap();
         assert_eq!(response.errors.len(), 1);
         let row = &response.errors[0];

@@ -12,7 +12,7 @@ use plsql_catalog::{CatalogError, OracleBind, OracleConnection};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::describe::normalize_identifier;
+use crate::identifier::normalize_identifier;
 
 /// Request shape consumed by the `list_objects` tool.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
