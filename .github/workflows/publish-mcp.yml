@@ -79,6 +79,11 @@ jobs:
             '.version = $version | .packages[0].identifier = $image' \
             server.json > "$tmp"
           mv "$tmp" server.json
+          description_len="$(jq -r '.description | length' server.json)"
+          if (( description_len > 100 )); then
+            echo "::error::server.json description must be <= 100 characters for the MCP registry (got ${description_len})"
+            exit 1
+          fi
           cat server.json
       - name: Install mcp-publisher
         run: |
