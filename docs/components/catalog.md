@@ -347,8 +347,9 @@ pub enum CatalogSchemaFilter {
 }
 ```
 
-The `OracleConnection` trait abstracts the database driver. The first implementation
-uses the `oracle` crate (Rust Oracle driver) behind the `oracle-driver` Cargo feature.
+The `OracleConnection` trait abstracts the database driver. `plsql-catalog` stays
+offline-first and does not carry a direct Oracle client dependency; the live
+`plsql-mcp` path adapts `oraclemcp-db` connections into this trait.
 
 ### 6.3 DBMS_METADATA files
 

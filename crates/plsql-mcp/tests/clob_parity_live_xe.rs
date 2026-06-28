@@ -1,13 +1,13 @@
-//! Integration test: X.2 large-CLOB differential parity between the temporary
-//! thick catalog driver and the `oraclemcp-db` thin catalog adapter.
+//! Integration test: X.2 large-CLOB catalog extraction through the
+//! `oraclemcp-db` thin catalog adapter.
 //!
-//! This is the gate that lets Phase C retire the legacy `oracle` / ODPI-C path:
-//! a real Oracle XE object whose DBMS_METADATA output exceeds
-//! `oraclemcp-db`'s agent-facing default CLOB cap must extract identically
-//! through the catalog adapter's uncapped serialization path.
+//! The original differential gate compared this adapter against the temporary
+//! thick catalog driver. After C.6 retired that driver, this regression keeps
+//! the important production guarantee: a real Oracle XE object whose
+//! DBMS_METADATA output exceeds `oraclemcp-db`'s agent-facing default CLOB cap
+//! must extract through the catalog adapter's uncapped serialization path.
 //!
 //! ```sh
-//! LD_LIBRARY_PATH=/tmp/instantclient_23_7 \
 //! PLSQL_XE_SYSTEM_PASSWORD='...' \
 //! cargo test -p plsql-mcp --features live-xe \
 //!   --test clob_parity_live_xe -- --nocapture
@@ -29,8 +29,7 @@ mod live {
     };
     use plsql_catalog::{
         CatalogError, CatalogLoadRequest, CatalogObject, CatalogSnapshot, DbmsMetadataDdl,
-        OracleBind as CatalogBind, OracleConnectOptions as ThickConnectOptions,
-        OracleConnection as CatalogOracleConnection, RustOracleConnection,
+        OracleBind as CatalogBind, OracleConnection as CatalogOracleConnection,
         load_snapshot_from_connection, populate_dbms_metadata_ddl,
     };
     use plsql_mcp::OraclemcpCatalogConnection;
@@ -61,17 +60,6 @@ mod live {
             let cx = Cx::current().expect("live-xe runtime installs a request Cx");
             body(cx).await
         })
-    }
-
-    fn thick_options() -> ThickConnectOptions {
-        ThickConnectOptions::new(
-            SYSTEM_USER,
-            required_env("PLSQL_XE_SYSTEM_PASSWORD"),
-            CONNECT_STRING,
-        )
-        .with_module("plsql-mcp-x2-clob-parity")
-        .with_action("oracle-plsql-converge-0lnu.15.3")
-        .with_client_identifier("plsql-mcp-x2")
     }
 
     fn thin_options() -> oraclemcp_db::OracleConnectOptions {
@@ -115,9 +103,9 @@ mod live {
         ddl
     }
 
-    async fn install_large_package_fixture(
+    async fn install_large_package_fixture<C: CatalogOracleConnection>(
         cx: &Cx,
-        conn: &RustOracleConnection,
+        conn: &C,
     ) -> Result<(), CatalogError> {
         conn.execute(cx, &build_large_package_ddl(), &[]).await?;
         let rows = conn
@@ -226,50 +214,35 @@ mod live {
     }
 
     #[test]
-    fn large_clob_catalog_extraction_matches_thick_driver() {
+    fn large_clob_catalog_extraction_uses_uncapped_thin_adapter() {
         run_with_cx(|cx| async move {
-            let thick = RustOracleConnection::connect(thick_options())
-                .expect("legacy thick SYSTEM connection to local XE must succeed");
-            install_large_package_fixture(&cx, &thick)
-                .await
-                .expect("large-CLOB fixture installation failed");
-
             let thin = OraclemcpCatalogConnection::connect(&cx, thin_options())
                 .await
                 .expect("oraclemcp-db thin SYSTEM connection to local XE must succeed");
+            install_large_package_fixture(&cx, &thin)
+                .await
+                .expect("large-CLOB fixture installation failed");
 
             assert_default_oraclemcp_lob_path_would_truncate(&cx, &thin).await;
 
-            let thick_snapshot = load_snapshot_with_ddl(&cx, &thick)
-                .await
-                .expect("legacy thick catalog extraction failed");
             let thin_snapshot = load_snapshot_with_ddl(&cx, &thin)
                 .await
                 .expect("oraclemcp-db catalog extraction failed");
 
-            let thick_ddl =
-                fixture_package_ddl(&thick_snapshot, "thick").expect("thick fixture package DDL");
             let thin_ddl =
                 fixture_package_ddl(&thin_snapshot, "thin").expect("thin fixture package DDL");
             let default_cap = SerializeOptions::default().max_lob_chars;
 
-            assert!(
-                thick_ddl.ddl_text.chars().count() > default_cap,
-                "thick DBMS_METADATA DDL must exceed the default CLOB cap"
-            );
             assert!(
                 thin_ddl.ddl_text.chars().count() > default_cap,
                 "thin catalog adapter must return uncapped DBMS_METADATA DDL"
             );
             assert!(thin_ddl.ddl_text.contains(START_MARKER));
             assert!(thin_ddl.ddl_text.contains(END_MARKER));
-            assert_eq!(thin_ddl.normalized_ddl, thick_ddl.normalized_ddl);
-            assert_eq!(thin_ddl.xml_text, thick_ddl.xml_text);
 
             eprintln!(
-                "[PLSQL-X2] default_cap={} thick_ddl_chars={} thin_ddl_chars={} xml_chars={}",
+                "[PLSQL-X2] default_cap={} thin_ddl_chars={} xml_chars={}",
                 default_cap,
-                thick_ddl.ddl_text.chars().count(),
                 thin_ddl.ddl_text.chars().count(),
                 thin_ddl
                     .xml_text

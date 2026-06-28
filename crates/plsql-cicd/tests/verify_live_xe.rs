@@ -1,12 +1,11 @@
 //! Live Oracle XE 23ai integration test for `verify <changeset>`.
 //!
 //! Gated behind the `live-xe` feature flag so the default test profile
-//! (no Docker, no `LD_LIBRARY_PATH`) doesn't try to reach a container
-//! that isn't there. Run the real path with:
+//! (no Docker, no live Oracle) doesn't try to reach a container that isn't
+//! there. Run the real path with:
 //!
 //! ```sh
-//! LD_LIBRARY_PATH=/tmp/instantclient_23_7 \
-//!     cargo test -p plsql-cicd --features live-xe \
+//! cargo test -p plsql-cicd --features live-xe \
 //!     --test verify_live_xe -- --nocapture
 //! ```
 //!
@@ -45,8 +44,7 @@ fn live_xe_verify_is_feature_gated() {
 mod live {
     use asupersync::{Cx, runtime::RuntimeBuilder};
     use plsql_catalog::{
-        CatalogError, OracleBind, OracleConnectOptions, OracleConnection, OracleRow,
-        RustOracleConnection,
+        CatalogError, OracleBind, OracleConnection, OracleRow, OraclemcpDbConnection,
     };
     use plsql_cicd::verify::{
         StatementOutcome, VerifyChangeset, VerifyOptions, VerifyReport, is_scratch_schema,
@@ -60,17 +58,27 @@ mod live {
 
     static SCRATCH_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+    type LiveConnection = OraclemcpDbConnection;
+
     const SYSTEM_USER: &str = "SYSTEM";
     const CONNECT_STRING: &str = "//localhost:1521/FREEPDB1";
 
     /// Connect as SYSTEM (has CREATE USER / DROP USER / GRANT privileges).
-    fn system_conn() -> RustOracleConnection {
+    fn system_conn() -> LiveConnection {
         let password = required_env("PLSQL_XE_SYSTEM_PASSWORD");
-        let opts = OracleConnectOptions::new(SYSTEM_USER, &password, CONNECT_STRING)
-            .with_module("plsql-cicd-verify-test")
-            .with_action("PLSQL-CICD-005");
-        RustOracleConnection::connect(opts)
-            .expect("SYSTEM connection to //localhost:1521/FREEPDB1 must succeed")
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            OraclemcpDbConnection::connect_with_password(
+                &cx,
+                SYSTEM_USER,
+                password,
+                CONNECT_STRING,
+                "plsql-cicd-verify-test",
+                "PLSQL-CICD-005",
+            )
+            .await
+            .expect("SYSTEM thin connection to //localhost:1521/FREEPDB1 must succeed")
+        })
     }
 
     fn run_live_future<F: Future>(future: F) -> F::Output {
@@ -94,7 +102,7 @@ mod live {
     }
 
     fn verify(
-        conn: &RustOracleConnection,
+        conn: &LiveConnection,
         changeset: &VerifyChangeset,
         options: &VerifyOptions,
     ) -> Result<VerifyReport, plsql_cicd::verify::VerifyError> {

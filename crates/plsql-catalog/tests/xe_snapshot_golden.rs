@@ -7,8 +7,7 @@
 //! flip the feature and execute the real path via:
 //!
 //! ```sh
-//! LD_LIBRARY_PATH=/tmp/instantclient_23_7 \
-//!     cargo test -p plsql-catalog --features live-xe \
+//! cargo test -p plsql-catalog --features live-xe \
 //!     --test xe_snapshot_golden -- --nocapture
 //! ```
 //!
@@ -49,8 +48,8 @@ mod live {
 
     use asupersync::{Cx, runtime::RuntimeBuilder};
     use plsql_catalog::{
-        CatalogLoadRequest, CatalogObject, CatalogSnapshot, OracleConnectOptions,
-        RustOracleConnection, load_snapshot_from_connection,
+        CatalogLoadRequest, CatalogObject, CatalogSnapshot, OraclemcpDbConnection,
+        load_snapshot_from_connection,
     };
 
     const USERNAME: &str = "DEMO";
@@ -78,12 +77,19 @@ mod live {
     ];
 
     /// Connects to the DEMO schema on the live XE container.
-    fn connect() -> RustOracleConnection {
+    async fn connect(cx: &Cx) -> OraclemcpDbConnection {
         let password = std::env::var("PLSQL_XE_DEMO_PASSWORD")
             .expect("PLSQL_XE_DEMO_PASSWORD must be set for live-xe catalog tests");
-        let opts = OracleConnectOptions::new(USERNAME, &password, CONNECT_STRING);
-        RustOracleConnection::connect(opts)
-            .expect("PLSQL-CAT-008: failed to connect to DEMO@//localhost:1521/FREEPDB1")
+        OraclemcpDbConnection::connect_with_password(
+            cx,
+            USERNAME,
+            password,
+            CONNECT_STRING,
+            "plsql-catalog-live-xe-test",
+            "PLSQL-CAT-008",
+        )
+        .await
+        .expect("PLSQL-CAT-008: failed to connect to DEMO@//localhost:1521/FREEPDB1")
     }
 
     /// Returns the `ObjectCommon` fields (name symbol + type) as
@@ -148,8 +154,6 @@ mod live {
 
     #[test]
     fn xe_demo_snapshot_matches_golden() {
-        let conn = connect();
-
         // Scope extraction to the DEMO schema by name so that it works
         // regardless of whether the current schema in the session is DEMO.
         let request = CatalogLoadRequest::for_named_schemas(["DEMO"]);
@@ -158,6 +162,7 @@ mod live {
             .expect("PLSQL-CAT-008: asupersync runtime")
             .block_on(async {
                 let cx = Cx::current().expect("PLSQL-CAT-008: request Cx");
+                let conn = connect(&cx).await;
                 load_snapshot_from_connection(&cx, &conn, &request).await
             })
             .expect("PLSQL-CAT-008: load_snapshot_from_connection failed");

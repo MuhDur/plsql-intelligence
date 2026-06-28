@@ -48,7 +48,7 @@ coding agents (`plsql-mcp`, Apache-2.0 OR MIT).
 | `LineageResult` / `AffectedNode`       | `crates/plsql-lineage/src/lib.rs`                 | `impact()` / `dependencies()` traversal result with confidence aggregation.                      |
 | `ChangeSet` + `InvalidationPrediction` | `crates/plsql-cicd/src/lib.rs`                    | Foundational CI/CD types (`PLSQL-CICD-001`).                                                     |
 | `BindingPlan` + `OracleType`           | `crates/plsql-bindgen/src/{lib.rs,type_mapping.rs}` | Per-package binding IR + §12.3 Oracle → Rust type mapping.                                       |
-| `DoctorReport` (MCP)                   | `crates/plsql-mcp/src/doctor.rs:22`               | Live-DB build status, Instant Client posture, audit posture, per-connection write posture.       |
+| `DoctorReport` (MCP)                   | `crates/plsql-mcp/src/doctor.rs:22`               | Live-DB build status, retired Instant Client posture, audit posture, per-connection write posture. |
 | `SessionSafetyState` + `EnableWritesToken` | `crates/plsql-mcp/src/safety.rs`              | Read-only-by-default session guard + single-use 60s confirmation token (`PLSQL-MCP-LIVE-008`).   |
 | `Diagnostic` + `UnknownReason`         | `crates/plsql-core/src/lib.rs:313`                | Layer-0 typed diagnostic surface. R13 invariant: every blind spot is a `UnknownReason` variant.  |
 
@@ -111,7 +111,7 @@ could confuse with "looked, found none".
 
 | Dependency          | Purpose                                                                                              | Critical?                                              |
 |---------------------|------------------------------------------------------------------------------------------------------|--------------------------------------------------------|
-| `rust-oracle` 0.6   | Live-DB connection (loaded behind `oracle-driver` Cargo feature; gated on Instant Client at runtime) | Yes (live-DB feature)                                  |
+| `oraclemcp-db` 0.4  | Live-DB connection layer over the pure-Rust `oracledb` driver                                      | Yes (live-DB feature)                                  |
 | `antlr-rust` 0.3    | ANTLR4 runtime for the parser backend (codegen behind `antlr-codegen` feature)                       | Yes (parser)                                           |
 | `chrono` 0.4        | Temporal type wrappers; `CatalogSnapshot.generated_at`, `OracleDateTime` default backend             | Yes                                                    |
 | `serde` / `serde_json` | Every public type is serde-derived; JSON snapshots round-trip via `CatalogSnapshotDocument`       | Yes                                                    |
@@ -121,7 +121,6 @@ could confuse with "looked, found none".
 | `miette` 7          | Human-readable diagnostics (downstream of `thiserror`)                                               | Indirect                                               |
 | `thiserror` 2       | Library-level error enums (used in every crate)                                                      | Yes                                                    |
 | `tracing` 0.1       | Structured logging; spans on every public API call per `AGENTS.md`                                   | Yes                                                    |
-| Oracle Instant Client (runtime) | Required by `rust-oracle` when the `live-db` feature is on                              | Yes (live-DB)                                          |
 
 ## Configuration
 
@@ -129,11 +128,10 @@ could confuse with "looked, found none".
 |------------------------------------------|-----------|------------------------------------------------------------------------------------------------------------------|
 | `~/.plsql-mcp/connections.toml`           | Per-user  | `[[connection]]` tables w/ `name`, `connect_string`, `username`, `permanently_read_only` (`PLSQL-MCP-LIVE-009`). |
 | `~/.dbtools`                              | Per-user  | Mirrored by `DbToolsAlias::probe` so SQLcl / SQL Developer aliases work verbatim (`PLSQL-MCP-LIVE-002`).         |
-| `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH` / `ORACLE_HOME` | Env       | Doctor's Instant Client detection (`PLSQL-MCP-LIVE-001`).                                            |
-| `TNS_ADMIN`                               | Env       | Wallet directory; resolved by `rust-oracle` at connect time.                                                     |
+| `TNS_ADMIN`                               | Env       | Wallet directory; resolved by the pure-Rust live connection path when applicable.                              |
 | `--robot-json` global flag                | Per-call  | Every CLI surface honors it (R10/R11). Distinct schemas registered in `LINEAGE_SCHEMAS` + per-tool envelopes.    |
 | `OracleTargetVersion` (parser)            | Per-call  | Drives dialect-feature diagnostic emission via `unsupported_dialect_feature_diagnostic` (`PLSQL-DIALECT-003`).   |
-| Cargo features `live-db`, `oracle-driver`, `antlr-codegen` | Build-time | Gate Instant Client + ANTLR codegen so static-only builds stay fast.                          |
+| Cargo features `live-db`, `live-xe`, `antlr-codegen` | Build-time | Gate live-DB tests and ANTLR codegen so static-only builds stay fast.                          |
 | `.plsql-bindgen.toml` (planned)           | Per-project | Manual row-shape overrides for REF CURSOR (`PLSQL-BG-008`), datetime backend selection (`PLSQL-BG-016`).        |
 | `.plsql-cicd-policy.toml` (planned)       | Per-project | Release-gate thresholds + predict-mode default (`PLSQL-CICD-006`).                                              |
 
@@ -201,7 +199,7 @@ PL/SQL examples are vendored under `corpus/public/` with manifest entries
 - [`CHANGELOG.md`](../CHANGELOG.md) — Unreleased entries enumerate every
   bead closed under this multi-agent session arc.
 - [`docs/integrations/live-db/`](integrations/live-db/) — Per-platform
-  Instant Client setup, wallet configuration, and editor / agent config
+  thin live-DB setup, wallet configuration, and editor / agent config
   snippets (`PLSQL-MCP-LIVE-020`).
 
 ## Session delta (2026-05-17)
@@ -222,9 +220,10 @@ suites unattended. A `DOCKER_COMPOSE` autodetect in the Makefile falls
 back to standalone `docker-compose` when the v2 plugin is absent.
 
 **Live-DB integration surface (now wired + verified).** A feature-gated
-`live-xe = ["oracle-driver"]` test pattern (gate-off trivial stub +
-gated real test, mirroring `crates/plsql-bindgen/tests/xe_roundtrip.rs`)
-runs across `plsql-catalog`, `plsql-cicd`, `plsql-mcp`. Delivered + live-
+`live-xe` test pattern (gate-off trivial stub + gated real test, mirroring
+`crates/plsql-bindgen/tests/xe_roundtrip.rs`) runs across `plsql-catalog`,
+`plsql-cicd`, `plsql-mcp`. Release live paths use `oraclemcp-db` over
+`oracledb`, not the retired thick `oracle` / ODPI-C driver. Delivered + live-
 verified against the container: catalog snapshot golden (`PLSQL-CAT-008`);
 `plsql-cicd::verify` against a throwaway `VERIFY_T_*` scratch schema with
 RAII teardown + no-rollback contract (`PLSQL-CICD-005`) and the

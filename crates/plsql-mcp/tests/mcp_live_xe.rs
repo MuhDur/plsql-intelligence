@@ -1,13 +1,12 @@
 //! Integration test: every live-DB tool E2E against Oracle XE 23ai.
 //!
 //! Gated behind the `live-xe` feature flag so the default test profile
-//! (no Docker, no `LD_LIBRARY_PATH`) doesn't try to reach a container that
-//! isn't there. The orchestrator or a developer with the lab container running
+//! (no Docker, no live Oracle) doesn't try to reach a container that isn't
+//! there. The orchestrator or a developer with the lab container running
 //! can flip the feature and execute the real path via:
 //!
 //! ```sh
-//! LD_LIBRARY_PATH=/tmp/instantclient_23_7 \
-//!     cargo test -p plsql-mcp --features live-xe \
+//! cargo test -p plsql-mcp --features live-xe \
 //!     --test mcp_live_xe -- --nocapture
 //! ```
 //!
@@ -70,10 +69,7 @@ fn live_xe_mcp_is_feature_gated() {
 #[cfg(feature = "live-xe")]
 mod live {
     use asupersync::{Cx, runtime::RuntimeBuilder};
-    use plsql_catalog::{
-        CatalogError, OracleBind, OracleConnectOptions, OracleConnection, OracleRow,
-        RustOracleConnection,
-    };
+    use plsql_catalog::{CatalogError, OracleBind, OracleConnection, OracleRow};
     use plsql_mcp::{
         CompileToolError,
         CompileWithWarningsResponse,
@@ -86,6 +82,7 @@ mod live {
         GetObjectSourceResponse,
         ListObjectsRequest,
         ListObjectsResponse,
+        OraclemcpCatalogConnection,
         // preview + execute_approved (chained flow)
         PreviewRegistry,
         QueryError,
@@ -119,29 +116,42 @@ mod live {
 
     static SCRATCH_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+    type LiveConnection = OraclemcpCatalogConnection<oraclemcp_db::RustOracleConnection>;
+
     const SYSTEM_USER: &str = "SYSTEM";
     const DEMO_USER: &str = "DEMO";
     const CONNECT_STRING: &str = "//localhost:1521/FREEPDB1";
 
     /// Connect as SYSTEM (DML/DDL privileges, can see ALL_* views broadly).
-    fn system_conn() -> RustOracleConnection {
+    fn system_conn() -> LiveConnection {
         let password = required_env("PLSQL_XE_SYSTEM_PASSWORD");
-        let opts = OracleConnectOptions::new(SYSTEM_USER, &password, CONNECT_STRING)
-            .with_module("plsql-mcp-live-xe-test")
-            .with_action("PLSQL-MCP-LIVE-018");
-        RustOracleConnection::connect(opts).expect(
-            "PLSQL-MCP-LIVE-018: SYSTEM connection to //localhost:1521/FREEPDB1 must succeed",
-        )
+        connect(SYSTEM_USER, password, "PLSQL-MCP-LIVE-018")
     }
 
     /// Connect as DEMO (read-only fixtures; DEMO is treated as read-only in tests).
-    fn demo_conn() -> RustOracleConnection {
+    fn demo_conn() -> LiveConnection {
         let password = required_env("PLSQL_XE_DEMO_PASSWORD");
-        let opts = OracleConnectOptions::new(DEMO_USER, &password, CONNECT_STRING)
-            .with_module("plsql-mcp-live-xe-test")
-            .with_action("PLSQL-MCP-LIVE-018-demo");
-        RustOracleConnection::connect(opts)
-            .expect("PLSQL-MCP-LIVE-018: DEMO connection to //localhost:1521/FREEPDB1 must succeed")
+        connect(DEMO_USER, password, "PLSQL-MCP-LIVE-018-demo")
+    }
+
+    fn connect(username: &str, password: String, action: &str) -> LiveConnection {
+        let opts = oraclemcp_db::OracleConnectOptions {
+            connect_string: CONNECT_STRING.to_owned(),
+            username: Some(username.to_owned()),
+            password: Some(password),
+            session_identity: Some(oraclemcp_db::OracleSessionIdentity {
+                module: Some("plsql-mcp-live-xe-test".to_owned()),
+                action: Some(action.to_owned()),
+                ..oraclemcp_db::OracleSessionIdentity::default()
+            }),
+            ..oraclemcp_db::OracleConnectOptions::default()
+        };
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            OraclemcpCatalogConnection::connect(&cx, opts)
+                .await
+                .expect("live-XE thin connection to //localhost:1521/FREEPDB1 must succeed")
+        })
     }
 
     /// Returns a scratch table name unique to this process.
@@ -183,7 +193,7 @@ mod live {
     }
 
     /// Drop the scratch table if it still exists (best-effort teardown).
-    fn drop_scratch_table_if_exists(conn: &RustOracleConnection, name: &str) {
+    fn drop_scratch_table_if_exists(conn: &LiveConnection, name: &str) {
         // Oracle has no DROP TABLE IF EXISTS before 23ai; use a PL/SQL block.
         let sql = format!(
             "BEGIN \

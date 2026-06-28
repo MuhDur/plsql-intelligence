@@ -28,8 +28,7 @@
 //!
 //! Run the live path with:
 //! ```sh
-//! LD_LIBRARY_PATH=/tmp/instantclient_23_7 \
-//!     cargo test -p plsql-mcp --features live-xe \
+//! cargo test -p plsql-mcp --features live-xe \
 //!     --test hero_demo_live_xe -- --nocapture
 //! ```
 
@@ -50,12 +49,11 @@ fn hero_demo_live_xe_is_feature_gated() {
 #[cfg(feature = "live-xe")]
 mod live {
     use asupersync::{Cx, runtime::RuntimeBuilder};
-    use plsql_catalog::{
-        CatalogError, OracleBind, OracleConnectOptions, OracleConnection, RustOracleConnection,
-    };
+    use plsql_catalog::{CatalogError, OracleBind, OracleConnection};
     use plsql_mcp::{
         GetErrorsResponse, GetObjectSourceResponse, ListObjectsRequest, ListObjectsResponse,
-        QueryError, QueryResponse, SourceToolError, run_get_errors as run_get_errors_async,
+        OraclemcpCatalogConnection, QueryError, QueryResponse, SourceToolError,
+        run_get_errors as run_get_errors_async,
         run_get_object_source as run_get_object_source_async,
         run_list_objects as run_list_objects_async, run_query as run_query_async,
     };
@@ -71,17 +69,30 @@ mod live {
 
     static SCRATCH_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+    type LiveConnection = OraclemcpCatalogConnection<oraclemcp_db::RustOracleConnection>;
+
     const SYSTEM_USER: &str = "SYSTEM";
     const CONNECT_STRING: &str = "//localhost:1521/FREEPDB1";
 
-    fn system_conn() -> RustOracleConnection {
+    fn system_conn() -> LiveConnection {
         let password = required_env("PLSQL_XE_SYSTEM_PASSWORD");
-        let opts = OracleConnectOptions::new(SYSTEM_USER, &password, CONNECT_STRING)
-            .with_module("plsql-mcp-hero-demo-test")
-            .with_action("PLSQL-MCP-LIVE-019");
-        RustOracleConnection::connect(opts).expect(
-            "PLSQL-MCP-LIVE-019: SYSTEM connection to //localhost:1521/FREEPDB1 must succeed",
-        )
+        let opts = oraclemcp_db::OracleConnectOptions {
+            connect_string: CONNECT_STRING.to_owned(),
+            username: Some(SYSTEM_USER.to_owned()),
+            password: Some(password),
+            session_identity: Some(oraclemcp_db::OracleSessionIdentity {
+                module: Some("plsql-mcp-hero-demo-test".to_owned()),
+                action: Some("PLSQL-MCP-LIVE-019".to_owned()),
+                ..oraclemcp_db::OracleSessionIdentity::default()
+            }),
+            ..oraclemcp_db::OracleConnectOptions::default()
+        };
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            OraclemcpCatalogConnection::connect(&cx, opts)
+                .await
+                .expect("PLSQL-MCP-LIVE-019: SYSTEM thin connection must succeed")
+        })
     }
 
     fn run_live_future<F: Future>(future: F) -> F::Output {
@@ -184,7 +195,7 @@ mod live {
     }
 
     /// Drop the entire scratch schema (user + all its objects) unconditionally.
-    fn drop_scratch_schema(conn: &RustOracleConnection, schema: &str) {
+    fn drop_scratch_schema(conn: &LiveConnection, schema: &str) {
         // Oracle 23ai: DROP USER … CASCADE removes all objects.
         let sql = format!(
             "BEGIN \
@@ -197,7 +208,7 @@ mod live {
 
     /// Create a minimal schema (user) with CONNECT + RESOURCE privileges so we
     /// can create packages inside it.
-    fn create_scratch_schema(conn: &RustOracleConnection, schema: &str) {
+    fn create_scratch_schema(conn: &LiveConnection, schema: &str) {
         // 1. Drop leftover debris from a previous aborted run.
         drop_scratch_schema(conn, schema);
 
@@ -226,7 +237,7 @@ mod live {
     /// Drops the scratch schema in `Drop::drop` so teardown is unconditional
     /// even if the test panics mid-way.
     struct SchemaGuard {
-        conn: RustOracleConnection,
+        conn: LiveConnection,
         schema: String,
     }
 

@@ -22,7 +22,7 @@
 | Backend | Crate | State in this repo |
 |---|---|---|
 | `antlr4rust` | `plsql-parser-antlr` | In-process; the working default. Drives lowering for the whole pipeline. |
-| `java-antlr` | `plsql-parser-java` | Subprocess shell-out (PARSE-000B) + neutral wire protocol (PARSE-000D). The Java ANTLR worker **jar is not built in this environment**. |
+| `java-antlr` | `plsql-parser-java` | Retired on 2026-06-28 after the backend tournament loser was removed from the workspace. Historical notes below describe the removed fallback candidate. |
 
 Both implement the *same* `ParseBackend` trait (PARSE-000), so
 either can be slotted in without touching consumers.
@@ -75,9 +75,9 @@ checklist a future tournament re-run must satisfy:
       for the degradation path; must remain true for the live
       path).
 
-Until then the system ships single-backend (`antlr4rust`) with
-`java-antlr` available behind explicit configuration as an
-operator escape hatch.
+After the 2026-06-28 retirement, the system ships single-backend
+(`antlr4rust`). Reintroducing a Java fallback would be a new
+tournament/revival decision, not a hidden configuration switch.
 
 ## 4. Why this is safe to decide now
 

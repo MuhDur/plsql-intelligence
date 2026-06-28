@@ -12,7 +12,6 @@ members = [
     "crates/plsql-symbols",
     "crates/plsql-parser",
     "crates/plsql-parser-antlr",
-    "crates/plsql-parser-java",
     "crates/plsql-project",
     "crates/plsql-doc",
     "crates/plsql-bindgen",
@@ -58,7 +57,7 @@ dbg_macro = "deny"
 todo = "deny"
 
 # Crash safety (plan §5.7, bead P2-2): the shipped server aborts on panic rather
-# than unwinding across the ODPI-C FFI / async tasks. Only affects release
+# than unwinding across async server tasks. Only affects release
 # builds; `cargo test` still unwinds (so #[should_panic] works).
 [profile.release]
 panic = "abort"

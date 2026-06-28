@@ -43,8 +43,7 @@
 //!
 //! Requires the `live-xe` feature flag:
 //! ```sh
-//! LD_LIBRARY_PATH=/tmp/instantclient_23_7 \
-//!     cargo test -p plsql-cicd --features live-xe \
+//! cargo test -p plsql-cicd --features live-xe \
 //!     --test cicd_cycle_live_xe -- --nocapture
 //! ```
 //!
@@ -69,8 +68,7 @@ fn live_xe_cicd_cycle_is_feature_gated() {
 mod live {
     use asupersync::{Cx, runtime::RuntimeBuilder};
     use plsql_catalog::{
-        CatalogError, OracleBind, OracleConnectOptions, OracleConnection, OracleRow,
-        RustOracleConnection,
+        CatalogError, OracleBind, OracleConnection, OracleRow, OraclemcpDbConnection,
     };
     use plsql_cicd::{
         ChangeSet, ChangedObject, ChangedObjectKind, DeploymentRisk, DeploymentStatementKind,
@@ -90,17 +88,27 @@ mod live {
 
     static SCRATCH_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+    type LiveConnection = OraclemcpDbConnection;
+
     const SYSTEM_USER: &str = "SYSTEM";
     const CONNECT_STRING: &str = "//localhost:1521/FREEPDB1";
 
     /// Connect as SYSTEM (has CREATE USER / DROP USER / GRANT privileges).
-    fn system_conn() -> RustOracleConnection {
+    fn system_conn() -> LiveConnection {
         let password = required_env("PLSQL_XE_SYSTEM_PASSWORD");
-        let opts = OracleConnectOptions::new(SYSTEM_USER, &password, CONNECT_STRING)
-            .with_module("plsql-cicd-cycle-test")
-            .with_action("PLSQL-CICD-010");
-        RustOracleConnection::connect(opts)
-            .expect("SYSTEM connection to //localhost:1521/FREEPDB1 must succeed")
+        run_live_future(async {
+            let cx = Cx::current().expect("live-xe runtime installs a request Cx");
+            OraclemcpDbConnection::connect_with_password(
+                &cx,
+                SYSTEM_USER,
+                password,
+                CONNECT_STRING,
+                "plsql-cicd-cycle-test",
+                "PLSQL-CICD-010",
+            )
+            .await
+            .expect("SYSTEM thin connection to //localhost:1521/FREEPDB1 must succeed")
+        })
     }
 
     fn run_live_future<F: Future>(future: F) -> F::Output {
@@ -124,7 +132,7 @@ mod live {
     }
 
     fn verify(
-        conn: &RustOracleConnection,
+        conn: &LiveConnection,
         changeset: &VerifyChangeset,
         options: &VerifyOptions,
     ) -> Result<VerifyReport, plsql_cicd::verify::VerifyError> {

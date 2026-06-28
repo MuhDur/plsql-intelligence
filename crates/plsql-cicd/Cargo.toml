@@ -7,14 +7,10 @@ license.workspace = true
 
 [features]
 default = []
-## Compile the `oracle` crate driver (wraps OCI) into plsql-catalog so that
-## `plsql-cicd` can open live Oracle connections for `verify` and `inspect`.
-oracle-driver = ["plsql-catalog/oracle-driver"]
 ## Enable the live Oracle XE 23ai integration tests for `verify`
 ## (oracle-m941 / PLSQL-CICD-005). Requires the `plsql-intelligence-xe`
-## container running at localhost:1521/FREEPDB1 and
-## LD_LIBRARY_PATH=/tmp/instantclient_23_7 set.
-live-xe = ["oracle-driver"]
+## container running at localhost:1521/FREEPDB1.
+live-xe = ["plsql-catalog/live-xe"]
 
 [dependencies]
 async-trait = "0.1"

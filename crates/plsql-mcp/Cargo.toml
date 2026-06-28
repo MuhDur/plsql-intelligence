@@ -13,13 +13,10 @@ default = ["live-db"]
 # exposes the foundation static-analysis tools.
 live-db = []
 # Enables the live Oracle XE 23ai integration tests for the MCP live-DB
-# tools (oracle-7nmg / PLSQL-MCP-LIVE-018).  Requires the
-# `plsql-intelligence-xe` container running at localhost:1521/FREEPDB1 and
-# `LD_LIBRARY_PATH=/tmp/instantclient_23_7` set.
-live-xe = ["oracle-driver"]
-# Internal alias: keep the legacy thick catalog driver compilable until the
-# C.6 parity gate retires it. The default binary path does not use this.
-oracle-driver = ["plsql-catalog/oracle-driver"]
+# tools (oracle-7nmg / PLSQL-MCP-LIVE-018). Runtime connections use the
+# published pure-Rust `oraclemcp-db` backend; no Oracle Instant Client is
+# required for this feature.
+live-xe = []
 
 [[bin]]
 name = "plsql-mcp"

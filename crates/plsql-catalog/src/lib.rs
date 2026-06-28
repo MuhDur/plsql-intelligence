@@ -7,13 +7,6 @@ use std::path::PathBuf;
 
 use asupersync::Cx;
 use chrono::{DateTime, Utc};
-#[cfg(feature = "oracle-driver")]
-use oracle::sql_type::ToSql as OracleToSql;
-#[cfg(feature = "oracle-driver")]
-use oracle::{
-    Connection as DriverConnection, Connector as DriverConnector, Row as DriverRow,
-    SqlValue as DriverSqlValue,
-};
 use plsql_core::{
     AnalysisProfile, ColumnName, EditionName, MemberName, ObjectName, OracleVersion, RoleName,
     SchemaName, SymbolId, SymbolInterner, UserName,
@@ -672,7 +665,7 @@ pub enum CatalogError {
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("oracle backend `{backend}` is not compiled in; enable Cargo feature `{feature}`")]
+    #[error("oracle backend `{backend}` is unavailable in this build; use `{feature}`")]
     OracleBackendNotCompiled {
         backend: OracleBackend,
         feature: &'static str,
@@ -1010,110 +1003,87 @@ pub trait OracleConnection: Send + Sync {
     }
 }
 
-#[must_use]
-#[instrument(level = "trace")]
-pub fn rust_oracle_driver_compiled() -> bool {
-    cfg!(feature = "oracle-driver")
+/// Pure-Rust thin Oracle adapter over the shared `oraclemcp-db` connection
+/// layer.
+///
+/// This adapter is optional and exists for live-XE tests and lower-layer
+/// callers that need a concrete implementation of [`OracleConnection`] without
+/// depending on the MCP crate. The default catalog crate remains offline-first.
+#[cfg(feature = "oraclemcp-db")]
+pub struct OraclemcpDbConnection {
+    inner: oraclemcp_db::RustOracleConnection,
+    connect_string: String,
 }
 
-#[derive(Debug)]
-pub struct RustOracleConnection {
-    options: OracleConnectOptions,
-    #[cfg(feature = "oracle-driver")]
-    inner: DriverConnection,
-}
-
-impl RustOracleConnection {
-    #[instrument(level = "trace", skip(options))]
-    pub fn connect(options: OracleConnectOptions) -> Result<Self, CatalogError> {
-        #[cfg(not(feature = "oracle-driver"))]
-        {
-            let _ = options;
-            Err(CatalogError::OracleBackendNotCompiled {
-                backend: OracleBackend::RustOracle,
-                feature: "oracle-driver",
-            })
-        }
-
-        #[cfg(feature = "oracle-driver")]
-        {
-            let connection = connect_with_rust_oracle(&options)?;
-            Ok(Self {
-                options,
-                inner: connection,
-            })
-        }
+#[cfg(feature = "oraclemcp-db")]
+impl OraclemcpDbConnection {
+    /// Open a pure-Rust thin Oracle connection.
+    pub async fn connect(
+        cx: &Cx,
+        options: oraclemcp_db::OracleConnectOptions,
+    ) -> Result<Self, CatalogError> {
+        let connect_string = options.connect_string.clone();
+        let inner = oraclemcp_db::RustOracleConnection::connect(cx, options)
+            .await
+            .map_err(map_oraclemcp_db_error)?;
+        Ok(Self {
+            inner,
+            connect_string,
+        })
     }
 
+    /// Open a password-authenticated pure-Rust thin Oracle connection with a
+    /// module/action identity.
+    pub async fn connect_with_password(
+        cx: &Cx,
+        username: impl Into<String>,
+        password: impl Into<String>,
+        connect_string: impl Into<String>,
+        module: impl Into<String>,
+        action: impl Into<String>,
+    ) -> Result<Self, CatalogError> {
+        let options = oraclemcp_db::OracleConnectOptions {
+            connect_string: connect_string.into(),
+            username: Some(username.into()),
+            password: Some(password.into()),
+            session_identity: Some(oraclemcp_db::OracleSessionIdentity {
+                module: Some(module.into()),
+                action: Some(action.into()),
+                ..oraclemcp_db::OracleSessionIdentity::default()
+            }),
+            ..oraclemcp_db::OracleConnectOptions::default()
+        };
+        Self::connect(cx, options).await
+    }
+
+    /// Borrow the underlying shared driver connection.
     #[must_use]
-    #[instrument(level = "trace", skip(self))]
-    pub fn options(&self) -> &OracleConnectOptions {
-        &self.options
+    pub fn inner(&self) -> &oraclemcp_db::RustOracleConnection {
+        &self.inner
     }
 }
 
+#[cfg(feature = "oraclemcp-db")]
 #[async_trait::async_trait(?Send)]
-impl OracleConnection for RustOracleConnection {
+impl OracleConnection for OraclemcpDbConnection {
     #[instrument(level = "trace", skip(self))]
     fn backend(&self) -> OracleBackend {
-        OracleBackend::RustOracle
+        OracleBackend::OracleRs
     }
 
     #[instrument(level = "trace", skip(self))]
     async fn ping(&self, cx: &Cx) -> Result<(), CatalogError> {
-        let _ = cx;
-        #[cfg(not(feature = "oracle-driver"))]
-        {
-            Err(CatalogError::OracleBackendNotCompiled {
-                backend: OracleBackend::RustOracle,
-                feature: "oracle-driver",
-            })
-        }
-
-        #[cfg(feature = "oracle-driver")]
-        {
-            self.inner.ping().map_err(map_rust_oracle_error)
-        }
+        oraclemcp_db::OracleConnection::ping(&self.inner, cx)
+            .await
+            .map_err(map_oraclemcp_db_error)
     }
 
     #[instrument(level = "trace", skip(self))]
     async fn describe(&self, cx: &Cx) -> Result<OracleConnectionInfo, CatalogError> {
-        #[cfg(not(feature = "oracle-driver"))]
-        {
-            let _ = cx;
-            Err(CatalogError::OracleBackendNotCompiled {
-                backend: OracleBackend::RustOracle,
-                feature: "oracle-driver",
-            })
-        }
-
-        #[cfg(feature = "oracle-driver")]
-        {
-            let info = self.inner.info().map_err(map_rust_oracle_error)?;
-            let (_, server_version) = self.inner.server_version().map_err(map_rust_oracle_error)?;
-            let current_schema = self
-                .query_optional_row(
-                    cx,
-                    "select sys_context('userenv', 'current_schema') as current_schema from dual",
-                    &[],
-                )
-                .await?
-                .and_then(|row| row.text("CURRENT_SCHEMA").map(String::from));
-
-            Ok(OracleConnectionInfo {
-                backend: OracleBackend::RustOracle,
-                connect_string: self.options.connect_string.clone(),
-                current_schema,
-                server_version,
-                db_name: info.db_name.clone(),
-                db_domain: info.db_domain.clone(),
-                service_name: info.service_name.clone(),
-                instance_name: info.instance_name.clone(),
-                server_type: format!("{:?}", info.server_type),
-                max_identifier_length: info.max_identifier_length,
-                max_open_cursors: info.max_open_cursors,
-            })
-        }
+        oraclemcp_db::OracleConnection::describe(&self.inner, cx)
+            .await
+            .map(|info| map_oraclemcp_connection_info(info, &self.connect_string))
+            .map_err(map_oraclemcp_db_error)
     }
 
     #[instrument(level = "trace", skip(self, sql, params))]
@@ -1123,34 +1093,11 @@ impl OracleConnection for RustOracleConnection {
         sql: &str,
         params: &[OracleBind],
     ) -> Result<Vec<OracleRow>, CatalogError> {
-        let _ = cx;
-        #[cfg(not(feature = "oracle-driver"))]
-        {
-            let _ = sql;
-            let _ = params;
-            Err(CatalogError::OracleBackendNotCompiled {
-                backend: OracleBackend::RustOracle,
-                feature: "oracle-driver",
-            })
-        }
-
-        #[cfg(feature = "oracle-driver")]
-        {
-            let owned_binds = rust_oracle_binds(params);
-            let bind_refs = rust_oracle_bind_refs(&owned_binds);
-            let rows = self
-                .inner
-                .query(sql, &bind_refs)
-                .map_err(map_rust_oracle_error)?;
-            let mut collected = Vec::new();
-
-            for row_result in rows {
-                let row = row_result.map_err(map_rust_oracle_error)?;
-                collected.push(driver_row_to_catalog_row(&row)?);
-            }
-
-            Ok(collected)
-        }
+        let binds = map_oraclemcp_binds(params)?;
+        oraclemcp_db::OracleConnection::query_rows(&self.inner, cx, sql, &binds)
+            .await
+            .map(map_oraclemcp_rows)
+            .map_err(map_oraclemcp_db_error)
     }
 
     #[instrument(level = "trace", skip(self, sql, params))]
@@ -1160,132 +1107,78 @@ impl OracleConnection for RustOracleConnection {
         sql: &str,
         params: &[OracleBind],
     ) -> Result<u64, CatalogError> {
-        let _ = cx;
-        #[cfg(not(feature = "oracle-driver"))]
-        {
-            let _ = sql;
-            let _ = params;
-            Err(CatalogError::OracleBackendNotCompiled {
-                backend: OracleBackend::RustOracle,
-                feature: "oracle-driver",
-            })
-        }
-
-        #[cfg(feature = "oracle-driver")]
-        {
-            let owned_binds = rust_oracle_binds(params);
-            let bind_refs = rust_oracle_bind_refs(&owned_binds);
-            let statement = self
-                .inner
-                .execute(sql, &bind_refs)
-                .map_err(map_rust_oracle_error)?;
-            statement.row_count().map_err(map_rust_oracle_error)
-        }
+        let binds = map_oraclemcp_binds(params)?;
+        oraclemcp_db::OracleConnection::execute(&self.inner, cx, sql, &binds)
+            .await
+            .map_err(map_oraclemcp_db_error)
     }
 }
 
-#[cfg(feature = "oracle-driver")]
-#[instrument(level = "trace", skip(options))]
-fn connect_with_rust_oracle(
-    options: &OracleConnectOptions,
-) -> Result<DriverConnection, CatalogError> {
-    let connector = DriverConnector::new(
-        options.username.clone(),
-        options.password.clone(),
-        options.connect_string.clone(),
-    );
-    let connection = connector.connect().map_err(map_rust_oracle_error)?;
-
-    if let Some(current_schema) = &options.current_schema {
-        connection
-            .set_current_schema(current_schema)
-            .map_err(map_rust_oracle_error)?;
+#[cfg(feature = "oraclemcp-db")]
+fn map_oraclemcp_connection_info(
+    info: oraclemcp_db::OracleConnectionInfo,
+    connect_string: &str,
+) -> OracleConnectionInfo {
+    OracleConnectionInfo {
+        backend: OracleBackend::OracleRs,
+        connect_string: connect_string.to_owned(),
+        current_schema: info.current_schema,
+        server_version: info.server_version.unwrap_or_default(),
+        db_name: String::new(),
+        db_domain: String::new(),
+        service_name: String::new(),
+        instance_name: String::new(),
+        server_type: info.database_role.unwrap_or_default(),
+        max_identifier_length: 128,
+        max_open_cursors: 0,
     }
-    if let Some(module) = &options.module {
-        connection
-            .set_module(module)
-            .map_err(map_rust_oracle_error)?;
-    }
-    if let Some(action) = &options.action {
-        connection
-            .set_action(action)
-            .map_err(map_rust_oracle_error)?;
-    }
-    if let Some(client_info) = &options.client_info {
-        connection
-            .set_client_info(client_info)
-            .map_err(map_rust_oracle_error)?;
-    }
-    if let Some(client_identifier) = &options.client_identifier {
-        connection
-            .set_client_identifier(client_identifier)
-            .map_err(map_rust_oracle_error)?;
-    }
-
-    Ok(connection)
 }
 
-#[cfg(feature = "oracle-driver")]
-fn rust_oracle_binds(params: &[OracleBind]) -> Vec<Box<dyn OracleToSql>> {
-    let mut binds = Vec::<Box<dyn OracleToSql>>::with_capacity(params.len());
-    for param in params {
-        match param {
-            OracleBind::String(value) => binds.push(Box::new(value.clone())),
-            OracleBind::I64(value) => binds.push(Box::new(*value)),
-            OracleBind::U64(value) => binds.push(Box::new(*value)),
-            OracleBind::Bool(value) => binds.push(Box::new(*value)),
-        }
-    }
-    binds
-}
-
-#[cfg(feature = "oracle-driver")]
-fn rust_oracle_bind_refs(params: &[Box<dyn OracleToSql>]) -> Vec<&dyn OracleToSql> {
+#[cfg(feature = "oraclemcp-db")]
+fn map_oraclemcp_binds(
+    params: &[OracleBind],
+) -> Result<Vec<oraclemcp_db::OracleBind>, CatalogError> {
     params
         .iter()
-        .map(|value| value.as_ref())
-        .collect::<Vec<_>>()
+        .map(|param| match param {
+            OracleBind::String(value) => Ok(oraclemcp_db::OracleBind::String(value.clone())),
+            OracleBind::I64(value) => Ok(oraclemcp_db::OracleBind::I64(*value)),
+            OracleBind::U64(value) => {
+                let signed =
+                    i64::try_from(*value).map_err(|_| CatalogError::InvalidColumnValue {
+                        column: String::from("bind"),
+                        expected: "u64 <= i64::MAX for oraclemcp-db positional bind",
+                        value: value.to_string(),
+                    })?;
+                Ok(oraclemcp_db::OracleBind::I64(signed))
+            }
+            OracleBind::Bool(value) => Ok(oraclemcp_db::OracleBind::Bool(*value)),
+        })
+        .collect()
 }
 
-#[cfg(feature = "oracle-driver")]
-fn driver_row_to_catalog_row(row: &DriverRow) -> Result<OracleRow, CatalogError> {
-    let mut converted = OracleRow::default();
-    let sql_values = row.sql_values();
+#[cfg(feature = "oraclemcp-db")]
+fn map_oraclemcp_rows(rows: Vec<oraclemcp_db::OracleRow>) -> Vec<OracleRow> {
+    rows.into_iter().map(map_oraclemcp_row).collect()
+}
 
-    for (index, column_info) in row.column_info().iter().enumerate() {
-        let Some(sql_value) = sql_values.get(index) else {
-            return Err(CatalogError::MissingColumn {
-                column: column_info.name().to_ascii_uppercase(),
-            });
-        };
-        let value = driver_sql_value_to_text(sql_value)?;
-        converted.insert(
-            column_info.name(),
-            column_info.oracle_type().to_string(),
-            value,
+#[cfg(feature = "oraclemcp-db")]
+fn map_oraclemcp_row(row: oraclemcp_db::OracleRow) -> OracleRow {
+    let mut mapped = OracleRow::default();
+    for (name, cell) in row.columns {
+        mapped.columns.insert(
+            name.to_ascii_uppercase(),
+            OracleCell::new(cell.oracle_type, cell.value),
         );
     }
-
-    Ok(converted)
+    mapped
 }
 
-#[cfg(feature = "oracle-driver")]
-fn driver_sql_value_to_text(value: &DriverSqlValue<'_>) -> Result<Option<String>, CatalogError> {
-    if value.is_null().map_err(map_rust_oracle_error)? {
-        return Ok(None);
-    }
-
-    match value.get::<String>() {
-        Ok(text) => Ok(Some(text)),
-        Err(_) => Ok(Some(value.to_string())),
-    }
-}
-
-#[cfg(feature = "oracle-driver")]
-fn map_rust_oracle_error(error: oracle::Error) -> CatalogError {
+#[cfg(feature = "oraclemcp-db")]
+fn map_oraclemcp_db_error(err: oraclemcp_db::DbError) -> CatalogError {
     CatalogError::OracleBackendError {
-        backend: OracleBackend::RustOracle,
-        message: error.to_string(),
+        backend: OracleBackend::OracleRs,
+        message: err.to_string(),
     }
 }
 
@@ -5507,8 +5400,6 @@ mod tests {
     use plsql_core::{AnalysisProfile, ColumnName, MemberName, ObjectName, SchemaName, SymbolId};
     use tempfile::tempdir;
 
-    #[cfg(not(feature = "oracle-driver"))]
-    use crate::RustOracleConnection;
     use crate::{
         AccessibleByTarget, CATALOG_SNAPSHOT_SCHEMA_ID, CATALOG_SNAPSHOT_SCHEMA_VERSION,
         CapabilityWarning, CatalogCapabilities, CatalogDependencyKind, CatalogError,
@@ -5521,7 +5412,7 @@ mod tests {
         TriggerTiming, TypeFinality, TypeInstantiable, export_snapshot_to_json,
         grantee_from_dictionary_value, load_catalog_users, load_from_dbms_metadata_dir,
         load_snapshot_from_connection, load_snapshot_from_json, negotiate_capabilities,
-        populate_dbms_metadata_ddl, rust_oracle_driver_compiled,
+        populate_dbms_metadata_ddl,
     };
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -7287,32 +7178,6 @@ mod tests {
     }
 
     #[test]
-    fn rust_oracle_driver_flag_matches_cfg() {
-        assert_eq!(
-            rust_oracle_driver_compiled(),
-            cfg!(feature = "oracle-driver")
-        );
-    }
-
-    #[cfg(not(feature = "oracle-driver"))]
-    #[test]
-    fn rust_oracle_connect_reports_missing_feature_gate() {
-        let error = RustOracleConnection::connect(OracleConnectOptions::new(
-            "scott",
-            "tiger",
-            "//localhost/XE",
-        ));
-
-        assert!(matches!(
-            error,
-            Err(CatalogError::OracleBackendNotCompiled {
-                backend: OracleBackend::RustOracle,
-                feature: "oracle-driver",
-            })
-        ));
-    }
-
-    #[test]
     fn catalog_snapshot_initializes_with_empty_schema_map() {
         let snapshot = CatalogSnapshot::new(
             AnalysisProfile::default(),
@@ -8018,7 +7883,7 @@ mod tests {
             CatalogSource {
                 kind: CatalogSourceKind::LiveConnection,
                 path: None,
-                description: Some(String::from("live extraction via rust-oracle from xe")),
+                description: Some(String::from("live extraction via oraclemcp-db from xe")),
             },
             DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
         );

@@ -375,7 +375,7 @@ fn derive_write_posture(registry: &ConnectionRegistry) -> Vec<ConnectionWritePos
         .collect()
 }
 
-/// Report the legacy Instant Client posture.
+/// Report the retired Instant Client posture.
 ///
 /// The normal live-DB path uses `oraclemcp-db` and does not inspect client
 /// library paths. C.6 removes the remaining thick-driver compatibility path.
