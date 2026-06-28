@@ -198,7 +198,7 @@ runs:
                 ($payload.compile_error_flags // []
                   | .[:10]
                   | map("- " + .object_type + " #" + (.owner_symbol | tostring) + "." + (.name_symbol | tostring)
-                      + ": " + .message);
+                      + ": " + .message));
                 "- None"
               ),
               "",
