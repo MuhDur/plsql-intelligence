@@ -72,9 +72,9 @@ impl Rule for Qual001WhenOthersThenNull {
                     "`WHEN OTHERS THEN NULL` in `{unit_logical_id}` silently swallows every \
                      exception"
                 ),
-                ctx.source_file,
+                ctx.source_file_for_fact(fact),
                 // Exception-handler facts are source-scanned and
-                // carry no precise span; point at the unit.
+                // carry no precise span; point at the fact source.
                 0,
                 (0, 0),
             );
@@ -152,7 +152,7 @@ impl Rule for Qual004TxnControlInHandler {
                     "`{verb}` inside the `WHEN {scope}` exception handler of \
                      `{unit_logical_id}` breaks caller atomicity on the error path"
                 ),
-                ctx.source_file,
+                ctx.source_file_for_fact(fact),
                 0,
                 (0, 0),
             );
@@ -181,6 +181,8 @@ mod tests {
             component: "test".to_string(),
             component_version: "0".to_string(),
             run_id: String::new(),
+            source_logical_id: None,
+            source_file: None,
         }
     }
 

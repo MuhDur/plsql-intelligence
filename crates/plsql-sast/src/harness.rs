@@ -181,23 +181,20 @@ pub fn run_scan(
             ))
     });
 
-    // Interim guard for the per-unit / project-scoped split
-    // (oracle-qm3q.24): fact-driven rules iterate the whole shared
-    // `FactStore` *inside* the per-unit loop, so a single
-    // catalog/DDL fact (e.g. one `GRANT … TO PUBLIC`) is emitted
-    // once per unit, each copy mis-stamped with the iterated unit's
-    // `source_file`. Until fact payloads carry their own source and
-    // such rules run once project-wide, collapse exact logical
-    // duplicates on the location-insensitive `primary` fingerprint.
+    // Guard for the per-unit / project-scoped split: fact-driven
+    // rules iterate the whole shared `FactStore` *inside* the
+    // per-unit loop, so a single catalog/DDL fact (e.g. one `GRANT …
+    // TO PUBLIC`) can be emitted once per unit. Fact provenance keeps
+    // source-aware rules attributed to the fact source; this guard
+    // still collapses exact logical duplicates until those rules can
+    // run once project-wide.
     //
     // This is sound because every rule's message embeds the
     // offending object / site / unit identity, so two findings that
     // share a `primary` (rule_id + severity + message) are the same
     // logical finding — never two distinct sites that merely happen
     // to read alike. Dedup runs *after* the sort so the survivor is
-    // deterministic. It does not yet correct attribution (the
-    // surviving copy keeps the first sorted `source_file`); that
-    // needs fact-carried provenance and is tracked as deferred.
+    // deterministic.
     {
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         report
@@ -367,6 +364,8 @@ mod tests {
                 component: "plsql-sast-test".to_string(),
                 component_version: "0".to_string(),
                 run_id: String::new(),
+                source_logical_id: None,
+                source_file: None,
             },
             FactPayload::Privilege {
                 grantee: "R".to_string(),
@@ -429,7 +428,10 @@ mod tests {
                 component: "plsql-sast-test".to_string(),
                 component_version: "0".to_string(),
                 run_id: String::new(),
-            },
+                source_logical_id: None,
+                source_file: None,
+            }
+            .with_source("HR.PKG", "catalog/grants.sql"),
             FactPayload::Privilege {
                 grantee: "PUBLIC".to_string(),
                 privilege: "EXECUTE".to_string(),
@@ -467,6 +469,7 @@ mod tests {
         );
         assert_eq!(r.findings[0].rule_id, "SEC006");
         assert!(r.findings[0].message.contains("HR.PKG"));
+        assert_eq!(r.findings[0].location.file, "catalog/grants.sql");
     }
 
     #[test]
@@ -485,6 +488,8 @@ mod tests {
                     component: "plsql-sast-test".to_string(),
                     component_version: "0".to_string(),
                     run_id: String::new(),
+                    source_logical_id: None,
+                    source_file: None,
                 },
                 FactPayload::Privilege {
                     grantee: "PUBLIC".to_string(),

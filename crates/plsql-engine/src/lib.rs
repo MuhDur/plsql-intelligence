@@ -633,7 +633,7 @@ fn leading_dml_verb(raw_text: &str) -> Option<plsql_ir::SqlVerb> {
                 // `DELETED_FLAG` would masquerade as a verb.
                 let boundary = match trimmed[kw.len()..].chars().next() {
                     None => true,
-                    Some(c) => !(c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '#'),
+                    Some(c) => !(c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '#')),
                 };
                 if boundary {
                     return Some(verb);
@@ -885,6 +885,8 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
         component: "plsql-engine".into(),
         component_version: env!("CARGO_PKG_VERSION").into(),
         run_id: String::new(),
+        source_logical_id: None,
+        source_file: None,
     };
     // The synthetic "UNKNOWN" schema used for nodes whose schema cannot
     // be resolved from source alone (no live catalog).
@@ -947,16 +949,19 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
         });
         run.diagnostics.extend(parse_result.diagnostics);
         run.diagnostics.extend(lowered.diagnostics);
+        let fact_source_file = f.relative_path.clone();
+        let source_prov = |source_logical_id: &str| {
+            engine_prov().with_source(source_logical_id.to_string(), fact_source_file.clone())
+        };
 
         // --- Fact emission: one Declaration fact per top-level decl --------
-        let prov = engine_prov();
         for decl in &lowered.declarations {
             let logical_id = interner
                 .resolve(decl.common().name)
                 .unwrap_or("")
                 .to_ascii_uppercase();
             let decl_fact = mint_fact(
-                prov.clone(),
+                source_prov(&logical_id),
                 FactPayload::Declaration {
                     decl: plsql_ir::DeclId::new(next_node_id),
                     logical_id: logical_id.clone(),
@@ -1057,7 +1062,7 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
                 let callee_logical = cs.callee_parts.join(".").to_ascii_uppercase();
                 // Emit a call fact.
                 let call_fact = mint_fact(
-                    engine_prov(),
+                    source_prov(&caller_id_str),
                     FactPayload::DependencyEdge {
                         from_logical_id: caller_id_str.clone(),
                         to_logical_id: callee_logical.clone(),
@@ -1161,7 +1166,7 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
 
                 // Emit a DependencyEdge fact (Reads/Writes).
                 fact_store.push(mint_fact(
-                    engine_prov(),
+                    source_prov(&caller_id_str),
                     FactPayload::DependencyEdge {
                         from_logical_id: caller_id_str.clone(),
                         to_logical_id: table_logical.clone(),
@@ -2004,6 +2009,17 @@ mod tests {
             run.fact_store.fact_count,
             "facts list length must equal fact_count"
         );
+        for fact in &run.fact_store.facts {
+            assert_eq!(
+                fact.provenance.source_file.as_deref(),
+                Some("pkg_orders.pkb"),
+                "engine-minted facts must carry source-file provenance: {fact:?}"
+            );
+            assert!(
+                fact.provenance.source_logical_id.is_some(),
+                "engine-minted facts must carry source logical provenance: {fact:?}"
+            );
+        }
 
         // The dep graph must carry a Reads edge (SELECT FROM
         // raw_orders) AND a Writes edge (INSERT INTO orders_summary).

@@ -24,7 +24,7 @@
 //!   constructs a rule inspects (dynamic SQL, AUTHID, grants).
 
 use plsql_core::{Confidence, ConfidenceLevel};
-use plsql_ir::{FactKind, FactStore, FlowQuery};
+use plsql_ir::{Fact, FactKind, FactStore, FlowQuery};
 use serde::{Deserialize, Serialize};
 
 pub mod baseline;
@@ -174,6 +174,20 @@ impl<'a> ScanContext<'a> {
             flow,
             facts,
         }
+    }
+
+    /// Source file for a finding derived from `fact`.
+    ///
+    /// Project-wide fact stores are shared across every scanned unit. When the
+    /// fact itself carries source provenance, prefer it over the currently
+    /// iterated unit so reports point at the catalog/source artifact that
+    /// actually produced the evidence.
+    #[must_use]
+    pub fn source_file_for_fact<'b>(&'b self, fact: &'b Fact) -> &'b str {
+        fact.provenance
+            .source_file
+            .as_deref()
+            .unwrap_or(self.source_file)
     }
 
     /// Helper: build a `RuleSkippedDiagnostic` scoped to this

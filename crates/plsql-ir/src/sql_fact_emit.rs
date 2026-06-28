@@ -155,6 +155,8 @@ mod tests {
             component: "plsql-ir".into(),
             component_version: "0.1.0".into(),
             run_id: String::new(),
+            source_logical_id: None,
+            source_file: None,
         }
     }
 

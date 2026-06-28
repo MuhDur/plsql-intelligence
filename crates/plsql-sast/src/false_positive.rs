@@ -24,6 +24,8 @@ fn corpus_provenance() -> plsql_ir::FactProvenance {
         component: "corpus".into(),
         component_version: "0".into(),
         run_id: String::new(),
+        source_logical_id: None,
+        source_file: None,
     }
 }
 

@@ -3292,6 +3292,8 @@ mod tests {
             component: "lineage-test".to_string(),
             component_version: "0".to_string(),
             run_id: String::new(),
+            source_logical_id: None,
+            source_file: None,
         }
     }
 

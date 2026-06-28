@@ -95,6 +95,29 @@ pub struct FactProvenance {
     /// fact was minted by a one-shot CLI.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub run_id: String,
+    /// Optional logical source of the fact. For source-derived facts this is
+    /// usually the unit/object logical id; for catalog-derived project facts it
+    /// names the object or catalog row the fact came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_logical_id: Option<String>,
+    /// Optional project-relative source file or catalog artifact that produced
+    /// this fact. Consumers should prefer this over their current iteration
+    /// unit when presenting fact-derived findings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
+}
+
+impl FactProvenance {
+    #[must_use]
+    pub fn with_source(
+        mut self,
+        source_logical_id: impl Into<String>,
+        source_file: impl Into<String>,
+    ) -> Self {
+        self.source_logical_id = Some(source_logical_id.into());
+        self.source_file = Some(source_file.into());
+        self
+    }
 }
 
 /// Discriminated payload — one variant per `FactKind`. The
@@ -413,6 +436,8 @@ mod tests {
             component: "plsql-lineage".into(),
             component_version: "0.1.0".into(),
             run_id: String::new(),
+            source_logical_id: None,
+            source_file: None,
         }
     }
 
@@ -513,6 +538,25 @@ mod tests {
         let f = mint_fact(prov(), payload());
         let json = serde_json::to_string(&f).unwrap();
         assert!(!json.contains("\"run_id\""));
+    }
+
+    #[test]
+    fn source_attribution_omitted_when_absent_and_round_trips_when_present() {
+        let without_source = serde_json::to_string(&mint_fact(prov(), payload())).unwrap();
+        assert!(!without_source.contains("source_logical_id"));
+        assert!(!without_source.contains("source_file"));
+
+        let with_source = prov().with_source("hr.pkg", "src/hr/pkg.pks");
+        let fact = mint_fact(with_source, payload());
+        let json = serde_json::to_string(&fact).unwrap();
+        assert!(json.contains("\"source_logical_id\":\"hr.pkg\""));
+        assert!(json.contains("\"source_file\":\"src/hr/pkg.pks\""));
+        let back: Fact = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.provenance.source_logical_id.as_deref(), Some("hr.pkg"));
+        assert_eq!(
+            back.provenance.source_file.as_deref(),
+            Some("src/hr/pkg.pks")
+        );
     }
 
     #[test]

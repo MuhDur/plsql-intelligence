@@ -150,7 +150,7 @@ impl Rule for Sec001ExecuteImmediateInjection {
                          (TaintFact {})",
                         taint_fact_id.0
                     ),
-                    ctx.source_file,
+                    ctx.source_file_for_fact(fact),
                     0,
                     (0, 0),
                 );
@@ -247,7 +247,7 @@ impl Rule for Sec006GrantToPublic {
                 self.id(),
                 self.default_severity(),
                 &msg,
-                ctx.source_file,
+                ctx.source_file_for_fact(fact),
                 // Privilege facts are catalog/DDL-derived and
                 // carry no source span; point at the unit rather
                 // than fabricate a precise location.
@@ -322,7 +322,7 @@ impl Rule for Sec002DbmsSqlParse {
                      analysis ({reason}); injection cannot be ruled out automatically \
                      ({evidence})"
                 ),
-                ctx.source_file,
+                ctx.source_file_for_fact(fact),
                 0,
                 (0, 0),
             );
@@ -395,7 +395,7 @@ impl Rule for Perf001CursorForLoopBulkCollect {
                     "Cursor FOR loop `{loop_var}` in `{unit_logical_id}` fetches row-by-row; \
                      BULK COLLECT … LIMIT avoids per-row context switches"
                 ),
-                ctx.source_file,
+                ctx.source_file_for_fact(fact),
                 0,
                 (0, 0),
             );
@@ -464,7 +464,7 @@ impl Rule for Perf002CursorForLoopForall {
                     "Cursor FOR loop `{loop_var}` in `{unit_logical_id}` performs row-by-row \
                      DML; a FORALL bulk bind eliminates per-row context switches"
                 ),
-                ctx.source_file,
+                ctx.source_file_for_fact(fact),
                 0,
                 (0, 0),
             );
@@ -527,7 +527,7 @@ impl Rule for Style001MissingInstrumentation {
                     "`{unit_logical_id}` has an executable body but no recognized \
                      instrumentation/logging call (house-policy STYLE001)"
                 ),
-                ctx.source_file,
+                ctx.source_file_for_fact(fact),
                 0,
                 (0, 0),
             );
@@ -595,7 +595,7 @@ impl Rule for Sec003HardcodedCredentials {
                     "Hardcoded credential in `{unit_logical_id}`: a string literal follows \
                      `{marker}` — the secret is committed to source"
                 ),
-                ctx.source_file,
+                ctx.source_file_for_fact(fact),
                 0,
                 (0, 0),
             );
@@ -660,7 +660,7 @@ impl Rule for Sec004InvokerRights {
                      resolution defer to the caller at run time — confirm this is intended and \
                      the caller context is trusted"
                 ),
-                ctx.source_file,
+                ctx.source_file_for_fact(fact),
                 0,
                 (0, 0),
             );
@@ -714,7 +714,7 @@ impl Rule for Sec007RefCursorReturn {
                      ensure it cannot be opened from unsanitized dynamic SQL and that callers \
                      close it"
                 ),
-                ctx.source_file,
+                ctx.source_file_for_fact(fact),
                 0,
                 (0, 0),
             );
@@ -766,7 +766,7 @@ impl Rule for Qual007DmlInFunction {
                     "Function `{unit_logical_id}` performs row-level DML; side-effecting \
                      functions are unsafe in SQL, parallel query, and replication"
                 ),
-                ctx.source_file,
+                ctx.source_file_for_fact(fact),
                 0,
                 (0, 0),
             );
@@ -817,7 +817,7 @@ impl Rule for Qual003UnboundedBulkCollect {
                     "Unbounded BULK COLLECT in `{unit_logical_id}`: no LIMIT clause — the entire \
                      result set is loaded into PGA memory"
                 ),
-                ctx.source_file,
+                ctx.source_file_for_fact(fact),
                 0,
                 (0, 0),
             );
@@ -870,7 +870,7 @@ impl Rule for Qual005DeprecatedFeature {
                 self.id(),
                 self.default_severity(),
                 &format!("`{unit_logical_id}` uses a deprecated/legacy construct: {feature}"),
-                ctx.source_file,
+                ctx.source_file_for_fact(fact),
                 0,
                 (0, 0),
             );
@@ -927,7 +927,7 @@ impl Rule for Qual008DeterministicMisuse {
                     "`{unit_logical_id}` is declared DETERMINISTIC but its body uses {construct} \
                      — the determinism contract is violated"
                 ),
-                ctx.source_file,
+                ctx.source_file_for_fact(fact),
                 0,
                 (0, 0),
             );
@@ -983,7 +983,7 @@ impl Rule for Qual006MutatingTableTrigger {
                     "Row-level trigger `{unit_logical_id}` references its own base table \
                      `{table}` — ORA-04091 mutating-table error at run time"
                 ),
-                ctx.source_file,
+                ctx.source_file_for_fact(fact),
                 0,
                 (0, 0),
             );
@@ -1035,7 +1035,7 @@ impl Rule for Qual002LogWithoutReraise {
                     "`{unit_logical_id}` logs an exception but does not re-raise — the failure \
                      is swallowed and execution continues"
                 ),
-                ctx.source_file,
+                ctx.source_file_for_fact(fact),
                 0,
                 (0, 0),
             );
@@ -1092,7 +1092,7 @@ impl Rule for Dep001CrossSchemaWrite {
                     "`{unit_logical_id}` writes to `{target}` in another schema — confirm the \
                      grant is intended and minimally scoped"
                 ),
-                ctx.source_file,
+                ctx.source_file_for_fact(fact),
                 0,
                 (0, 0),
             );
@@ -1152,7 +1152,7 @@ impl Rule for Sec005SensitivePublicSynonym {
                     "PUBLIC SYNONYM `{synonym}` in `{unit_logical_id}` exposes sensitive object \
                      `{target}` to every database account"
                 ),
-                ctx.source_file,
+                ctx.source_file_for_fact(fact),
                 0,
                 (0, 0),
             );
@@ -1212,7 +1212,7 @@ impl Rule for Perf003IsNullOnIndexedColumn {
                     "`{unit_logical_id}` has `{column} IS NULL` but `{column}` is indexed — a \
                      plain B-tree index cannot serve IS NULL, so this silently full-scans"
                 ),
-                ctx.source_file,
+                ctx.source_file_for_fact(fact),
                 0,
                 (0, 0),
             );
@@ -1244,6 +1244,8 @@ mod tests {
             component: "test".to_string(),
             component_version: "0".to_string(),
             run_id: String::new(),
+            source_logical_id: None,
+            source_file: None,
         }
     }
 
