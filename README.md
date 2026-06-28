@@ -237,10 +237,12 @@ coverage_index = extracted_semantics_ratio        (frozen public corpus
 ```
 
 `scripts/accretion_tripwire.sh` (a required CI check) asserts
-`coverage_index(HEAD) >= coverage_index(last release tag)`. A release that
-lowers it fails. The `coverage_index`-over-time table lives in
-`CHANGELOG.md`; the first release seeds the monotone floor
-deterministically.
+`coverage_index(HEAD) >= coverage_index(last release tag)` and
+`extracted_semantics_ratio(HEAD) >= extracted_semantics_ratio(last release)`.
+Fresh CI checkouts compare against the tracked deterministic seed in
+`crates/plsql-accretion/accretion_floor.json`, so the first floor is durable
+even though `.usr/ledger/` is scratch. A release that lowers either metric
+fails. The `coverage_index`-over-time table lives in `CHANGELOG.md`.
 
 ### Definition of Done
 

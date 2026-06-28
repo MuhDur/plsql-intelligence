@@ -217,9 +217,10 @@ enum LedgerAction {
     /// (never the private estate) PLUS `distinct_resolved_gap_signatures` from
     /// the provenance Ledger, append it to the append-only
     /// `accretion_ledger.jsonl`, and assert `coverage_index(HEAD) ≥
-    /// coverage_index(last release tag)`. If no release tag exists
-    /// yet, seed the monotone floor deterministically and PASS. Exit
-    /// non-zero iff the index dropped.
+    /// coverage_index(last release tag)` plus any tracked floor file.
+    /// Also assert `extracted_semantics_ratio` does not regress. If no
+    /// release tag or floor exists, seed the monotone floor
+    /// deterministically and PASS. Exit non-zero iff either metric dropped.
     Tripwire {
         /// Frozen public benchmark corpus root (never the private estate).
         corpus_path: PathBuf,
@@ -227,9 +228,13 @@ enum LedgerAction {
         #[arg(long, default_value = "HEAD")]
         git_ref: String,
         /// The release ref to assert monotonicity against. If absent
-        /// or unknown the first run seeds the floor and PASSes.
+        /// or unknown, the tracked floor file still applies.
         #[arg(long)]
         baseline_ref: Option<String>,
+        /// Tracked deterministic floor JSON for fresh CI checkouts that
+        /// do not carry a prior `.usr/ledger/accretion_ledger.jsonl`.
+        #[arg(long)]
+        floor_file: Option<PathBuf>,
     },
 }
 
@@ -902,8 +907,86 @@ fn run_ledger(action: LedgerAction, robot_json: bool) -> ExitCode {
             corpus_path,
             git_ref,
             baseline_ref,
-        } => run_tripwire(&corpus_path, &git_ref, baseline_ref.as_deref(), robot_json),
+            floor_file,
+        } => run_tripwire(
+            &corpus_path,
+            &git_ref,
+            baseline_ref.as_deref(),
+            floor_file.as_deref(),
+            robot_json,
+        ),
     }
+}
+
+#[derive(Clone, Debug)]
+struct TripwireBaseline {
+    source: String,
+    coverage_index: f64,
+    extracted_semantics_ratio: f64,
+}
+
+fn read_tripwire_floor(path: &Path) -> Result<TripwireBaseline, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read floor file {}: {e}", path.display()))?;
+    parse_tripwire_floor_json(&text, &format!("tracked-floor:{}", path.display()))
+        .map_err(|e| format!("floor file {} invalid: {e}", path.display()))
+}
+
+fn parse_tripwire_floor_json(text: &str, default_source: &str) -> Result<TripwireBaseline, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("cannot parse JSON: {e}"))?;
+    let coverage_index = finite_nonnegative_f64(&v, "coverage_index")?;
+    let extracted_semantics_ratio = finite_nonnegative_f64(&v, "extracted_semantics_ratio")?;
+    let source = v
+        .get("git_ref")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map_or_else(
+            || default_source.to_string(),
+            |git_ref| format!("tracked-floor:{git_ref}"),
+        );
+    Ok(TripwireBaseline {
+        source,
+        coverage_index,
+        extracted_semantics_ratio,
+    })
+}
+
+fn finite_nonnegative_f64(v: &serde_json::Value, field: &str) -> Result<f64, String> {
+    let Some(n) = v.get(field).and_then(serde_json::Value::as_f64) else {
+        return Err(format!("missing numeric `{field}`"));
+    };
+    if n.is_finite() && n >= 0.0 {
+        Ok(n)
+    } else {
+        Err(format!("invalid `{field}`: {n}"))
+    }
+}
+
+fn tripwire_baseline_failures(
+    coverage_index: f64,
+    extracted_semantics_ratio: f64,
+    baselines: &[TripwireBaseline],
+) -> Vec<serde_json::Value> {
+    baselines
+        .iter()
+        .filter_map(|b| {
+            let coverage_ok = coverage_index + f64::EPSILON >= b.coverage_index;
+            let extraction_ok =
+                extracted_semantics_ratio + f64::EPSILON >= b.extracted_semantics_ratio;
+            if coverage_ok && extraction_ok {
+                None
+            } else {
+                Some(serde_json::json!({
+                    "source": b.source,
+                    "coverage_ok": coverage_ok,
+                    "extracted_semantics_ratio_ok": extraction_ok,
+                    "coverage_index_floor": b.coverage_index,
+                    "extracted_semantics_ratio_floor": b.extracted_semantics_ratio,
+                }))
+            }
+        })
+        .collect()
 }
 
 /// §4 monotonic tripwire. Deterministic: the index is a pure function
@@ -917,6 +1000,7 @@ fn run_tripwire(
     corpus_path: &Path,
     git_ref: &str,
     baseline_ref: Option<&str>,
+    floor_file: Option<&Path>,
     robot_json: bool,
 ) -> ExitCode {
     use plsql_accretion::{AccretionLedger, BenchmarkRecord, Ledger, compute_accretion_index};
@@ -1024,44 +1108,96 @@ fn run_tripwire(
         );
         return ExitCode::from(1);
     }
-    // 4. Monotonic assertion vs the baseline ref.
+    // 4. Monotonic assertion vs every available baseline. The tracked
+    // floor is what makes a fresh CI checkout deterministic; the
+    // release-ref ledger entry, when present, keeps the historical
+    // release comparison.
     let history = acc.iter().unwrap_or_default();
     let baseline_entry =
         baseline_ref.and_then(|r| history.iter().rfind(|e| e.git_ref == r).cloned());
-    let (status, exit) = match &baseline_entry {
-        None => {
-            // No release baseline yet — seed the monotone floor and
-            // PASS (documented, spec §4: first run establishes the
-            // floor; a regression is structurally impossible with no
-            // prior point).
-            (
-                "seeded-floor (no release baseline yet — monotone floor established; PASS)",
-                ExitCode::SUCCESS,
-            )
-        }
-        Some(base) => {
-            if index.coverage_index + f64::EPSILON >= base.index.coverage_index {
-                (
-                    "monotonic-ok (coverage_index ≥ baseline)",
-                    ExitCode::SUCCESS,
-                )
-            } else {
-                (
-                    "REGRESSION (coverage_index dropped below baseline — I-MONOTONIC-VALUE violated)",
-                    ExitCode::from(1),
-                )
+    let floor_baseline = match floor_file {
+        Some(path) => match read_tripwire_floor(path) {
+            Ok(floor) => Some(floor),
+            Err(e) => {
+                emit_error_envelope(
+                    robot_json,
+                    "tripwire_floor_invalid",
+                    &e,
+                    Some(path),
+                    Some(
+                        "provide a deterministic floor JSON with coverage_index and extracted_semantics_ratio",
+                    ),
+                );
+                return ExitCode::from(1);
             }
-        }
+        },
+        None => None,
+    };
+    let mut baselines = Vec::new();
+    if let Some(base) = &baseline_entry {
+        baselines.push(TripwireBaseline {
+            source: format!("release-ref:{}", base.git_ref),
+            coverage_index: base.index.coverage_index,
+            extracted_semantics_ratio: base.index.extracted_semantics_ratio,
+        });
+    }
+    if let Some(floor) = floor_baseline.clone() {
+        baselines.push(floor);
+    }
+
+    let baseline_reports: Vec<_> = baselines
+        .iter()
+        .map(|b| {
+            serde_json::json!({
+                "source": b.source,
+                "coverage_index": b.coverage_index,
+                "extracted_semantics_ratio": b.extracted_semantics_ratio,
+            })
+        })
+        .collect();
+    let failures = tripwire_baseline_failures(
+        index.coverage_index,
+        index.extracted_semantics_ratio,
+        &baselines,
+    );
+    let baseline_coverage_index = baselines.iter().map(|b| b.coverage_index).reduce(f64::max);
+    let baseline_extracted_semantics_ratio = baselines
+        .iter()
+        .map(|b| b.extracted_semantics_ratio)
+        .reduce(f64::max);
+    let (status, exit) = if baselines.is_empty() {
+        // No release baseline and no tracked floor — preserve the
+        // original first-run behavior for manual bootstrap use only.
+        (
+            "seeded-floor (no release baseline or tracked floor supplied — monotone floor established; PASS)",
+            ExitCode::SUCCESS,
+        )
+    } else if failures.is_empty() {
+        (
+            "monotonic-ok (coverage_index and extracted_semantics_ratio ≥ all baselines)",
+            ExitCode::SUCCESS,
+        )
+    } else {
+        (
+            "REGRESSION (coverage_index or extracted_semantics_ratio dropped below baseline — I-MONOTONIC-VALUE violated)",
+            ExitCode::from(1),
+        )
     };
     let report = serde_json::json!({
         "action": "tripwire",
         "git_ref": git_ref,
         "baseline_ref": baseline_ref,
+        "floor_file": floor_file.map(|p| p.display().to_string()),
         "coverage_index": index.coverage_index,
         "extracted_semantics_ratio": index.extracted_semantics_ratio,
         "distinct_resolved_gap_signatures": index.distinct_resolved_gap_signatures,
         "landed_signatures": landed_sigs,
         "baseline_coverage_index": baseline_entry.as_ref().map(|e| e.index.coverage_index),
+        "baseline_extracted_semantics_ratio": baseline_entry.as_ref().map(|e| e.index.extracted_semantics_ratio),
+        "effective_baseline_coverage_index": baseline_coverage_index,
+        "effective_baseline_extracted_semantics_ratio": baseline_extracted_semantics_ratio,
+        "baseline_checks": baseline_reports,
+        "baseline_failures": failures,
         "accretion_ledger": acc.path().display().to_string(),
         "accretion_ledger_entries_before": entries_before,
         "accretion_ledger_entries_after": acc.iter().map(|v| v.len()).unwrap_or(0),
@@ -1478,6 +1614,64 @@ mod tests {
                 "robot-docs must mention `{required}`"
             );
         }
+    }
+
+    #[test]
+    fn tripwire_floor_json_parses_required_metrics() {
+        let floor = parse_tripwire_floor_json(
+            r#"{
+                "git_ref": "release-0.5.0-floor",
+                "coverage_index": 0.875,
+                "extracted_semantics_ratio": 0.875
+            }"#,
+            "fallback",
+        )
+        .expect("floor parses");
+        assert_eq!(floor.source, "tracked-floor:release-0.5.0-floor");
+        assert_eq!(floor.coverage_index, 0.875);
+        assert_eq!(floor.extracted_semantics_ratio, 0.875);
+    }
+
+    #[test]
+    fn tripwire_floor_json_rejects_missing_ratio() {
+        let err = parse_tripwire_floor_json(r#"{"coverage_index": 1.0}"#, "fallback")
+            .expect_err("floor without extracted ratio must fail");
+        assert!(
+            err.contains("extracted_semantics_ratio"),
+            "error should name missing field: {err}"
+        );
+    }
+
+    #[test]
+    fn tripwire_baseline_fails_coverage_drop() {
+        let failures = tripwire_baseline_failures(
+            0.90,
+            1.0,
+            &[TripwireBaseline {
+                source: "tracked-floor:test".into(),
+                coverage_index: 1.0,
+                extracted_semantics_ratio: 1.0,
+            }],
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["coverage_ok"], false);
+        assert_eq!(failures[0]["extracted_semantics_ratio_ok"], true);
+    }
+
+    #[test]
+    fn tripwire_baseline_fails_extraction_drop_even_when_index_passes() {
+        let failures = tripwire_baseline_failures(
+            2.0,
+            0.80,
+            &[TripwireBaseline {
+                source: "tracked-floor:test".into(),
+                coverage_index: 1.0,
+                extracted_semantics_ratio: 0.95,
+            }],
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["coverage_ok"], true);
+        assert_eq!(failures[0]["extracted_semantics_ratio_ok"], false);
     }
 
     /// Capabilities subcommand list must match the `Command` enum

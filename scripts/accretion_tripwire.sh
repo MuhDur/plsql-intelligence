@@ -17,13 +17,17 @@
 #
 # It appends the measurement to the append-only, content-addressed
 # `accretion_ledger.jsonl` (its own tamper-evident hash chain) and
-# asserts `coverage_index(HEAD) >= coverage_index(last release tag)`.
+# asserts `coverage_index(HEAD) >= coverage_index(last release tag)`
+# plus the tracked deterministic floor in
+# `crates/plsql-accretion/accretion_floor.json`. It also asserts the
+# corpus-only `extracted_semantics_ratio` has not regressed; closed
+# signatures may not mask extraction loss.
 #
-# FIRST-RUN SEMANTICS (documented, spec §4): if no release tag exists
-# yet (or `--baseline-ref` names an unknown ref), there is no prior
-# point a regression could be measured against, so the run
-# deterministically SEEDS the monotone floor and PASSes. Every
-# subsequent run compares against that committed history.
+# FIRST-RUN SEMANTICS (documented, spec §4): the committed floor JSON is
+# the deterministic seed for fresh CI checkouts. If a caller deliberately
+# invokes `usr-loop ledger tripwire` without that floor and without a
+# release baseline, the Rust CLI preserves manual bootstrap semantics and
+# seeds a scratch floor; this wrapper never does that in CI.
 #
 #   Usage: scripts/accretion_tripwire.sh [<git-ref>] [<baseline-ref>]
 #   Exit:  0 = index monotone non-decreasing (or floor seeded)
@@ -46,21 +50,27 @@ cd "${REPO_ROOT}" || { echo "TRIPWIRE: FAIL cannot cd repo root"; exit 1; }
 
 # Frozen public benchmark set (corpus-derived, NEVER private estate code).
 BENCH="${USR_TRIPWIRE_BENCH:-${REPO_ROOT}/corpus/synthetic/l1}"
+FLOOR_FILE="${USR_TRIPWIRE_FLOOR_FILE:-${REPO_ROOT}/crates/plsql-accretion/accretion_floor.json}"
 GIT_REF="${1:-HEAD}"
-# Auto-detect the most recent release tag as the monotone baseline;
-# none yet ⇒ first run seeds the floor (documented above).
+# Auto-detect the most recent release tag as an additional monotone
+# baseline; fresh checkouts always compare against FLOOR_FILE too.
 BASELINE_REF="${2:-$(git -C "${REPO_ROOT}" describe --tags --abbrev=0 2>/dev/null || true)}"
 
 if [[ ! -d "${BENCH}" ]]; then
   echo "TRIPWIRE: FAIL frozen benchmark set missing: ${BENCH}"
   exit 1
 fi
+if [[ ! -f "${FLOOR_FILE}" ]]; then
+  echo "TRIPWIRE: FAIL deterministic floor file missing: ${FLOOR_FILE}"
+  exit 1
+fi
 
 echo "== USR §4 accretion tripwire =="
 echo "benchmark (public, never a private estate): ${BENCH}"
-echo "git_ref=${GIT_REF}  baseline_ref=${BASELINE_REF:-<none — first run seeds the monotone floor>}"
+echo "floor_file=${FLOOR_FILE}"
+echo "git_ref=${GIT_REF}  baseline_ref=${BASELINE_REF:-<none — using deterministic floor file>}"
 
-ARGS=(run -q -p usr-loop -- ledger tripwire "${BENCH}" --git-ref "${GIT_REF}")
+ARGS=(run -q -p usr-loop -- ledger tripwire "${BENCH}" --git-ref "${GIT_REF}" --floor-file "${FLOOR_FILE}")
 if [[ -n "${BASELINE_REF}" ]]; then
   ARGS+=(--baseline-ref "${BASELINE_REF}")
 fi
@@ -70,8 +80,8 @@ RC=$?
 echo "${OUT}"
 
 if [[ ${RC} -ne 0 ]]; then
-  echo "TRIPWIRE: FAIL coverage_index regressed — I-MONOTONIC-VALUE violated; a release may NOT lower it (spec §4)"
+  echo "TRIPWIRE: FAIL coverage_index or extracted_semantics_ratio regressed — I-MONOTONIC-VALUE violated; a release may NOT lower it (spec §4)"
   exit 1
 fi
-echo "TRIPWIRE: PASS coverage_index monotone non-decreasing (spec §4 / §1 I-MONOTONIC-VALUE)"
+echo "TRIPWIRE: PASS coverage_index and extracted_semantics_ratio monotone non-decreasing (spec §4 / §1 I-MONOTONIC-VALUE)"
 exit 0

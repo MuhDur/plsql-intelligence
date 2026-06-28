@@ -168,14 +168,15 @@ green throughout (2603 tests, zero failures; `clippy -D warnings` clean;
     ```
 
     appended to a hash-chained `accretion_ledger.jsonl`; CI asserts
-    `coverage_index(HEAD) ≥ coverage_index(last release tag)`; a
-    release that lowers it fails. **coverage_index over time** (the
-    public, auditable compounding line; the first release seeds the
-    monotone floor deterministically):
+    `coverage_index(HEAD) ≥ coverage_index(last release tag)` and the
+    tracked deterministic floor in
+    `crates/plsql-accretion/accretion_floor.json`; a release that lowers
+    `coverage_index` or `extracted_semantics_ratio` fails.
+    **coverage_index over time** (the public, auditable compounding line):
 
     | git ref | coverage_index | extracted_semantics_ratio | distinct_resolved |
     |---------|----------------|---------------------------|-------------------|
-    | P6 baseline (monotone floor) | seeded at first run | corpus-only, reproducible | 0 → grows as the loop lands |
+    | `0.5.0-migration-floor` | `1.0` | `1.0` | `0` |
 
   - **§5 acceptance proof** (`scripts/usr_acceptance.sh`): the single
     re-runnable DoD; drives the loop to close a *real* private estate gap

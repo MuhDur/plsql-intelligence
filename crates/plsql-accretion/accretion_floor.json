@@ -1,0 +1,8 @@
+{
+  "_doc": "USR §4 deterministic public coverage_index floor for the 0.5.0 migration continuity gate. Generated from `usr-loop --robot-json ledger index corpus/synthetic/l1` on the committed public L1 corpus at commit 0520fda before the Phase X 15.4 tripwire change. This file is the durable CI seed because `.usr/ledger/accretion_ledger.jsonl` is scratch and gitignored. Never lower coverage_index or extracted_semantics_ratio without an explicit reviewed regression decision.",
+  "git_ref": "0.5.0-migration-floor",
+  "corpus_path": "corpus/synthetic/l1",
+  "coverage_index": 1.0,
+  "extracted_semantics_ratio": 1.0,
+  "distinct_resolved_gap_signatures": 0
+}
