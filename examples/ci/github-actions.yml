@@ -1,13 +1,13 @@
-# Example GitHub Actions workflow that gates PRs touching PL/SQL with
-# the `plsql cicd` family. Drop this into `.github/workflows/` of a
-# downstream PL/SQL repository and adjust the `paths:` filter, the
-# `oracle_version` target, and the policy-file path to match the
-# consumer's environment.
+# Example GitHub Actions workflow that comments on PRs touching PL/SQL
+# with the release-0.5.0 `plsql predict --robot-json` blast-radius
+# payload. Drop this into `.github/workflows/` of a downstream PL/SQL
+# repository and adjust the `paths:` filter to match the consumer's
+# source layout.
 #
-# Three jobs are wired:
-#   1. `predict`   — predicts invalidation from the changeset
-#   2. `gate`      — applies the policy file (`.plsql-cicd-policy.toml`)
-#   3. `pr-comment`— posts a structured PR comment with the verdict
+# This example assumes the composite action directory
+# `.github/actions/plsql-change-impact/` is vendored alongside the
+# workflow. Consumers that prefer a central template should pin the
+# action to a release tag in the plsql-intelligence repository instead.
 #
 # Plan reference: §15 (CI/CD Recompilation Cascade) + §15.5 (CICD bead seeds).
 
@@ -26,11 +26,12 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write   # required by `plsql post-pr-comment`
+  issues: write          # required by the issue-comments API endpoint
+  pull-requests: read
 
 jobs:
-  plsql-cicd:
-    name: plsql cicd predict + gate
+  plsql-change-impact:
+    name: PL/SQL change impact
     runs-on: ubuntu-latest
     steps:
       - name: Checkout (full depth for git-diff classification)
@@ -44,41 +45,14 @@ jobs:
         run: |
           curl -fsSL https://example.invalid/install.sh | bash -s -- --version 0.x
 
-      - name: Determine changeset
-        id: changeset
-        run: |
-          plsql lineage classify-change \
-            --before ${{ github.event.pull_request.base.sha }} \
-            --after  ${{ github.sha }} \
-            --robot-json > changeset.json
-          echo "path=changeset.json" >> "$GITHUB_OUTPUT"
-
-      - name: Predict invalidations
-        run: |
-          plsql cicd predict \
-            --changeset ${{ steps.changeset.outputs.path }} \
-            --mode catalog-aware \
-            --catalog-snapshot ./.plsql/catalog-snapshot.json \
-            --robot-json > prediction.json
-
-      - name: Apply policy gate
-        id: gate
-        run: |
-          plsql cicd gate \
-            --prediction prediction.json \
-            --policy .plsql-cicd-policy.toml \
-            --robot-json > gate.json
-          # Exit code: 0 pass, 1 violations, 2 invocation error.
-
-      - name: Post structured PR comment
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          plsql post-pr-comment \
-            --gate gate.json \
-            --pull-request ${{ github.event.pull_request.number }} \
-            --repository ${{ github.repository }}
+      - name: Predict and comment on PL/SQL blast radius
+        id: impact
+        uses: ./.github/actions/plsql-change-impact
+        with:
+          plsql-bin: plsql
+          git-range: ${{ github.event.pull_request.base.sha }}..${{ github.sha }}
+          mode: catalog-aware
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload artifacts
         if: always()
@@ -86,6 +60,6 @@ jobs:
         with:
           name: plsql-cicd-reports
           path: |
-            changeset.json
-            prediction.json
-            gate.json
+            ${{ steps.impact.outputs.predict-json }}
+            ${{ steps.impact.outputs.comment-body }}
+          if-no-files-found: error

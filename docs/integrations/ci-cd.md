@@ -1,27 +1,52 @@
 # CI/CD integration
 
-Reference workflows for embedding the `plsql cicd` family
-(predict → plan → gate → post-pr-comment) into your CI/CD platform of
-choice. (`PLSQL-CICD-020` / oracle-vri2.)
+Reference workflows for embedding the release-0.5.0
+`plsql predict --robot-json` change-impact surface into CI/CD.
+(`PLSQL-CICD-020` / oracle-vri2.)
+
+## GitHub Action shipped in this repo
+
+The reusable Action lives at
+`.github/actions/plsql-change-impact/action.yml`. It performs three
+steps:
+
+1. Run `plsql predict --robot-json` from a changeset source, a
+   before/after directory pair, or a PR git range.
+2. Render the stable `plsql.cicd.change_impact` envelope into a PR
+   comment that names invalidation count, recompile candidates,
+   compile-error flags, uncertainty count, and max dependency
+   distance.
+3. POST or PATCH one GitHub issue comment carrying the stable
+   `<!-- plsql-cicd:change-impact v1 -->` marker.
+
+The Action leaves both the raw prediction JSON and rendered Markdown
+comment as outputs so downstream jobs can upload or inspect them.
+
+The self-test workflow
+`.github/workflows/plsql-change-impact-selftest.yml` builds the F.5
+`plsql` binary, runs the Action on a fixture changeset with
+`post-comment: "false"`, and asserts the expected blast-radius
+comment. That is the CI proof for F.6.
 
 ## Reference workflows shipped in this repo
 
-All four mirror the same five-stage shape:
+The GitHub files mirror the same shape:
 
-1. Compute the changeset (unified diff against the merge target).
-2. `plsql cicd predict` — emit `target/predict.json`.
-3. `plsql cicd plan` — emit `target/plan.json`.
-4. `plsql cicd gate --pr-comment-json` — emit `target/gate.json`
-   (the `plsql.cicd.gate_pr_comment` envelope, CICD-014).
-5. `plsql cicd post-pr-comment` — POST/EDIT the PR/MR comment via
-   the platform API (CICD-015 + CICD-016 idempotent update).
+1. Checkout with `fetch-depth: 0` so `--git-range` can classify the PR
+   diff.
+2. Install the `plsql` CLI.
+3. Call `.github/actions/plsql-change-impact` with
+   `git-range: ${{ github.event.pull_request.base.sha }}..${{ github.sha }}`.
+4. Upload the raw `plsql.cicd.change_impact` JSON and rendered
+   comment body.
 
 | Platform | File | Auth env var | Status |
 |---|---|---|---|
-| GitHub Actions | [`examples/ci/github-actions.yml`](../../examples/ci/github-actions.yml) | `PLSQL_GH_TOKEN` (or `GITHUB_TOKEN`) | shipped |
-| GitLab CI | [`examples/ci/gitlab-ci.yml`](../../examples/ci/gitlab-ci.yml) | `PLSQL_GL_TOKEN` | shipped |
-| Jenkins (Multibranch) | [`examples/ci/Jenkinsfile.groovy`](../../examples/ci/Jenkinsfile.groovy) | Jenkins credentials store (`plsql-gh-token` / `plsql-gl-token`) | shipped |
-| GitHub Actions gate-only | [`.github/workflows/plsql-gate.yml`](../../.github/workflows/plsql-gate.yml) | n/a (own-repo gate template) | shipped |
+| GitHub Actions | [`examples/ci/github-actions.yml`](../../examples/ci/github-actions.yml) | `GITHUB_TOKEN` | shipped |
+| GitHub Actions self-test | [`.github/workflows/plsql-change-impact-selftest.yml`](../../.github/workflows/plsql-change-impact-selftest.yml) | n/a (`post-comment: "false"`) | shipped |
+| GitHub Actions reference gate | [`.github/workflows/plsql-gate.yml`](../../.github/workflows/plsql-gate.yml) | `GITHUB_TOKEN` | shipped |
+| GitLab CI | [`examples/ci/gitlab-ci.yml`](../../examples/ci/gitlab-ci.yml) | `PLSQL_GL_TOKEN` | legacy template, outside F.6 Action self-test |
+| Jenkins (Multibranch) | [`examples/ci/Jenkinsfile.groovy`](../../examples/ci/Jenkinsfile.groovy) | Jenkins credentials store (`plsql-gh-token` / `plsql-gl-token`) | legacy template, outside F.6 Action self-test |
 
 ## Companion templates repo (planned)
 
@@ -51,13 +76,20 @@ pinned independently.
 
 ### Pointers from the companion repo back here
 
-- `gate.json` schema → `crates/plsql-cicd/src/gate.rs` (`PrCommentEnvelope`).
+- Change-impact schema → `crates/plsql-cicd/src/predict.rs`
+  (`ChangeImpactEnvelope`).
+- GitHub Action → `.github/actions/plsql-change-impact/action.yml`.
+- Action self-test →
+  `.github/workflows/plsql-change-impact-selftest.yml`.
+- Future gate-comment schema → `crates/plsql-cicd/src/gate.rs`
+  (`PrCommentEnvelope`).
 - Idempotent edit logic → `crates/plsql-cicd/src/post_pr_comment.rs`
   (`find_existing_comment` + `build_request`).
 - PR-integration doctor → `crates/plsql-cicd/src/post_pr_comment.rs`
   (`pr_integration_doctor`).
-- HTML marker version → `<!-- plsql-cicd:gate v1 -->` (bumps with
-  envelope schema version).
+- GitHub Action HTML marker version →
+  `<!-- plsql-cicd:change-impact v1 -->` (bumps with envelope schema
+  version).
 
 ## Bead chain
 

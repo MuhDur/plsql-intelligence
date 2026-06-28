@@ -1,0 +1,86 @@
+name: plsql-change-impact action self-test
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - ".github/actions/plsql-change-impact/action.yml"
+      - ".github/workflows/plsql-change-impact-selftest.yml"
+      - "crates/plsql-cicd/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - ".github/actions/plsql-change-impact/action.yml"
+      - ".github/workflows/plsql-change-impact-selftest.yml"
+      - "crates/plsql-cicd/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+permissions:
+  contents: read
+
+jobs:
+  self-test:
+    name: fixture PR comment dry run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-05-11
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build plsql CLI
+        run: cargo build -p plsql-cicd --bin plsql
+
+      - name: Write fixture changeset
+        run: |
+          cat > "$RUNNER_TEMP/plsql-change-impact-fixture.json" <<'JSON'
+          {
+            "origin": null,
+            "objects": [
+              {
+                "owner": 0,
+                "name": 1,
+                "kind": "PackageSpec",
+                "new_hash": null,
+                "previous_hash": null,
+                "file_paths": [],
+                "uncertainties": []
+              }
+            ],
+            "unclassified_files": []
+          }
+          JSON
+
+      - name: Run action without posting
+        id: impact
+        uses: ./.github/actions/plsql-change-impact
+        with:
+          plsql-bin: ./target/debug/plsql
+          changeset-source: ${{ runner.temp }}/plsql-change-impact-fixture.json
+          source-kind: changeset-json
+          post-comment: "false"
+
+      - name: Assert expected comment payload
+        run: |
+          test -s "${{ steps.impact.outputs.predict-json }}"
+          test -s "${{ steps.impact.outputs.comment-body }}"
+          jq -e '.schema_id == "plsql.cicd.change_impact"' "${{ steps.impact.outputs.predict-json }}" >/dev/null
+          jq -e '.payload.summary.invalidation_count == 1' "${{ steps.impact.outputs.predict-json }}" >/dev/null
+          grep -F "<!-- plsql-cicd:change-impact v1 -->" "${{ steps.impact.outputs.comment-body }}"
+          grep -F "Invalidations: 1" "${{ steps.impact.outputs.comment-body }}"
+
+      - name: Upload self-test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: plsql-change-impact-self-test
+          path: |
+            ${{ steps.impact.outputs.predict-json }}
+            ${{ steps.impact.outputs.comment-body }}
+          if-no-files-found: error

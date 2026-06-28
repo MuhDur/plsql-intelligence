@@ -24,6 +24,15 @@ fn fixture_root(label: &str) -> PathBuf {
         ))
 }
 
+fn repo_file(path: &str) -> String {
+    std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(path),
+    )
+    .expect("read repository file")
+}
+
 #[test]
 fn predict_robot_json_accepts_changeset_source_after_subcommand() {
     let root = fixture_root("direct");
@@ -228,4 +237,67 @@ fn missing_changeset_source_emits_robot_error_envelope() {
     assert_eq!(value["schema_id"], "plsql.cicd.error_envelope");
     assert_eq!(value["payload"]["kind"], "error");
     assert_eq!(value["payload"]["code"], "changeset_source_missing");
+}
+
+#[test]
+fn github_change_impact_action_matches_predict_cli_contract() {
+    let action = repo_file(".github/actions/plsql-change-impact/action.yml");
+
+    assert!(action.contains("args=(predict --robot-json"));
+    assert!(action.contains("--git-range"));
+    assert!(action.contains("--lineage-impact"));
+    assert!(action.contains("--lineage-metadata"));
+    assert!(action.contains("plsql.cicd.change_impact"));
+    assert!(
+        action.contains("api.github.com/repos/${GITHUB_REPOSITORY}/issues/${pr_number}/comments")
+    );
+    assert!(action.contains("plsql-cicd:change-impact v1"));
+    assert!(action.contains("post-comment"));
+    assert!(!action.contains("plsql cicd"));
+    assert!(!action.contains("plsql post-pr-comment"));
+}
+
+#[test]
+fn github_change_impact_selftest_runs_action_without_posting() {
+    let workflow = repo_file(".github/workflows/plsql-change-impact-selftest.yml");
+
+    assert!(workflow.contains("cargo build -p plsql-cicd --bin plsql"));
+    assert!(workflow.contains("uses: ./.github/actions/plsql-change-impact"));
+    assert!(workflow.contains("post-comment: \"false\""));
+    assert!(workflow.contains("jq -e '.payload.summary.invalidation_count == 1'"));
+    assert!(workflow.contains("Invalidations: 1"));
+    assert!(!workflow.contains("github-token:"));
+    assert!(!workflow.contains("plsql cicd"));
+}
+
+#[test]
+fn github_reference_workflows_use_change_impact_action() {
+    for path in [
+        ".github/workflows/plsql-gate.yml",
+        "examples/ci/github-actions.yml",
+    ] {
+        let workflow = repo_file(path);
+        assert!(
+            workflow.contains("uses: ./.github/actions/plsql-change-impact"),
+            "{path} should call the reusable change-impact action"
+        );
+        assert!(
+            workflow.contains(
+                "git-range: ${{ github.event.pull_request.base.sha }}..${{ github.sha }}"
+            ),
+            "{path} should use the PR git range"
+        );
+        assert!(
+            workflow.contains("${{ steps.impact.outputs.predict-json }}"),
+            "{path} should upload the raw prediction JSON"
+        );
+        assert!(
+            !workflow.contains("plsql cicd"),
+            "{path} should not reference the pre-F.5 CLI namespace"
+        );
+        assert!(
+            !workflow.contains("plsql post-pr-comment"),
+            "{path} should not reference an unshipped posting subcommand"
+        );
+    }
 }

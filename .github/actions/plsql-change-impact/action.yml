@@ -1,0 +1,268 @@
+name: PL/SQL change impact
+description: Run plsql predict --robot-json and post or update a GitHub PR comment.
+
+inputs:
+  plsql-bin:
+    description: Path or command name for the plsql CLI.
+    default: plsql
+  changeset-source:
+    description: Optional changeset source path. Omit when using before/after or git-range.
+    required: false
+    default: ""
+  source-kind:
+    description: "Source type for changeset-source: auto, directory, diff, script, or changeset-json."
+    required: false
+    default: auto
+  mode:
+    description: "Prediction mode: source-only, catalog-aware, or live-snapshot."
+    required: false
+    default: catalog-aware
+  before:
+    description: Before directory for before/after prediction.
+    required: false
+    default: ""
+  after:
+    description: After directory for before/after prediction.
+    required: false
+    default: ""
+  git-range:
+    description: Git range in FROM..TO form. Used for pull_request workflows.
+    required: false
+    default: ""
+  repo:
+    description: Repository path used with git-range.
+    required: false
+    default: "."
+  lineage-impact:
+    description: Optional newline-separated LineageResult JSON paths.
+    required: false
+    default: ""
+  lineage-metadata:
+    description: Optional lineage metadata JSON path required when lineage-impact is supplied.
+    required: false
+    default: ""
+  output-dir:
+    description: Directory for generated predict JSON and comment body files.
+    required: false
+    default: ""
+  post-comment:
+    description: Whether to post or update the GitHub PR comment.
+    required: false
+    default: "true"
+  github-token:
+    description: Token used to post or update pull request comments.
+    required: false
+    default: ""
+  comment-title:
+    description: Markdown heading for the PR comment.
+    required: false
+    default: PL/SQL change impact
+
+outputs:
+  predict-json:
+    description: Path to the plsql.cicd.change_impact robot JSON envelope.
+    value: ${{ steps.predict.outputs.predict_json }}
+  comment-body:
+    description: Path to the rendered Markdown PR comment body.
+    value: ${{ steps.render.outputs.comment_body }}
+  comment-url:
+    description: URL of the created or updated GitHub comment when posting is enabled.
+    value: ${{ steps.post.outputs.comment_url }}
+
+runs:
+  using: composite
+  steps:
+    - id: predict
+      shell: bash
+      env:
+        PLSQL_BIN: ${{ inputs.plsql-bin }}
+        CHANGESET_SOURCE: ${{ inputs.changeset-source }}
+        SOURCE_KIND: ${{ inputs.source-kind }}
+        MODE: ${{ inputs.mode }}
+        BEFORE_DIR: ${{ inputs.before }}
+        AFTER_DIR: ${{ inputs.after }}
+        GIT_RANGE: ${{ inputs.git-range }}
+        REPO_DIR: ${{ inputs.repo }}
+        LINEAGE_IMPACT: ${{ inputs.lineage-impact }}
+        LINEAGE_METADATA: ${{ inputs.lineage-metadata }}
+        OUTPUT_DIR: ${{ inputs.output-dir }}
+      run: |
+        set -euo pipefail
+
+        command -v "$PLSQL_BIN" >/dev/null 2>&1 || {
+          echo "::error::plsql CLI not found: $PLSQL_BIN"
+          exit 2
+        }
+        command -v jq >/dev/null 2>&1 || {
+          echo "::error::jq is required to validate the PL/SQL change-impact JSON"
+          exit 2
+        }
+
+        output_dir="${OUTPUT_DIR:-${RUNNER_TEMP:-.}}"
+        mkdir -p "$output_dir"
+        predict_json="$output_dir/plsql-change-impact.json"
+
+        args=(predict --robot-json --mode "$MODE")
+        if [[ -n "$SOURCE_KIND" && "$SOURCE_KIND" != "auto" ]]; then
+          args+=(--source-kind "$SOURCE_KIND")
+        fi
+        if [[ -n "$BEFORE_DIR" || -n "$AFTER_DIR" ]]; then
+          if [[ -z "$BEFORE_DIR" || -z "$AFTER_DIR" ]]; then
+            echo "::error::before and after must be supplied together"
+            exit 2
+          fi
+          args+=(--before "$BEFORE_DIR" --after "$AFTER_DIR")
+        elif [[ -n "$GIT_RANGE" ]]; then
+          args+=(--git-range "$GIT_RANGE" --repo "$REPO_DIR")
+        else
+          if [[ -z "$CHANGESET_SOURCE" ]]; then
+            echo "::error::changeset-source is required unless before/after or git-range is supplied"
+            exit 2
+          fi
+          args+=("$CHANGESET_SOURCE")
+        fi
+
+        while IFS= read -r impact_path; do
+          if [[ -n "$impact_path" ]]; then
+            args+=(--lineage-impact "$impact_path")
+          fi
+        done <<< "$LINEAGE_IMPACT"
+        if [[ -n "$LINEAGE_METADATA" ]]; then
+          args+=(--lineage-metadata "$LINEAGE_METADATA")
+        fi
+
+        echo "running plsql predict --robot-json"
+        "$PLSQL_BIN" "${args[@]}" > "$predict_json"
+        jq -e '.schema_id == "plsql.cicd.change_impact"' "$predict_json" >/dev/null
+        printf 'predict_json=%s\n' "$predict_json" >> "$GITHUB_OUTPUT"
+
+    - id: render
+      shell: bash
+      env:
+        PREDICT_JSON: ${{ steps.predict.outputs.predict_json }}
+        COMMENT_TITLE: ${{ inputs.comment-title }}
+        OUTPUT_DIR: ${{ inputs.output-dir }}
+      run: |
+        set -euo pipefail
+
+        command -v jq >/dev/null 2>&1 || {
+          echo "::error::jq is required to render the PL/SQL change-impact comment"
+          exit 2
+        }
+
+        output_dir="${OUTPUT_DIR:-${RUNNER_TEMP:-.}}"
+        mkdir -p "$output_dir"
+        comment_body="$output_dir/plsql-change-impact-comment.md"
+
+        jq -r --arg title "$COMMENT_TITLE" '
+          def rows_or_none($rows; $empty):
+            if ($rows | length) == 0 then $empty else ($rows | join("\n")) end;
+          .payload as $payload
+          | $payload.summary as $summary
+          | [
+              "<!-- plsql-cicd:change-impact v1 -->",
+              "### " + $title,
+              "",
+              "- Invalidations: \($summary.invalidation_count)",
+              "- Recompile candidates: \($summary.recompile_count)",
+              "- Compile-error flags: \($summary.compile_error_flag_count)",
+              "- Uncertainties: \($summary.uncertainty_count)",
+              "- Max dependency distance: \($summary.max_distance)",
+              "",
+              "#### Invalidated objects by kind",
+              rows_or_none(
+                ($payload.invalidated_objects_by_kind // []
+                  | map("- " + .object_type + ": " + (.count | tostring))),
+                "- None"
+              ),
+              "",
+              "#### Recompile candidates",
+              rows_or_none(
+                ($payload.recompile_plan // []
+                  | .[:10]
+                  | map("- " + .object_type + " #" + (.owner_symbol | tostring) + "." + (.name_symbol | tostring)
+                      + (if .force_compile then " (force compile)" else " (check status)" end))),
+                "- None"
+              ),
+              "",
+              "#### Compile-error flags",
+              rows_or_none(
+                ($payload.compile_error_flags // []
+                  | .[:10]
+                  | map("- " + .object_type + " #" + (.owner_symbol | tostring) + "." + (.name_symbol | tostring)
+                      + ": " + .message)),
+                "- None"
+              ),
+              "",
+              "Raw `plsql.cicd.change_impact` JSON is available as an action output."
+            ]
+          | join("\n")
+        ' "$PREDICT_JSON" > "$comment_body"
+
+        printf 'comment_body=%s\n' "$comment_body" >> "$GITHUB_OUTPUT"
+
+    - id: post
+      shell: bash
+      env:
+        POST_COMMENT: ${{ inputs.post-comment }}
+        GITHUB_TOKEN_INPUT: ${{ inputs.github-token }}
+        COMMENT_BODY: ${{ steps.render.outputs.comment_body }}
+      run: |
+        set -euo pipefail
+
+        post_comment="$(printf '%s' "$POST_COMMENT" | tr '[:upper:]' '[:lower:]')"
+        if [[ "$post_comment" != "true" ]]; then
+          printf 'comment_url=\n' >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if [[ -z "$GITHUB_TOKEN_INPUT" ]]; then
+          echo "::error::github-token is required when post-comment is true"
+          exit 2
+        fi
+        if [[ -z "${GITHUB_EVENT_PATH:-}" || ! -f "$GITHUB_EVENT_PATH" ]]; then
+          echo "::error::GITHUB_EVENT_PATH is required when post-comment is true"
+          exit 2
+        fi
+        if [[ -z "${GITHUB_REPOSITORY:-}" ]]; then
+          echo "::error::GITHUB_REPOSITORY is required when post-comment is true"
+          exit 2
+        fi
+
+        pr_number="$(jq -r '.pull_request.number // empty' "$GITHUB_EVENT_PATH")"
+        if [[ -z "$pr_number" ]]; then
+          echo "::error::PL/SQL change-impact comments can only be posted for pull_request events"
+          exit 2
+        fi
+
+        marker="<!-- plsql-cicd:change-impact v1 -->"
+        comments_url="https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${pr_number}/comments"
+        headers=(
+          -H "Authorization: Bearer ${GITHUB_TOKEN_INPUT}"
+          -H "Accept: application/vnd.github+json"
+          -H "X-GitHub-Api-Version: 2022-11-28"
+        )
+        body_json="${RUNNER_TEMP:-.}/plsql-change-impact-comment-request.json"
+        jq -Rs '{body: .}' "$COMMENT_BODY" > "$body_json"
+
+        existing_comment_id="$(
+          curl -fsSL "${headers[@]}" "$comments_url?per_page=100" \
+            | jq -r --arg marker "$marker" 'first(.[] | select(.body | contains($marker)) | .id) // empty'
+        )"
+
+        if [[ -n "$existing_comment_id" ]]; then
+          response="$(
+            curl -fsSL -X PATCH "${headers[@]}" \
+              -d @"$body_json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/comments/${existing_comment_id}"
+          )"
+        else
+          response="$(
+            curl -fsSL -X POST "${headers[@]}" \
+              -d @"$body_json" \
+              "$comments_url"
+          )"
+        fi
+
+        comment_url="$(printf '%s' "$response" | jq -r '.html_url // empty')"
+        printf 'comment_url=%s\n' "$comment_url" >> "$GITHUB_OUTPUT"

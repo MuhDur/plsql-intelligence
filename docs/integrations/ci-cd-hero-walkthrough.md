@@ -1,9 +1,10 @@
 # Hero demo — PR-integration walkthrough
 
-End-to-end walkthrough that exercises every stage of the
-`plsql cicd` pipeline against the synthetic L1 hero diff
-(`corpus/lab/hero_diff/`). Demonstrates the full predict → plan →
-gate → post-pr-comment cycle without needing a live Oracle instance.
+End-to-end walkthrough that exercises the release-0.5.0
+`plsql predict --robot-json` and GitHub Action path against the
+synthetic L1 hero diff (`corpus/lab/hero_diff/`). Demonstrates the
+predict → render → PR-comment cycle without needing a live Oracle
+instance.
 (`PLSQL-CICD-021` / oracle-5vga.)
 
 ## What the demo proves
@@ -11,10 +12,9 @@ gate → post-pr-comment cycle without needing a live Oracle instance.
 The L1 hero scenario: a developer opens a PR that renames the
 `p_emp_id` parameter on `pkg_employee_mgmt.fire_employee` to
 `p_employee_id`. Every caller using named notation
-(`employee_mgmt.fire_employee(p_emp_id => 42)`) breaks. The CI gate
+(`employee_mgmt.fire_employee(p_emp_id => 42)`) breaks. The CI Action
 catches this before merge, posts a single self-editing comment on the
-PR, and either blocks the merge or lets it through depending on
-policy.
+PR, and leaves the raw robot JSON available for a later policy gate.
 
 ## Stage 0 — clone + build
 
@@ -56,115 +56,70 @@ cargo run --release -p plsql-cicd --bin plsql -- predict \
 `--lineage-metadata` is the explicit logical-id-to-object map used to
 lower `LineageResult` rows into the stable numeric-symbol payload.
 
-## Stage 2 — plan recompile order
+## Stage 2 — render the GitHub Action comment locally
 
-```sh
-cargo run --release -p plsql-cicd -- plan \
-    --changeset corpus/lab/hero_diff/change.diff \
-    --robot-json > /tmp/plan.json
+The reusable Action renders the same `/tmp/predict.json` into a
+Markdown comment with these fields:
+
+- invalidation count
+- recompile candidates
+- compile-error flags
+- uncertainty count
+- max dependency distance
+
+In GitHub Actions this rendering happens inside
+`.github/actions/plsql-change-impact/action.yml`. Its self-test builds
+the CLI, feeds a fixture changeset into the Action, and asserts the
+expected `<!-- plsql-cicd:change-impact v1 -->` marker plus the
+expected invalidation count.
+
+## Stage 3 — run the Action on a PR
+
+The reference workflow calls the Action directly:
+
+```yaml
+- name: Predict and comment on PL/SQL blast radius
+  id: impact
+  uses: ./.github/actions/plsql-change-impact
+  with:
+    plsql-bin: plsql
+    git-range: ${{ github.event.pull_request.base.sha }}..${{ github.sha }}
+    mode: catalog-aware
+    github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
-`/tmp/plan.json` contains the topologically-sorted DDL order so a
-deployment script can recompile dependent objects after the changed
-package re-validates.
+The first run creates the PR comment. Later runs edit the same comment
+in place by searching existing issue comments for
+`<!-- plsql-cicd:change-impact v1 -->`.
 
-## Stage 3 — gate against policy
+## Stage 4 — verify the integration is healthy
 
-Drop a `.plsql-cicd-policy.toml` in your repo:
-
-```toml
-max_invalidations = 25
-blocked_kinds = []
-min_confidence = "medium"
-blocking_unknown_reasons = ["WrappedSource", "DynamicSqlOpaque"]
-```
-
-Then:
-
-```sh
-cargo run --release -p plsql-cicd -- gate \
-    --predict /tmp/predict.json \
-    --policy .plsql-cicd-policy.toml \
-    --pr-comment-json > /tmp/gate.json
-```
-
-`/tmp/gate.json` is the `plsql.cicd.gate_pr_comment` envelope
-(`PrCommentEnvelope`, CICD-014). Inspect:
-
-```sh
-jq '.pr_comment.verdict, .pr_comment.headline' /tmp/gate.json
-# "pass" or "fail"
-# "plsql cicd gate: PASS — no policy violations" (or similar)
-```
-
-The body markdown is in `.pr_comment.body_md` — that's what gets
-posted to the PR.
-
-## Stage 4 — post the PR comment (GitHub example)
-
-```sh
-export PLSQL_GH_TOKEN='ghp_<your-token>'
-
-cargo run --release -p plsql-cicd -- post-pr-comment \
-    --envelope /tmp/gate.json \
-    --platform github \
-    --owner acme-corp \
-    --repository billing-db \
-    --pull-request 42
-```
-
-The first run creates the comment. The second (and every subsequent)
-run edits the same comment in place — `find_existing_comment`
-(CICD-016) scans the PR's existing comments for the
-`<!-- plsql-cicd:gate v1 -->` HTML marker and turns the CREATE into a
-PATCH automatically.
-
-## Stage 5 — verify the integration is healthy
-
-```sh
-cargo run --release -p plsql-cicd -- doctor pr-integration \
-    --platform github \
-    --envelope /tmp/gate.json
-```
-
-Reports the `PrIntegrationDoctorReport` (CICD-022): token presence,
-envelope schema version, last-comment status, and one-line
-remediation hints. `posture: healthy` means the integration is
-operational; `caution` or `unknown` surface the action needed.
+The release-0.5.0 self-test is
+`.github/workflows/plsql-change-impact-selftest.yml`. It runs with
+`post-comment: "false"` so CI proves the Action and comment renderer
+without requiring a fixture pull request or a live token.
 
 ## What the synthetic lab proves
 
 Running this walkthrough end-to-end against `corpus/lab/hero_diff/`:
 
 1. Confirms the **deterministic-output** invariant — same diff →
-   byte-identical `gate.json` every time.
-2. Exercises the **HTML-marker idempotence** path — the second
-   `post-pr-comment` call must edit, not create.
+   byte-identical `plsql.cicd.change_impact` JSON every time.
+2. Exercises the **HTML-marker idempotence** path in the GitHub
+   Action — the second Action run edits the existing comment.
 3. Validates the **golden artifact** — `expected_what_breaks.json`
-   should match the `gate.json.decision.failures` summary modulo
-   ordering.
+   should match the reported invalidation and compile-error summary
+   modulo ordering.
 4. Verifies the **CI binding contract** — copy the
    [`github-actions.yml`](../../examples/ci/github-actions.yml)
    reference into a fresh repo, push a PR with the same diff, and
-   the gate runs identically.
-
-## Failure-mode walkthrough
-
-Replace the policy file with a tighter version to force a `fail`:
-
-```toml
-max_invalidations = 0   # any invalidation blocks
-```
-
-Re-run stages 3-4. The gate now emits `verdict: fail`, the body lists
-the violation, and the same `post-pr-comment` call edits the existing
-comment in place — no duplicate comments per PR.
+   the Action runs identically.
 
 ## Pointers
 
 - L1 hero diff: `corpus/lab/hero_diff/` (PLSQL-LAB-002).
-- Gate envelope schema: `crates/plsql-cicd/src/gate.rs::PrCommentEnvelope` (CICD-014).
-- Comment poster: `crates/plsql-cicd/src/post_pr_comment.rs` (CICD-015 + CICD-016).
-- PR-integration doctor: `pr_integration_doctor` (CICD-022).
+- Change-impact envelope schema: `crates/plsql-cicd/src/predict.rs::ChangeImpactEnvelope`.
+- GitHub Action: `.github/actions/plsql-change-impact/action.yml`.
+- Action self-test: `.github/workflows/plsql-change-impact-selftest.yml`.
 - CI reference workflows: `examples/ci/` (CICD-017/018/019).
 - Companion-repo plan: [`ci-cd.md`](ci-cd.md) (CICD-020).
