@@ -2904,7 +2904,10 @@ mod tests {
 
     #[test]
     fn guarded_create_or_replace_apply_audits_before_execute() {
-        use oraclemcp_audit::{MemoryAuditSink, SigningKey, VerifyOutcome, verify_records};
+        use oraclemcp_audit::{
+            AuditEntryDraft, BrokenReason, MemoryAuditSink, SigningKey, VerifyOutcome,
+            verify_records,
+        };
 
         struct SharedSink(Arc<MemoryAuditSink>);
         impl oraclemcp_audit::AuditSink for SharedSink {
@@ -2998,15 +3001,107 @@ mod tests {
             "apply response carries the same typed blast-radius payload"
         );
         assert_eq!(sink.flush_count(), 2, "enable + DDL both fsync");
+        let records = sink.records();
+        assert_eq!(records.len(), 2, "enable + DDL append two audit records");
+        let audit_golden: Vec<Value> = records
+            .iter()
+            .enumerate()
+            .map(|(index, record)| {
+                json!({
+                    "seq": record.seq,
+                    "tool": record.tool.as_str(),
+                    "danger_level": record.danger_level.as_str(),
+                    "decision": record.decision,
+                    "outcome": record.outcome,
+                    "rows_affected": record.rows_affected,
+                    "key_id": record.key_id.as_deref(),
+                    "sql_preview": record.sql_preview.as_str(),
+                    "prev_link": if index == 0 { "genesis" } else { "previous" },
+                    "signed": record.signature.is_some(),
+                })
+            })
+            .collect();
         assert_eq!(
-            verify_records(
-                &sink.records(),
-                &[SigningKey::new(
-                    "k-dispatch",
-                    b"dispatch-audit-key".to_vec()
-                )],
-            ),
+            audit_golden,
+            vec![
+                json!({
+                    "seq": 1,
+                    "tool": "enable_writes",
+                    "danger_level": "ESCALATION",
+                    "decision": "ALLOWED",
+                    "outcome": "PENDING",
+                    "rows_affected": null,
+                    "key_id": "k-dispatch",
+                    "sql_preview": "enable_writes dev: replace BILLING.V_AUDIT",
+                    "prev_link": "genesis",
+                    "signed": true,
+                }),
+                json!({
+                    "seq": 2,
+                    "tool": "create_or_replace",
+                    "danger_level": "DDL",
+                    "decision": "ALLOWED",
+                    "outcome": "PENDING",
+                    "rows_affected": null,
+                    "key_id": "k-dispatch",
+                    "sql_preview": ddl,
+                    "prev_link": "previous",
+                    "signed": true,
+                }),
+            ]
+        );
+        let verify_key = SigningKey::new("k-dispatch", b"dispatch-audit-key".to_vec());
+        assert_eq!(
+            verify_records(&records, std::slice::from_ref(&verify_key)),
             VerifyOutcome::Ok { records: 2 }
+        );
+
+        let mut in_place_tamper = records.clone();
+        in_place_tamper
+            .get_mut(1)
+            .expect("DDL audit record")
+            .sql_preview
+            .push_str(" -- tampered");
+        assert_eq!(
+            verify_records(&in_place_tamper, std::slice::from_ref(&verify_key)),
+            VerifyOutcome::Broken {
+                seq: 2,
+                index: 1,
+                reason: BrokenReason::HashMismatch,
+            }
+        );
+
+        let enable_record = records.first().expect("enable_writes audit record");
+        let ddl_record = records.get(1).expect("DDL audit record");
+        let forged_draft = AuditEntryDraft {
+            agent_identity: ddl_record.agent_identity.clone(),
+            tool: ddl_record.tool.clone(),
+            sql: format!("{ddl} -- attacker recompute"),
+            danger_level: ddl_record.danger_level.clone(),
+            decision: ddl_record.decision,
+            rows_affected: ddl_record.rows_affected,
+            outcome: ddl_record.outcome,
+        };
+        let forged = AuditRecord::chained_signed(
+            &forged_draft,
+            ddl_record.seq,
+            &enable_record.entry_hash,
+            ddl_record.timestamp.clone(),
+            &SigningKey::new("k-dispatch", b"attacker-recompute-key".to_vec()),
+        );
+        assert!(
+            forged.hash_is_valid(),
+            "attacker recomputed a hash-valid replacement record"
+        );
+        let mut recomputed_without_key = records.clone();
+        *recomputed_without_key.get_mut(1).expect("DDL audit record") = forged;
+        assert_eq!(
+            verify_records(&recomputed_without_key, std::slice::from_ref(&verify_key)),
+            VerifyOutcome::Broken {
+                seq: 2,
+                index: 1,
+                reason: BrokenReason::SignatureMismatch,
+            }
         );
 
         let executes = observed.observed_executes();
