@@ -122,6 +122,124 @@ pub fn run_compare_oracle_deps(
     plsql_lineage::compare_oracle_deps(graph, snapshot, interner)
 }
 
+fn change_tool_schema(name: &str) -> Option<serde_json::Value> {
+    use serde_json::json;
+    match name {
+        "what_breaks" => Some(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["changeset"],
+            "properties": {
+                "changeset": {
+                    "type": "object",
+                    "description": "plsql-cicd ChangeSet JSON describing changed objects.",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["source_only", "catalog_aware"],
+                    "default": "catalog_aware",
+                    "description": "Prediction mode to use when the server has catalog context.",
+                },
+            },
+        })),
+        "recompile_plan" => Some(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["changed"],
+            "properties": {
+                "changed": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Logical object ids changed in the already-loaded dependency graph.",
+                },
+            },
+        })),
+        "classify_change" => Some(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["before", "after"],
+            "properties": {
+                "before": {
+                    "type": "string",
+                    "description": "Filesystem path to the baseline PL/SQL source tree.",
+                },
+                "after": {
+                    "type": "string",
+                    "description": "Filesystem path to the candidate PL/SQL source tree.",
+                },
+            },
+        })),
+        "compare_oracle_deps" => Some(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["catalog_snapshot"],
+            "properties": {
+                "catalog_snapshot": {
+                    "type": "object",
+                    "description": "Oracle catalog snapshot JSON to compare against the already-loaded dependency graph.",
+                },
+            },
+        })),
+        "release_gate" => Some(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["prediction", "policy"],
+            "properties": {
+                "prediction": {
+                    "type": "object",
+                    "description": "InvalidationPrediction JSON from what_breaks.",
+                },
+                "policy": {
+                    "type": "object",
+                    "description": "GatePolicy JSON defining release thresholds.",
+                },
+            },
+        })),
+        "sarif_scan" => Some(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["report", "tool_name", "tool_version"],
+            "properties": {
+                "report": {
+                    "type": "object",
+                    "description": "plsql-sast ScanReport JSON to render.",
+                },
+                "tool_name": {
+                    "type": "string",
+                    "description": "Name to place in the SARIF run.tool.driver block.",
+                },
+                "tool_version": {
+                    "type": "string",
+                    "description": "Version string to place in the SARIF run.tool.driver block.",
+                },
+            },
+        })),
+        "orphan_candidates" => Some(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "assume_incomplete_augmentation": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true, classify candidates conservatively because augmentation may be incomplete.",
+                },
+            },
+        })),
+        "explain_lifecycle" => Some(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["target"],
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "Logical object id of the node to explain in the already-loaded dependency graph.",
+                },
+            },
+        })),
+        _ => None,
+    }
+}
+
 /// Register all eight change-analysis tool descriptors. Tools are
 /// `FoundationStatic` tier — pure static analysis, no live DB.
 /// Idempotent: the underlying [`ToolRegistry`] deduplicates by name.
@@ -160,11 +278,11 @@ pub fn register_change_tools(registry: &mut ToolRegistry) {
             "Lifecycle explanation of a node (in/out edges, summary).",
         ),
     ] {
-        registry.register(ToolDescriptor::new(
-            name,
-            ToolTier::FoundationStatic,
-            summary,
-        ));
+        let mut descriptor = ToolDescriptor::new(name, ToolTier::FoundationStatic, summary);
+        if let Some(schema) = change_tool_schema(name) {
+            descriptor = descriptor.with_input_schema(schema);
+        }
+        registry.register(descriptor);
     }
 }
 

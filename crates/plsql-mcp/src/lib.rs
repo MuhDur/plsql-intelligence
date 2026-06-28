@@ -129,6 +129,7 @@ pub fn register_execute_approved_tools(registry: &mut ToolRegistry) {
             ToolTier::FoundationLiveDb,
             "Run a previously-previewed DDL statement under its approval token. Verifies the supplied bytes against the previewed payload byte-for-byte and runs the cross-schema typed-name guard before returning the execution plan. Prerequisites: a prior dry_run (create_or_replace / patch_package / patch_view) minted the 60s approval token, and the session is write-enabled (connect → enable_writes); call within 60s of the dry_run or re-preview.",
         )
+        .with_input_schema(execute_approved_input_schema())
         .destructive(),
     );
     registry.register(
@@ -137,6 +138,7 @@ pub fn register_execute_approved_tools(registry: &mut ToolRegistry) {
             ToolTier::FoundationLiveDb,
             "Lock-free DDL deployment via a one-shot DBMS_SCHEDULER PLSQL_BLOCK job. Returns the submit block + the USER_SCHEDULER_JOB_RUN_DETAILS poll query.",
         )
+        .with_input_schema(deploy_ddl_input_schema())
         .destructive(),
     );
 }
@@ -154,6 +156,7 @@ pub fn register_patch_view_tool(registry: &mut ToolRegistry) {
             ToolTier::FoundationLiveDb,
             "Targeted view replacement. `dry_run` synthesises CREATE OR REPLACE VIEW <schema>.<name> AS … and mints a 60s approval token; `apply` verifies the supplied query byte-for-byte against the previewed payload before returning the executable DDL.",
         )
+        .with_input_schema(patch_view_input_schema())
         .destructive(),
     );
 }
@@ -171,6 +174,7 @@ pub fn register_create_or_replace_tool(registry: &mut ToolRegistry) {
             ToolTier::FoundationLiveDb,
             "Full-DDL deployment under per-operation approval. Accepts CREATE OR REPLACE … for PACKAGE [BODY] / PROCEDURE / FUNCTION / TRIGGER / VIEW / TYPE [BODY] / SYNONYM / LIBRARY. Guarded-write workflow: connect → enable_writes (consumes the single-use operator token) → this tool with mode=dry_run (mints a 60s approval token) → mode=apply (verifies the supplied bytes against the previewed payload byte-for-byte under that token before returning the executable DDL). The approval token expires 60s after dry_run.",
         )
+        .with_input_schema(create_or_replace_input_schema())
         .destructive(),
     );
 }
@@ -183,6 +187,7 @@ pub fn register_patch_package_tool(registry: &mut ToolRegistry) {
             ToolTier::FoundationLiveDb,
             "Targeted REPLACE-based package edit. `dry_run` synthesises CREATE OR REPLACE PACKAGE [BODY] DDL and mints a 60s approval token via the preview registry; `apply` verifies the supplied source byte-for-byte against the previewed payload before returning the executable DDL.",
         )
+        .with_input_schema(patch_package_input_schema())
         .destructive(),
     );
 }
@@ -260,6 +265,199 @@ pub use safety::{
 pub use oraclemcp_guard::MonotonicDeadline;
 pub use tools::{ToolDescriptor, ToolRegistry, ToolTier};
 
+fn no_args_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+    })
+}
+
+fn string_property(description: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "string",
+        "description": description,
+    })
+}
+
+fn nullable_string_property(description: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": ["string", "null"],
+        "description": description,
+    })
+}
+
+fn approval_mode_schema() -> serde_json::Value {
+    serde_json::json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["mode"],
+                "properties": {
+                    "mode": {
+                        "const": "dry_run",
+                        "description": "Preview the exact DDL bytes and mint a 60s approval token; no DDL is executed.",
+                    },
+                },
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["mode", "token"],
+                "properties": {
+                    "mode": {
+                        "const": "apply",
+                        "description": "Verify the supplied bytes against the dry-run preview and then execute the guarded DDL.",
+                    },
+                    "token": string_property("Approval token returned by the matching dry_run response."),
+                },
+            },
+        ],
+    })
+}
+
+fn patch_package_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["connection", "schema", "package", "part", "source", "mode"],
+        "properties": {
+            "connection": string_property("Active connection name from connect/list_connections."),
+            "schema": string_property("Target Oracle schema owner as a simple SQL name."),
+            "package": string_property("Target package name as a simple SQL name."),
+            "part": {
+                "type": "string",
+                "enum": ["spec", "body"],
+                "description": "Package half to replace.",
+            },
+            "source": string_property("Complete replacement package spec/body source after the package keyword; the CREATE OR REPLACE header is synthesized."),
+            "mode": approval_mode_schema(),
+        },
+    })
+}
+
+fn patch_view_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["connection", "schema", "view", "query", "mode"],
+        "properties": {
+            "connection": string_property("Active connection name from connect/list_connections."),
+            "schema": string_property("Target Oracle schema owner as a simple SQL name."),
+            "view": string_property("Target view name as a simple SQL name."),
+            "query": string_property("Replacement SELECT text following CREATE OR REPLACE VIEW <schema>.<view> AS."),
+            "mode": approval_mode_schema(),
+        },
+    })
+}
+
+fn create_or_replace_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["connection", "operation_summary", "ddl_bytes", "mode"],
+        "properties": {
+            "connection": string_property("Active connection name from connect/list_connections."),
+            "operation_summary": string_property("One-line human/operator summary recorded in the approval and audit trail."),
+            "ddl_bytes": string_property("Complete CREATE OR REPLACE statement bytes for a supported PL/SQL object kind."),
+            "mode": approval_mode_schema(),
+        },
+    })
+}
+
+fn execute_approved_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["connection", "token", "ddl_bytes", "principal_schema", "target_schema"],
+        "properties": {
+            "connection": string_property("Active connection name from connect/list_connections."),
+            "token": string_property("Approval token returned by a prior dry_run preview."),
+            "ddl_bytes": string_property("The exact DDL bytes approved during dry_run; verified byte-for-byte before execution."),
+            "principal_schema": string_property("Connected principal/current schema used for cross-schema guard decisions."),
+            "target_schema": string_property("Caller-declared target schema. Empty string is allowed only when the verified DDL is same-schema or does not name an owner."),
+            "operator_typed_schema": nullable_string_property("Human/operator typed confirmation for cross-schema writes; null for same-schema writes."),
+        },
+    })
+}
+
+fn deploy_ddl_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["job_name", "ddl_bytes"],
+        "properties": {
+            "job_name": string_property("Unique DBMS_SCHEDULER job name used to correlate the asynchronous DDL run."),
+            "ddl_bytes": string_property("DDL statement bytes wrapped into a one-shot DBMS_SCHEDULER job."),
+        },
+    })
+}
+
+fn connection_tool_input_schema(name: &str) -> serde_json::Value {
+    match name {
+        "connect" => serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name"],
+            "properties": {
+                "name": string_property("Stable in-process connection name to activate or create."),
+                "connect_string": nullable_string_property("Oracle Net connect identifier. Required when opening a new session; omit/null to reactivate an existing session."),
+                "username": nullable_string_property("Oracle username, or null for wallet/external authentication."),
+                "password": nullable_string_property("Oracle password for this request. Never returned in responses."),
+                "description": nullable_string_property("Optional operator-facing profile description."),
+                "permanently_read_only": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true, this session refuses enable_writes for its lifetime.",
+                },
+                "external_auth": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Use external/wallet authentication instead of password auth.",
+                },
+            },
+        }),
+        "switch_database" => serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name"],
+            "properties": {
+                "name": string_property("Existing in-process connection name to make active."),
+            },
+        }),
+        "list_connections" | "disconnect" | "current_database" => no_args_input_schema(),
+        _ => no_args_input_schema(),
+    }
+}
+
+fn safety_tool_input_schema(name: &str) -> serde_json::Value {
+    match name {
+        "set_safety_profile" => serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["profile"],
+            "properties": {
+                "profile": {
+                    "type": "string",
+                    "enum": ["static_only", "inspect_only", "ddl_guarded", "session_write_enabled"],
+                    "description": "Target named safety profile. session_write_enabled still requires enable_writes.",
+                },
+            },
+        }),
+        "enable_writes" => serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["token"],
+            "properties": {
+                "token": string_property("Single-use operator confirmation token minted for the active session."),
+            },
+        }),
+        "current_safety_profile" | "disable_writes" => no_args_input_schema(),
+        _ => no_args_input_schema(),
+    }
+}
+
 /// Build the canonical tool registry the `serve` command exposes.
 ///
 /// `ToolRegistry::new()` is intentionally *empty* — it is the bare
@@ -334,22 +532,10 @@ pub fn register_safety_tools(registry: &mut ToolRegistry) {
         ),
     ];
     for (name, summary) in descriptors {
-        let descriptor = ToolDescriptor::new(name, ToolTier::FoundationLiveDb, summary);
+        let descriptor = ToolDescriptor::new(name, ToolTier::FoundationLiveDb, summary)
+            .with_input_schema(safety_tool_input_schema(name));
         let descriptor = match name {
-            "connect" => descriptor.with_input_schema(serde_json::json!({
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["name"],
-                    "properties": {
-                        "name": {"type": "string", "description": "Stable in-process connection name to activate."},
-                        "connect_string": {"type": ["string", "null"], "description": "Oracle Net connect identifier. Required when opening a new session; omitted when re-activating an existing live session."},
-                        "username": {"type": ["string", "null"], "description": "Oracle username, or null for wallet/external authentication."},
-                        "password": {"type": ["string", "null"], "description": "Oracle password for this request. Never returned in responses."},
-                        "description": {"type": ["string", "null"], "description": "Optional operator-facing profile description."},
-                        "permanently_read_only": {"type": "boolean", "default": false, "description": "When true, this session refuses enable_writes for its lifetime."},
-                        "external_auth": {"type": "boolean", "default": false, "description": "Use external/wallet authentication instead of password auth."}
-                    }
-                })),
+            "enable_writes" => descriptor.destructive(),
             _ => descriptor,
         };
         registry.register(descriptor);
@@ -380,10 +566,9 @@ pub fn register_connection_tools(registry: &mut ToolRegistry) {
         ),
     ];
     for (name, summary) in descriptors {
-        registry.register(ToolDescriptor::new(
-            name,
-            ToolTier::FoundationLiveDb,
-            summary,
-        ));
+        registry.register(
+            ToolDescriptor::new(name, ToolTier::FoundationLiveDb, summary)
+                .with_input_schema(connection_tool_input_schema(name)),
+        );
     }
 }

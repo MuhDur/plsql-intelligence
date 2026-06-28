@@ -113,6 +113,55 @@ pub fn run_doc_lookup(req: &DocLookupRequest) -> DocLookupResponse {
     DocLookupResponse { matches }
 }
 
+fn foundation_tool_schema(name: &str) -> Option<serde_json::Value> {
+    use serde_json::json;
+    match name {
+        "dynamic_sql_evidence" => Some(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["call_text", "site"],
+            "properties": {
+                "call_text": {
+                    "type": "string",
+                    "description": "Single dynamic-SQL call text, e.g. an EXECUTE IMMEDIATE or DBMS_SQL call.",
+                },
+                "site": {
+                    "type": "string",
+                    "description": "Logical provenance for the call site, such as file:line or package.routine.",
+                },
+            },
+        })),
+        "completeness_report" => Some(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["project_root"],
+            "properties": {
+                "project_root": {
+                    "type": "string",
+                    "description": "Filesystem path to the PL/SQL project root to analyze.",
+                },
+            },
+        })),
+        "doc_lookup" => Some(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["source"],
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "PL/SQL source text to scan for documentation comments.",
+                },
+                "query": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Case-insensitive substring to match against doc tags or bodies. Empty string returns every doc comment.",
+                },
+            },
+        })),
+        _ => None,
+    }
+}
+
 /// Register the three descriptors. Foundation-static tier.
 pub fn register_foundation_tools(registry: &mut ToolRegistry) {
     for (name, summary) in [
@@ -133,11 +182,11 @@ pub fn register_foundation_tools(registry: &mut ToolRegistry) {
              filtered by a case-insensitive query against tag or body.",
         ),
     ] {
-        registry.register(ToolDescriptor::new(
-            name,
-            ToolTier::FoundationStatic,
-            summary,
-        ));
+        let mut descriptor = ToolDescriptor::new(name, ToolTier::FoundationStatic, summary);
+        if let Some(schema) = foundation_tool_schema(name) {
+            descriptor = descriptor.with_input_schema(schema);
+        }
+        registry.register(descriptor);
     }
 }
 

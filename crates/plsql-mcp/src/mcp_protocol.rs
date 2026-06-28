@@ -624,6 +624,7 @@ mod tests {
     use super::*;
     use crate::register_query_tool;
     use asupersync::Cx;
+    use std::collections::HashSet;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -899,6 +900,36 @@ mod tests {
         let r = crate::default_tool_registry();
         let resp = handle_request(&req(7, "tools/list", None), &r).unwrap();
         let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+        let registry_names: HashSet<&str> = r.tools.iter().map(|tool| tool.name.as_str()).collect();
+        let dispatch_names: HashSet<&str> = crate::dispatch_table().iter().copied().collect();
+        assert_eq!(
+            registry_names, dispatch_names,
+            "default_tool_registry and dispatch_table must stay in lockstep"
+        );
+        for tool in &tools {
+            let name = tool["name"].as_str().expect("tool name");
+            let Some(schema) = tool["inputSchema"].as_object() else {
+                assert!(
+                    tool["inputSchema"].is_object(),
+                    "{name} inputSchema must be an object: {tool}"
+                );
+                continue;
+            };
+            assert_eq!(
+                schema.get("type"),
+                Some(&Value::String(String::from("object"))),
+                "{name} inputSchema must declare an object root: {tool}"
+            );
+            assert_eq!(
+                schema.get("additionalProperties"),
+                Some(&Value::Bool(false)),
+                "{name} inputSchema must be strict, not the permissive fallback: {tool}"
+            );
+            assert!(
+                tool.get("input_schema").is_none(),
+                "{name} must use MCP camelCase inputSchema, not input_schema"
+            );
+        }
         let by = |name: &str| -> Value {
             tools
                 .iter()
@@ -911,9 +942,31 @@ mod tests {
             ("query", "sql"),
             ("parse_file", "source"),
             ("get_symbol", "source"),
+            ("compile_check", "source"),
+            ("dynamic_sql_evidence", "call_text"),
+            ("completeness_report", "project_root"),
+            ("doc_lookup", "source"),
             ("find_callers", "target"),
+            ("find_callees", "target"),
+            ("get_dependencies", "target"),
+            ("explain_lifecycle", "target"),
+            ("what_breaks", "changeset"),
+            ("recompile_plan", "changed"),
+            ("classify_change", "before"),
+            ("compare_oracle_deps", "catalog_snapshot"),
+            ("release_gate", "prediction"),
+            ("sarif_scan", "report"),
             ("analyze_project", "project_root"),
             ("plsql_analyze", "project_root"),
+            ("connect", "name"),
+            ("switch_database", "name"),
+            ("set_safety_profile", "profile"),
+            ("enable_writes", "token"),
+            ("patch_package", "connection"),
+            ("patch_view", "connection"),
+            ("create_or_replace", "ddl_bytes"),
+            ("execute_approved", "token"),
+            ("deploy_ddl", "job_name"),
         ] {
             let t = by(name);
             let req_arr = t["inputSchema"]["required"]
@@ -923,6 +976,29 @@ mod tests {
                 req_arr.iter().any(|v| v == field),
                 "{name} inputSchema.required must contain {field}: {t}"
             );
+        }
+        for name in [
+            "query",
+            "parse_file",
+            "get_symbol",
+            "compile_check",
+            "dynamic_sql_evidence",
+            "completeness_report",
+            "doc_lookup",
+            "find_callers",
+            "find_callees",
+            "get_dependencies",
+            "explain_lifecycle",
+            "what_breaks",
+            "recompile_plan",
+            "classify_change",
+            "compare_oracle_deps",
+            "release_gate",
+            "sarif_scan",
+            "analyze_project",
+            "plsql_analyze",
+        ] {
+            let t = by(name);
             assert_eq!(
                 t["annotations"]["readOnlyHint"],
                 Value::Bool(true),
@@ -931,10 +1007,12 @@ mod tests {
         }
         // Destructive write tools carry destructiveHint (.9).
         for name in [
+            "enable_writes",
             "deploy_ddl",
             "create_or_replace",
             "execute_approved",
             "patch_package",
+            "patch_view",
         ] {
             let t = by(name);
             assert_eq!(
