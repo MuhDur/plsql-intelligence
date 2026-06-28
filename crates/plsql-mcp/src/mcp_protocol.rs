@@ -274,11 +274,7 @@ pub fn handle_request(req: &JsonRpcRequest, registry: &ToolRegistry) -> Option<J
     match req.method.as_str() {
         "initialize" => Some(handle_initialize(id, req.params.as_ref())),
         "tools/list" => Some(handle_tools_list(id, registry)),
-        "tools/call" => Some(JsonRpcResponse::err(
-            id,
-            -32603,
-            "tools/call requires the server-owned Asupersync dispatch context",
-        )),
+        "tools/call" => Some(tools_call_requires_dispatch_context_response(id)),
         "ping" => Some(JsonRpcResponse::ok(id, Value::Object(Default::default()))),
         other => Some(JsonRpcResponse::err(
             id,
@@ -485,10 +481,10 @@ async fn handle_tools_call(
     use crate::dispatch::{PlsqlDispatchContext, dispatch_tool_with_runtime};
 
     let Some(params) = params else {
-        return JsonRpcResponse::err(id, -32602, "tools/call requires params");
+        return invalid_tools_call_params_response(id, "tools/call requires params");
     };
     let Some(name) = params.get("name").and_then(Value::as_str) else {
-        return JsonRpcResponse::err(id, -32602, "tools/call params missing `name`");
+        return invalid_tools_call_params_response(id, "tools/call params missing `name`");
     };
     // The tool must be advertised — `tools/list` and `tools/call`
     // share `registry` as the single source of truth. On a miss, carry a
@@ -519,6 +515,14 @@ async fn handle_tools_call(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| Value::Object(Default::default()));
+    if let Some(envelope) = validate_advertised_argument_names(registry, name, &arguments) {
+        return JsonRpcResponse::err_with_data(
+            id,
+            -32602,
+            envelope.message.clone(),
+            envelope.to_json(),
+        );
+    }
 
     // oracle-l65d: dispatch into the real `run_*` implementation.
     // `dispatch_tool` is the single async dispatch table; it deserializes the
@@ -560,8 +564,146 @@ async fn handle_tools_call(
             JsonRpcResponse::err_with_data(id, -32601, envelope.message.clone(), envelope.to_json())
         }
         Err(envelope) => {
+            let envelope = enrich_invalid_argument_envelope(registry, name, envelope);
             JsonRpcResponse::err_with_data(id, -32602, envelope.message.clone(), envelope.to_json())
         }
+    }
+}
+
+fn invalid_tools_call_params_response(id: Value, message: &'static str) -> JsonRpcResponse {
+    let envelope = oraclemcp_error::ErrorEnvelope::new(
+        oraclemcp_error::ErrorClass::InvalidArguments,
+        message,
+    )
+    .with_next_step(
+        "Call tools/call with params.name set to an advertised tool name and params.arguments set \
+         to an object.",
+    );
+    JsonRpcResponse::err_with_data(id, -32602, message, envelope.to_json())
+}
+
+fn tools_call_requires_dispatch_context_response(id: Value) -> JsonRpcResponse {
+    let message = "tools/call requires the server-owned Asupersync dispatch context";
+    let envelope =
+        oraclemcp_error::ErrorEnvelope::new(oraclemcp_error::ErrorClass::Internal, message)
+            .with_next_step(
+                "Route tools/call through PlsqlMcpServer::handle_request so the server can supply \
+                 its dispatch runtime and live-DB state.",
+            );
+    JsonRpcResponse::err_with_data(id, -32603, message, envelope.to_json())
+}
+
+fn validate_advertised_argument_names(
+    registry: &ToolRegistry,
+    tool_name: &str,
+    arguments: &Value,
+) -> Option<oraclemcp_error::ErrorEnvelope> {
+    let schema = advertised_argument_schema(registry, tool_name)?;
+    if schema.get("type").and_then(Value::as_str) != Some("object") {
+        return None;
+    }
+    let Some(args) = arguments.as_object() else {
+        return Some(
+            oraclemcp_error::ErrorEnvelope::new(
+                oraclemcp_error::ErrorClass::InvalidArguments,
+                format!("arguments for tool `{tool_name}` must be an object"),
+            )
+            .with_next_step(format!(
+                "Inspect `{tool_name}`'s inputSchema in tools/list and send an object as arguments."
+            )),
+        );
+    };
+    if schema.get("additionalProperties") != Some(&Value::Bool(false)) {
+        return None;
+    }
+    let mut property_names = advertised_argument_property_names(registry, tool_name);
+    property_names.sort();
+    let mut unknown = args
+        .keys()
+        .filter(|key| !property_names.iter().any(|known| known == *key))
+        .cloned()
+        .collect::<Vec<_>>();
+    unknown.sort();
+    let bad_name = unknown.into_iter().next()?;
+    Some(argument_name_error_envelope(
+        tool_name,
+        &bad_name,
+        &property_names,
+    ))
+}
+
+fn enrich_invalid_argument_envelope(
+    registry: &ToolRegistry,
+    tool_name: &str,
+    envelope: oraclemcp_error::ErrorEnvelope,
+) -> oraclemcp_error::ErrorEnvelope {
+    if envelope.error_class != oraclemcp_error::ErrorClass::InvalidArguments
+        || !envelope.fuzzy_matches.is_empty()
+    {
+        return envelope;
+    }
+    let Some(bad_name) = backtick_field_after(&envelope.message, "unknown field ") else {
+        return envelope;
+    };
+    let mut property_names = advertised_argument_property_names(registry, tool_name);
+    property_names.sort();
+    if property_names.is_empty() {
+        return envelope;
+    }
+    argument_name_error_envelope(tool_name, &bad_name, &property_names).with_next_step(format!(
+        "Original validation error from `{tool_name}`: {}",
+        envelope.message
+    ))
+}
+
+fn argument_name_error_envelope(
+    tool_name: &str,
+    bad_name: &str,
+    property_names: &[String],
+) -> oraclemcp_error::ErrorEnvelope {
+    let candidates = property_names
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    oraclemcp_error::ErrorEnvelope::new(
+        oraclemcp_error::ErrorClass::InvalidArguments,
+        format!("unknown argument `{bad_name}` for tool `{tool_name}`"),
+    )
+    .with_fuzzy_matches(oraclemcp_error::fuzzy_suggest(bad_name, &candidates, 5))
+    .with_next_step(format!(
+        "Use one of `{tool_name}`'s advertised inputSchema properties: {}.",
+        property_names.join(", ")
+    ))
+}
+
+fn advertised_argument_schema<'a>(
+    registry: &'a ToolRegistry,
+    tool_name: &str,
+) -> Option<&'a Value> {
+    registry
+        .tools
+        .iter()
+        .find(|tool| tool.name == tool_name)?
+        .input_schema
+        .as_ref()
+}
+
+fn advertised_argument_property_names(registry: &ToolRegistry, tool_name: &str) -> Vec<String> {
+    advertised_argument_schema(registry, tool_name)
+        .and_then(|schema| schema.get("properties"))
+        .and_then(Value::as_object)
+        .map(|properties| properties.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn backtick_field_after(message: &str, marker: &str) -> Option<String> {
+    let tail = message.split_once(marker)?.1;
+    let (_, after_open) = tail.split_once('`')?;
+    let (field, _) = after_open.split_once('`')?;
+    if field.is_empty() {
+        None
+    } else {
+        Some(field.to_owned())
     }
 }
 
@@ -695,6 +837,28 @@ mod tests {
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
         assert!(tools.iter().any(|t| t["name"] == "query"));
+    }
+
+    #[test]
+    fn context_free_tools_call_error_carries_envelope() {
+        let r = registry_with_query();
+        let resp = handle_request(
+            &req(
+                4,
+                "tools/call",
+                Some(serde_json::json!({"name": "query", "arguments": {}})),
+            ),
+            &r,
+        )
+        .unwrap();
+        let err = resp.error.expect("context-free tools/call is an error");
+        assert_eq!(err.code, -32603);
+        let data = err.data.expect("structured envelope");
+        assert_eq!(data["error_class"], "INTERNAL");
+        assert!(
+            !data["next_steps"].as_array().unwrap().is_empty(),
+            "next_steps should identify the server-owned dispatch path: {data}"
+        );
     }
 
     #[test]
@@ -1040,12 +1204,46 @@ mod tests {
         let err = resp.error.expect("protocol error");
         assert_eq!(err.code, -32601);
         let data = err.data.expect("structured envelope in error.data");
+        assert_eq!(data["error_class"], "INVALID_ARGUMENTS");
         let fuzzy = data["fuzzy_matches"]
             .as_array()
             .expect("fuzzy_matches present");
         assert!(
             fuzzy.iter().any(|v| v == "parse_file"),
             "fuzzy_matches should suggest parse_file: {data}"
+        );
+    }
+
+    #[test]
+    fn bad_argument_name_error_carries_fuzzy_suggestion() {
+        // oracle-plsql-converge-0lnu.12.6: argument-name typos are caught
+        // against the advertised inputSchema and returned as structured
+        // ErrorEnvelope data, including a did-you-mean candidate.
+        let resp = server_response(
+            crate::default_tool_registry(),
+            req(
+                18,
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "parse_file",
+                    "arguments": {"sorce": "BEGIN NULL; END;\n/\n"}
+                })),
+            ),
+        );
+        let err = resp.error.expect("protocol error");
+        assert_eq!(err.code, -32602);
+        let data = err.data.expect("structured envelope in error.data");
+        assert_eq!(data["error_class"], "INVALID_ARGUMENTS");
+        assert_eq!(
+            data["message"],
+            "unknown argument `sorce` for tool `parse_file`"
+        );
+        let fuzzy = data["fuzzy_matches"]
+            .as_array()
+            .expect("fuzzy_matches present");
+        assert!(
+            fuzzy.iter().any(|v| v == "source"),
+            "fuzzy_matches should suggest source: {data}"
         );
     }
 
@@ -1323,6 +1521,8 @@ mod tests {
         );
         let err = resp.error.expect("invalid arguments => error");
         assert_eq!(err.code, -32602);
+        let data = err.data.expect("structured envelope");
+        assert_eq!(data["error_class"], "INVALID_ARGUMENTS");
     }
 
     #[test]
@@ -1436,6 +1636,12 @@ mod tests {
         );
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32602);
+        let data = err.data.expect("structured envelope");
+        assert_eq!(data["error_class"], "INVALID_ARGUMENTS");
+        assert!(
+            !data["next_steps"].as_array().unwrap().is_empty(),
+            "next_steps should guide malformed tools/call params: {data}"
+        );
     }
 
     #[test]
