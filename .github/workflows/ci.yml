@@ -49,6 +49,39 @@ jobs:
       - run: cargo test --workspace --all-targets
       - run: cargo test --workspace --doc
 
+  # `oracle-plsql-converge-0lnu.15` Phase X aggregate DoD — prove the
+  # shipping stdio MCP loop can connect and exercise live tools over the real
+  # JSON-RPC wire against Oracle Free 23ai, not just in-process helpers.
+  live-wire-xe:
+    name: mcp live wire (Oracle 23ai)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-05-11
+      - uses: Swatinem/rust-cache@v2
+      - name: Start Oracle Free 23ai
+        env:
+          ORACLE_PWD: DemoPlsqlIntel#2026
+        run: make demo-oracle-xe-ci
+      - name: Exercise plsql-mcp serve over JSON-RPC
+        env:
+          PLSQL_XE_SYSTEM_PASSWORD: DemoPlsqlIntel#2026
+          PLSQL_XE_DEMO_PASSWORD: DemoLab#2026
+        run: |
+          cargo test -p plsql-mcp --locked --features live-xe \
+            --test mcp_live_xe serve_stdio_live_surface_e2e_skips_without_oracle \
+            -- --test-threads=1 --nocapture
+      - name: Stop Oracle Free 23ai
+        if: always()
+        run: |
+          docker compose \
+            -f examples/oracle-xe/docker-compose.yml \
+            -f examples/oracle-xe/docker-compose.gvenzl.yml \
+            down --volumes
+
   # `oracle-plsql-converge-0lnu.15.12` — keep the PL/SQL layer from reaching
   # around the published oraclemcp-db adapter into Oracle drivers or async/server
   # runtimes directly.
