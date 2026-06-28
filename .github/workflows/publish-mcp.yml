@@ -3,11 +3,18 @@ name: Publish to MCP Registry (plsql-mcp)
 # Lists plsql-mcp ("PL/SQL Intelligence") in the official MCP registry
 # (registry.modelcontextprotocol.io) under io.github.MuhDur, authenticated via
 # GitHub OIDC (no token/secret). server.json references the OCI image
-# ghcr.io/muhdur/plsql-mcp built by docker.yml — run this AFTER that image is
-# pushed and its GHCR package is public. Dispatch-only so it never races the
-# image build on a tag.
+# ghcr.io/muhdur/plsql-mcp built by docker.yml. On v* tags this workflow waits
+# for the matching GHCR image before publishing server.json so the MCP registry
+# never sees a manifest pointing at an image tag that is not available yet.
 on:
-  workflow_dispatch: {}
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "MCP registry version/image tag to publish (e.g. 0.5.0)"
+        required: true
+        default: "0.5.0"
 
 jobs:
   publish:
@@ -16,8 +23,63 @@ jobs:
     permissions:
       id-token: write # GitHub OIDC
       contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v4
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            version="${{ github.event.inputs.version }}"
+          else
+            ref="${GITHUB_REF_NAME}"
+            case "$ref" in
+              v*) version="${ref#v}" ;;
+              *) version="$ref" ;;
+            esac
+          fi
+          if [[ ! "$version" =~ ^[0-9]+[.][0-9]+[.][0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::unsupported MCP registry version '$version' from ref '${GITHUB_REF_NAME:-manual}'"
+            exit 1
+          fi
+          echo "v=$version" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/muhdur/plsql-mcp:$version" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR for image probe
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Wait for matching GHCR image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${{ steps.ver.outputs.image }}"
+          for attempt in {1..20}; do
+            if docker buildx imagetools inspect "$image" >/dev/null 2>&1; then
+              echo "found $image"
+              exit 0
+            fi
+            echo "waiting for $image ($attempt/20)"
+            sleep 30
+          done
+          echo "::error::GHCR image not available: $image"
+          exit 1
+      - name: Render server.json for version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp)"
+          jq \
+            --arg version "${{ steps.ver.outputs.v }}" \
+            --arg image "${{ steps.ver.outputs.image }}" \
+            '.version = $version | .packages[0].identifier = $image' \
+            server.json > "$tmp"
+          mv "$tmp" server.json
+          cat server.json
       - name: Install mcp-publisher
         run: |
           curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher

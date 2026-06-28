@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.MuhDur/plsql-mcp",
   "title": "PL/SQL Intelligence",
-  "description": "PL/SQL Intelligence MCP server — live Oracle DB tools + offline analyze/lineage/SAST (unofficial).",
-  "version": "0.1.0",
+  "description": "PL/SQL Intelligence MCP server — the superset sibling to oraclemcp: live Oracle DB tools plus offline PL/SQL analyze/lineage/SAST/change-impact.",
+  "version": "0.5.0",
   "repository": {
     "url": "https://github.com/MuhDur/plsql-intelligence",
     "source": "github"
@@ -11,7 +11,7 @@
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/muhdur/plsql-mcp:0.1.0",
+      "identifier": "ghcr.io/muhdur/plsql-mcp:0.5.0",
       "transport": {
         "type": "stdio"
       }

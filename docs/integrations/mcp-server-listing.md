@@ -20,20 +20,20 @@ For `modelcontextprotocol/servers` (README "Community Servers" /
 ```json
 {
   "name": "plsql-intelligence",
-  "description": "Static analysis for Oracle PL/SQL: dependency graph, lineage, dynamic-SQL/taint evidence, SAST findings, change-impact tools, and completeness reporting. Apache-2.0 OR MIT; no live database required.",
+  "description": "Superset Oracle MCP server: live DB inspection/guarded writes plus PL/SQL dependency graph, lineage, SAST, change-impact, and completeness reporting. Apache-2.0 OR MIT.",
   "vendor": "plsql-intelligence",
-  "sourceUrl": "https://example.invalid/plsql-intelligence",
+  "sourceUrl": "https://github.com/MuhDur/plsql-intelligence",
   "license": "Apache-2.0 OR MIT",
-  "runtime": "native binary (Rust)",
+  "runtime": "native binary or OCI image (Rust)",
   "transport": ["stdio"],
   "command": "plsql-mcp",
   "args": ["serve"]
 }
 ```
 
-(Replace `sourceUrl` with the public repository URL at submission
-time — left as a non-resolving placeholder here per the no-guessed-URLs
-rule.)
+Dual-tier positioning: `oraclemcp` is the lean live-Oracle access server;
+`plsql-mcp` is the superset that adds offline PL/SQL intelligence and the
+guarded change-impact surface.
 
 ## awesome-mcp-servers entry
 
@@ -41,13 +41,13 @@ Markdown list line (under the "Databases" or "Developer Tools"
 section):
 
 ```markdown
-- [plsql-intelligence](https://example.invalid/plsql-intelligence) - Static analysis for Oracle PL/SQL: dependency/lineage graph, dynamic-SQL & taint evidence, SAST findings, completeness reporting. Stdio MCP, no live DB. (Rust, Apache-2.0/MIT)
+- [plsql-intelligence](https://github.com/MuhDur/plsql-intelligence) - Superset Oracle MCP server: live DB tools plus PL/SQL dependency/lineage graph, SAST, change-impact, and completeness reporting. (Rust, Apache-2.0/MIT)
 ```
 
 ## One-line description (≤ 160 chars, for indexes that cap it)
 
 ```
-Static analysis for Oracle PL/SQL — dependency/lineage graph, dynamic-SQL & taint evidence, SAST findings, completeness reporting. Stdio MCP, no live DB.
+Superset Oracle MCP server — live DB tools plus PL/SQL dependency/lineage graph, SAST, change-impact, and completeness reporting.
 ```
 
 ## Tool surface advertised
@@ -64,7 +64,7 @@ license gate.
 
 ## Submission checklist (for the maintainer doing the PRs)
 
-- [ ] Public source URL is live and replaces every `example.invalid`.
+- [ ] Public source URL is live.
 - [ ] README has an install + MCP-client config section (see
       [`mcp-clients.md`](mcp-clients.md)).
 - [ ] `plsql-mcp doctor --robot-json` output pasted into the PR as
