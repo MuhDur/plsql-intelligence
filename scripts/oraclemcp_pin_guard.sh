@@ -62,6 +62,20 @@ simple_semver() {
   [[ "${version}" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]]
 }
 
+parse_cargo_info_version() {
+  local info="$1"
+  awk '
+    {
+      gsub(/\033\[[0-9;]*[[:alpha:]]/, "", $0)
+      if ($0 ~ /^version: /) {
+        sub(/^version: /, "", $0)
+        print
+        exit
+      }
+    }
+  ' <<<"${info}"
+}
+
 version_gt() {
   local left="$1"
   local right="$2"
@@ -108,12 +122,12 @@ latest_published_version() {
     return 0
   fi
 
-  if ! info="$(cargo info "${crate}" --locked 2>&1)"; then
+  if ! info="$(CARGO_TERM_COLOR=never cargo info "${crate}" --locked 2>&1)"; then
     echo "ORACLEMCP-PIN-GUARD: FAIL cargo info failed for ${crate}" >&2
     echo "${info}" >&2
     return 2
   fi
-  latest="$(awk -F': ' '$1 == "version" {print $2; exit}' <<<"${info}")"
+  latest="$(parse_cargo_info_version "${info}")"
   if [[ -z "${latest}" ]]; then
     echo "ORACLEMCP-PIN-GUARD: FAIL could not parse latest version for ${crate}" >&2
     echo "${info}" >&2
@@ -136,7 +150,7 @@ run_pin_gate() {
   row_count=0
   failures=0
   printf 'package\tcrate\tpin\tlatest\tstatus\tmanifest\n'
-  while IFS=$'\t' read -r package crate req optional manifest; do
+  while IFS=$'\t' read -r package crate req _optional manifest; do
     local pinned latest status
     row_count=$((row_count + 1))
     status="PASS"
@@ -181,7 +195,14 @@ run_pin_gate() {
 }
 
 self_test() {
-  local planted_metadata overrides rc
+  local planted_metadata overrides parsed_color rc
+  parsed_color="$(parse_cargo_info_version $'\033[1m\033[92mversion:\033[0m 0.4.0')"
+  if [[ "${parsed_color}" != "0.4.0" ]]; then
+    echo "ORACLEMCP-PIN-GUARD: SELF-TEST FAIL ANSI cargo-info version parse returned ${parsed_color:-<empty>}" >&2
+    return 1
+  fi
+  echo "ORACLEMCP-PIN-GUARD: SELF-TEST PASS ANSI cargo-info version parse"
+
   planted_metadata='{
     "packages": [
       {
