@@ -79,6 +79,23 @@ jobs:
       - name: Prove planted forbidden string fails
         run: scripts/plsql_mcp_honesty_grep.sh --self-test
 
+  # `oracle-plsql-converge-0lnu.15.14` — keep plsql-mcp's published
+  # oraclemcp-* spine pins current with crates.io so the adapter cannot
+  # silently fall minors behind again.
+  oraclemcp-pin-guard:
+    name: oraclemcp pin guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-05-11
+      - uses: Swatinem/rust-cache@v2
+      - name: Check published oraclemcp-* pin currency
+        run: scripts/oraclemcp_pin_guard.sh
+      - name: Prove planted stale pin fails
+        run: scripts/oraclemcp_pin_guard.sh --self-test
+
   # NOTE: the engine-free oraclemcp-* MCP spine classifier cargo-fuzz smoke moved
   # to the standalone MuhDur/oraclemcp repo in Phase-E. That CI job now lives
   # there; plsql-mcp consumes the published crates.
