@@ -390,11 +390,13 @@ LAYER 1.5 — ORACLE CONTEXT
         └──────────────────┬─────────────────┘
                            v
 LAYER 2 — SEMANTICS
-   plsql-ir ──► plsql-symbols ──► plsql-privileges ──► plsql-sqlsem ──► plsql-flow ──► plsql-facts ──► plsql-depgraph
-   (typed IR)   (resolution +    (definer/invoker,    (embedded SQL    (value flow,    (normalized    (stable node ids,
-                 overloads)       grants, roles)       semantics:        taint,         relational      evidence-bearing
-                                                       projections,      constants,     facts for all   edges)
-                                                       column R/W)       value sets)    consumers)
+   plsql-ir ──► plsql-symbols ──► plsql-privileges ──► plsql-depgraph
+   (typed IR,   (resolution +    (definer/invoker,    (stable node ids,
+    embedded     overloads)       grants, roles)       evidence-bearing
+    SQL model,                                       edges; consumes
+    flow state,                                      normalized facts)
+    FactStore
+    emission)
                           │
                           v
 LAYER 2.5 — ANALYSIS ORCHESTRATION
@@ -431,7 +433,7 @@ FUTURE PRODUCT (separate plan; consumes catalog + lineage)
 - Layer 0 must finish first. All other layers block on it.
 - Layer 1 (parser frontend) blocks Layer 1.5 and Layer 2.
 - Within Layer 1.5, `plsql-project` and `plsql-catalog` are mutually independent.
-- Layer 2 components have an internal partial order: IR → symbols → privileges → sqlsem → flow → facts → depgraph. Symbols and privileges can be partly parallel; flow consumes IR+symbols; facts consumes everything above; depgraph consumes facts.
+- Layer 2 components have an internal partial order: IR → symbols → privileges → depgraph. The embedded-SQL model, flow-state solver, and normalized `FactStore` emission are modules inside `plsql-ir`, not separate crates. Phase G (`oracle-plsql-converge-0lnu.14`) was the tracked build of the emitted-fact projection boundary over the existing solver.
 - Layer 2.5 (`plsql-engine`) cannot be marked complete until every Layer 2 component is complete. Its skeleton (public types, module structure) may be created during Layer 0 scaffolding, but the implementation belongs to Layer 2.5.
 - Within Layer 3, all consumers (`plsql-scan`, `plsql-doc`, `plsql-bindgen`) are mutually independent and consume `FactStore` first, falling to raw IR only for component-specific details.
 - Layer 4 (`plsql-lineage`) blocks on Layer 2 + Layer 2.5.
@@ -499,12 +501,9 @@ plsql-intelligence/
 │   ├── plsql-project/          # SQL*Plus splitting, includes, spec/body, wrapped detection, CC preprocessing
 │   ├── plsql-parser/           # Layer 1 (ParseBackend-abstracted)
 │   ├── plsql-catalog/          # Layer 1.5 (Oracle dictionary metadata + PL/Scope, offline-first)
-│   ├── plsql-ir/               # Layer 2
+│   ├── plsql-ir/               # Layer 2 (typed IR, embedded SQL model, flow state, FactStore emission)
 │   ├── plsql-symbols/          # Layer 2
 │   ├── plsql-privileges/       # Layer 2
-│   ├── plsql-sqlsem/           # Layer 2 (embedded-SQL semantic model)
-│   ├── plsql-flow/             # Layer 2 (value flow, taint, constants, value sets)
-│   ├── plsql-facts/            # Layer 2 (normalized fact store consumed by all product surfaces)
 │   ├── plsql-depgraph/         # Layer 2
 │   ├── plsql-engine/           # Layer 2.5 — canonical analysis-pipeline orchestrator (skeleton in Layer 0)
 │   ├── plsql-lineage/          # Layer 4 product surface
@@ -1341,33 +1340,36 @@ Models authorization-relevant semantics — distinct from raw catalog data becau
 
 Output feeds SAST evidence, lineage confidence, and CI/CD risk reports. Distinct enough from symbol resolution to be its own crate; sharing types with `plsql-symbols` via `plsql-core`.
 
-#### 9.2.5 `plsql-facts` crate — normalized fact store
+#### 9.2.5 `plsql-ir::fact` — normalized fact store
 
 **Why this layer exists:** without an explicit intermediate fact model, each product surface (SAST, lineage, docs, bindgen) would walk the raw IR independently and re-interpret semantics. Over time they would drift — SAST resolving a name one way, lineage another, docs another. A normalized fact store gives every consumer the same answers to the same questions.
 
-The fact store is **not** a Datalog/Prolog system on day one. It is a set of relational fact families with stable schemas:
+The current implementation lives in `plsql-ir` (`fact.rs`, `fact_emit.rs`,
+`sql_fact_emit.rs`). There is **no** separate `plsql-facts` crate in this
+workspace. The fact store is **not** a Datalog/Prolog system on day one. It is a
+set of relational fact families with stable schemas and content-addressed IDs:
 
 ```rust
 pub enum FactKind {
-    Decl,              // DeclFact: declarations (vars, params, cursors, procs, types, tables, ...)
-    Reference,         // ReferenceFact: name reference → resolved declaration (or unknown)
-    Call,              // CallFact: caller → callee with overload signature
-    SqlTableUse,       // SqlTableUseFact: statement → table use with read/write role
-    SqlColumnUse,      // SqlColumnUseFact: statement → column use with read/write/derived role
-    Privilege,         // PrivilegeFact: grant/role/AUTHID-relevant authorization
-    DynamicSql,        // DynamicSqlFact: dynamic SQL site with structured evidence
-    Unknown,           // UnknownFact: explicit uncertainty record with UnknownReason
-    CatalogObject,    // CatalogObjectFact: object metadata from catalog snapshot
-    DocComment,        // DocCommentFact: parsed doc comments
+    Declaration,
+    Reference,
+    DependencyEdge,
+    DynamicSqlEvidence,
+    DbLinkReference,
+    Opacity,
+    ResolutionReport,
+    Privilege,
+    ConstantValue,
+    ValueSet,
+    StringShape,
+    Taint,
+    Sanitizer,
+    // plus SAST/domain fact families such as ExceptionHandler,
+    // CrossSchemaWrite, SensitivePublicSynonym, and others.
 }
 
-pub struct FactStore { /* facts indexed by kind + key */ }
+pub struct FactStore { /* facts indexed by kind */ }
 ```
-
-Two backends:
-
-- In-memory relation sets for library use (single-process pipeline)
-- SQLite-backed persisted facts through `plsql-store` for CLI/CI use (queryable across processes, cache-friendly)
 
 **All product surfaces consume `FactStore` first** and only drop to raw IR for component-specific details:
 
@@ -1377,23 +1379,34 @@ Two backends:
 - `plsql-bindgen` emits bindings from facts
 - `plsql-cicd` predicts invalidation from facts
 
-#### 9.2.6 `plsql-flow` crate — value flow, taint, constants, value sets
+#### 9.2.6 `plsql-ir` flow state and emitted-fact projection
 
 **Why this layer exists:** the v0.4 SAST and dynamic-SQL story jumped from syntax to findings without a dataflow engine. Real SQL injection analysis needs to answer: where did the dynamic string come from? Did user input enter it? Was DBMS_ASSERT used? Was the value bound or concatenated? Was the table name selected from a bounded set?
 
-Models conservative value flow across PL/SQL variables, parameters, assignments, branches, string operations, cursor loops, and procedure calls.
+The working solver is a `plsql-ir` flow-state model (`FlowEnv`, `FlowQuery`,
+`RoutineFlowSummary`, `FlowUnknownFact`, and related intra/inter-procedural
+modules). There is **no** separate `plsql-flow` crate. The solver models
+conservative value flow across PL/SQL variables, parameters, assignments,
+branches, string operations, cursor loops, and procedure calls.
 
-Primary outputs:
+Phase G (`oracle-plsql-converge-0lnu.14`) was the tracked build of the intended
+end-state: keep the solver, but materialize its evidence as normalized
+`FactStore` rows. That projection produces stable `ConstantValue`, `ValueSet`,
+`StringShape`, `Taint`, `Sanitizer`, and `Opacity`/unknown facts via
+`plsql-ir::fact_emit`, with golden snapshots and fact-ID-stability coverage.
+
+The important distinction is architectural: flow **state** is internal solver
+machinery; emitted flow **facts** are the cross-surface contract.
+
+Representative emitted fact families:
 
 ```rust
-pub enum FlowFact {
-    Taint(TaintFact),                       // source → sink path for security analysis
-    ConstantValue(ConstantValueFact),       // literal or compile-time constant value
-    ValueSet(ValueSetFact),                 // bounded set of possible values
-    StringShape(StringShapeFact),           // concatenation template with literal + symbolic segments
-    Sanitizer(SanitizerFact),               // observed validation (DBMS_ASSERT, REGEXP_LIKE, etc.)
-    FlowUnknown(FlowUnknownFact),           // loop/alias/call boundary where flow becomes conservative
-}
+FactKind::Taint               // source -> sink path for security analysis
+FactKind::ConstantValue       // literal or compile-time constant value
+FactKind::ValueSet            // bounded set of possible values
+FactKind::StringShape         // concatenation template with literal + symbolic segments
+FactKind::Sanitizer           // observed validation (DBMS_ASSERT, REGEXP_LIKE, etc.)
+FactKind::Opacity             // loop/alias/call boundary where flow remains conservative
 ```
 
 Consumers:
@@ -1405,9 +1418,12 @@ Consumers:
 
 Without this layer, SAST findings on dynamic SQL would be either too noisy (false positives on any `EXECUTE IMMEDIATE`) or too weak (missing real injections inside loop-built strings). With it, SAST becomes evidence-based instead of regex-with-good-intentions.
 
-#### 9.2.7 `plsql-sqlsem` crate — embedded-SQL semantic model
+#### 9.2.7 `plsql-ir` embedded-SQL semantic model
 
 PL/SQL intelligence is not only PL/SQL. Most customer-facing value (especially column-level lineage) comes from understanding **embedded SQL**. Treating SQL analysis as scattered special cases in `plsql-ir` would have created a pile of brittle edge cases. A separate semantic model for SQL statements is the right abstraction.
+
+That semantic model now lives as `plsql-ir` modules and emits normalized facts
+through `sql_fact_emit.rs`; there is **no** separate `plsql-sqlsem` crate.
 
 Responsibilities:
 
@@ -1474,12 +1490,12 @@ pub struct SemanticConfig {
 - Role-mediated authorization produces `UnknownReason::RuntimeGrantOrRole` where runtime role state would change the result
 - Invoker-rights cross-schema read/write paths emit evidence records consumable by SAST `SEC004` and lineage confidence scoring
 - Privilege doctor reports grant coverage, unresolved authorization edges, role-dependent edges, `PUBLIC` exposure surface, and cross-schema write surface
-- `plsql-sqlsem` resolves table aliases, CTE scopes, subqueries, DML target/source roles, `MERGE` roles, and `RETURNING INTO` fixtures with expected table/column-use facts
-- `plsql-sqlsem` never emits exact column lineage for `SELECT *`, `NATURAL JOIN`, unsupported view expansion, or dynamic projections — it emits precision-tiered unknowns instead
-- `plsql-flow` fixture suite includes at least 10 cases each for: constants, bounded value sets, string concatenation templates, tainted parameter flow, sanitizer classification, loop boundaries, unresolved-call boundaries, and inter-procedural parameter/return flow
-- `plsql-flow` emits expected `ConstantValueFact`, `ValueSetFact`, `StringShapeFact`, `TaintFact`, `SanitizerFact`, and `FlowUnknownFact` records for those fixtures with golden JSON snapshots
-- `plsql-flow` is conservative at loops, unresolved calls, aliasing boundaries, and dynamic dispatch — no rule may treat missing flow as proof of safety
-- `plsql-facts` round-trips every `FactKind` through in-memory and SQLite-backed stores with stable fact IDs across two identical runs
+- `plsql-ir` embedded-SQL modules resolve table aliases, CTE scopes, subqueries, DML target/source roles, `MERGE` roles, and `RETURNING INTO` fixtures with expected table/column-use facts
+- `plsql-ir` embedded-SQL fact emission never emits exact column lineage for `SELECT *`, `NATURAL JOIN`, unsupported view expansion, or dynamic projections — it emits precision-tiered unknowns instead
+- `plsql-ir` flow-state fixture suite includes at least 10 cases each for: constants, bounded value sets, string concatenation templates, tainted parameter flow, sanitizer classification, loop boundaries, unresolved-call boundaries, and inter-procedural parameter/return flow
+- `plsql-ir` emitted-fact projection emits expected `ConstantValue`, `ValueSet`, `StringShape`, `Taint`, `Sanitizer`, and opacity/unknown fact records for those fixtures with golden JSON snapshots
+- `plsql-ir` flow analysis is conservative at loops, unresolved calls, aliasing boundaries, and dynamic dispatch — no rule may treat missing flow as proof of safety
+- `plsql-ir::FactStore` round-trips every `FactKind` through the in-memory store with stable fact IDs across two identical runs; any persisted projection remains a `plsql-store` responsibility
 - Fact IDs remain stable across whitespace/comment-only source changes where the underlying semantic identity is unchanged
 - Every product surface has one integration test proving it can answer its common inventory query from `FactStore` without raw AST traversal: SAST rule input, doc object inventory, bindgen package inventory, lineage edge input, and CI/CD change classification input
 - Doctor subcommand (`plsql-ir doctor`) reports symbol-resolution health on the corpus
@@ -1518,7 +1534,7 @@ pub struct SemanticConfig {
 | `PLSQL-FLOW-005` | Expose taint-path and string-shape query API for SAST and dynamic-SQL consumers (Layer 2 must not depend on Layer 3) | FLOW-003 | M |
 | `PLSQL-FACT-001` | Define normalized fact schema (`FactKind` enum, per-family types) with stable fact IDs | SQLSEM-001 + PRIV-001 + SYM-006 | M |
 | `PLSQL-FACT-002` | Emit declaration/reference/call facts from semantic model | FACT-001 | M |
-| `PLSQL-FACT-003` | Emit SQL table/column-use facts from `plsql-sqlsem` | FACT-001 + SQLSEM-003 | M |
+| `PLSQL-FACT-003` | Emit SQL table/column-use facts from the `plsql-ir` embedded-SQL model | FACT-001 + SQLSEM-003 | M |
 | `PLSQL-FACT-004` | Emit privilege, dynamic-SQL, and unknown facts with evidence | FACT-001 + PRIV-002 + SYM-005 | M |
 | `PLSQL-FACT-005` | Persist and query facts through `plsql-store` (in-memory + SQLite backends) | FACT-001 + WS-006 | M |
 | `PLSQL-SUPPORT-003` | Add literal classifier (credential-like, SQL-like, URL-like, free-text, numeric, date/time, unknown) for dynamic-SQL evidence + diagnostics | SUPPORT-001 + FLOW-001 | M |
@@ -1880,7 +1896,7 @@ A `ScanContext` accumulates findings. Each finding includes: rule ID, severity, 
 - **Medium-confidence default rules** are clearly marked, easily suppressible, and target ≤15% false positives
 - **House-style and experimental rules** are disabled by default; quality bar is "useful for shops that opt in"
 - Every default-enabled security rule declares `required_facts()` and `minimum_completeness()`. Rules that cannot meet evidence requirements emit `RuleSkippedDiagnostic`, never weak findings
-- SEC001/SEC002 findings include a taint path or `StringShapeFact` reference when available (from `plsql-flow`)
+- SEC001/SEC002 findings include a taint path or `StringShapeFact` reference when available (from `plsql-ir` emitted flow facts)
 - False-negative rate on the positive corpus ≤5% for high-confidence rules
 - SARIF output validates against the official SARIF 2.1.0 schema (emitted from `plsql-scan`'s own renderer per R5)
 - Doctor subcommand: per-rule firing count + per-rule tier on a corpus, useful for tuning
@@ -2118,7 +2134,7 @@ The MCP server uses the standard Model Context Protocol: stdio transport by defa
 | `find_callers` | qualified name | direct callers + transitive callers up to N hops, with evidence | `plsql-depgraph` |
 | `find_callees` | qualified name | direct callees + transitive callees up to N hops, with evidence | `plsql-depgraph` |
 | `get_dependencies` | object id | full dependency neighborhood (in + out edges) | `plsql-depgraph` |
-| `dynamic_sql_evidence` | file path + line range OR object id | `DynamicSqlEvidence` records for all dynamic SQL sites in scope (expression fragments, bind-vs-concat classification, candidate names, confidence per candidate) | `plsql-flow` + `plsql-facts` |
+| `dynamic_sql_evidence` | file path + line range OR object id | `DynamicSqlEvidence` records for all dynamic SQL sites in scope (expression fragments, bind-vs-concat classification, candidate names, confidence per candidate) | `plsql-ir` flow state + `FactStore` |
 | `completeness_report` | scope (file / package / project) | Trust Block (§1.5) at the requested scope | `plsql-engine` |
 | `compile_check` | inline PL/SQL source | parse + symbol-resolution diagnostics; no execution, no DB connection | `plsql-parser` + `plsql-symbols` |
 | `doc_lookup` | object id | rendered markdown documentation for the object (signatures, doc comments, examples) | `plsql-doc` |
@@ -3053,7 +3069,7 @@ If the Rust backend wins, this section becomes a no-op but stays in the plan to 
 
 ### 20.3 Naming
 
-- Crates: `plsql-core`, `plsql-output`, `plsql-render`, `plsql-store`, `plsql-project`, `plsql-parser`, `plsql-catalog`, `plsql-engine`, `plsql-ir`, `plsql-symbols`, `plsql-privileges`, `plsql-sqlsem`, `plsql-flow`, `plsql-facts`, `plsql-depgraph`, `plsql-doc`, `plsql-scan`, `plsql-bindgen`, `plsql-lineage`, `plsql-cicd`, `plsql-subset`
+- Crates: `plsql-core`, `plsql-output`, `plsql-render`, `plsql-store`, `plsql-project`, `plsql-parser`, `plsql-catalog`, `plsql-engine`, `plsql-ir` (including embedded-SQL semantics, flow state, and `FactStore` emission), `plsql-symbols`, `plsql-privileges`, `plsql-depgraph`, `plsql-doc`, `plsql-scan`, `plsql-bindgen`, `plsql-lineage`, `plsql-cicd`, `plsql-subset`
 - Binaries: `plsql` (umbrella CLI with subcommands, including `plsql analyze`) + each component as a standalone binary (`plsql-doc`, `plsql-scan`, etc.) + optional local daemon `plsqld`
 - Marketing name for the family: **TBD** — `plsql-intelligence` is the project key, not necessarily the brand. Brand decision deferred (D15).
 
