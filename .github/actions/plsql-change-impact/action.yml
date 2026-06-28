@@ -180,7 +180,7 @@ runs:
               "#### Invalidated objects by kind",
               rows_or_none(
                 ($payload.invalidated_objects_by_kind // []
-                  | map("- " + .object_type + ": " + (.count | tostring))),
+                  | map("- " + .object_type + ": " + (.count | tostring)));
                 "- None"
               ),
               "",
@@ -189,7 +189,7 @@ runs:
                 ($payload.recompile_plan // []
                   | .[:10]
                   | map("- " + .object_type + " #" + (.owner_symbol | tostring) + "." + (.name_symbol | tostring)
-                      + (if .force_compile then " (force compile)" else " (check status)" end))),
+                      + (if .force_compile then " (force compile)" else " (check status)" end)));
                 "- None"
               ),
               "",
@@ -198,7 +198,7 @@ runs:
                 ($payload.compile_error_flags // []
                   | .[:10]
                   | map("- " + .object_type + " #" + (.owner_symbol | tostring) + "." + (.name_symbol | tostring)
-                      + ": " + .message)),
+                      + ": " + .message);
                 "- None"
               ),
               "",
