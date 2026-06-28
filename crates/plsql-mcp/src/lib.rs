@@ -59,6 +59,7 @@ pub mod doctor;
 pub mod execute_approved;
 pub mod foundation_tools;
 pub mod graph_tools;
+pub mod impact;
 pub mod list_objects;
 pub mod live_runtime;
 pub mod mcp_protocol;

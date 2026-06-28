@@ -50,6 +50,13 @@ pub struct CreateOrReplaceRequest {
     pub mode: CreateOrReplaceMode,
 }
 
+/// Parsed target object from a `CREATE OR REPLACE` DDL header.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CreateOrReplaceTarget {
+    pub owner: Option<String>,
+    pub object: String,
+}
+
 /// Successful response.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -218,6 +225,12 @@ pub fn classify_kind(ddl: &str) -> Result<String, CreateOrReplaceError> {
 /// carry extra clauses, but the object name still immediately follows
 /// the kind keyword, so the same head-token scan applies.
 pub fn parse_target_schema(ddl: &str) -> Result<Option<String>, CreateOrReplaceError> {
+    Ok(parse_target_object(ddl)?.owner)
+}
+
+/// Parse the target object named in a `CREATE OR REPLACE … [schema.]name`
+/// DDL header.
+pub fn parse_target_object(ddl: &str) -> Result<CreateOrReplaceTarget, CreateOrReplaceError> {
     let kind = classify_kind(ddl)?;
 
     // `CREATE OR REPLACE` occupies the first 3 whitespace-delimited tokens; the
@@ -230,7 +243,9 @@ pub fn parse_target_schema(ddl: &str) -> Result<Option<String>, CreateOrReplaceE
     let skip_tokens = 3 + kind.split_whitespace().count();
     let Some(region_start) = nth_token_offset(ddl, skip_tokens) else {
         // No object-name token at all — genuinely unqualified.
-        return Ok(None);
+        return Err(CreateOrReplaceError::MalformedQualifiedName {
+            name: String::new(),
+        });
     };
 
     // oracle-j1ep.1: extract the object-name region honouring Oracle
@@ -257,9 +272,15 @@ pub fn parse_target_schema(ddl: &str) -> Result<Option<String>, CreateOrReplaceE
 
     match segments.as_slice() {
         // Genuinely unqualified — targets the current/principal schema.
-        [object] if !object.is_empty() => Ok(None),
+        [object] if !object.is_empty() => Ok(CreateOrReplaceTarget {
+            owner: None,
+            object: object.clone(),
+        }),
         // Well-formed `OWNER.OBJECT`: two non-empty segments.
-        [owner, object] if !owner.is_empty() && !object.is_empty() => Ok(Some(owner.clone())),
+        [owner, object] if !owner.is_empty() && !object.is_empty() => Ok(CreateOrReplaceTarget {
+            owner: Some(owner.clone()),
+            object: object.clone(),
+        }),
         // `OWNER.`, `.OBJECT`, `OWNER..OBJECT`, `A.B.C`, or empty: ambiguous /
         // malformed. Fail CLOSED rather than route to the principal schema and
         // skip the operator-typed cross-schema confirmation.
@@ -275,17 +296,17 @@ pub fn parse_target_schema(ddl: &str) -> Result<Option<String>, CreateOrReplaceE
 /// `CREATE OR REPLACE <kind>` head tokens, so the name's original case (which
 /// matters for quoted identifiers) is preserved.
 fn nth_token_offset(s: &str, n: usize) -> Option<usize> {
-    let mut token = 0usize;
+    let mut word_index = 0usize;
     let mut in_token = false;
     for (idx, ch) in s.char_indices() {
         if ch.is_whitespace() {
             in_token = false;
         } else {
             if !in_token {
-                if token == n {
+                if word_index == n {
                     return Some(idx);
                 }
-                token += 1;
+                word_index += 1;
                 in_token = true;
             }
         }
@@ -432,10 +453,10 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_mints_token_and_classifies_view() {
+    fn dry_run_mints_token_and_classifies_view() -> Result<(), String> {
         let mut registry = PreviewRegistry::new();
-        let response =
-            run_create_or_replace(&mut registry, billing_view_req(), fixed("tok-v")).unwrap();
+        let response = run_create_or_replace(&mut registry, billing_view_req(), fixed("tok-v"))
+            .map_err(|err| err.to_string())?;
         let CreateOrReplaceResponse::DryRun {
             token,
             object_kind,
@@ -443,33 +464,37 @@ mod tests {
             ..
         } = response
         else {
-            panic!("expected DryRun");
+            return Err(String::from("expected DryRun"));
         };
         assert_eq!(token, "tok-v");
         assert_eq!(object_kind, "VIEW");
         assert!(ddl_sha256.starts_with("sha256:"));
+        Ok(())
     }
 
     #[test]
-    fn apply_returns_verified_bytes() {
+    fn apply_returns_verified_bytes() -> Result<(), String> {
         let mut registry = PreviewRegistry::new();
         let dry = billing_view_req();
-        let _ = run_create_or_replace(&mut registry, dry.clone(), fixed("tok-a")).unwrap();
+        let _ = run_create_or_replace(&mut registry, dry.clone(), fixed("tok-a"))
+            .map_err(|err| err.to_string())?;
         let mut apply = dry;
         apply.mode = CreateOrReplaceMode::Apply {
             token: "tok-a".into(),
         };
-        let response = run_create_or_replace(&mut registry, apply, fixed("nope")).unwrap();
+        let response = run_create_or_replace(&mut registry, apply, fixed("nope"))
+            .map_err(|err| err.to_string())?;
         let CreateOrReplaceResponse::Apply {
             object_kind,
             ddl_bytes,
             ..
         } = response
         else {
-            panic!("expected Apply");
+            return Err(String::from("expected Apply"));
         };
         assert_eq!(object_kind, "VIEW");
         assert!(ddl_bytes.contains("BILLING.INVOICE_SUMMARY"));
+        Ok(())
     }
 
     #[test]

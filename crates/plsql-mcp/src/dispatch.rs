@@ -903,14 +903,26 @@ async fn run_patch_package_live(
                 ))
             })?;
     match response {
-        dry_run @ crate::patch::PatchPackageResponse::DryRun { .. } => {
-            Ok(serde_json::to_value(dry_run).unwrap_or(Value::Object(Default::default())))
-        }
+        crate::patch::PatchPackageResponse::DryRun {
+            token,
+            connection,
+            ddl_bytes,
+            ddl_sha256,
+        } => Ok(serde_json::json!({
+            "kind": "dry_run",
+            "token": token,
+            "connection": connection,
+            "ddl_bytes": ddl_bytes,
+            "ddl_sha256": ddl_sha256,
+            "impact_summary": crate::impact::guarded_write_impact("patch_package", &connection, &ddl_bytes),
+        })),
         crate::patch::PatchPackageResponse::Apply {
             connection,
             ddl_bytes,
             ddl_sha256,
         } => {
+            let impact_summary =
+                crate::impact::guarded_write_impact("patch_package", &connection, &ddl_bytes);
             let executed =
                 execute_guarded_sql(cx, live_runtime, &connection, "patch_package", &ddl_bytes)
                     .await?;
@@ -920,6 +932,7 @@ async fn run_patch_package_live(
                 "connection": connection,
                 "ddl_bytes": ddl_bytes,
                 "ddl_sha256": ddl_sha256,
+                "impact_summary": impact_summary,
                 "rows_affected": executed.rows_affected,
                 "audit_record": executed.audit_record,
             }))
@@ -939,14 +952,26 @@ async fn run_patch_view_live(
         crate::patch::run_patch_view(live_runtime.preview_registry_mut(), req, move || token)
             .map_err(|err| Box::new(invalid_arguments_envelope("patch_view", &err.to_string())))?;
     match response {
-        dry_run @ crate::patch::PatchViewResponse::DryRun { .. } => {
-            Ok(serde_json::to_value(dry_run).unwrap_or(Value::Object(Default::default())))
-        }
+        crate::patch::PatchViewResponse::DryRun {
+            token,
+            connection,
+            ddl_bytes,
+            ddl_sha256,
+        } => Ok(serde_json::json!({
+            "kind": "dry_run",
+            "token": token,
+            "connection": connection,
+            "ddl_bytes": ddl_bytes,
+            "ddl_sha256": ddl_sha256,
+            "impact_summary": crate::impact::guarded_write_impact("patch_view", &connection, &ddl_bytes),
+        })),
         crate::patch::PatchViewResponse::Apply {
             connection,
             ddl_bytes,
             ddl_sha256,
         } => {
+            let impact_summary =
+                crate::impact::guarded_write_impact("patch_view", &connection, &ddl_bytes);
             let executed =
                 execute_guarded_sql(cx, live_runtime, &connection, "patch_view", &ddl_bytes)
                     .await?;
@@ -956,6 +981,7 @@ async fn run_patch_view_live(
                 "connection": connection,
                 "ddl_bytes": ddl_bytes,
                 "ddl_sha256": ddl_sha256,
+                "impact_summary": impact_summary,
                 "rows_affected": executed.rows_affected,
                 "audit_record": executed.audit_record,
             }))
@@ -983,15 +1009,29 @@ async fn run_create_or_replace_live(
         ))
     })?;
     match response {
-        dry_run @ crate::create_or_replace::CreateOrReplaceResponse::DryRun { .. } => {
-            Ok(serde_json::to_value(dry_run).unwrap_or(Value::Object(Default::default())))
-        }
+        crate::create_or_replace::CreateOrReplaceResponse::DryRun {
+            token,
+            connection,
+            object_kind,
+            ddl_bytes,
+            ddl_sha256,
+        } => Ok(serde_json::json!({
+            "kind": "dry_run",
+            "token": token,
+            "connection": connection,
+            "object_kind": object_kind,
+            "ddl_bytes": ddl_bytes,
+            "ddl_sha256": ddl_sha256,
+            "impact_summary": crate::impact::guarded_write_impact("create_or_replace", &connection, &ddl_bytes),
+        })),
         crate::create_or_replace::CreateOrReplaceResponse::Apply {
             connection,
             object_kind,
             ddl_bytes,
             ddl_sha256,
         } => {
+            let impact_summary =
+                crate::impact::guarded_write_impact("create_or_replace", &connection, &ddl_bytes);
             let executed = execute_guarded_sql(
                 cx,
                 live_runtime,
@@ -1007,6 +1047,7 @@ async fn run_create_or_replace_live(
                 "object_kind": object_kind,
                 "ddl_bytes": ddl_bytes,
                 "ddl_sha256": ddl_sha256,
+                "impact_summary": impact_summary,
                 "rows_affected": executed.rows_affected,
                 "audit_record": executed.audit_record,
             }))
@@ -1029,6 +1070,8 @@ async fn run_execute_approved_live(
                     &err.to_string(),
                 ))
             })?;
+    let impact_summary =
+        crate::impact::guarded_write_impact("execute_approved", &plan.connection, &plan.ddl_bytes);
     let executed = execute_guarded_sql(
         cx,
         live_runtime,
@@ -1041,6 +1084,7 @@ async fn run_execute_approved_live(
     Ok(serde_json::json!({
         "kind": "executed",
         "plan": plan,
+        "impact_summary": impact_summary,
         "rows_affected": executed.rows_affected,
         "audit_record": executed.audit_record,
     }))
@@ -1075,6 +1119,8 @@ async fn run_deploy_ddl_live(
         })?
         .to_string();
     let plan = crate::execute_approved::build_deploy_plan(&args.job_name, &args.ddl_bytes);
+    let impact_summary =
+        crate::impact::guarded_write_impact("deploy_ddl", &connection, &args.ddl_bytes);
     let executed = execute_guarded_sql(
         cx,
         live_runtime,
@@ -1087,6 +1133,7 @@ async fn run_deploy_ddl_live(
         "kind": "submitted",
         "connection": connection,
         "plan": plan,
+        "impact_summary": impact_summary,
         "rows_affected": executed.rows_affected,
         "audit_record": executed.audit_record,
     }))
@@ -2276,6 +2323,18 @@ mod tests {
             &mut live_runtime,
         )
         .expect("dry-run mints approval token");
+        assert_eq!(
+            dry_run["impact_summary"]["schema_id"],
+            "plsql.mcp.guarded_write_impact"
+        );
+        assert_eq!(
+            dry_run["impact_summary"]["target"]["name"], "V_AUDIT",
+            "dry-run must show the target before the approval token is spent"
+        );
+        assert_eq!(
+            dry_run["impact_summary"]["change_impact"]["payload"]["summary"]["invalidation_count"],
+            1
+        );
         let approval_token = dry_run["token"].as_str().expect("approval token");
 
         let write_token = live_runtime
@@ -2304,6 +2363,10 @@ mod tests {
 
         assert_eq!(applied["kind"], "apply");
         assert_eq!(applied["audit_record"]["tool"], "create_or_replace");
+        assert_eq!(
+            applied["impact_summary"]["target"]["object_type"], "VIEW",
+            "apply response carries the same typed blast-radius payload"
+        );
         assert_eq!(sink.flush_count(), 2, "enable + DDL both fsync");
         assert_eq!(
             verify_records(

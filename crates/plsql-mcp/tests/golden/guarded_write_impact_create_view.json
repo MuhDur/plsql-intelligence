@@ -1,0 +1,115 @@
+{
+  "schema_id": "plsql.mcp.guarded_write_impact",
+  "schema_version": "1.0.0",
+  "computed_before_execute": true,
+  "tool_name": "create_or_replace",
+  "connection": "billing-dev",
+  "target": {
+    "owner": "BILLING",
+    "name": "REPORT_VIEW",
+    "object_type": "VIEW",
+    "changed_kind": "ViewDefinitionChange",
+    "classification_source": "create_or_replace_header"
+  },
+  "change_impact": {
+    "format": "plsql-robot-json",
+    "schema_id": "plsql.cicd.change_impact",
+    "schema_version": {
+      "major": 1,
+      "minor": 0,
+      "patch": 0
+    },
+    "payload": {
+      "summary": {
+        "mode": "SourceOnly",
+        "invalidation_count": 1,
+        "recompile_count": 0,
+        "uncertainty_count": 2,
+        "compile_error_flag_count": 0,
+        "max_distance": 1
+      },
+      "invalidated_objects_by_kind": [
+        {
+          "object_type": "VIEW",
+          "count": 1
+        }
+      ],
+      "invalidations": [
+        {
+          "owner_symbol": 0,
+          "name_symbol": 1,
+          "object_type": "VIEW",
+          "reason_code": "other",
+          "reason_detail": "view definition changed — dependents on column-set or projection must be revalidated",
+          "confidence": "low",
+          "confidence_explanation": "source-only predict — no catalog confirmation",
+          "distance": 1
+        }
+      ],
+      "recompile_plan": [],
+      "compile_error_flags": [],
+      "lineage_notes": [],
+      "uncertainties": [
+        {
+          "reason": "MissingCatalogObject",
+          "affected_owner_symbol": 0,
+          "affected_name_symbol": 1,
+          "description": "source-only mode — catalog-confirmed dependents not consulted"
+        },
+        {
+          "reason": "MissingCatalogObject",
+          "affected_owner_symbol": 0,
+          "affected_name_symbol": 1,
+          "description": "ViewDefinitionChange change for SchemaName(SymbolId(0)).ObjectName(SymbolId(1)) carries opacity"
+        }
+      ],
+      "completeness": {
+        "files_total": 0,
+        "files_parsed_cleanly": 0,
+        "files_recovered": 0,
+        "skipped_token_ratio": 0.0,
+        "objects_total": 1,
+        "objects_with_source": 0,
+        "objects_catalog_only": 0,
+        "wrapped_units": {
+          "unmeasured": true
+        },
+        "missing_package_bodies": {
+          "unmeasured": true
+        },
+        "dynamic_sql_sites": {
+          "unmeasured": true
+        },
+        "opaque_dynamic_sql_sites": {
+          "unmeasured": true
+        },
+        "db_link_edges": {
+          "unmeasured": true
+        },
+        "unresolved_references": {
+          "unmeasured": true
+        },
+        "diagnostics_total": 2,
+        "objects_unrecognized": 1,
+        "objects_with_extracted_semantics": 0,
+        "extracted_semantics_ratio": 0.0,
+        "posture": "Degraded",
+        "catalog_available": false,
+        "plscope_available": false
+      },
+      "attributes": {}
+    }
+  },
+  "lineage": {
+    "status": "not_bound",
+    "notes": [
+      "No project AnalysisRun/FactStore is bound to this live write session; response includes direct source-only invalidation rules, not transitive dependency-graph lineage."
+    ]
+  },
+  "sast": {
+    "status": "not_bound",
+    "notes": [
+      "No project source tree or flow facts are attached to this guarded write; run plsql_analyze/analyze_project for SAST findings over the full project."
+    ]
+  }
+}
