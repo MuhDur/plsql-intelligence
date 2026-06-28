@@ -2945,6 +2945,12 @@ mod tests {
         .expect("ddl_guarded profile enables previews");
 
         let ddl = "CREATE OR REPLACE VIEW BILLING.V_AUDIT AS SELECT 1 AS id FROM dual";
+        let expected_impact = serde_json::to_value(crate::impact::guarded_write_impact(
+            "create_or_replace",
+            "dev",
+            ddl,
+        ))
+        .expect("serialize guarded-write impact");
         let dry_run = dispatch_with_runtime_for_test(
             "create_or_replace",
             json!({
@@ -2956,19 +2962,37 @@ mod tests {
             &mut live_runtime,
         )
         .expect("dry-run mints approval token");
+        let dry_run_impact = dry_run
+            .get("impact_summary")
+            .expect("dry-run includes impact summary");
         assert_eq!(
-            dry_run["impact_summary"]["schema_id"],
-            "plsql.mcp.guarded_write_impact"
+            dry_run_impact.get("schema_id"),
+            Some(&json!("plsql.mcp.guarded_write_impact"))
         );
         assert_eq!(
-            dry_run["impact_summary"]["target"]["name"], "V_AUDIT",
+            dry_run_impact
+                .get("target")
+                .and_then(|target| target.get("name")),
+            Some(&json!("V_AUDIT")),
             "dry-run must show the target before the approval token is spent"
         );
         assert_eq!(
-            dry_run["impact_summary"]["change_impact"]["payload"]["summary"]["invalidation_count"],
-            1
+            dry_run_impact
+                .get("change_impact")
+                .and_then(|change_impact| change_impact.get("payload"))
+                .and_then(|payload| payload.get("summary"))
+                .and_then(|summary| summary.get("invalidation_count")),
+            Some(&json!(1))
         );
-        let approval_token = dry_run["token"].as_str().expect("approval token");
+        assert_eq!(
+            Some(dry_run_impact),
+            Some(&expected_impact),
+            "dry-run response must match the guarded-write impact golden builder"
+        );
+        let approval_token = dry_run
+            .get("token")
+            .and_then(|token| token.as_str())
+            .expect("approval token");
 
         let write_token = live_runtime
             .active_session_mut()
@@ -2994,11 +3018,27 @@ mod tests {
         )
         .expect("apply executes through guarded audit");
 
-        assert_eq!(applied["kind"], "apply");
-        assert_eq!(applied["audit_record"]["tool"], "create_or_replace");
+        let applied_impact = applied
+            .get("impact_summary")
+            .expect("apply includes impact summary");
+        assert_eq!(applied.get("kind"), Some(&json!("apply")));
         assert_eq!(
-            applied["impact_summary"]["target"]["object_type"], "VIEW",
+            applied
+                .get("audit_record")
+                .and_then(|audit_record| audit_record.get("tool")),
+            Some(&json!("create_or_replace"))
+        );
+        assert_eq!(
+            applied_impact
+                .get("target")
+                .and_then(|target| target.get("object_type")),
+            Some(&json!("VIEW")),
             "apply response carries the same typed blast-radius payload"
+        );
+        assert_eq!(
+            Some(applied_impact),
+            Some(&expected_impact),
+            "apply response must match the guarded-write impact golden builder"
         );
         assert_eq!(sink.flush_count(), 2, "enable + DDL both fsync");
         let records = sink.records();
