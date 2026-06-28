@@ -68,12 +68,17 @@ If that audit trail is missing, then you must act as if the operation never happ
 
 - **Build system:** Cargo workspace. One crate per component (plan.md §6.2.1).
 - **Toolchain:** `rust-toolchain.toml` pins `nightly-2026-05-11`. There is
-  no stable MSRV or `rust-version` floor while the live-DB convergence depends
-  on nightly-only `asupersync` features.
+  no MSRV or `rust-version` floor while the live-DB convergence depends on
+  nightly-only `asupersync` features.
 - **Style:** `cargo fmt` (default config) + `cargo clippy -- -D warnings`. No exceptions.
 - **Errors:** `miette` for human diagnostics, `thiserror` for library errors. No `anyhow` except `main()`.
 - **Observability:** `tracing` with structured fields. Spans on every public API call.
-- **Async runtime:** Tokio for CLIs / daemon / I/O. Public library APIs stay sync-first unless explicitly documented async.
+- **Async/runtime model:** asupersync is the runtime boundary for live-DB
+  sessions, MCP serving, cancellation, timers, and daemon/I/O paths that need
+  async execution. Public library APIs for the offline engine (parse, IR,
+  depgraph, lineage, SAST, docs, bindgen, CI/CD prediction) stay sync-first by
+  default. Add or expose async APIs only for live Oracle I/O or server/daemon
+  integration, and document the cancellation/timeout behavior at that boundary.
 - **asupersync/nightly bump runbook:** Treat the Rust nightly pin and
   `asupersync` version as one coordinated bump. Before changing either,
   re-check the current `oraclemcp`, `rust-oracledb`, `asupersync`, and
