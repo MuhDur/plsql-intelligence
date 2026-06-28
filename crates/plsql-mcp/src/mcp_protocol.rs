@@ -33,7 +33,7 @@
 
 use asupersync::Cx;
 use asupersync::runtime::{Runtime, RuntimeBuilder};
-use oraclemcp_core::DispatchContext;
+use oraclemcp_core::{DispatchContext, ResourceContents, ResourceUri, resource_templates};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -275,6 +275,9 @@ pub fn handle_request(req: &JsonRpcRequest, registry: &ToolRegistry) -> Option<J
         "initialize" => Some(handle_initialize(id, req.params.as_ref())),
         "tools/list" => Some(handle_tools_list(id, registry)),
         "tools/call" => Some(tools_call_requires_dispatch_context_response(id)),
+        "resources/list" => Some(handle_resources_list(id)),
+        "resources/templates/list" => Some(handle_resource_templates_list(id)),
+        "resources/read" => Some(handle_resource_read(id, req.params.as_ref(), registry)),
         "ping" => Some(JsonRpcResponse::ok(id, Value::Object(Default::default()))),
         other => Some(JsonRpcResponse::err(
             id,
@@ -314,6 +317,9 @@ pub async fn handle_request_with_context(
         "tools/call" => Some(
             handle_tools_call(id, req.params.as_ref(), registry, live_runtime, cx, context).await,
         ),
+        "resources/list" => Some(handle_resources_list(id)),
+        "resources/templates/list" => Some(handle_resource_templates_list(id)),
+        "resources/read" => Some(handle_resource_read(id, req.params.as_ref(), registry)),
         "ping" => Some(JsonRpcResponse::ok(id, Value::Object(Default::default()))),
         other => Some(JsonRpcResponse::err(
             id,
@@ -365,16 +371,17 @@ fn handle_initialize(id: Value, params: Option<&Value>) -> JsonRpcResponse {
             "version": env!("CARGO_PKG_VERSION"),
         },
         "capabilities": {
-            "tools": { "listChanged": false }
+            "tools": { "listChanged": false },
+            "resources": { "subscribe": false, "listChanged": false }
         },
         // Orient the agent before its first tool call (oracle-da9j.3): the
         // zero-arg discovery tool + tools/list together report the feature
         // flags, the tool surface, and each tool's argument schema.
-        "instructions": "Call the zero-arg `oracle_capabilities` tool and `tools/list` FIRST: \
-                         they report the build feature flags (live-db on/off), the tool surface, \
-                         and each tool's argument inputSchema + readOnlyHint/destructiveHint. \
-                         Static-analysis tools run with no database; live-DB tools require an \
-                         active `connect`."
+        "instructions": "Call the zero-arg `oracle_capabilities` tool, resources/list, and \
+                         tools/list FIRST: they report the build feature flags (live-db on/off), \
+                         oracle:// discovery resources, the tool surface, and each tool's \
+                         argument inputSchema + readOnlyHint/destructiveHint. Static-analysis \
+                         tools run with no database; live-DB tools require an active `connect`."
     });
     JsonRpcResponse::ok(id, result)
 }
@@ -387,6 +394,147 @@ fn handle_tools_list(id: Value, registry: &ToolRegistry) -> JsonRpcResponse {
             "tools": tools,
         }),
     )
+}
+
+fn handle_resources_list(id: Value) -> JsonRpcResponse {
+    JsonRpcResponse::ok(
+        id,
+        serde_json::json!({
+            "resources": [
+                {
+                    "uri": "oracle://capabilities",
+                    "name": "capabilities",
+                    "description": "Core CapabilitiesReport for this plsql-mcp server.",
+                    "mimeType": "application/json",
+                },
+                {
+                    "uri": "oracle://tools",
+                    "name": "tools",
+                    "description": "MCP tool catalog with inputSchema and read/write annotations.",
+                    "mimeType": "application/json",
+                }
+            ],
+        }),
+    )
+}
+
+fn handle_resource_templates_list(id: Value) -> JsonRpcResponse {
+    let templates = resource_templates()
+        .into_iter()
+        .map(|template| serde_json::to_value(template).unwrap_or(Value::Null))
+        .collect::<Vec<_>>();
+    JsonRpcResponse::ok(
+        id,
+        serde_json::json!({
+            "resourceTemplates": templates,
+        }),
+    )
+}
+
+fn handle_resource_read(
+    id: Value,
+    params: Option<&Value>,
+    registry: &ToolRegistry,
+) -> JsonRpcResponse {
+    let Some(Value::Object(params)) = params else {
+        let envelope = oraclemcp_error::ErrorEnvelope::new(
+            oraclemcp_error::ErrorClass::InvalidArguments,
+            "resources/read params must be an object",
+        )
+        .with_next_step("Call resources/read with params.uri set to an oracle:// resource URI.");
+        return JsonRpcResponse::err_with_data(
+            id,
+            -32602,
+            envelope.message.clone(),
+            envelope.to_json(),
+        );
+    };
+    let Some(uri) = params.get("uri").and_then(Value::as_str) else {
+        let envelope = oraclemcp_error::ErrorEnvelope::new(
+            oraclemcp_error::ErrorClass::InvalidArguments,
+            "resources/read uri must be a string",
+        )
+        .with_next_step("Use resources/list or resources/templates/list to discover valid URIs.");
+        return JsonRpcResponse::err_with_data(
+            id,
+            -32602,
+            envelope.message.clone(),
+            envelope.to_json(),
+        );
+    };
+    let uri = match ResourceUri::parse(uri) {
+        Ok(uri) => uri,
+        Err(envelope) => {
+            return JsonRpcResponse::err_with_data(
+                id,
+                -32602,
+                envelope.message.clone(),
+                envelope
+                    .with_next_step(
+                        "Use resources/list or resources/templates/list to discover valid oracle:// URIs.",
+                    )
+                    .to_json(),
+            );
+        }
+    };
+    match read_plsql_resource(&uri, registry) {
+        Ok(contents) => JsonRpcResponse::ok(id, serde_json::json!({ "contents": [contents] })),
+        Err(envelope) => JsonRpcResponse::err_with_data(
+            id,
+            resource_error_code(envelope.error_class),
+            envelope.message.clone(),
+            envelope.to_json(),
+        ),
+    }
+}
+
+fn read_plsql_resource(
+    uri: &ResourceUri,
+    registry: &ToolRegistry,
+) -> Result<ResourceContents, Box<oraclemcp_error::ErrorEnvelope>> {
+    match uri {
+        ResourceUri::Capabilities => {
+            let report = crate::dispatch::capabilities_report_for_registry(registry);
+            Ok(ResourceContents {
+                uri: uri.to_uri(),
+                mime_type: "application/json".to_owned(),
+                text: report.to_string(),
+            })
+        }
+        ResourceUri::Tools => {
+            let tools = registry.tools.iter().map(tool_to_mcp_value).collect::<Vec<_>>();
+            Ok(ResourceContents {
+                uri: uri.to_uri(),
+                mime_type: "application/json".to_owned(),
+                text: serde_json::json!({ "tools": tools }).to_string(),
+            })
+        }
+        ResourceUri::Schema { .. } | ResourceUri::Object { .. } | ResourceUri::Session { .. } => {
+            Err(Box::new(oraclemcp_error::ErrorEnvelope::new(
+                oraclemcp_error::ErrorClass::RuntimeStateRequired,
+                format!("resource `{}` requires an active live Oracle session", uri.to_uri()),
+            )
+            .with_suggested_tool("connect")
+            .with_next_step(
+                "Call connect first, then retry the oracle:// live resource once session-backed resources are available.",
+            )))
+        }
+        ResourceUri::Export { .. } => Err(Box::new(oraclemcp_error::ErrorEnvelope::new(
+            oraclemcp_error::ErrorClass::InvalidArguments,
+            "oracle-export:// resources are not produced by plsql-mcp yet",
+        )
+        .with_next_step(
+            "Use oracle://capabilities and oracle://tools for the current discovery surface.",
+        ))),
+    }
+}
+
+fn resource_error_code(class: oraclemcp_error::ErrorClass) -> i32 {
+    match class {
+        oraclemcp_error::ErrorClass::InvalidArguments
+        | oraclemcp_error::ErrorClass::ObjectNotFound => -32602,
+        _ => -32603,
+    }
 }
 
 /// Whether a tool should be advertised as CALLABLE on the current wire — given
@@ -840,6 +988,124 @@ mod tests {
     }
 
     #[test]
+    fn resources_list_advertises_oracle_discovery_resources() {
+        let resp = handle_request(
+            &req(13, "resources/list", Some(serde_json::json!({}))),
+            &crate::default_tool_registry(),
+        )
+        .unwrap();
+        let result = resp.result.expect("ok result");
+        let resources = result["resources"].as_array().expect("resources array");
+        assert!(
+            resources
+                .iter()
+                .any(|r| r["uri"] == "oracle://capabilities"),
+            "resources/list should advertise oracle://capabilities: {resources:?}"
+        );
+        assert!(
+            resources.iter().any(|r| r["uri"] == "oracle://tools"),
+            "resources/list should advertise oracle://tools: {resources:?}"
+        );
+    }
+
+    #[test]
+    fn resource_templates_list_advertises_oracle_templates() {
+        let resp = handle_request(
+            &req(14, "resources/templates/list", Some(serde_json::json!({}))),
+            &crate::default_tool_registry(),
+        )
+        .unwrap();
+        let result = resp.result.expect("ok result");
+        let templates = result["resourceTemplates"]
+            .as_array()
+            .expect("resourceTemplates array");
+        assert!(
+            templates
+                .iter()
+                .any(|t| t["uriTemplate"] == "oracle://object/{owner}/{type}/{name}"),
+            "resourceTemplates should expose object URI template: {templates:?}"
+        );
+    }
+
+    #[test]
+    fn resources_read_capabilities_returns_core_report() {
+        let resp = handle_request(
+            &req(
+                18,
+                "resources/read",
+                Some(serde_json::json!({"uri": "oracle://capabilities"})),
+            ),
+            &crate::default_tool_registry(),
+        )
+        .unwrap();
+        let result = resp.result.expect("ok result");
+        let contents = result["contents"].as_array().expect("contents array");
+        assert_eq!(contents[0]["uri"], "oracle://capabilities");
+        assert_eq!(contents[0]["mimeType"], "application/json");
+        let report: Value =
+            serde_json::from_str(contents[0]["text"].as_str().unwrap()).expect("json text");
+        assert_eq!(report["server_name"], "plsql-mcp");
+        assert_eq!(report["protocol_version"], PROTOCOL_VERSION);
+        assert!(report["tools"].as_array().unwrap().len() >= 30);
+        assert!(
+            report["next_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s.as_str().unwrap_or("").contains("resources/list")),
+            "capabilities resource should guide resource discovery: {report}"
+        );
+    }
+
+    #[test]
+    fn resources_read_tools_returns_mcp_catalog() {
+        let resp = handle_request(
+            &req(
+                19,
+                "resources/read",
+                Some(serde_json::json!({"uri": "oracle://tools"})),
+            ),
+            &crate::default_tool_registry(),
+        )
+        .unwrap();
+        let result = resp.result.expect("ok result");
+        let text = result["contents"][0]["text"].as_str().unwrap();
+        let catalog: Value = serde_json::from_str(text).expect("json text");
+        let tools = catalog["tools"].as_array().expect("tools array");
+        let parse_file = tools
+            .iter()
+            .find(|tool| tool["name"] == "parse_file")
+            .expect("parse_file in tools resource");
+        assert_eq!(parse_file["inputSchema"]["required"][0], "source");
+        assert_eq!(parse_file["annotations"]["readOnlyHint"], Value::Bool(true));
+    }
+
+    #[test]
+    fn resources_read_bad_uri_returns_structured_error() {
+        let resp = handle_request(
+            &req(
+                20,
+                "resources/read",
+                Some(serde_json::json!({"uri": "oracle://nonsense"})),
+            ),
+            &crate::default_tool_registry(),
+        )
+        .unwrap();
+        let err = resp.error.expect("bad uri is a JSON-RPC error");
+        assert_eq!(err.code, -32602);
+        let data = err.data.expect("structured envelope");
+        assert_eq!(data["error_class"], "INVALID_ARGUMENTS");
+        assert!(
+            data["next_steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step.as_str().unwrap_or("").contains("resources/list")),
+            "bad resource URI should point at discovery: {data}"
+        );
+    }
+
+    #[test]
     fn context_free_tools_call_error_carries_envelope() {
         let r = registry_with_query();
         let resp = handle_request(
@@ -1284,8 +1550,9 @@ mod tests {
         let result = resp.result.expect("ok result");
         assert_eq!(result["isError"], Value::Bool(false));
         let doc = &result["structuredContent"];
-        assert_eq!(doc["server"], "plsql-mcp");
+        assert_eq!(doc["server_name"], "plsql-mcp");
         assert!(doc["features"]["live_db"].is_boolean());
+        assert!(doc["tools"].as_array().unwrap().len() >= 30);
         assert!(
             doc["next_actions"]
                 .as_array()

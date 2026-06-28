@@ -53,7 +53,8 @@ use asupersync::Cx;
 use asupersync::cx::SubsetOf;
 use oraclemcp_audit::{AuditDecision, AuditOutcome, AuditRecord};
 use oraclemcp_core::{
-    DispatchContext, DispatchFuture, ReadPathCaps, RequestBudget, ToolDispatch, narrow_to_read_path,
+    CapabilitiesReport, DispatchContext, DispatchFuture, FeatureTiers, ReadPathCaps, RequestBudget,
+    ToolDispatch, ToolRegistry, narrow_to_read_path,
 };
 use oraclemcp_error::{ErrorClass, ErrorEnvelope};
 use oraclemcp_guard::{OperatingLevel, SessionLevelState};
@@ -308,27 +309,63 @@ pub fn dispatch_table() -> &'static [&'static str] {
 /// per-tool detail). Honest about the runtime: the pure protocol layer holds no
 /// live connection between calls; live-DB tools require the `live-db` build
 /// feature + an active `connect`.
-fn capabilities_report() -> Value {
+pub(crate) fn capabilities_report_for_registry(registry: &ToolRegistry) -> Value {
     let live_db = cfg!(feature = "live-db");
-    serde_json::json!({
-        "server": "plsql-mcp",
-        "version": env!("CARGO_PKG_VERSION"),
-        "protocol_version": crate::mcp_protocol::PROTOCOL_VERSION,
-        "tool_count": dispatch_table().len(),
-        "features": { "live_db": live_db },
-        "runtime": {
-            "live_db_active": live_db,
-            "note": "Static-analysis tools (parse_file, analyze_project, plsql_analyze, the graph \
-                     tools, …) run with no database. Live-DB tools (query, connect, deploy_ddl, …) \
-                     require the `live-db` build feature AND an active connection; without it they \
-                     return a runtime-state-required result naming the recovery tool."
+    let mut report = CapabilitiesReport::new(
+        env!("CARGO_PKG_VERSION"),
+        registry.tools.clone(),
+        OperatingLevel::Ddl,
+        FeatureTiers {
+            live_db,
+            engine: true,
+            http_transport: false,
         },
-        "next_actions": [
-            "Call tools/list to read each tool's argument inputSchema and readOnlyHint/destructiveHint.",
-            "Static analysis needs no connection — start with analyze_project, then the graph tools (find_callers / find_callees / get_dependencies).",
-            "For any live-DB tool, call `connect` first."
-        ]
-    })
+    );
+    report.server_name = "plsql-mcp".to_owned();
+    report.protocol_version = crate::mcp_protocol::PROTOCOL_VERSION.to_owned();
+
+    let mut value = serde_json::to_value(report).unwrap_or_else(|_| {
+        serde_json::json!({
+            "server_name": "plsql-mcp",
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "protocol_version": crate::mcp_protocol::PROTOCOL_VERSION,
+        })
+    });
+    if let Value::Object(obj) = &mut value {
+        obj.insert(
+            "tool_count".to_owned(),
+            serde_json::json!(registry.tools.len()),
+        );
+        obj.insert(
+            "runtime".to_owned(),
+            serde_json::json!({
+                "live_db_active": live_db,
+                "note": "Static-analysis tools (parse_file, analyze_project, plsql_analyze, the graph \
+                         tools, ...) run with no database. Live-DB tools (query, connect, deploy_ddl, ...) \
+                         require the `live-db` build feature AND an active connection; without it they \
+                         return a runtime-state-required result naming the recovery tool."
+            }),
+        );
+        obj.insert(
+            "resources".to_owned(),
+            serde_json::json!(["oracle://capabilities", "oracle://tools"]),
+        );
+        obj.insert(
+            "next_actions".to_owned(),
+            serde_json::json!([
+                "Call resources/list to discover the oracle:// resources.",
+                "Call resources/read with oracle://capabilities for this report as a resource.",
+                "Call tools/list to read each tool's argument inputSchema and readOnlyHint/destructiveHint.",
+                "Static analysis needs no connection: start with analyze_project, then graph tools.",
+                "For any live-DB tool, call connect first."
+            ]),
+        );
+    }
+    value
+}
+
+fn capabilities_report() -> Value {
+    capabilities_report_for_registry(&crate::default_tool_registry())
 }
 
 /// Deserialize the `arguments` object into a tool Request type,
