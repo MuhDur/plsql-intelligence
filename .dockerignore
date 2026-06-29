@@ -2,6 +2,10 @@
 # `cargo build -p plsql-mcp` resolves the workspace. Exclude build output, VCS,
 # fixtures, and docs/state dirs that the build never reads.
 target/
+target-*/
+release-artifacts/
+release-staging/
+.doctor/
 .git/
 .github/
 .beads/

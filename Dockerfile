@@ -20,7 +20,7 @@ RUN dnf -y install gcc java-17-openjdk-headless && dnf clean all && \
 ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p plsql-mcp
+RUN cargo +nightly-2026-05-11 build --release -p plsql-mcp
 
 # ---- runtime: plain Oracle Linux, no Instant Client layer ----
 FROM oraclelinux:9
