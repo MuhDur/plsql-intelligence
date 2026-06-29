@@ -15,10 +15,11 @@
 //!
 //! # Codegen
 //!
-//! When built with `--features antlr-codegen`, the `build.rs` script runs
-//! the antlr4rust Java tool to generate Rust lexer/parser/listener code
-//! from the `.g4` grammars.  The generated code is written to `OUT_DIR`
-//! and included here as private modules.
+//! Normal builds with `--features antlr-codegen` compile the committed
+//! lexer/parser/listener code under `src/generated/`; Java is not required.
+//! To refresh the generated code after a grammar or tool change, run the build
+//! with `PLSQL_ANTLR_REGEN=1`. CI regenerates into a temporary directory and
+//! diffs that output against the committed copy.
 //!
 //! Without the feature, only the grammar files and this documentation
 //! are available.
@@ -34,13 +35,22 @@ mod generated {
     extern crate antlr_rust;
 
     pub mod plsqllexer {
-        include!(concat!(env!("OUT_DIR"), "/plsqllexer.rs"));
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/generated/plsqllexer.rs"
+        ));
     }
     pub mod plsqlparser {
-        include!(concat!(env!("OUT_DIR"), "/plsqlparser.rs"));
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/generated/plsqlparser.rs"
+        ));
     }
     pub mod plsqlparserlistener {
-        include!(concat!(env!("OUT_DIR"), "/plsqlparserlistener.rs"));
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/generated/plsqlparserlistener.rs"
+        ));
     }
 }
 

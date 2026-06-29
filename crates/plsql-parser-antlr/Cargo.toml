@@ -7,8 +7,8 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
-# The .g4 grammar files are included as data for the build.rs codegen step.
-# They are NOT compiled directly — ANTLR generates Rust source from them.
+# The .g4 grammar files are included as provenance for the committed generated
+# Rust source under src/generated/.
 include = [
     "grammars/",
     "tools/",
@@ -19,8 +19,9 @@ include = [
 
 [features]
 default = []
-# Enable ANTLR codegen at build time. Requires Java 11+ on PATH.
-# Pulls in the antlr-rust runtime so generated code can compile.
+# Enable the generated ANTLR backend.
+# Pulls in the antlr-rust runtime so committed generated code can compile.
+# Java regeneration is explicit only: PLSQL_ANTLR_REGEN=1.
 # Without this feature, the crate exposes only the grammar files and docs.
 antlr-codegen = ["antlr-rust"]
 

@@ -1,6 +1,6 @@
 //! Build script for `plsql-parser-antlr`.
 //!
-//! When the `antlr-codegen` feature is enabled, this script:
+//! When `PLSQL_ANTLR_REGEN=1` is set, this script:
 //!
 //! 1. Locates the vendored `antlr4-rust.jar` codegen tool
 //! 2. Runs `java -jar <jar> -Dlanguage=Rust` on `PlSqlLexer.g4` and
@@ -9,9 +9,11 @@
 //!    - Replaces `fn` keyword collisions with `r#fn`
 //!    - Replaces Java-style `this.` with Rust-style `recog.` in embedded
 //!      actions
-//! 4. Writes the generated Rust source into `OUT_DIR`
+//! 4. Writes the generated Rust source into `src/generated/`, or into
+//!    `PLSQL_ANTLR_REGEN_DIR` when that environment variable is set
 //!
-//! Without the `antlr-codegen` feature, the build script is a no-op.
+//! Normal builds never require Java. They compile the committed generated
+//! source under `src/generated/`.
 
 use std::env;
 use std::fs;
@@ -19,20 +21,43 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    // Only run codegen when the feature is enabled.
+    println!("cargo:rerun-if-env-changed=PLSQL_ANTLR_REGEN");
+    println!("cargo:rerun-if-env-changed=PLSQL_ANTLR_REGEN_DIR");
+
+    // Only validate or regenerate generated code when the feature is enabled.
     if env::var("CARGO_FEATURE_ANTLR_CODEGEN").is_err() {
         println!("cargo:warning=antlr-codegen feature not enabled, skipping ANTLR codegen");
         return;
     }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let committed_generated_dir = manifest_dir.join("src/generated");
 
     let jar_path = manifest_dir.join("tools/antlr4-rust.jar");
     let lexer_grammar = manifest_dir.join("grammars/PlSqlLexer.g4");
     let parser_grammar = manifest_dir.join("grammars/PlSqlParser.g4");
 
-    // Verify inputs exist.
+    // Re-run if inputs or committed generated files change.
+    println!("cargo:rerun-if-changed={}", lexer_grammar.display());
+    println!("cargo:rerun-if-changed={}", parser_grammar.display());
+    println!("cargo:rerun-if-changed={}", jar_path.display());
+    for name in generated_file_names() {
+        println!(
+            "cargo:rerun-if-changed={}",
+            committed_generated_dir.join(name).display()
+        );
+    }
+
+    if !regen_requested() {
+        verify_generated_files(&committed_generated_dir);
+        println!(
+            "cargo:warning=Using committed ANTLR generated source from {}",
+            committed_generated_dir.display()
+        );
+        return;
+    }
+
+    // Verify generator inputs exist only for explicit regeneration.
     assert!(
         jar_path.exists(),
         "antlr4-rust.jar not found at {}",
@@ -49,10 +74,11 @@ fn main() {
         parser_grammar.display()
     );
 
-    // Re-run if grammar files change.
-    println!("cargo:rerun-if-changed={}", lexer_grammar.display());
-    println!("cargo:rerun-if-changed={}", parser_grammar.display());
-    println!("cargo:rerun-if-changed={}", jar_path.display());
+    let out_dir = env::var_os("PLSQL_ANTLR_REGEN_DIR")
+        .map(PathBuf::from)
+        .unwrap_or(committed_generated_dir);
+    fs::create_dir_all(&out_dir)
+        .unwrap_or_else(|e| panic!("Failed to create generated output dir: {e}"));
 
     // --- Generate lexer ---
     println!("cargo:warning=Generating Rust lexer from PlSqlLexer.g4...");
@@ -66,8 +92,7 @@ fn main() {
     run_antlr_with_listener(&jar_path, &parser_grammar, &out_dir, true);
 
     // Verify output files were generated.
-    let expected = ["plsqllexer.rs", "plsqlparser.rs", "plsqlparserlistener.rs"];
-    for name in &expected {
+    for name in generated_file_names() {
         let path = out_dir.join(name);
         assert!(
             path.exists(),
@@ -88,6 +113,28 @@ fn main() {
         "cargo:warning=ANTLR codegen complete. Output in {}",
         out_dir.display()
     );
+}
+
+fn regen_requested() -> bool {
+    env::var("PLSQL_ANTLR_REGEN")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn generated_file_names() -> [&'static str; 3] {
+    ["plsqllexer.rs", "plsqlparser.rs", "plsqlparserlistener.rs"]
+}
+
+fn verify_generated_files(dir: &Path) {
+    for name in generated_file_names() {
+        let path = dir.join(name);
+        assert!(
+            path.exists(),
+            "Committed ANTLR generated file missing at {}. \
+             Restore it from git, or run `PLSQL_ANTLR_REGEN=1 cargo build -p plsql-parser-antlr --features antlr-codegen` to regenerate it.",
+            path.display()
+        );
+    }
 }
 
 /// Run ANTLR codegen for a lexer grammar.

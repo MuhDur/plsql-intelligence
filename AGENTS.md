@@ -135,7 +135,24 @@ Longer-term target layout (`docs/`, `tools/`, additional crates, fuller corpus):
 
 <!-- CUSTOMIZE: If you have generated files, document them here -->
 
-**Current state:** There are no generated files in this repo.
+**Current state:** `crates/plsql-parser-antlr/src/generated/` contains
+committed ANTLR outputs used by the normal `antlr-codegen` feature path so
+engine builds do not require Java. Do not hand-edit files in that directory.
+Regenerate them only with:
+
+```bash
+PLSQL_ANTLR_REGEN=1 cargo build -p plsql-parser-antlr --features antlr-codegen
+```
+
+For CI drift checks, regenerate to a scratch directory and compare against the
+committed copy:
+
+```bash
+PLSQL_ANTLR_REGEN=1 \
+PLSQL_ANTLR_REGEN_DIR=/tmp/plsql-parser-antlr-generated \
+cargo build -p plsql-parser-antlr --features antlr-codegen
+diff -ru crates/plsql-parser-antlr/src/generated /tmp/plsql-parser-antlr-generated
+```
 
 If/when you add generated artifacts:
 - **Rule:** Never hand-edit generated outputs.
