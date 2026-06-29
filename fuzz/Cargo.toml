@@ -25,24 +25,42 @@ path = "../crates/plsql-ir"
 
 [dependencies.plsql-catalog]
 path = "../crates/plsql-catalog"
+optional = true
 
 [dependencies.plsql-mcp]
 path = "../crates/plsql-mcp"
+optional = true
 
 [dependencies.asupersync]
 version = "=0.3.4"
+optional = true
 
 [dependencies.async-trait]
 version = "0.1"
+optional = true
 
 [dependencies.oraclemcp-core]
 version = "=0.4.1"
+optional = true
 
 [dependencies.oraclemcp-db]
 version = "=0.4.1"
+optional = true
 
 [dependencies.serde_json]
 version = "1"
+
+[features]
+catalog = ["dep:plsql-catalog"]
+live-mcp = [
+    "dep:asupersync",
+    "dep:async-trait",
+    "dep:oraclemcp-core",
+    "dep:oraclemcp-db",
+    "dep:plsql-catalog",
+    "dep:plsql-mcp",
+    "plsql-catalog/oraclemcp-db",
+]
 
 [[bin]]
 name = "parse_lower"
@@ -85,6 +103,7 @@ path = "fuzz_targets/catalog_snapshot_json.rs"
 test = false
 doc = false
 bench = false
+required-features = ["catalog"]
 
 [[bin]]
 name = "mcp_async_dispatch"
@@ -92,6 +111,7 @@ path = "fuzz_targets/mcp_async_dispatch.rs"
 test = false
 doc = false
 bench = false
+required-features = ["live-mcp"]
 
 [[bin]]
 name = "catalog_async_loader"
@@ -99,6 +119,7 @@ path = "fuzz_targets/catalog_async_loader.rs"
 test = false
 doc = false
 bench = false
+required-features = ["live-mcp"]
 
 [[bin]]
 name = "live_runtime_ops"
@@ -106,3 +127,4 @@ path = "fuzz_targets/live_runtime_ops.rs"
 test = false
 doc = false
 bench = false
+required-features = ["live-mcp"]
