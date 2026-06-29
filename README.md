@@ -100,16 +100,19 @@ degradation responses inherited from the `oraclemcp-*` core.
 
 ## Status
 
-The latest completed release is `v0.6.0`, the line for trio stack-doctor
-parity and publication hardening. The project is still pre-1.0, so APIs can
+The latest completed release is `v0.6.1`, the patch line for trio
+stack-doctor contract hardening, stable default workspace gates, and
+publication metadata. The project is still pre-1.0, so APIs can
 change before the 1.0 line. `plan.md`
 remains the authoritative specification and `docs/ARCHITECTURE.md` is the
 technical architecture snapshot.
 
-- The `v0.6.0` line adds the `plsql-mcp` doctor contract needed for
+- The `v0.6.1` line completes the `plsql-mcp` doctor contract needed for
   stack-wide parity with `oraclemcp` and `rust-oracledb`: `doctor`,
-  `doctor health`, `doctor capabilities`, `doctor robot-docs`,
-  `doctor ls`, `doctor diff`, `doctor undo`, and guarded `doctor gc`.
+  `doctor fix`, `doctor explain <finding-id>`, `doctor health`,
+  `doctor capabilities`, `doctor robot-docs`, `doctor ls`, `doctor diff`,
+  `doctor undo`, and guarded `doctor gc`. Diagnose writes a full local run
+  bundle under `.doctor/runs/<run-id>/`.
 - The Cargo workspace has 26 members: 21 `plsql-*` engine and analysis
   crates plus 5 tool crates (`crates/`, `tools/`). Release binaries are
   produced for `plsql`, `plsql-depgraph`, and `plsql-mcp`.
@@ -130,7 +133,7 @@ technical architecture snapshot.
   `plsql-accretion` library, the `usr-loop` tool, the sha-pinned
   conformance gate, the monotone tripwire, and the re-runnable acceptance
   proof `scripts/usr_acceptance.sh`.
-- The post-`v0.5.0` fast-follow lane is closed in `v0.6.0`: upstream
+- The post-`v0.5.0` fast-follow lane is closed in the `v0.6.x` line: upstream
   driver gaps needed by `plsql-mcp` are filed as
   [`rust-oracledb#13`](https://github.com/MuhDur/rust-oracledb/issues/13),
   [`oraclemcp#2`](https://github.com/MuhDur/oraclemcp/issues/2), and
@@ -445,6 +448,8 @@ Exit codes for `gate`/`land`: `0` accepted/landed, `3` rejected/quarantined
 plsql-mcp info                       # server identity and tool tiers
 plsql-mcp --robot-json capabilities  # machine-readable agent contract
 plsql-mcp --json doctor              # stack-orientation health report
+plsql-mcp --json doctor fix          # forensic fixer contract; no mutating fixers today
+plsql-mcp --json doctor explain ID   # explain a current finding code
 plsql-mcp --json doctor health       # compact health block
 plsql-mcp --json doctor capabilities # doctor-specific contract
 plsql-mcp doctor robot-docs          # agent handbook

@@ -1,6 +1,6 @@
 [package]
 name = "plsql-catalog"
-version = "0.1.0"
+version = "0.1.1"
 description = "Offline-first Oracle catalog snapshot model for plsql-intelligence"
 edition.workspace = true
 license.workspace = true

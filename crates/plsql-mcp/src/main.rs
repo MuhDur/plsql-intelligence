@@ -105,6 +105,13 @@ struct DoctorArgs {
 enum DoctorCommand {
     /// Run diagnostics. This is also the default when no doctor subcommand is given.
     Diagnose,
+    /// Run the fixer contract. Current plsql-mcp fixers are forensic/no-op.
+    Fix,
+    /// Explain one finding by stable finding code.
+    Explain {
+        /// Finding code from `findings[].code`, for example MCP_CONNECTIONS_FILE_NOT_LOADED.
+        finding_id: String,
+    },
     /// Emit the compact health block only.
     Health,
     /// Emit the doctor-specific machine contract.
@@ -494,8 +501,8 @@ fn run_capabilities(robot_json: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_doctor(args: DoctorArgs, robot_json: bool) -> ExitCode {
-    match args.command.as_ref() {
+fn run_doctor(mut args: DoctorArgs, robot_json: bool) -> ExitCode {
+    match args.command.take() {
         Some(DoctorCommand::Health) => run_doctor_health(robot_json),
         Some(DoctorCommand::Capabilities) => run_doctor_capabilities(robot_json),
         Some(DoctorCommand::RobotDocs) => {
@@ -503,9 +510,14 @@ fn run_doctor(args: DoctorArgs, robot_json: bool) -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(DoctorCommand::Ls) => run_doctor_ls(robot_json),
-        Some(DoctorCommand::Diff { run_id }) => run_doctor_diff(run_id, robot_json),
-        Some(DoctorCommand::Undo { run_id }) => run_doctor_undo(run_id, robot_json),
-        Some(DoctorCommand::Gc { before, yes }) => run_doctor_gc(before, *yes, robot_json),
+        Some(DoctorCommand::Diff { run_id }) => run_doctor_diff(&run_id, robot_json),
+        Some(DoctorCommand::Undo { run_id }) => run_doctor_undo(&run_id, robot_json),
+        Some(DoctorCommand::Gc { before, yes }) => run_doctor_gc(&before, yes, robot_json),
+        Some(DoctorCommand::Explain { finding_id }) => run_doctor_explain(&finding_id, robot_json),
+        Some(DoctorCommand::Fix) => {
+            args.fix = true;
+            run_doctor_diagnose(args, robot_json)
+        }
         Some(DoctorCommand::Diagnose) | None => run_doctor_diagnose(args, robot_json),
     }
 }
@@ -575,6 +587,57 @@ fn run_doctor_capabilities(robot_json: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn run_doctor_explain(finding_id: &str, robot_json: bool) -> ExitCode {
+    let config = McpConfig::default();
+    let registry = default_tool_registry();
+    let report = doctor_report(&config, &registry);
+    let finding = report
+        .findings
+        .iter()
+        .find(|finding| finding.code == finding_id);
+
+    match finding {
+        Some(finding) => {
+            let payload = serde_json::json!({
+                "schema_version": DOCTOR_SCHEMA_VERSION,
+                "tool": "plsql-mcp",
+                "tool_version": env!("CARGO_PKG_VERSION"),
+                "doctor_contract_version": DOCTOR_CONTRACT_VERSION,
+                "finding_id": finding_id,
+                "found": true,
+                "finding": finding,
+                "manual_remediation": &finding.remediation,
+                "stdout_contract": "stdout is data only; diagnostics go to stderr"
+            });
+            if robot_json {
+                println!("{}", serde_json::to_string(&payload).unwrap());
+            } else {
+                println!("{}", serde_json::to_string_pretty(&payload).unwrap());
+            }
+            ExitCode::SUCCESS
+        }
+        None => {
+            let payload = serde_json::json!({
+                "schema_version": DOCTOR_SCHEMA_VERSION,
+                "tool": "plsql-mcp",
+                "ok": false,
+                "exit_code": 66,
+                "error": {
+                    "code": "MCP_DOCTOR_FINDING_NOT_FOUND",
+                    "message": format!("finding `{finding_id}` was not present in the current doctor report")
+                },
+                "available_findings": report.findings.iter().map(|finding| finding.code.as_str()).collect::<Vec<_>>()
+            });
+            if robot_json {
+                println!("{}", serde_json::to_string(&payload).unwrap());
+            } else {
+                eprintln!("plsql-mcp doctor explain: finding `{finding_id}` not found");
+            }
+            ExitCode::from(66)
+        }
+    }
+}
+
 fn doctor_health_json(report: &DoctorReport) -> serde_json::Value {
     serde_json::json!({
         "schema_version": DOCTOR_SCHEMA_VERSION,
@@ -606,6 +669,8 @@ fn doctor_capabilities_json() -> serde_json::Value {
         "commands": {
             "doctor": "diagnose and write a local run artifact",
             "doctor diagnose": "explicit diagnose alias",
+            "doctor fix": "run the fixer contract; this release is forensic-only and records zero mutating actions",
+            "doctor explain <finding-id>": "explain one current finding code and its manual remediation",
             "doctor health": "compact machine health",
             "doctor capabilities": "doctor-specific machine contract",
             "doctor robot-docs": "doctor-specific handbook",
@@ -637,15 +702,79 @@ fn doctor_capabilities_json() -> serde_json::Value {
             "74": "I/O error"
         },
         "detectors": [
-            "oracle_live_backend",
-            "mcp_tool_registry",
-            "mcp_transport",
-            "audit_guarded_writes",
-            "connection_profiles",
+            {
+                "id": "oracle_live_backend",
+                "description": "reports whether the live Oracle backend is compiled in and which thin stack boundary is active",
+                "online_required": false
+            },
+            {
+                "id": "mcp_tool_registry",
+                "description": "verifies the MCP server exposes the same non-empty registry that serve uses",
+                "online_required": false
+            },
+            {
+                "id": "mcp_transport",
+                "description": "validates the configured transport shape without binding public sockets",
+                "online_required": false
+            },
+            {
+                "id": "audit_guarded_writes",
+                "description": "checks guarded-write audit env vars are all present or all absent",
+                "online_required": false
+            },
+            {
+                "id": "connection_profiles",
+                "description": "summarizes named connection profiles and write posture when connections.toml is loaded",
+                "online_required": false
+            },
+            {
+                "id": "analysis_profile",
+                "description": "checks the offline PL/SQL analysis profile for contradictory Oracle version settings",
+                "online_required": false
+            }
+        ],
+        "subsystems": [
+            "mcp_protocol",
+            "tool_registry",
+            "oraclemcp_db_thin_backend",
+            "live_db_safety_profile",
+            "connections_toml",
+            "guarded_write_audit",
             "analysis_profile"
         ],
         "fixers": [],
+        "fixer_posture": {
+            "mode": "forensic_only",
+            "mutating_fixers_available": false,
+            "reason": "plsql-mcp has no safe local state repair to perform today; doctor records manual remediations instead of mutating configuration behind an agent's back."
+        },
+        "manual_remediations": {
+            "MCP_CONNECTIONS_FILE_NOT_LOADED": "Create ~/.plsql-mcp/connections.toml for named live-DB profiles.",
+            "MCP_GUARDED_AUDIT_ENV_INCOMPLETE": "Set both PLSQL_MCP_AUDIT_FILE and PLSQL_MCP_AUDIT_HMAC_KEY, or unset both.",
+            "MCP_PROD_DSN_WITHOUT_PERMANENTLY_READ_ONLY": "Mark production-looking connection profiles with permanently_read_only = true.",
+            "MCP_TRANSPORT_UNHEALTHY": "Set a parseable loopback listen address such as 127.0.0.1:7070.",
+            "MCP_ANALYSIS_PROFILE_INSANE": "Lower compatibility to <= oracle_version or raise the target Oracle version."
+        },
         "artifact_root": DOCTOR_RUNS_DIR,
+        "write_scopes": [
+            ".doctor/runs/<run-id>/report.json",
+            ".doctor/runs/<run-id>/actions.jsonl",
+            ".doctor/runs/<run-id>/scorecard.json",
+            ".doctor/runs/<run-id>/stdout.json",
+            ".doctor/runs/<run-id>/report.md",
+            ".doctor/runs/<run-id>/backups/"
+        ],
+        "run_artifact_schema": {
+            "report.json": "envelope containing mode, empty actions list, and the DoctorReport",
+            "actions.jsonl": "newline-delimited action log; empty because this release has no mutating fixers",
+            "scorecard.json": "machine summary of pass/warn/fail/skip counts and fixer posture",
+            "stdout.json": "exact JSON payload emitted by --json doctor for reproducible agent capture",
+            "report.md": "short human-readable report generated from the same DoctorReport",
+            "backups/": "reserved backup directory; empty for forensic-only runs"
+        },
+        "report_schema": "DoctorReport v1",
+        "actions_schema": "DoctorActionLog v1; empty list is a valid forensic-only run",
+        "online_checks": [],
         "stdout_contract": "stdout is data only; diagnostics go to stderr"
     })
 }
@@ -659,6 +788,8 @@ fix text, and a process exit code derived from failing checks.
 
 Core commands:
   plsql-mcp --json doctor
+  plsql-mcp --json doctor fix
+  plsql-mcp --json doctor explain MCP_CONNECTIONS_FILE_NOT_LOADED
   plsql-mcp --json doctor health
   plsql-mcp --json doctor capabilities
   plsql-mcp doctor robot-docs
@@ -672,9 +803,9 @@ Current fixer posture:
   list is empty until a future typed fixer is added.
 
 Run artifacts:
-  Diagnose writes {runs_dir}/<run-id>/report.json with the report and the
-  empty action list. These files are local operator artifacts, not release
-  artifacts.
+  Diagnose writes {runs_dir}/<run-id>/ with report.json, actions.jsonl,
+  scorecard.json, stdout.json, report.md, and backups/. These files are local
+  operator artifacts, not release artifacts.
 
 Exit codes:
   0 healthy / no failing checks
@@ -694,6 +825,7 @@ fn persist_doctor_run(report: DoctorReport, args: &DoctorArgs) -> std::io::Resul
     let run_id = new_run_id();
     let dir = Path::new(DOCTOR_RUNS_DIR).join(&run_id);
     fs::create_dir_all(&dir)?;
+    fs::create_dir_all(dir.join("backups"))?;
     let report = report.with_run(run_id.clone(), dir.display().to_string());
     let payload = serde_json::json!({
         "schema_version": DOCTOR_SCHEMA_VERSION,
@@ -709,8 +841,93 @@ fn persist_doctor_run(report: DoctorReport, args: &DoctorArgs) -> std::io::Resul
         "actions": [],
         "report": &report,
     });
+    let scorecard = doctor_scorecard_json(&report, args);
+    let stdout_json = serde_json::to_value(&report).map_err(std::io::Error::other)?;
     write_json_create_new(&dir.join("report.json"), &payload)?;
+    write_text_create_new(
+        &dir.join("actions.jsonl"),
+        "# forensic-only doctor run; no mutating actions recorded\n",
+    )?;
+    write_json_create_new(&dir.join("scorecard.json"), &scorecard)?;
+    write_json_create_new(&dir.join("stdout.json"), &stdout_json)?;
+    write_text_create_new(
+        &dir.join("report.md"),
+        &doctor_report_markdown(&report, args),
+    )?;
     Ok(report)
+}
+
+fn doctor_scorecard_json(report: &DoctorReport, args: &DoctorArgs) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": DOCTOR_SCHEMA_VERSION,
+        "tool": "plsql-mcp",
+        "tool_version": env!("CARGO_PKG_VERSION"),
+        "doctor_contract_version": DOCTOR_CONTRACT_VERSION,
+        "run_id": &report.run_id,
+        "ok": report.ok,
+        "exit_code": report.exit_code,
+        "mode": {
+            "fix": args.fix,
+            "dry_run": args.dry_run,
+            "quick": args.quick,
+            "online": args.online,
+            "only": &args.only,
+        },
+        "counts": {
+            "pass": report.summary.pass,
+            "warn": report.summary.warn,
+            "fail": report.summary.fail,
+            "skip": report.summary.skip,
+            "blocker": report.summary.blocker_count,
+            "warning": report.summary.warning_count,
+            "info": report.summary.info_count,
+            "findings": report.summary.finding_count,
+        },
+        "fixer_posture": {
+            "mode": "forensic_only",
+            "mutating_fixers_available": false,
+            "actions_recorded": 0,
+            "actions_applied": report.summary.actions_applied,
+        },
+        "checks": &report.checks,
+    })
+}
+
+fn doctor_report_markdown(report: &DoctorReport, args: &DoctorArgs) -> String {
+    let mut out = String::new();
+    out.push_str("# plsql-mcp doctor report\n\n");
+    out.push_str(&format!(
+        "- run_id: {}\n",
+        report.run_id.as_deref().unwrap_or("<none>")
+    ));
+    out.push_str(&format!("- ok: {}\n", report.ok));
+    out.push_str(&format!("- exit_code: {}\n", report.exit_code));
+    out.push_str(&format!("- fix: {}\n", args.fix));
+    out.push_str(&format!("- dry_run: {}\n\n", args.dry_run));
+    out.push_str("## Summary\n\n");
+    out.push_str(&format!("- pass: {}\n", report.summary.pass));
+    out.push_str(&format!("- warn: {}\n", report.summary.warn));
+    out.push_str(&format!("- fail: {}\n", report.summary.fail));
+    out.push_str(&format!("- skip: {}\n", report.summary.skip));
+    out.push_str(&format!("- blockers: {}\n", report.summary.blocker_count));
+    out.push_str(&format!("- warnings: {}\n", report.summary.warning_count));
+    out.push_str(&format!("- info: {}\n\n", report.summary.info_count));
+    out.push_str("## Findings\n\n");
+    for finding in &report.findings {
+        out.push_str(&format!(
+            "- {:?} {}: {}\n",
+            finding.severity, finding.code, finding.summary
+        ));
+        if let Some(remediation) = &finding.remediation {
+            out.push_str(&format!("  remediation: {remediation}\n"));
+        }
+    }
+    if report.findings.is_empty() {
+        out.push_str("- none\n");
+    }
+    out.push_str("\n## Actions\n\n");
+    out.push_str("- no mutating actions recorded; this release is forensic-only\n");
+    out
 }
 
 fn write_json_create_new(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
@@ -721,6 +938,14 @@ fn write_json_create_new(path: &Path, value: &serde_json::Value) -> std::io::Res
     let json = serde_json::to_string_pretty(value).map_err(std::io::Error::other)?;
     file.write_all(json.as_bytes())?;
     file.write_all(b"\n")
+}
+
+fn write_text_create_new(path: &Path, text: &str) -> std::io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(text.as_bytes())
 }
 
 fn new_run_id() -> String {
@@ -768,9 +993,14 @@ fn list_doctor_runs() -> std::io::Result<Vec<serde_json::Value>> {
             continue;
         }
         let run_id = entry.file_name().to_string_lossy().into_owned();
+        let run_path = entry.path();
         runs.push(serde_json::json!({
             "run_id": run_id,
-            "report_path": entry.path().join("report.json").display().to_string(),
+            "report_path": run_path.join("report.json").display().to_string(),
+            "actions_path": run_path.join("actions.jsonl").display().to_string(),
+            "scorecard_path": run_path.join("scorecard.json").display().to_string(),
+            "stdout_path": run_path.join("stdout.json").display().to_string(),
+            "markdown_path": run_path.join("report.md").display().to_string(),
         }));
     }
     runs.sort_by(|a, b| a["run_id"].as_str().cmp(&b["run_id"].as_str()));
@@ -788,6 +1018,7 @@ fn run_doctor_diff(run_id: &str, robot_json: bool) -> ExitCode {
         "schema_version": DOCTOR_SCHEMA_VERSION,
         "tool": "plsql-mcp",
         "run_id": run_id,
+        "actions_path": Path::new(DOCTOR_RUNS_DIR).join(run_id).join("actions.jsonl").display().to_string(),
         "actions": [],
         "diff": [],
         "message": "diagnose-only run; no actions were recorded",
@@ -811,6 +1042,7 @@ fn run_doctor_undo(run_id: &str, robot_json: bool) -> ExitCode {
         "schema_version": DOCTOR_SCHEMA_VERSION,
         "tool": "plsql-mcp",
         "run_id": run_id,
+        "actions_path": Path::new(DOCTOR_RUNS_DIR).join(run_id).join("actions.jsonl").display().to_string(),
         "undone": [],
         "message": "diagnose-only run; no actions to undo",
     });
@@ -1289,6 +1521,12 @@ mod tests {
     /// executable's own location: the binary is a sibling in the same
     /// `target/<profile>/` directory (the test harness lives in `deps/`).
     fn bin() -> std::path::PathBuf {
+        if let Some(path) = option_env!("CARGO_BIN_EXE_plsql-mcp") {
+            let path = std::path::PathBuf::from(path);
+            if path.is_file() {
+                return path;
+            }
+        }
         let mut dir = std::env::current_exe().expect("test exe path");
         dir.pop(); // drop the test binary file name
         if dir.ends_with("deps") {
@@ -1299,7 +1537,25 @@ mod tests {
         } else {
             "plsql-mcp"
         };
-        dir.join(exe)
+        let path = dir.join(exe);
+        if !path.is_file() {
+            static BUILD_BINARY_ONCE: std::sync::Once = std::sync::Once::new();
+            BUILD_BINARY_ONCE.call_once(|| {
+                let status = std::process::Command::new("cargo")
+                    .args([
+                        "+nightly-2026-05-11",
+                        "build",
+                        "-p",
+                        "plsql-mcp",
+                        "--bin",
+                        "plsql-mcp",
+                    ])
+                    .status()
+                    .expect("build plsql-mcp binary for CLI-spawning tests");
+                assert!(status.success(), "plsql-mcp binary build failed");
+            });
+        }
+        path
     }
 
     /// Spawn the built binary in stdio mode, drive a real MCP session
@@ -1571,9 +1827,32 @@ mod tests {
         let run_dir = parsed["run_dir"]
             .as_str()
             .expect("doctor report carries run_dir");
+        let run_dir = std::path::Path::new(run_dir);
+        for file in [
+            "report.json",
+            "actions.jsonl",
+            "scorecard.json",
+            "stdout.json",
+            "report.md",
+        ] {
+            assert!(
+                run_dir.join(file).is_file(),
+                "doctor run artifact {file} should exist under {}",
+                run_dir.display()
+            );
+        }
         assert!(
-            std::path::Path::new(run_dir).join("report.json").is_file(),
-            "doctor run artifact should exist under {run_dir}"
+            run_dir.join("backups").is_dir(),
+            "doctor run artifact should reserve backups/ under {}",
+            run_dir.display()
+        );
+        let scorecard: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(run_dir.join("scorecard.json")).unwrap())
+                .expect("scorecard JSON parses");
+        assert_eq!(scorecard["fixer_posture"]["mode"], "forensic_only");
+        assert_eq!(
+            scorecard["fixer_posture"]["mutating_fixers_available"],
+            false
         );
     }
 
@@ -1591,7 +1870,30 @@ mod tests {
         assert_eq!(cap_json["tool"], "plsql-mcp");
         assert_eq!(cap_json["doctor_contract_version"], DOCTOR_CONTRACT_VERSION);
         assert!(cap_json["commands"]["doctor health"].is_string());
+        assert!(cap_json["commands"]["doctor fix"].is_string());
+        assert!(cap_json["commands"]["doctor explain <finding-id>"].is_string());
         assert!(cap_json["exit_codes"]["73"].is_string());
+        assert_eq!(cap_json["fixer_posture"]["mode"], "forensic_only");
+        assert_eq!(
+            cap_json["fixer_posture"]["mutating_fixers_available"],
+            false
+        );
+        assert!(cap_json["manual_remediations"]["MCP_CONNECTIONS_FILE_NOT_LOADED"].is_string());
+        assert!(
+            cap_json["run_artifact_schema"]["actions.jsonl"]
+                .as_str()
+                .is_some_and(|value| value.contains("empty"))
+        );
+        assert!(cap_json["write_scopes"].as_array().is_some_and(|scopes| {
+            scopes
+                .iter()
+                .any(|scope| scope == ".doctor/runs/<run-id>/actions.jsonl")
+        }));
+        assert!(cap_json["detectors"].as_array().is_some_and(|detectors| {
+            detectors
+                .iter()
+                .any(|detector| detector["id"] == "mcp_tool_registry")
+        }));
 
         let health = PCommand::new(bin())
             .args(["--json", "doctor", "health"])
@@ -1607,6 +1909,60 @@ mod tests {
                 .as_array()
                 .is_some_and(|checks| !checks.is_empty())
         );
+    }
+
+    #[test]
+    fn doctor_fix_alias_is_forensic_and_records_zero_actions() {
+        use std::process::Command as PCommand;
+
+        let out = PCommand::new(bin())
+            .args(["--json", "doctor", "fix"])
+            .output()
+            .expect("run doctor fix");
+        assert!(out.status.success());
+        let report: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("doctor fix JSON report");
+        let run_dir = std::path::Path::new(
+            report["run_dir"]
+                .as_str()
+                .expect("doctor fix carries run_dir"),
+        );
+        let scorecard: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(run_dir.join("scorecard.json")).unwrap())
+                .expect("scorecard JSON parses");
+        assert_eq!(scorecard["mode"]["fix"], true);
+        assert_eq!(scorecard["fixer_posture"]["actions_recorded"], 0);
+        let actions = std::fs::read_to_string(run_dir.join("actions.jsonl")).unwrap();
+        assert!(
+            actions.contains("no mutating actions"),
+            "forensic action log should be explicit, got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn doctor_explain_known_finding_is_json_contract() {
+        use std::process::Command as PCommand;
+
+        let out = PCommand::new(bin())
+            .args([
+                "--json",
+                "doctor",
+                "explain",
+                "MCP_CONNECTIONS_FILE_NOT_LOADED",
+            ])
+            .output()
+            .expect("run doctor explain");
+        assert!(out.status.success());
+        let payload: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("doctor explain JSON");
+        assert_eq!(payload["tool"], "plsql-mcp");
+        assert_eq!(payload["finding_id"], "MCP_CONNECTIONS_FILE_NOT_LOADED");
+        assert_eq!(payload["found"], true);
+        assert_eq!(
+            payload["finding"]["code"],
+            "MCP_CONNECTIONS_FILE_NOT_LOADED"
+        );
+        assert!(payload["manual_remediation"].is_string());
     }
 
     /// Every Unix-style CLI accepts `--version`. clap auto-derives it from

@@ -1,6 +1,6 @@
 [package]
 name = "plsql-cicd"
-version = "0.6.0"
+version = "0.6.1"
 description = "CI/CD recompilation cascade types and operations for plsql-intelligence"
 edition.workspace = true
 license.workspace = true
@@ -19,7 +19,7 @@ async-trait = "0.1"
 asupersync = { version = "=0.3.4", optional = true }
 clap = { version = "4.5", features = ["derive"] }
 getrandom = "0.3"
-plsql-catalog = { path = "../plsql-catalog", version = "0.1.0" }
+plsql-catalog = { path = "../plsql-catalog", version = "0.1.1" }
 plsql-core = { path = "../plsql-core", version = "0.1.0" }
 plsql-lineage = { path = "../plsql-lineage", version = "0.1.0" }
 plsql-output = { path = "../plsql-output", version = "0.1.0" }

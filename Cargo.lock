@@ -1915,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "plsql-catalog"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "asupersync",
  "async-trait",
@@ -1933,7 +1933,7 @@ dependencies = [
 
 [[package]]
 name = "plsql-cicd"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "asupersync",
  "async-trait",
@@ -2041,7 +2041,7 @@ dependencies = [
 
 [[package]]
 name = "plsql-mcp"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "asupersync",
  "async-trait",

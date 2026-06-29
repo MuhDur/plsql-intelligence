@@ -9,6 +9,27 @@ work.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-06-29
+
+- **Doctor contract hardening.** `plsql-mcp doctor` now exposes
+  `doctor fix` as an explicit forensic/no-op fixer contract, adds
+  `doctor explain <finding-id>`, publishes detector metadata and manual
+  remediations in `doctor capabilities`, and writes a complete local run
+  bundle: `report.json`, `actions.jsonl`, `scorecard.json`, `stdout.json`,
+  `report.md`, and `backups/`.
+- **Published build fix.** The `plsql-mcp` crate now enables the
+  `plsql-catalog/oraclemcp-db` adapter feature it compiles against, so the
+  default published MCP build can use the catalog `OracleConnection` seam.
+- **Stable default workspace hardening.** The default Cargo workspace and
+  USR gate now exclude the nightly-only `plsql-mcp` live stack; stable gates
+  cover the offline engine while the MCP/live stack remains verified on the
+  pinned nightly.
+- **Upstream timeout issue clarified.** `oraclemcp#4` now carries concrete
+  timeout/cancellation acceptance criteria for the `plsql-mcp ->
+  oraclemcp-db -> oracledb` path, including the rule for splitting a
+  driver-only reproduction to `rust-oracledb` if investigation proves the
+  hang lives below the adapter.
+
 ## [0.6.0] - 2026-06-28
 
 - **Trio stack-doctor parity.** `plsql-mcp doctor` now follows the

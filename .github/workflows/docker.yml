@@ -10,9 +10,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Image version tag (e.g. 0.6.0)"
+        description: "Image version tag (e.g. 0.6.1)"
         required: true
-        default: "0.6.0"
+        default: "0.6.1"
 
 permissions:
   contents: read
