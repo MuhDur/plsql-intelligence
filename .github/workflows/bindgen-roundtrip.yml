@@ -12,6 +12,9 @@
 # `PLSQL-BG-014` / oracle-9rkm. Plan reference: §13 (Bindings
 # Generator) + §6.2.8 (Synthetic Lab).
 #
+# Offline pivot note: this remains a transitional nightly/live workflow until
+# the live round-trip coverage moves to oraclemcp in Phase 5.
+#
 # This workflow is intentionally **manual** (workflow_dispatch +
 # scheduled weekly) because:
 #   - It requires `docker login container-registry.oracle.com` with
@@ -20,7 +23,7 @@
 #   - Round-trip flakiness would block unrelated PRs if it gated
 #     every push.
 
-name: bindgen-roundtrip (XE container)
+name: bindgen-roundtrip (XE container, transitional nightly)
 
 on:
   workflow_dispatch:
@@ -30,7 +33,7 @@ on:
 
 jobs:
   roundtrip:
-    name: bindgen round-trip (Oracle XE 23ai)
+    name: bindgen round-trip (Oracle XE 23ai, transitional nightly)
     runs-on: ubuntu-latest
     services:
       oracle-xe:
@@ -54,6 +57,10 @@ jobs:
           --health-start-period 5m
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
       - uses: dtolnay/rust-toolchain@nightly
         with:
           toolchain: nightly-2026-05-11
@@ -67,14 +74,14 @@ jobs:
             https://download.oracle.com/otn_software/linux/instantclient/2370000/instantclient-basic-linux.x64-23.7.0.25.01.zip
           sudo unzip -q /tmp/instantclient.zip -d /opt/oracle
           sudo ln -sf /opt/oracle/instantclient_23_7 /opt/oracle/instantclient
-          echo "LD_LIBRARY_PATH=/opt/oracle/instantclient" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=/opt/oracle/instantclient" >> "$GITHUB_ENV"
 
       - name: Deploy synthetic test package
         env:
           ORACLE_PWD: ${{ secrets.ORACLE_XE_PWD }}
         run: |
           /opt/oracle/instantclient/sqlplus -s \
-            system/$ORACLE_PWD@//localhost:1521/FREEPDB1 <<'SQL'
+            "system/${ORACLE_PWD}@//localhost:1521/FREEPDB1" <<'SQL'
           @corpus/synthetic/l1/pkg_employee_mgmt.pks
           @corpus/synthetic/l1/pkg_employee_mgmt.pkb
           exit;

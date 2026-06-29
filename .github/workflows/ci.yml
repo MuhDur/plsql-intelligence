@@ -19,68 +19,59 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: nightly-2026-05-11
           components: rustfmt
-      - run: cargo +nightly-2026-05-11 fmt --all -- --check
+      - run: cargo fmt --all -- --check
 
   clippy:
     name: clippy (-D warnings)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: nightly-2026-05-11
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo +nightly-2026-05-11 clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --exclude plsql-mcp --all-targets -- -D warnings
 
   test:
     name: cargo test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          toolchain: nightly-2026-05-11
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo +nightly-2026-05-11 test --workspace --all-targets
-      - run: cargo +nightly-2026-05-11 test --workspace --doc
+      - run: cargo test --workspace --exclude plsql-mcp --all-targets
+      - run: cargo test --workspace --exclude plsql-mcp --doc
 
-  # `oracle-plsql-converge-0lnu.15` Phase X aggregate DoD — prove the
-  # shipping stdio MCP loop can connect and exercise live tools over the real
-  # JSON-RPC wire against Oracle Free 23ai, not just in-process helpers.
-  live-wire-xe:
-    name: mcp live wire (Oracle 23ai)
+  # Offline pivot transition job: stable is the default everywhere else; this
+  # job keeps the remaining live/codegen/MCP surfaces compiling on the pinned
+  # nightly until Phase 2/5 removes or relocates them.
+  nightly-transition:
+    name: nightly transition (live/codegen/plsql-mcp)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
       - uses: dtolnay/rust-toolchain@nightly
         with:
           toolchain: nightly-2026-05-11
       - uses: Swatinem/rust-cache@v2
-      - name: Start Oracle Free 23ai
-        env:
-          ORACLE_PWD: DemoPlsqlIntel#2026
-        run: make demo-oracle-xe-ci
-      - name: Exercise plsql-mcp serve over JSON-RPC
-        env:
-          PLSQL_XE_SYSTEM_PASSWORD: DemoPlsqlIntel#2026
-          PLSQL_XE_DEMO_PASSWORD: DemoLab#2026
-        run: |
-          cargo +nightly-2026-05-11 test -p plsql-mcp --locked --features live-xe \
-            --test mcp_live_xe serve_stdio_live_surface_e2e_skips_without_oracle \
-            -- --test-threads=1 --nocapture
-      - name: Stop Oracle Free 23ai
-        if: always()
-        run: |
-          docker compose \
-            -f examples/oracle-xe/docker-compose.yml \
-            -f examples/oracle-xe/docker-compose.gvenzl.yml \
-            down --volumes
+        with:
+          key: nightly-transition
+      - name: Check gated catalog live adapter
+        run: cargo +nightly-2026-05-11 check -p plsql-catalog --features oraclemcp-db
+      - name: Check gated CI/CD live adapter
+        run: cargo +nightly-2026-05-11 check -p plsql-cicd --features live-xe
+      - name: Build ANTLR codegen backend
+        run: cargo +nightly-2026-05-11 build -p plsql-parser-antlr --features antlr-codegen
+      - name: Build transitional plsql-mcp
+        run: cargo +nightly-2026-05-11 build -p plsql-mcp --all-targets
 
   # `oracle-plsql-converge-0lnu.15.12` — keep the PL/SQL layer from reaching
   # around the published oraclemcp-db adapter into Oracle drivers or async/server
@@ -90,9 +81,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          toolchain: nightly-2026-05-11
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run forbidden dependency boundary lint
         run: scripts/plsql_mcp_boundary_lint.sh
@@ -120,9 +109,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          toolchain: nightly-2026-05-11
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Check published oraclemcp-* pin currency
         run: scripts/oraclemcp_pin_guard.sh
@@ -139,40 +126,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          toolchain: nightly-2026-05-11
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo deny (advisories, licenses, bans, sources)
         run: |
-          cargo +stable install --locked cargo-deny || true
-          cargo +nightly-2026-05-11 deny check
+          cargo install --locked cargo-deny || true
+          cargo deny check
       - name: cargo audit (RUSTSEC advisories)
         run: |
-          cargo +stable install --locked cargo-audit || true
-          cargo +nightly-2026-05-11 audit || true
+          cargo install --locked cargo-audit || true
+          cargo audit || true
 
   bench-no-run:
     name: cargo bench --no-run
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          toolchain: nightly-2026-05-11
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo +nightly-2026-05-11 bench --workspace --no-run
+      - run: cargo bench --workspace --exclude plsql-mcp --no-run
 
   corpus-license-check:
     name: corpus license check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          toolchain: nightly-2026-05-11
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo +nightly-2026-05-11 run -p corpus-license-check
+      - run: cargo run -p corpus-license-check
 
   # Surrogate for `PLSQL-PARSE-012` — once the parse-corpus harness lands it
   # will replace this job with structured parse-quality metrics (clean rate,
@@ -182,11 +163,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          toolchain: nightly-2026-05-11
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo +nightly-2026-05-11 test -p plsql-parser -p plsql-parser-antlr
+      - run: cargo test -p plsql-parser -p plsql-parser-antlr
 
   # `PLSQL-LAB-010` — lab-as-release-gate. PR-blocking CI for drift
   # in `corpus/lab/expected/*.json` goldens. Fails if any golden is
@@ -197,9 +176,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          toolchain: nightly-2026-05-11
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: make lab-gate
 
@@ -212,9 +189,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          toolchain: nightly-2026-05-11
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: make demo-no-db-verify
 
@@ -226,14 +201,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          toolchain: nightly-2026-05-11
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run plan-lint (human report)
-        run: cargo +nightly-2026-05-11 run -p plan-lint -- --doctor
+        run: cargo run -p plan-lint -- --doctor
       - name: Run plan-lint (JSON report)
-        run: cargo +nightly-2026-05-11 run -p plan-lint -- --robot-json > plan-lint-report.json
+        run: cargo run -p plan-lint -- --robot-json > plan-lint-report.json
       - name: Upload JSON report
         if: always()
         uses: actions/upload-artifact@v4

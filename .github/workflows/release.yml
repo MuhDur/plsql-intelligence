@@ -18,8 +18,12 @@ env:
   CARGO_TERM_COLOR: always
   # Public binaries (i.e., those intended for end users). Internal-only
   # dev tools like `plan-lint` and `corpus-license-check` stay out of the
-  # release archive.
-  RELEASE_PACKAGES: "plsql-depgraph plsql-mcp plsql-cicd"
+  # release archive. `plsql-mcp` remains a transitional nightly-only artifact
+  # until the offline-pivot sign-off bead removes it from this repo.
+  RELEASE_STABLE_PACKAGES: "plsql-depgraph plsql-cicd"
+  RELEASE_STABLE_BINS: "plsql-depgraph plsql"
+  RELEASE_NIGHTLY_PACKAGES: "plsql-mcp"
+  RELEASE_NIGHTLY_BINS: "plsql-mcp"
   RELEASE_BINS: "plsql-depgraph plsql-mcp plsql"
 
 jobs:
@@ -50,45 +54,72 @@ jobs:
             cross: false
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: nightly-2026-05-11
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      - name: Install pinned nightly for transitional plsql-mcp
+        shell: bash
+        run: rustup toolchain install nightly-2026-05-11 --profile minimal --target ${{ matrix.target }}
       - name: Install cross
         if: matrix.cross
-        run: cargo +stable install cross --locked
-      - name: Build (cargo)
+        run: cargo install cross --locked
+      - name: Build stable release binaries (cargo)
         if: ${{ !matrix.cross }}
         shell: bash
         run: |
           set -euo pipefail
-          # Build only the public binaries — internal dev tools
-          # (plan-lint, corpus-license-check) stay out of the release
-          # path so a cross-compile failure there can't block a release.
-          args=""
-          for package in $RELEASE_PACKAGES; do
-            args="$args -p $package"
+          # Build only the public stable binaries — internal dev tools
+          # (plan-lint, corpus-license-check) stay out of the release path.
+          args=()
+          for package in $RELEASE_STABLE_PACKAGES; do
+            args+=("-p" "$package")
           done
-          for bin in $RELEASE_BINS; do
-            args="$args --bin $bin"
+          for bin in $RELEASE_STABLE_BINS; do
+            args+=("--bin" "$bin")
           done
-          cargo +nightly-2026-05-11 build --release --target ${{ matrix.target }} $args
-      - name: Build (cross)
+          cargo build --release --target ${{ matrix.target }} "${args[@]}"
+      - name: Build transitional plsql-mcp (cargo nightly)
+        if: ${{ !matrix.cross }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=()
+          for package in $RELEASE_NIGHTLY_PACKAGES; do
+            args+=("-p" "$package")
+          done
+          for bin in $RELEASE_NIGHTLY_BINS; do
+            args+=("--bin" "$bin")
+          done
+          cargo +nightly-2026-05-11 build --release --target ${{ matrix.target }} "${args[@]}"
+      - name: Build stable release binaries (cross)
         if: matrix.cross
         shell: bash
         run: |
           set -euo pipefail
-          args=""
-          for package in $RELEASE_PACKAGES; do
-            args="$args -p $package"
+          args=()
+          for package in $RELEASE_STABLE_PACKAGES; do
+            args+=("-p" "$package")
           done
-          for bin in $RELEASE_BINS; do
-            args="$args --bin $bin"
+          for bin in $RELEASE_STABLE_BINS; do
+            args+=("--bin" "$bin")
           done
-          cross +nightly-2026-05-11 build --release --target ${{ matrix.target }} $args
+          cross build --release --target ${{ matrix.target }} "${args[@]}"
+      - name: Build transitional plsql-mcp (cross nightly)
+        if: matrix.cross
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=()
+          for package in $RELEASE_NIGHTLY_PACKAGES; do
+            args+=("-p" "$package")
+          done
+          for bin in $RELEASE_NIGHTLY_BINS; do
+            args+=("--bin" "$bin")
+          done
+          cross +nightly-2026-05-11 build --release --target ${{ matrix.target }} "${args[@]}"
       - name: Stage release artifacts
         shell: bash
         run: |
@@ -131,7 +162,12 @@ jobs:
         run: |
           set -euo pipefail
           cd release-artifacts
-          (sha256sum * 2>/dev/null || shasum -a 256 *) | sort > SHA256SUMS
+          mapfile -d '' files < <(find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z)
+          if (( ${#files[@]} == 0 )); then
+            echo "::error::no release artifacts found"
+            exit 1
+          fi
+          sha256sum "${files[@]}" | sed 's#  \./#  #' > SHA256SUMS
           cat SHA256SUMS
       - name: Resolve tag name
         id: tag

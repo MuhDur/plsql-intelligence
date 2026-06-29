@@ -28,14 +28,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          toolchain: nightly-2026-05-11
+      - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Build plsql CLI
-        run: cargo +nightly-2026-05-11 build -p plsql-cicd --bin plsql
+        run: cargo build -p plsql-cicd --bin plsql
 
       - name: Write fixture changeset
         run: |

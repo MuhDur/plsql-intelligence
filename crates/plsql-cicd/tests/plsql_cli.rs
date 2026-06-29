@@ -403,7 +403,7 @@ fn github_change_impact_action_matches_predict_cli_contract() {
 fn github_change_impact_selftest_runs_action_with_mocked_posting() {
     let workflow = repo_file(".github/workflows/plsql-change-impact-selftest.yml");
 
-    assert!(workflow.contains("cargo +nightly-2026-05-11 build -p plsql-cicd --bin plsql"));
+    assert!(workflow.contains("cargo build -p plsql-cicd --bin plsql"));
     assert!(workflow.contains("uses: ./.github/actions/plsql-change-impact"));
     assert!(workflow.contains("post-comment: \"true\""));
     assert!(workflow.contains("github-token: fixture-token"));
