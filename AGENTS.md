@@ -67,27 +67,27 @@ If that audit trail is missing, then you must act as if the operation never happ
 ## Rust toolchain
 
 - **Build system:** Cargo workspace. One crate per component (plan.md §6.2.1).
-- **Toolchain:** `rust-toolchain.toml` pins `nightly-2026-05-11`. There is
-  no MSRV or `rust-version` floor while the live-DB convergence depends on
-  nightly-only `asupersync` features.
+- **Toolchain:** `rust-toolchain.toml` uses `stable`; `Cargo.toml`
+  declares the workspace `rust-version` floor. Default workspace
+  builds, tests, clippy, and release binaries must stay stable-only.
+  Any remaining `cargo +nightly-2026-05-11` command is transitional
+  retirement work for still-unremoved live/MCP/codegen surfaces, not a
+  precedent for new engine code.
 - **Style:** `cargo fmt` (default config) + `cargo clippy -- -D warnings`. No exceptions.
 - **Errors:** `miette` for human diagnostics, `thiserror` for library errors. No `anyhow` except `main()`.
 - **Observability:** `tracing` with structured fields. Spans on every public API call.
-- **Async/runtime model:** asupersync is the runtime boundary for live-DB
-  sessions, MCP serving, cancellation, timers, and daemon/I/O paths that need
-  async execution. Public library APIs for the offline engine (parse, IR,
-  depgraph, lineage, SAST, docs, bindgen, CI/CD prediction) stay sync-first by
-  default. Add or expose async APIs only for live Oracle I/O or server/daemon
-  integration, and document the cancellation/timeout behavior at that boundary.
-- **asupersync/nightly bump runbook:** Treat the Rust nightly pin and
-  `asupersync` version as one coordinated bump. Before changing either,
-  re-check the current `oraclemcp`, `rust-oracledb`, `asupersync`, and
-  `oracledb` releases, then update `rust-toolchain.toml`, every CI/Docker
-  toolchain pin, and the future Phase-B `asupersync`/`oraclemcp-db`
-  dependency in one reviewed change. The current matched baseline is
-  `nightly-2026-05-11` with `asupersync 0.3.4`; Phase 0 documents this policy
-  only, and the exact direct/transitive dependency pin is verified when
-  `oraclemcp-db` lands in Phase B.
+- **Async/runtime model:** The offline engine is sync-first. Public
+  APIs for parse, IR, depgraph, lineage, SAST, docs, bindgen, CI/CD
+  prediction, catalog snapshot ingestion, and local analysis should be
+  synchronous by default. Do not introduce `asupersync`, `oraclemcp-db`,
+  live Oracle sockets, MCP serving, telemetry, or daemon/network runtime
+  dependencies in this repo. Live Oracle I/O and MCP serving belong in
+  the separate `oraclemcp` repository; this repo exposes stable library
+  crates and CLIs for that consumer.
+- **Parser codegen / Java:** Normal builds use committed ANTLR Rust
+  sources and must not require Java. Java is needed only when
+  intentionally regenerating parser output with `PLSQL_ANTLR_REGEN=1`
+  or running the CI drift-check path.
 
 ---
 
