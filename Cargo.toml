@@ -32,10 +32,38 @@ members = [
     "tools/plan-lint",
     "tools/usr-loop",
 ]
+default-members = [
+    "crates/plsql-core",
+    "crates/plsql-output",
+    "crates/plsql-render",
+    "crates/plsql-store",
+    "crates/plsql-engine",
+    "crates/plsql-catalog",
+    "crates/plsql-depgraph",
+    "crates/plsql-ir",
+    "crates/plsql-privileges",
+    "crates/plsql-symbols",
+    "crates/plsql-parser",
+    "crates/plsql-parser-antlr",
+    "crates/plsql-project",
+    "crates/plsql-doc",
+    "crates/plsql-bindgen",
+    "crates/plsql-lineage",
+    "crates/plsql-sast",
+    "crates/plsql-cicd",
+    "crates/plsql-support",
+    "crates/plsql-accretion",
+    "tools/corpus-bench",
+    "tools/corpus-grow",
+    "tools/corpus-license-check",
+    "tools/plan-lint",
+    "tools/usr-loop",
+]
 resolver = "2"
 
 [workspace.package]
 edition = "2024"
+rust-version = "1.96"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/MuhDur/plsql-intelligence"
 homepage = "https://github.com/MuhDur/plsql-intelligence"

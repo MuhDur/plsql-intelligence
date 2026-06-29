@@ -88,7 +88,10 @@ fail_stop() { echo "GATE $1: FAIL $2"; exit "${3:-1}"; }
 # ====================================================================
 # G1 — Builds
 # `rustup run nightly cargo build -p plsql-parser-antlr --features
-# antlr-codegen` AND `cargo build --workspace`, both exit 0.
+# antlr-codegen` AND the stable default workspace build, both exit 0.
+# `plsql-mcp` is intentionally excluded from the stable workspace gate: it
+# remains the explicit live/MCP release binary while the offline engine moves
+# to stable default members.
 # ====================================================================
 g1_builds() {
   local nightly_ok="no" ws_ok="no" ev=""
@@ -97,8 +100,8 @@ g1_builds() {
     # + a workspace check (compile-only). Never skip-as-pass: if this
     # real compile fails the stage FAILs.
     if cargo build -q -p plsql-accretion --bin usr-gate-rs 2>>/tmp/usr_gate_g1.log \
-       && cargo check -q --workspace 2>>/tmp/usr_gate_g1.log; then
-      pass G1 "builds OK (degraded-mode: USR_GATE_SKIP_BUILD ⇒ real cargo build accretion + cargo check --workspace)"
+       && cargo check -q --workspace --exclude plsql-mcp 2>>/tmp/usr_gate_g1.log; then
+      pass G1 "builds OK (degraded-mode: USR_GATE_SKIP_BUILD ⇒ real cargo build accretion + cargo check --workspace --exclude plsql-mcp)"
       return 0
     fi
     fail_stop G1 "real degraded build/check failed (see /tmp/usr_gate_g1.log)"
@@ -112,10 +115,10 @@ g1_builds() {
   else
     fail_stop G1 "nightly toolchain unavailable — cannot run the real antlr-codegen build (no skip-as-pass)"
   fi
-  if cargo build -q --workspace 2>>/tmp/usr_gate_g1.log; then
+  if cargo build -q --workspace --exclude plsql-mcp 2>>/tmp/usr_gate_g1.log; then
     ws_ok="yes"
   else
-    fail_stop G1 "cargo build --workspace failed"
+    fail_stop G1 "cargo build --workspace --exclude plsql-mcp failed"
   fi
   ev="nightly-antlr-codegen=${nightly_ok} workspace=${ws_ok}"
   pass G1 "${ev}"
@@ -158,21 +161,33 @@ g3_conformance() {
 
 # ====================================================================
 # G4 — Golden isomorphism
-# Re-render every committed golden; byte-identical OR a golden delta
-# explicitly listed+justified in the candidate; any silent churn = FAIL.
+# Re-render every stable-default committed golden; byte-identical OR a golden
+# delta explicitly listed+justified in the candidate; any silent churn = FAIL.
+# `plsql-mcp` goldens are still real release gates, but they are explicit
+# nightly/MCP-release gates and are opt-in here via USR_GATE_INCLUDE_MCP_GOLDENS=1.
 # ====================================================================
 g4_golden() {
-  # The committed golden suites live under crates/*/tests/golden and
+  # The committed stable-default golden suites live under
+  # crates/plsql-catalog/tests/golden, crates/plsql-cicd/tests/golden, and
   # corpus/golden. Re-render = re-run the golden-bearing test crates;
-  # insta/golden tests FAIL on any unaccepted churn (their own bar).
+  # golden tests FAIL on any unaccepted churn (their own bar).
   local declared=""
   declared="$(grep -E '^# *usr-gate: *golden-delta=' "${CANDIDATE}" 2>/dev/null | head -1 | sed 's/^.*golden-delta=//')"
   if cargo test -q -p plsql-catalog --test '*' 2>>/tmp/usr_gate_g4.log >/tmp/usr_gate_g4.out \
-     && cargo test -q -p plsql-mcp 2>>/tmp/usr_gate_g4.log >>/tmp/usr_gate_g4.out; then
+     && cargo test -q -p plsql-cicd --test plsql_cli predict_robot_json_matches_change_impact_golden_snapshot 2>>/tmp/usr_gate_g4.log >>/tmp/usr_gate_g4.out; then
+    if [[ "${USR_GATE_INCLUDE_MCP_GOLDENS:-0}" == "1" ]]; then
+      if ! rustup run nightly-2026-05-11 cargo test -q -p plsql-mcp 2>>/tmp/usr_gate_g4.log >>/tmp/usr_gate_g4.out; then
+        if [[ -n "${declared}" ]]; then
+          pass G4 "stable goldens re-rendered; plsql-mcp golden churn present AND explicitly declared+justified in candidate: ${declared}"
+          return 0
+        fi
+        fail_stop G4 "plsql-mcp golden churn or build failure (no '# usr-gate: golden-delta=' line in candidate; see /tmp/usr_gate_g4.log)"
+      fi
+    fi
     if [[ -n "${declared}" ]]; then
       pass G4 "goldens re-rendered byte-identical; declared+justified golden-delta: ${declared}"
     else
-      pass G4 "every committed golden re-rendered byte-identical (no churn)"
+      pass G4 "stable-default committed goldens re-rendered byte-identical (no churn; plsql-mcp goldens are explicit MCP release gates)"
     fi
   else
     if [[ -n "${declared}" ]]; then
