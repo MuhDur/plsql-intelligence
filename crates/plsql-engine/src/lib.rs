@@ -10,7 +10,6 @@ pub mod config {
     pub enum ParserBackendChoice {
         #[default]
         Antlr4Rust,
-        JavaAntlrWorker,
         TreeSitterExperimental,
     }
 
