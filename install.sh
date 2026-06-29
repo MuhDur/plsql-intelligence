@@ -31,6 +31,8 @@ DEFAULT_BIN_DIR="${HOME}/.local/bin"
 GITHUB_API_BASE="https://api.github.com/repos/${OWNER}/${REPO}"
 GITHUB_RELEASES_URL="https://github.com/${OWNER}/${REPO}/releases"
 PINNED_FALLBACK_VERSION="v0.7.0"
+COSIGN_IDENTITY_RE="${COSIGN_IDENTITY_RE:-^https://github.com/${OWNER}/${REPO}/.github/workflows/.*$}"
+COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
 
 QUIET=0
 NO_GUM=0
@@ -46,8 +48,17 @@ TARGET=""
 FROM_SOURCE=0
 TARGET_REASON=""
 IS_WSL=0
+TARGET_OS=""
+TARGET_ARCH=""
+ASSET_EXT=""
 RESOLVED_VERSION=""
 VERSION_SOURCE=""
+SHA256SUMS_FILE=""
+NO_VERIFY_WARNED=0
+PROXY_ARGS=()
+RELEASE_BINS=(plsql plsql-depgraph)
+DOWNLOADED_BINS=()
+DOWNLOADED_PATHS=()
 
 usage() {
   cat <<'USAGE'
@@ -81,6 +92,17 @@ detect_gum() {
   HAS_GUM=0
   if command -v gum >/dev/null 2>&1 && [[ -t 1 ]]; then
     HAS_GUM=1
+  fi
+}
+
+setup_proxy() {
+  PROXY_ARGS=()
+  if [[ -n "${HTTPS_PROXY:-}" ]]; then
+    PROXY_ARGS=(--proxy "$HTTPS_PROXY")
+    info "Using HTTPS proxy: $HTTPS_PROXY"
+  elif [[ -n "${HTTP_PROXY:-}" ]]; then
+    PROXY_ARGS=(--proxy "$HTTP_PROXY")
+    info "Using HTTP proxy: $HTTP_PROXY"
   fi
 }
 
@@ -273,11 +295,14 @@ detect_platform() {
   case "$arch_norm" in
     x86_64|amd64)
       arch_norm="x86_64"
+      TARGET_ARCH="$arch_norm"
       ;;
     aarch64|arm64)
       arch_norm="aarch64"
+      TARGET_ARCH="$arch_norm"
       ;;
     *)
+      TARGET_ARCH="$arch_norm"
       mark_from_source "unsupported CPU architecture: $arch"
       return 0
       ;;
@@ -285,13 +310,16 @@ detect_platform() {
 
   case "$os_norm" in
     linux)
+      TARGET_OS="linux"
       TARGET="${arch_norm}-unknown-linux-musl"
       detect_wsl
       ;;
     darwin)
+      TARGET_OS="macos"
       TARGET="${arch_norm}-apple-darwin"
       ;;
     *)
+      TARGET_OS="$os_norm"
       mark_from_source "unsupported operating system: $os"
       ;;
   esac
@@ -303,6 +331,7 @@ github_api_latest_tag() {
   command -v curl >/dev/null 2>&1 || return 1
   response=$(
     curl -fsSL \
+      "${PROXY_ARGS[@]}" \
       -H "Accept: application/vnd.github+json" \
       -H "User-Agent: ${PROJECT_NAME}-installer" \
       "${GITHUB_API_BASE}/releases/latest" 2>/dev/null || true
@@ -318,6 +347,7 @@ github_redirect_latest_tag() {
   command -v curl >/dev/null 2>&1 || return 1
   effective_url=$(
     curl -fsSIL \
+      "${PROXY_ARGS[@]}" \
       -H "User-Agent: ${PROJECT_NAME}-installer" \
       -o /dev/null \
       -w '%{url_effective}' \
@@ -337,6 +367,12 @@ resolve_version() {
     return 0
   fi
 
+  if [[ -n "$OFFLINE_TARBALL" ]]; then
+    RESOLVED_VERSION="offline"
+    VERSION_SOURCE="offline tarball"
+    return 0
+  fi
+
   if tag=$(github_api_latest_tag); then
     RESOLVED_VERSION="$tag"
     VERSION_SOURCE="GitHub API"
@@ -351,6 +387,383 @@ resolve_version() {
 
   RESOLVED_VERSION="$PINNED_FALLBACK_VERSION"
   VERSION_SOURCE="pinned fallback"
+}
+
+download_file() {
+  local url="$1"
+  local output="$2"
+
+  command -v curl >/dev/null 2>&1 || return 1
+  curl -fsSL \
+    "${PROXY_ARGS[@]}" \
+    --connect-timeout 10 \
+    --retry 2 \
+    --retry-delay 1 \
+    -H "User-Agent: ${PROJECT_NAME}-installer" \
+    "$url" \
+    -o "$output"
+}
+
+try_download_file() {
+  local url="$1"
+  local output="$2"
+
+  download_file "$url" "$output" >/dev/null 2>&1
+}
+
+asset_name_for() {
+  local bin="$1"
+  printf '%s-%s%s\n' "$bin" "$TARGET" "$ASSET_EXT"
+}
+
+simple_asset_name_for() {
+  local bin="$1"
+  printf '%s-%s-%s%s\n' "$bin" "$TARGET_OS" "$TARGET_ARCH" "$ASSET_EXT"
+}
+
+ensure_checksums() {
+  local output versioned_url latest_url
+
+  [[ "$NO_VERIFY" -eq 0 ]] || return 0
+  [[ -n "$SHA256SUMS_FILE" ]] && return 0
+
+  output="$TEMP_DIR/SHA256SUMS"
+  versioned_url="${GITHUB_RELEASES_URL}/download/${RESOLVED_VERSION}/SHA256SUMS"
+  latest_url="${GITHUB_RELEASES_URL}/latest/download/SHA256SUMS"
+
+  if try_download_file "$versioned_url" "$output"; then
+    SHA256SUMS_FILE="$output"
+    return 0
+  fi
+  if try_download_file "$latest_url" "$output"; then
+    SHA256SUMS_FILE="$output"
+    return 0
+  fi
+
+  err "Could not download SHA256SUMS; use --no-verify only if you accept the risk"
+  return 1
+}
+
+checksum_for_asset() {
+  local asset_name="$1"
+
+  awk -v name="$asset_name" '
+    $2 == name { print $1; found = 1; exit }
+    END { if (!found) exit 1 }
+  ' "$SHA256SUMS_FILE"
+}
+
+verify_checksum() {
+  local asset_name="$1"
+  local file="$2"
+  local expected actual
+
+  ensure_checksums
+  expected=$(checksum_for_asset "$asset_name") || {
+    err "SHA256SUMS has no entry for $asset_name"
+    return 1
+  }
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual=$(sha256sum "$file" | awk '{ print $1 }')
+  elif command -v shasum >/dev/null 2>&1; then
+    actual=$(shasum -a 256 "$file" | awk '{ print $1 }')
+  else
+    err "No SHA256 tool found; install sha256sum or shasum, or pass --no-verify"
+    return 1
+  fi
+
+  if [[ "$actual" != "$expected" ]]; then
+    err "Checksum mismatch for $asset_name"
+    err "  Expected: $expected"
+    err "  Got:      $actual"
+    return 1
+  fi
+  ok "SHA256 verified: $asset_name"
+}
+
+warn_no_verify_once() {
+  if [[ "$NO_VERIFY_WARNED" -eq 0 ]]; then
+    warn "Checksum/signature verification disabled"
+    NO_VERIFY_WARNED=1
+  fi
+}
+
+verify_sigstore() {
+  local asset_name="$1"
+  local file="$2"
+  local asset_url="$3"
+  local bundle_file
+
+  [[ "$NO_VERIFY" -eq 0 ]] || {
+    warn_no_verify_once
+    return 0
+  }
+
+  if ! command -v cosign >/dev/null 2>&1; then
+    warn "cosign not found; skipping optional Sigstore verification for $asset_name"
+    return 0
+  fi
+
+  bundle_file="$TEMP_DIR/${asset_name}.sigstore"
+  if ! try_download_file "${asset_url}.sigstore" "$bundle_file"; then
+    warn "No Sigstore bundle found for $asset_name; checksum verification already passed"
+    return 0
+  fi
+
+  if cosign verify-blob \
+    --bundle "$bundle_file" \
+    --certificate-identity-regexp "$COSIGN_IDENTITY_RE" \
+    --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
+    "$file" >/dev/null 2>&1; then
+    ok "Sigstore verified: $asset_name"
+  else
+    err "Sigstore verification failed for $asset_name"
+    return 1
+  fi
+}
+
+verify_downloaded_asset() {
+  local asset_name="$1"
+  local file="$2"
+  local asset_url="$3"
+
+  if [[ "$NO_VERIFY" -eq 1 ]]; then
+    warn_no_verify_once
+    return 0
+  fi
+
+  verify_checksum "$asset_name" "$file"
+  verify_sigstore "$asset_name" "$file" "$asset_url"
+}
+
+download_prebuilt_binary() {
+  local bin="$1"
+  local asset_name simple_name output url
+
+  asset_name=$(asset_name_for "$bin")
+  output="$TEMP_DIR/$asset_name"
+
+  url="${GITHUB_RELEASES_URL}/download/${RESOLVED_VERSION}/${asset_name}"
+  info "Downloading $asset_name"
+  if try_download_file "$url" "$output"; then
+    verify_downloaded_asset "$asset_name" "$output" "$url"
+    DOWNLOADED_BINS+=("$bin")
+    DOWNLOADED_PATHS+=("$output")
+    return 0
+  fi
+
+  url="${GITHUB_RELEASES_URL}/latest/download/${asset_name}"
+  if try_download_file "$url" "$output"; then
+    verify_downloaded_asset "$asset_name" "$output" "$url"
+    DOWNLOADED_BINS+=("$bin")
+    DOWNLOADED_PATHS+=("$output")
+    return 0
+  fi
+
+  simple_name=$(simple_asset_name_for "$bin")
+  output="$TEMP_DIR/$simple_name"
+  url="${GITHUB_RELEASES_URL}/latest/download/${simple_name}"
+  if try_download_file "$url" "$output"; then
+    verify_downloaded_asset "$simple_name" "$output" "$url"
+    DOWNLOADED_BINS+=("$bin")
+    DOWNLOADED_PATHS+=("$output")
+    return 0
+  fi
+
+  return 1
+}
+
+download_prebuilt_binaries() {
+  local bin
+
+  DOWNLOADED_BINS=()
+  DOWNLOADED_PATHS=()
+  for bin in "${RELEASE_BINS[@]}"; do
+    download_prebuilt_binary "$bin" || return 1
+  done
+}
+
+install_binary() {
+  local source="$1"
+  local bin="$2"
+  local destination="$BIN_DIR/$bin$ASSET_EXT"
+
+  mkdir -p "$BIN_DIR"
+  install -m 0755 "$source" "$destination"
+  ok "Installed $bin -> $destination"
+}
+
+install_marker_path() {
+  printf '%s/.plsql-intelligence-install\n' "$BIN_DIR"
+}
+
+write_install_marker() {
+  local marker
+
+  marker=$(install_marker_path)
+  {
+    printf 'version=%s\n' "$RESOLVED_VERSION"
+    printf 'target=%s\n' "$TARGET"
+    printf 'source=%s\n' "$VERSION_SOURCE"
+  } > "$marker"
+}
+
+install_marker_matches() {
+  local marker
+
+  marker=$(install_marker_path)
+  [[ -f "$marker" ]] || return 1
+  grep -Fxq "version=$RESOLVED_VERSION" "$marker" || return 1
+  grep -Fxq "target=$TARGET" "$marker" || return 1
+}
+
+install_downloaded_binaries() {
+  local i
+
+  for ((i = 0; i < ${#DOWNLOADED_BINS[@]}; i++)); do
+    install_binary "${DOWNLOADED_PATHS[$i]}" "${DOWNLOADED_BINS[$i]}"
+  done
+}
+
+archive_binary_path() {
+  local extract_dir="$1"
+  local bin="$2"
+  local found
+
+  found=$(find "$extract_dir" -type f \( -name "$bin" -o -name "${bin}${ASSET_EXT}" -o -name "$(asset_name_for "$bin")" \) -print | sed -n '1p')
+  [[ -n "$found" ]] || return 1
+  printf '%s\n' "$found"
+}
+
+install_from_archive() {
+  local archive="$1"
+  local extract_dir bin source
+
+  [[ -f "$archive" ]] || {
+    err "Offline tarball not found: $archive"
+    return 1
+  }
+  command -v tar >/dev/null 2>&1 || {
+    err "tar is required to install from an offline archive"
+    return 1
+  }
+
+  extract_dir="$TEMP_DIR/offline"
+  mkdir -p "$extract_dir"
+  tar -xf "$archive" -C "$extract_dir"
+
+  for bin in "${RELEASE_BINS[@]}"; do
+    source=$(archive_binary_path "$extract_dir" "$bin") || {
+      err "Offline archive does not contain $bin"
+      return 1
+    }
+    install_binary "$source" "$bin"
+  done
+}
+
+source_package_for_bin() {
+  case "$1" in
+    plsql)
+      printf 'plsql-cicd\n'
+      ;;
+    plsql-depgraph)
+      printf 'plsql-depgraph\n'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+build_from_source() {
+  local cargo_root bin package built_bin
+
+  command -v cargo >/dev/null 2>&1 || {
+    err "No prebuilt binary found and cargo is not installed for source fallback"
+    return 1
+  }
+
+  cargo_root="$TEMP_DIR/cargo-install"
+  for bin in "${RELEASE_BINS[@]}"; do
+    package=$(source_package_for_bin "$bin")
+    run_with_spinner "Building $bin from source" \
+      cargo install \
+        --git "https://github.com/${OWNER}/${REPO}.git" \
+        --tag "$RESOLVED_VERSION" \
+        --locked \
+        --root "$cargo_root" \
+        --bin "$bin" \
+        "$package"
+    built_bin="$cargo_root/bin/$bin"
+    [[ -x "$built_bin" ]] || {
+      err "Source build did not produce $built_bin"
+      return 1
+    }
+    install_binary "$built_bin" "$bin"
+  done
+}
+
+binary_matches_version() {
+  local binary="$1"
+  local output version_without_v
+
+  output=$("$binary" --version 2>/dev/null || true)
+  version_without_v="${RESOLVED_VERSION#v}"
+  printf '%s\n' "$output" | grep -Fq "$RESOLVED_VERSION" && return 0
+  printf '%s\n' "$output" | grep -Fq "$version_without_v"
+}
+
+already_installed() {
+  local bin path
+
+  [[ "$FORCE_INSTALL" -eq 0 ]] || return 1
+  [[ "$RESOLVED_VERSION" != "offline" ]] || return 1
+
+  for bin in "${RELEASE_BINS[@]}"; do
+    path="$BIN_DIR/$bin$ASSET_EXT"
+    [[ -x "$path" ]] || return 1
+  done
+
+  if install_marker_matches; then
+    ok "Requested release already installed in $BIN_DIR"
+    return 0
+  fi
+
+  for bin in "${RELEASE_BINS[@]}"; do
+    path="$BIN_DIR/$bin$ASSET_EXT"
+    binary_matches_version "$path" || return 1
+  done
+
+  ok "Requested version already installed in $BIN_DIR"
+}
+
+install_binaries() {
+  if already_installed; then
+    return 0
+  fi
+
+  if [[ -n "$OFFLINE_TARBALL" ]]; then
+    install_from_archive "$OFFLINE_TARBALL"
+    write_install_marker
+    return
+  fi
+
+  if [[ "$FROM_SOURCE" -eq 1 ]]; then
+    build_from_source
+    write_install_marker
+    return
+  fi
+
+  if download_prebuilt_binaries; then
+    install_downloaded_binaries
+    write_install_marker
+    return
+  fi
+
+  warn "No complete prebuilt release asset set found for $TARGET; building from source"
+  build_from_source
+  write_install_marker
 }
 
 create_temp_dir() {
@@ -393,13 +806,14 @@ print_plan() {
 main() {
   parse_args "$@"
   detect_gum
+  setup_proxy
   detect_platform
   resolve_version
   create_temp_dir
   show_header
   print_plan
-  ok "Installer scaffold initialized"
-  info "Binary acquisition is implemented by the follow-up installer beads."
+  install_binaries
+  ok "Installation complete"
 }
 
 main "$@"
