@@ -1,6 +1,6 @@
 [package]
 name = "plsql-mcp"
-version = "0.6.1"
+version = "0.6.2"
 description = "Foundation MCP adapter for the PL/SQL Intelligence engine (Apache-2.0 OR MIT)"
 edition.workspace = true
 license.workspace = true
@@ -42,7 +42,7 @@ oraclemcp-guard = "=0.4.0"
 # OracleConnection trait; that trait is deliberately feature-gated inside
 # plsql-catalog so stable/offline workspace gates can exclude this crate.
 plsql-catalog = { path = "../plsql-catalog", version = "0.1.1", features = ["oraclemcp-db"] }
-plsql-cicd = { path = "../plsql-cicd", version = "0.6.1" }
+plsql-cicd = { path = "../plsql-cicd", version = "0.6.2" }
 plsql-core = { path = "../plsql-core", version = "0.1.0" }
 plsql-depgraph = { path = "../plsql-depgraph", version = "0.6.0" }
 plsql-doc = { path = "../plsql-doc", version = "0.1.0" }

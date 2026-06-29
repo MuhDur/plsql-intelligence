@@ -1,6 +1,6 @@
 [package]
 name = "plsql-cicd"
-version = "0.6.1"
+version = "0.6.2"
 description = "CI/CD recompilation cascade types and operations for plsql-intelligence"
 edition.workspace = true
 license.workspace = true

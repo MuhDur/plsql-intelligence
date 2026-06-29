@@ -13,6 +13,9 @@ use crate::connections::ConnectionRegistry;
 use crate::safety::SafetyProfile;
 use crate::tools::ToolRegistry;
 
+pub const ORACLEMCP_STACK_VERSION: &str = "0.4.0";
+pub const RUST_ORACLEDB_STACK_VERSION: &str = "0.5.0";
+
 /// Top-level doctor report.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DoctorReport {
@@ -46,6 +49,11 @@ pub struct DoctorReport {
     pub mcp_health: McpHealth,
     /// oraclemcp-style check list for trio-stack parity.
     pub checks: Vec<DoctorCheck>,
+    /// Exact stack path plsql-mcp uses for live Oracle connectivity.
+    pub trio_stack: TrioStackReport,
+    /// Known upstream gaps filed from plsql-mcp and carried in the doctor
+    /// report so agents do not rediscover or silently ignore them.
+    pub known_upstream_gaps: Vec<UpstreamGap>,
     pub summary: DoctorSummary,
     pub findings: Vec<DoctorFinding>,
 }
@@ -97,6 +105,30 @@ impl DoctorCheck {
         self.fix = Some(fix.into());
         self
     }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TrioStackReport {
+    pub posture: String,
+    pub components: Vec<StackComponent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StackComponent {
+    pub name: String,
+    pub version: String,
+    pub role: String,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UpstreamGap {
+    pub id: String,
+    pub repository: String,
+    pub issue_url: String,
+    pub title: String,
+    pub status: String,
+    pub impact: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -247,6 +279,87 @@ pub struct DoctorFinding {
     pub remediation: Option<String>,
 }
 
+#[must_use]
+pub fn trio_stack_report() -> TrioStackReport {
+    TrioStackReport {
+        posture: String::from(
+            "plsql-mcp is the PL/SQL intelligence superset; it reuses the published oraclemcp live-Oracle spine and the rust-oracledb thin driver instead of forking a private runtime.",
+        ),
+        components: vec![
+            StackComponent {
+                name: String::from("plsql-mcp"),
+                version: String::from(env!("CARGO_PKG_VERSION")),
+                role: String::from("MCP server and PL/SQL intelligence layer"),
+                source: String::from("this crate"),
+            },
+            StackComponent {
+                name: String::from("oraclemcp-*"),
+                version: String::from(ORACLEMCP_STACK_VERSION),
+                role: String::from(
+                    "published MCP core, guard, audit, auth, config, error, and DB adapter crates",
+                ),
+                source: String::from("crates.io / MuhDur/oraclemcp"),
+            },
+            StackComponent {
+                name: String::from("oracledb"),
+                version: String::from(RUST_ORACLEDB_STACK_VERSION),
+                role: String::from("pure-Rust Oracle thin driver reached through oraclemcp-db"),
+                source: String::from("crates.io / MuhDur/rust-oracledb"),
+            },
+        ],
+    }
+}
+
+#[must_use]
+pub fn known_upstream_gaps() -> Vec<UpstreamGap> {
+    vec![
+        UpstreamGap {
+            id: String::from("RUST_ORACLEDB_ROUTINE_CALL_API"),
+            repository: String::from("MuhDur/rust-oracledb"),
+            issue_url: String::from("https://github.com/MuhDur/rust-oracledb/issues/13"),
+            title: String::from(
+                "High-level PL/SQL routine call API for OUT and IN OUT bind adapters",
+            ),
+            status: String::from("open"),
+            impact: String::from(
+                "Generated PL/SQL bind wrappers still need a stable driver-level routine-call helper instead of raw output-bind spelunking.",
+            ),
+        },
+        UpstreamGap {
+            id: String::from("ORACLEMCP_ROUTINE_OUT_INOUT"),
+            repository: String::from("MuhDur/oraclemcp"),
+            issue_url: String::from("https://github.com/MuhDur/oraclemcp/issues/2"),
+            title: String::from("Expose OUT / IN OUT routine execution through oraclemcp-db"),
+            status: String::from("open"),
+            impact: String::from(
+                "plsql-mcp cannot route generated routine wrappers through oraclemcp-db without a typed adapter-level routine contract.",
+            ),
+        },
+        UpstreamGap {
+            id: String::from("ORACLEMCP_CATALOG_NONLOSSY_VALUES"),
+            repository: String::from("MuhDur/oraclemcp"),
+            issue_url: String::from("https://github.com/MuhDur/oraclemcp/issues/3"),
+            title: String::from(
+                "Make oraclemcp-db catalog/value serialization non-lossy or explicitly typed",
+            ),
+            status: String::from("open"),
+            impact: String::from(
+                "Catalog snapshots need typed unsupported/lossy provenance instead of ordinary-looking placeholder strings.",
+            ),
+        },
+        UpstreamGap {
+            id: String::from("ORACLEMCP_TIMEOUT_CANCELLATION"),
+            repository: String::from("MuhDur/oraclemcp"),
+            issue_url: String::from("https://github.com/MuhDur/oraclemcp/issues/4"),
+            title: String::from("Thin live query can hang after Oracle TNS timeout / CLOSE-WAIT"),
+            status: String::from("open"),
+            impact: String::from(
+                "Live plsql-mcp tests need adapter/driver calls to return typed timeout/cancellation errors instead of hanging indefinitely.",
+            ),
+        },
+    ]
+}
+
 impl DoctorReport {
     #[must_use]
     pub fn with_run(mut self, run_id: impl Into<String>, run_dir: impl Into<String>) -> Self {
@@ -276,6 +389,8 @@ pub fn doctor_report_with_connections(
 ) -> DoctorReport {
     let live_db_feature_enabled = cfg!(feature = "live-db");
     let mut findings = Vec::new();
+    let trio_stack = trio_stack_report();
+    let known_upstream_gaps = known_upstream_gaps();
     let instant_client = detect_instant_client(live_db_feature_enabled);
     let oracle_connection_backend = describe_oracle_backend(live_db_feature_enabled);
     let guarded_write_audit_file = std::env::var(crate::GUARDED_AUDIT_FILE_ENV).ok();
@@ -357,6 +472,20 @@ pub fn doctor_report_with_connections(
             });
         }
     }
+    for gap in &known_upstream_gaps {
+        findings.push(DoctorFinding {
+            code: gap.id.clone(),
+            severity: DoctorSeverity::Info,
+            summary: format!(
+                "known upstream gap in {}: {} ({})",
+                gap.repository, gap.title, gap.issue_url
+            ),
+            remediation: Some(format!(
+                "Track {}; plsql-mcp reports this as a known upstream gap and should not fork a private workaround unless the issue is explicitly rejected.",
+                gap.issue_url
+            )),
+        });
+    }
 
     let transport_kind = match config.transport {
         crate::config::TransportConfig::Stdio => String::from("stdio"),
@@ -428,6 +557,8 @@ pub fn doctor_report_with_connections(
         &audit_posture,
         &mcp_health,
         connections,
+        &trio_stack,
+        &known_upstream_gaps,
         &findings,
     );
     let mut summary = summarize(&checks, &findings);
@@ -468,6 +599,8 @@ pub fn doctor_report_with_connections(
         connection_write_posture: derive_write_posture(connections),
         mcp_health,
         checks,
+        trio_stack,
+        known_upstream_gaps,
         summary,
         findings,
     }
@@ -483,6 +616,8 @@ fn build_checks(
     audit_posture: &AuditPosture,
     mcp_health: &McpHealth,
     connections: &ConnectionRegistry,
+    trio_stack: &TrioStackReport,
+    known_upstream_gaps: &[UpstreamGap],
     findings: &[DoctorFinding],
 ) -> Vec<DoctorCheck> {
     let live_status = if live_db_feature_enabled {
@@ -600,6 +735,22 @@ fn build_checks(
         analysis = analysis.with_fix("lower compatibility to <= oracle_version");
     }
 
+    let stack_versions = trio_stack
+        .components
+        .iter()
+        .map(|component| format!("{}={}", component.name, component.version))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let stack = DoctorCheck::new(
+        7,
+        "Trio stack provenance",
+        DoctorCheckStatus::Pass,
+        format!(
+            "{stack_versions}; known_upstream_gaps={}",
+            known_upstream_gaps.len()
+        ),
+    );
+
     vec![
         live,
         registry_check,
@@ -607,6 +758,7 @@ fn build_checks(
         audit,
         connection_check,
         analysis,
+        stack,
     ]
 }
 
@@ -921,6 +1073,48 @@ mod tests {
         } else {
             assert_eq!(report.oracle_connection_backend.name, "none");
             assert!(!report.oracle_connection_backend.compiled_in);
+        }
+    }
+
+    #[test]
+    fn doctor_report_carries_trio_stack_and_upstream_gap_provenance() {
+        let report = doctor_report(&McpConfig::default(), &ToolRegistry::new());
+        assert!(
+            report
+                .trio_stack
+                .components
+                .iter()
+                .any(|component| component.name == "oraclemcp-*"
+                    && component.version == ORACLEMCP_STACK_VERSION)
+        );
+        assert!(
+            report
+                .trio_stack
+                .components
+                .iter()
+                .any(|component| component.name == "oracledb"
+                    && component.version == RUST_ORACLEDB_STACK_VERSION)
+        );
+        for expected in [
+            "RUST_ORACLEDB_ROUTINE_CALL_API",
+            "ORACLEMCP_ROUTINE_OUT_INOUT",
+            "ORACLEMCP_CATALOG_NONLOSSY_VALUES",
+            "ORACLEMCP_TIMEOUT_CANCELLATION",
+        ] {
+            assert!(
+                report
+                    .known_upstream_gaps
+                    .iter()
+                    .any(|gap| gap.id == expected),
+                "missing upstream gap {expected}"
+            );
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .any(|finding| finding.code == expected),
+                "missing finding for upstream gap {expected}"
+            );
         }
     }
 }

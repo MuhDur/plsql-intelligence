@@ -18,7 +18,7 @@ use plsql_mcp::config::McpConfig;
 use plsql_mcp::default_tool_registry;
 use plsql_mcp::doctor::{
     DOCTOR_CONTRACT_VERSION, DOCTOR_SCHEMA_VERSION, DOCTOR_VERSION, DoctorReport, DoctorSeverity,
-    doctor_report,
+    doctor_report, known_upstream_gaps, trio_stack_report,
 };
 use plsql_mcp::mcp_protocol::PlsqlMcpServer;
 use plsql_mcp::tcp;
@@ -35,7 +35,7 @@ use plsql_mcp::tcp;
 )]
 struct Cli {
     /// Emit a single JSON object on stdout instead of human text.
-    #[arg(long, visible_alias = "json", global = true)]
+    #[arg(long, visible_aliases = ["json", "robot"], global = true)]
     robot_json: bool,
 
     /// Emit a single JSON mega-object combining capabilities, health, and
@@ -81,6 +81,9 @@ enum Command {
 
 #[derive(Args, Debug, Default)]
 struct DoctorArgs {
+    /// Emit doctor mega-triage JSON from the doctor namespace.
+    #[arg(long)]
+    robot_triage: bool,
     /// Attempt safe fixers. No plsql-mcp fixer mutates state yet; this reports
     /// the dry-run/no-op action plan through the same contract.
     #[arg(long)]
@@ -97,6 +100,39 @@ struct DoctorArgs {
     /// Restrict checks by name or numeric id. Repeat or comma-separate.
     #[arg(long, value_delimiter = ',')]
     only: Vec<String>,
+    /// Inverse of --only. Accepted for trio doctor parity; current detectors are cheap.
+    #[arg(long, value_delimiter = ',')]
+    skip: Vec<String>,
+    /// Diff findings against a previous run id. Accepted for contract parity.
+    #[arg(long)]
+    since: Option<String>,
+    /// Explain one finding without using the explain subcommand.
+    #[arg(long)]
+    explain: Option<String>,
+    /// Minimum severity to emit. Accepted values: ok, info, warning, blocker.
+    #[arg(long)]
+    severity: Option<String>,
+    /// Refuse if the requested doctor mode cannot fit in this approximate budget.
+    #[arg(long)]
+    budget: Option<String>,
+    /// Suppress diagnostic stderr; stdout data is unchanged.
+    #[arg(long)]
+    quiet: bool,
+    /// Force-disable ANSI color. Present for parity; this CLI emits no ANSI today.
+    #[arg(long)]
+    no_color: bool,
+    /// Force-disable progress spinners. Present for parity; this CLI emits none today.
+    #[arg(long)]
+    no_progress: bool,
+    /// Increase stderr verbosity.
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
+    /// Reserved unsafe override. No current plsql-mcp doctor operation honors it.
+    #[arg(long)]
+    force: bool,
+    /// Confirmation flag for gated operations such as gc.
+    #[arg(long)]
+    yes: bool,
     #[command(subcommand)]
     command: Option<DoctorCommand>,
 }
@@ -123,7 +159,7 @@ enum DoctorCommand {
     /// Show the action diff recorded for a run artifact.
     Diff {
         /// Run id from `plsql-mcp doctor ls`.
-        run_id: String,
+        run_id: Option<String>,
     },
     /// Undo a run's recorded actions. Current plsql-mcp runs are diagnose-only.
     Undo {
@@ -132,7 +168,7 @@ enum DoctorCommand {
     },
     /// Garbage-collect local doctor run artifacts.
     Gc {
-        /// Accepted value today: `all`. Date filtering can be added without changing the command.
+        /// Date cutoff (YYYY-MM-DD) or explicit `all`.
         #[arg(long)]
         before: String,
         /// Required confirmation for deleting local `.doctor/runs/*` artifacts.
@@ -473,6 +509,23 @@ fn run_robot_triage() -> ExitCode {
     ]);
 
     let mega = serde_json::json!({
+        "schema_version": DOCTOR_SCHEMA_VERSION,
+        "summary": {
+            "ok": report.ok,
+            "total_findings": report.summary.finding_count,
+            "auto_fixable": 0,
+            "blockers": report.summary.blocker_count,
+            "warnings": report.summary.warning_count,
+        },
+        "findings": &report.findings,
+        "actions_planned": [],
+        "recommended_command": if has_blocker {
+            "plsql-mcp --json doctor explain <finding-id>"
+        } else {
+            "plsql-mcp serve"
+        },
+        "capabilities_url": "plsql-mcp --json doctor capabilities",
+        "robot_docs_command": "plsql-mcp doctor robot-docs",
         "capabilities": capabilities_json(),
         "health": health,
         "quick_ref": quick_ref,
@@ -502,6 +555,19 @@ fn run_capabilities(robot_json: bool) -> ExitCode {
 }
 
 fn run_doctor(mut args: DoctorArgs, robot_json: bool) -> ExitCode {
+    if args.robot_triage {
+        return run_robot_triage();
+    }
+    if let Some(finding_id) = args.explain.as_deref() {
+        return run_doctor_explain(finding_id, robot_json);
+    }
+    if args.force && !args.yes {
+        return emit_doctor_refusal(
+            robot_json,
+            "MCP_DOCTOR_FORCE_REQUIRES_YES",
+            "--force is reserved for documented unsafe overrides and requires --yes",
+        );
+    }
     match args.command.take() {
         Some(DoctorCommand::Health) => run_doctor_health(robot_json),
         Some(DoctorCommand::Capabilities) => run_doctor_capabilities(robot_json),
@@ -510,9 +576,11 @@ fn run_doctor(mut args: DoctorArgs, robot_json: bool) -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(DoctorCommand::Ls) => run_doctor_ls(robot_json),
-        Some(DoctorCommand::Diff { run_id }) => run_doctor_diff(&run_id, robot_json),
+        Some(DoctorCommand::Diff { run_id }) => run_doctor_diff(run_id.as_deref(), robot_json),
         Some(DoctorCommand::Undo { run_id }) => run_doctor_undo(&run_id, robot_json),
-        Some(DoctorCommand::Gc { before, yes }) => run_doctor_gc(&before, yes, robot_json),
+        Some(DoctorCommand::Gc { before, yes }) => {
+            run_doctor_gc(&before, yes || args.yes, robot_json)
+        }
         Some(DoctorCommand::Explain { finding_id }) => run_doctor_explain(&finding_id, robot_json),
         Some(DoctorCommand::Fix) => {
             args.fix = true;
@@ -656,6 +724,8 @@ fn doctor_health_json(report: &DoctorReport) -> serde_json::Value {
         "checks": &report.checks,
         "summary": &report.summary,
         "findings": &report.findings,
+        "trio_stack": &report.trio_stack,
+        "known_upstream_gaps": &report.known_upstream_gaps,
     })
 }
 
@@ -675,18 +745,29 @@ fn doctor_capabilities_json() -> serde_json::Value {
             "doctor capabilities": "doctor-specific machine contract",
             "doctor robot-docs": "doctor-specific handbook",
             "doctor ls": "list local .doctor run artifacts",
-            "doctor diff <run-id>": "show recorded action diff for a run",
+            "doctor diff [<run-id>]": "show recorded action diff for a run or the latest run",
             "doctor undo <run-id>": "undo recorded actions; current runs are diagnose-only",
-            "doctor gc --before all --yes": "delete local doctor run artifacts"
+            "doctor gc --before <YYYY-MM-DD|all> --yes": "delete local doctor run artifacts before a date or all when explicitly requested"
         },
         "flags": {
             "--json": "alias for --robot-json",
+            "--robot": "alias for --robot-json",
             "--robot-json": "single-line JSON on stdout",
+            "--robot-triage": "mega-command returning summary, findings, action plan, recommended command, capabilities pointer, and health",
             "--fix": "run safe fixers; currently no plsql-mcp fixer mutates state",
             "--dry-run --fix": "show fixer plan without applying mutations",
             "--quick": "quick offline checks only",
             "--online": "permit online/live checks",
-            "--only": "restrict checks by name or id"
+            "--only": "restrict checks by name or id",
+            "--skip": "inverse of --only",
+            "--since": "compare against an earlier run id",
+            "--explain": "explain one current finding by id",
+            "--severity": "minimum severity filter accepted for contract parity",
+            "--budget": "accepted agent budget hint",
+            "--quiet": "suppress diagnostic stderr",
+            "--no-color": "disable ANSI color",
+            "--no-progress": "disable progress spinners",
+            "--force --yes": "reserved unsafe override; no current fixer uses it"
         },
         "exit_codes": {
             "0": "healthy / no failing doctor checks",
@@ -731,6 +812,11 @@ fn doctor_capabilities_json() -> serde_json::Value {
                 "id": "analysis_profile",
                 "description": "checks the offline PL/SQL analysis profile for contradictory Oracle version settings",
                 "online_required": false
+            },
+            {
+                "id": "trio_stack_provenance",
+                "description": "reports the plsql-mcp -> oraclemcp-* -> oracledb stack and known upstream gaps filed from plsql-mcp",
+                "online_required": false
             }
         ],
         "subsystems": [
@@ -743,6 +829,8 @@ fn doctor_capabilities_json() -> serde_json::Value {
             "analysis_profile"
         ],
         "fixers": [],
+        "trio_stack": trio_stack_report(),
+        "known_upstream_gaps": known_upstream_gaps(),
         "fixer_posture": {
             "mode": "forensic_only",
             "mutating_fixers_available": false,
@@ -766,7 +854,7 @@ fn doctor_capabilities_json() -> serde_json::Value {
         ],
         "run_artifact_schema": {
             "report.json": "envelope containing mode, empty actions list, and the DoctorReport",
-            "actions.jsonl": "newline-delimited action log; empty because this release has no mutating fixers",
+            "actions.jsonl": "newline-delimited action log; an empty file is a valid forensic-only run because this release has no mutating fixers",
             "scorecard.json": "machine summary of pass/warn/fail/skip counts and fixer posture",
             "stdout.json": "exact JSON payload emitted by --json doctor for reproducible agent capture",
             "report.md": "short human-readable report generated from the same DoctorReport",
@@ -802,10 +890,19 @@ Current fixer posture:
   are accepted so agents can use one contract across the trio, but the action
   list is empty until a future typed fixer is added.
 
+Trio stack:
+  plsql-mcp -> oraclemcp-* {oraclemcp_version} -> oracledb {oracledb_version}
+  Known upstream gaps are emitted as INFO findings with issue URLs:
+    RUST_ORACLEDB_ROUTINE_CALL_API
+    ORACLEMCP_ROUTINE_OUT_INOUT
+    ORACLEMCP_CATALOG_NONLOSSY_VALUES
+    ORACLEMCP_TIMEOUT_CANCELLATION
+
 Run artifacts:
   Diagnose writes {runs_dir}/<run-id>/ with report.json, actions.jsonl,
   scorecard.json, stdout.json, report.md, and backups/. These files are local
-  operator artifacts, not release artifacts.
+  operator artifacts, not release artifacts. A forensic-only actions.jsonl is
+  empty and therefore valid JSONL.
 
 Exit codes:
   0 healthy / no failing checks
@@ -816,6 +913,8 @@ Exit codes:
   74 I/O failure
 "#,
         runs_dir = DOCTOR_RUNS_DIR,
+        oraclemcp_version = plsql_mcp::doctor::ORACLEMCP_STACK_VERSION,
+        oracledb_version = plsql_mcp::doctor::RUST_ORACLEDB_STACK_VERSION,
     )
 }
 
@@ -837,6 +936,14 @@ fn persist_doctor_run(report: DoctorReport, args: &DoctorArgs) -> std::io::Resul
             "quick": args.quick,
             "online": args.online,
             "only": &args.only,
+            "skip": &args.skip,
+            "since": &args.since,
+            "severity": &args.severity,
+            "budget": &args.budget,
+            "quiet": args.quiet,
+            "no_color": args.no_color,
+            "no_progress": args.no_progress,
+            "verbose": args.verbose,
         },
         "actions": [],
         "report": &report,
@@ -844,10 +951,7 @@ fn persist_doctor_run(report: DoctorReport, args: &DoctorArgs) -> std::io::Resul
     let scorecard = doctor_scorecard_json(&report, args);
     let stdout_json = serde_json::to_value(&report).map_err(std::io::Error::other)?;
     write_json_create_new(&dir.join("report.json"), &payload)?;
-    write_text_create_new(
-        &dir.join("actions.jsonl"),
-        "# forensic-only doctor run; no mutating actions recorded\n",
-    )?;
+    write_text_create_new(&dir.join("actions.jsonl"), "")?;
     write_json_create_new(&dir.join("scorecard.json"), &scorecard)?;
     write_json_create_new(&dir.join("stdout.json"), &stdout_json)?;
     write_text_create_new(
@@ -872,6 +976,14 @@ fn doctor_scorecard_json(report: &DoctorReport, args: &DoctorArgs) -> serde_json
             "quick": args.quick,
             "online": args.online,
             "only": &args.only,
+            "skip": &args.skip,
+            "since": &args.since,
+            "severity": &args.severity,
+            "budget": &args.budget,
+            "quiet": args.quiet,
+            "no_color": args.no_color,
+            "no_progress": args.no_progress,
+            "verbose": args.verbose,
         },
         "counts": {
             "pass": report.summary.pass,
@@ -926,7 +1038,7 @@ fn doctor_report_markdown(report: &DoctorReport, args: &DoctorArgs) -> String {
         out.push_str("- none\n");
     }
     out.push_str("\n## Actions\n\n");
-    out.push_str("- no mutating actions recorded; this release is forensic-only\n");
+    out.push_str("- no mutating actions recorded; actions.jsonl is intentionally empty\n");
     out
 }
 
@@ -1007,18 +1119,29 @@ fn list_doctor_runs() -> std::io::Result<Vec<serde_json::Value>> {
     Ok(runs)
 }
 
-fn run_doctor_diff(run_id: &str, robot_json: bool) -> ExitCode {
-    let Some(path) = doctor_run_report_path(run_id) else {
-        return emit_doctor_not_found(run_id, robot_json);
+fn run_doctor_diff(run_id: Option<&str>, robot_json: bool) -> ExitCode {
+    let run_id = match run_id {
+        Some(run_id) => run_id.to_owned(),
+        None => match latest_doctor_run_id_owned() {
+            Ok(Some(run_id)) => run_id,
+            Ok(None) => return emit_doctor_not_found("latest", robot_json),
+            Err(err) => {
+                emit_doctor_io_error(robot_json, "MCP_DOCTOR_DIFF_FAILED", err);
+                return ExitCode::from(74);
+            }
+        },
+    };
+    let Some(path) = doctor_run_report_path(&run_id) else {
+        return emit_doctor_not_found(&run_id, robot_json);
     };
     if !path.exists() {
-        return emit_doctor_not_found(run_id, robot_json);
+        return emit_doctor_not_found(&run_id, robot_json);
     }
     let value = serde_json::json!({
         "schema_version": DOCTOR_SCHEMA_VERSION,
         "tool": "plsql-mcp",
-        "run_id": run_id,
-        "actions_path": Path::new(DOCTOR_RUNS_DIR).join(run_id).join("actions.jsonl").display().to_string(),
+        "run_id": &run_id,
+        "actions_path": Path::new(DOCTOR_RUNS_DIR).join(&run_id).join("actions.jsonl").display().to_string(),
         "actions": [],
         "diff": [],
         "message": "diagnose-only run; no actions were recorded",
@@ -1073,30 +1196,34 @@ fn run_doctor_gc(before: &str, yes: bool, robot_json: bool) -> ExitCode {
         }
         return ExitCode::from(4);
     }
-    if before != "all" {
-        let value = serde_json::json!({
-            "schema_version": DOCTOR_SCHEMA_VERSION,
-            "tool": "plsql-mcp",
-            "ok": false,
-            "exit_code": 64,
-            "error": {
-                "code": "MCP_DOCTOR_GC_UNSUPPORTED_BEFORE",
-                "message": "this release accepts only --before all"
+    let cutoff = match parse_gc_cutoff(before) {
+        Ok(cutoff) => cutoff,
+        Err(message) => {
+            let value = serde_json::json!({
+                "schema_version": DOCTOR_SCHEMA_VERSION,
+                "tool": "plsql-mcp",
+                "ok": false,
+                "exit_code": 64,
+                "error": {
+                    "code": "MCP_DOCTOR_GC_UNSUPPORTED_BEFORE",
+                    "message": message
+                }
+            });
+            if robot_json {
+                println!("{}", serde_json::to_string(&value).unwrap());
+            } else {
+                eprintln!("plsql-mcp doctor gc: {message}");
             }
-        });
-        if robot_json {
-            println!("{}", serde_json::to_string(&value).unwrap());
-        } else {
-            eprintln!("plsql-mcp doctor gc: this release accepts only --before all");
+            return ExitCode::from(64);
         }
-        return ExitCode::from(64);
-    }
-    match gc_all_doctor_runs() {
+    };
+    match gc_doctor_runs(cutoff) {
         Ok(deleted) => {
             let value = serde_json::json!({
                 "schema_version": DOCTOR_SCHEMA_VERSION,
                 "tool": "plsql-mcp",
                 "ok": true,
+                "before": before,
                 "deleted": deleted,
             });
             if robot_json {
@@ -1113,7 +1240,80 @@ fn run_doctor_gc(before: &str, yes: bool, robot_json: bool) -> ExitCode {
     }
 }
 
-fn gc_all_doctor_runs() -> std::io::Result<usize> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GcCutoff {
+    All,
+    BeforeUnixSeconds(u64),
+}
+
+fn parse_gc_cutoff(before: &str) -> Result<GcCutoff, String> {
+    if before == "all" {
+        return Ok(GcCutoff::All);
+    }
+    parse_ymd_utc_midnight(before)
+        .map(GcCutoff::BeforeUnixSeconds)
+        .ok_or_else(|| String::from("use --before YYYY-MM-DD or explicit --before all"))
+}
+
+fn parse_ymd_utc_midnight(value: &str) -> Option<u64> {
+    let mut parts = value.split('-');
+    let year = parts.next()?.parse::<i32>().ok()?;
+    let month = parts.next()?.parse::<u32>().ok()?;
+    let day = parts.next()?.parse::<u32>().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&month) {
+        return None;
+    }
+    let max_day = days_in_month(year, month)?;
+    if !(1..=max_day).contains(&day) {
+        return None;
+    }
+    let days = days_from_civil(year, month, day)?;
+    u64::try_from(days).ok()?.checked_mul(86_400)
+}
+
+fn days_in_month(year: i32, month: u32) -> Option<u32> {
+    Some(match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => return None,
+    })
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
+    const DAYS_TO_UNIX_EPOCH: i64 = 719_468;
+    let mut y = i64::from(year);
+    let m = i64::from(month);
+    let d = i64::from(day);
+    y -= i64::from(m <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let month_prime = m + if m > 2 { -3 } else { 9 };
+    let doy = (153 * month_prime + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    if doy >= 366 {
+        return None;
+    }
+    Some(era * 146_097 + doe - DAYS_TO_UNIX_EPOCH)
+}
+
+fn latest_doctor_run_id_owned() -> std::io::Result<Option<String>> {
+    Ok(list_doctor_runs()?
+        .last()
+        .and_then(|run| run["run_id"].as_str())
+        .map(str::to_owned))
+}
+
+fn run_id_unix_seconds(run_id: &str) -> Option<u64> {
+    run_id.strip_prefix("run-")?.split('-').next()?.parse().ok()
+}
+
+fn gc_doctor_runs(cutoff: GcCutoff) -> std::io::Result<usize> {
     let root = Path::new(DOCTOR_RUNS_DIR);
     if !root.exists() {
         return Ok(0);
@@ -1121,7 +1321,17 @@ fn gc_all_doctor_runs() -> std::io::Result<usize> {
     let mut deleted = 0usize;
     for entry in fs::read_dir(root)? {
         let entry = entry?;
-        if entry.file_type()?.is_dir() {
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let run_id = entry.file_name().to_string_lossy().into_owned();
+        let should_delete = match cutoff {
+            GcCutoff::All => true,
+            GcCutoff::BeforeUnixSeconds(cutoff) => {
+                run_id_unix_seconds(&run_id).is_some_and(|started| started < cutoff)
+            }
+        };
+        if should_delete {
             fs::remove_dir_all(entry.path())?;
             deleted += 1;
         }
@@ -1129,7 +1339,32 @@ fn gc_all_doctor_runs() -> std::io::Result<usize> {
     Ok(deleted)
 }
 
+fn emit_doctor_refusal(robot_json: bool, code: &str, message: &str) -> ExitCode {
+    let value = serde_json::json!({
+        "schema_version": DOCTOR_SCHEMA_VERSION,
+        "tool": "plsql-mcp",
+        "ok": false,
+        "exit_code": 4,
+        "error": {
+            "code": code,
+            "message": message
+        }
+    });
+    if robot_json {
+        println!("{}", serde_json::to_string(&value).unwrap());
+    } else {
+        eprintln!("plsql-mcp doctor: {message}");
+    }
+    ExitCode::from(4)
+}
+
 fn doctor_run_report_path(run_id: &str) -> Option<PathBuf> {
+    if run_id == "latest" {
+        return latest_doctor_run_id_owned()
+            .ok()
+            .flatten()
+            .and_then(|latest| doctor_run_report_path(&latest));
+    }
     if !run_id
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
@@ -1879,6 +2114,22 @@ mod tests {
             false
         );
         assert!(cap_json["manual_remediations"]["MCP_CONNECTIONS_FILE_NOT_LOADED"].is_string());
+        assert!(cap_json["flags"]["--robot"].is_string());
+        assert!(cap_json["flags"]["--robot-triage"].is_string());
+        assert!(
+            cap_json["trio_stack"]["components"]
+                .as_array()
+                .is_some_and(|components| components
+                    .iter()
+                    .any(|component| component["name"] == "oraclemcp-*"))
+        );
+        assert!(
+            cap_json["known_upstream_gaps"]
+                .as_array()
+                .is_some_and(|gaps| gaps
+                    .iter()
+                    .any(|gap| gap["id"] == "RUST_ORACLEDB_ROUTINE_CALL_API"))
+        );
         assert!(
             cap_json["run_artifact_schema"]["actions.jsonl"]
                 .as_str()
@@ -1934,8 +2185,8 @@ mod tests {
         assert_eq!(scorecard["fixer_posture"]["actions_recorded"], 0);
         let actions = std::fs::read_to_string(run_dir.join("actions.jsonl")).unwrap();
         assert!(
-            actions.contains("no mutating actions"),
-            "forensic action log should be explicit, got {actions:?}"
+            actions.is_empty(),
+            "forensic action log must be valid empty JSONL, got {actions:?}"
         );
     }
 
@@ -1963,6 +2214,57 @@ mod tests {
             "MCP_CONNECTIONS_FILE_NOT_LOADED"
         );
         assert!(payload["manual_remediation"].is_string());
+    }
+
+    #[test]
+    fn robot_alias_and_doctor_robot_triage_are_agent_contracts() {
+        use std::process::Command as PCommand;
+
+        let alias = PCommand::new(bin())
+            .args(["--robot", "doctor", "health"])
+            .output()
+            .expect("run doctor health through --robot alias");
+        assert!(alias.status.success());
+        let health: serde_json::Value =
+            serde_json::from_slice(&alias.stdout).expect("--robot emits JSON");
+        assert_eq!(health["tool"], "plsql-mcp");
+        assert!(
+            health["known_upstream_gaps"]
+                .as_array()
+                .is_some_and(|gaps| {
+                    gaps.iter()
+                        .any(|gap| gap["id"] == "ORACLEMCP_TIMEOUT_CANCELLATION")
+                })
+        );
+
+        let triage = PCommand::new(bin())
+            .args(["doctor", "--robot-triage"])
+            .output()
+            .expect("run doctor --robot-triage");
+        assert!(triage.status.success());
+        let payload: serde_json::Value =
+            serde_json::from_slice(&triage.stdout).expect("triage JSON parses");
+        for key in [
+            "summary",
+            "findings",
+            "actions_planned",
+            "recommended_command",
+            "capabilities_url",
+            "robot_docs_command",
+        ] {
+            assert!(payload.get(key).is_some(), "triage missing {key}");
+        }
+    }
+
+    #[test]
+    fn doctor_gc_cutoff_accepts_dates_and_rejects_invalid_dates() {
+        assert!(matches!(parse_gc_cutoff("all"), Ok(GcCutoff::All)));
+        assert_eq!(
+            parse_gc_cutoff("1970-01-02"),
+            Ok(GcCutoff::BeforeUnixSeconds(86_400))
+        );
+        assert!(parse_gc_cutoff("2026-02-31").is_err());
+        assert!(parse_gc_cutoff("yesterday").is_err());
     }
 
     /// Every Unix-style CLI accepts `--version`. clap auto-derives it from

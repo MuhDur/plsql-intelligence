@@ -9,6 +9,21 @@ work.
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-06-29
+
+- **Trio stack doctor provenance.** `plsql-mcp doctor` now reports the
+  exact `plsql-mcp -> oraclemcp-* -> oracledb` live stack, including
+  `oraclemcp 0.4.0`, `oracledb 0.5.0`, and the upstream gap issues filed
+  from `plsql-mcp`.
+- **Agent doctor parity.** `plsql-mcp` now accepts the `--robot` alias,
+  `doctor --robot-triage`, parity flags such as `--skip`, `--since`,
+  `--severity`, `--budget`, `--quiet`, `--no-color`, and `--no-progress`,
+  latest-run `doctor diff`, date-gated `doctor gc`, and guarded
+  `--force --yes` semantics.
+- **Forensic run contract fix.** Diagnose-only doctor runs now write an
+  empty `actions.jsonl`, which is valid empty JSONL instead of a comment
+  line masquerading as a log record.
+
 ## [0.6.1] - 2026-06-29
 
 - **Doctor contract hardening.** `plsql-mcp doctor` now exposes

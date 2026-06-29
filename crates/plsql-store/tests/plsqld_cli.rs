@@ -149,10 +149,9 @@ fn idle_connection_is_dropped_and_loop_keeps_serving() {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     // RAII short-path tempdir. Unix-domain socket paths are bounded by SUN_LEN
-    // (~108 bytes), so the long worktree-scoped TMPDIR that the disk-discipline
-    // harness sets is unusable for the socket. We mint a short base dir under
-    // `/tmp` (an ephemeral socket dir, not a cargo build artifact) and remove
-    // it on drop.
+    // (~108 bytes), so a long worktree-scoped TMPDIR can be unusable for the
+    // socket. Prefer TMPDIR when it is short enough; this keeps the test off
+    // quota-limited /tmp mounts on build hosts.
     struct ShortTempDir(std::path::PathBuf);
     impl Drop for ShortTempDir {
         fn drop(&mut self) {
@@ -176,8 +175,17 @@ fn idle_connection_is_dropped_and_loop_keeps_serving() {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let base =
-        std::path::PathBuf::from(format!("/tmp/plsqld-qbqf5-{}-{nanos}", std::process::id()));
+    let dir_name = format!("plsqld-qbqf5-{}-{nanos}", std::process::id());
+    let base_root = [
+        std::env::var_os("TMPDIR"),
+        std::env::var_os("XDG_RUNTIME_DIR"),
+    ]
+    .into_iter()
+    .flatten()
+    .map(std::path::PathBuf::from)
+    .find(|root| root.join(&dir_name).join("plsqld.sock").as_os_str().len() < 104)
+    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    let base = base_root.join(dir_name);
     std::fs::create_dir_all(&base).expect("create short tempdir");
     let dir = ShortTempDir(base);
     let sock_path = dir.0.join("plsqld.sock");
