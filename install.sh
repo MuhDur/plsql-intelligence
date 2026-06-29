@@ -15,7 +15,8 @@
 #   --version <v>       Install a specific release tag/version
 #   --bin-dir <dir>     Install binaries into dir (default: ~/.local/bin)
 #   --easy-mode         Offer shell PATH updates when bin dir is not on PATH
-#   --offline <tarball> Install from a pre-downloaded release tarball
+#   --offline <tarball> Install from a local tarball; include SHA256SUMS in the
+#                       archive or place it next to the tarball
 #   --no-verify         Skip checksum/signature verification
 #   --help              Show this help
 #
@@ -79,7 +80,8 @@ Options:
   --version <v>       Install a specific release tag/version
   --bin-dir <dir>     Install binaries into dir (default: ~/.local/bin)
   --easy-mode         Offer shell PATH updates when bin dir is not on PATH
-  --offline <tarball> Install from a pre-downloaded release tarball
+  --offline <tarball> Install from a local tarball; include SHA256SUMS in the
+                      archive or place it next to the tarball
   --no-verify         Skip checksum/signature verification
   --help              Show this help
 USAGE
@@ -641,9 +643,30 @@ archive_binary_path() {
   printf '%s\n' "$found"
 }
 
+offline_checksums_path() {
+  local archive="$1"
+  local extract_dir="$2"
+  local archive_dir extracted adjacent
+
+  extracted=$(find "$extract_dir" -type f -name SHA256SUMS -print | sed -n '1p')
+  if [[ -n "$extracted" ]]; then
+    printf '%s\n' "$extracted"
+    return 0
+  fi
+
+  archive_dir=$(dirname "$archive")
+  adjacent="$archive_dir/SHA256SUMS"
+  if [[ -f "$adjacent" ]]; then
+    printf '%s\n' "$adjacent"
+    return 0
+  fi
+
+  return 1
+}
+
 install_from_archive() {
   local archive="$1"
-  local extract_dir bin source
+  local extract_dir bin source source_name
 
   [[ -f "$archive" ]] || {
     err "Offline tarball not found: $archive"
@@ -658,11 +681,23 @@ install_from_archive() {
   mkdir -p "$extract_dir"
   tar -xf "$archive" -C "$extract_dir"
 
+  if [[ "$NO_VERIFY" -eq 0 ]]; then
+    SHA256SUMS_FILE=$(offline_checksums_path "$archive" "$extract_dir") || {
+      err "Offline install requires SHA256SUMS inside the archive or next to it; pass --no-verify only if you accept the risk"
+      return 1
+    }
+    info "Using offline checksums: $SHA256SUMS_FILE"
+  fi
+
   for bin in "${RELEASE_BINS[@]}"; do
     source=$(archive_binary_path "$extract_dir" "$bin") || {
       err "Offline archive does not contain $bin"
       return 1
     }
+    if [[ "$NO_VERIFY" -eq 0 ]]; then
+      source_name=$(basename "$source")
+      verify_checksum "$source_name" "$source"
+    fi
     install_binary "$source" "$bin"
   done
 }
