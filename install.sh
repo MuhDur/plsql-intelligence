@@ -28,6 +28,9 @@ REPO="plsql-intelligence"
 PROJECT_NAME="plsql-intelligence"
 DESCRIPTION="Offline PL/SQL intelligence CLIs"
 DEFAULT_BIN_DIR="${HOME}/.local/bin"
+GITHUB_API_BASE="https://api.github.com/repos/${OWNER}/${REPO}"
+GITHUB_RELEASES_URL="https://github.com/${OWNER}/${REPO}/releases"
+PINNED_FALLBACK_VERSION="v0.7.0"
 
 QUIET=0
 NO_GUM=0
@@ -39,6 +42,12 @@ BIN_DIR="$DEFAULT_BIN_DIR"
 OFFLINE_TARBALL=""
 HAS_GUM=0
 TEMP_DIR=""
+TARGET=""
+FROM_SOURCE=0
+TARGET_REASON=""
+IS_WSL=0
+RESOLVED_VERSION=""
+VERSION_SOURCE=""
 
 usage() {
   cat <<'USAGE'
@@ -232,6 +241,118 @@ parse_args() {
   done
 }
 
+mark_from_source() {
+  FROM_SOURCE=1
+  TARGET="source"
+  TARGET_REASON="$1"
+}
+
+detect_wsl() {
+  local kernel_release
+
+  kernel_release=$(uname -r 2>/dev/null || printf 'unknown')
+  if printf '%s' "$kernel_release" | grep -qiE 'microsoft|wsl'; then
+    IS_WSL=1
+    return 0
+  fi
+  if [[ -r /proc/version ]] && grep -qiE 'microsoft|wsl' /proc/version; then
+    IS_WSL=1
+    return 0
+  fi
+  IS_WSL=0
+}
+
+detect_platform() {
+  local os arch os_norm arch_norm
+
+  os=$(uname -s 2>/dev/null || printf 'unknown')
+  arch=$(uname -m 2>/dev/null || printf 'unknown')
+  os_norm=$(printf '%s' "$os" | tr '[:upper:]' '[:lower:]')
+  arch_norm=$(printf '%s' "$arch" | tr '[:upper:]' '[:lower:]')
+
+  case "$arch_norm" in
+    x86_64|amd64)
+      arch_norm="x86_64"
+      ;;
+    aarch64|arm64)
+      arch_norm="aarch64"
+      ;;
+    *)
+      mark_from_source "unsupported CPU architecture: $arch"
+      return 0
+      ;;
+  esac
+
+  case "$os_norm" in
+    linux)
+      TARGET="${arch_norm}-unknown-linux-musl"
+      detect_wsl
+      ;;
+    darwin)
+      TARGET="${arch_norm}-apple-darwin"
+      ;;
+    *)
+      mark_from_source "unsupported operating system: $os"
+      ;;
+  esac
+}
+
+github_api_latest_tag() {
+  local response tag
+
+  command -v curl >/dev/null 2>&1 || return 1
+  response=$(
+    curl -fsSL \
+      -H "Accept: application/vnd.github+json" \
+      -H "User-Agent: ${PROJECT_NAME}-installer" \
+      "${GITHUB_API_BASE}/releases/latest" 2>/dev/null || true
+  )
+  tag=$(printf '%s\n' "$response" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n '1p')
+  [[ -n "$tag" ]] || return 1
+  printf '%s\n' "$tag"
+}
+
+github_redirect_latest_tag() {
+  local effective_url tag
+
+  command -v curl >/dev/null 2>&1 || return 1
+  effective_url=$(
+    curl -fsSIL \
+      -H "User-Agent: ${PROJECT_NAME}-installer" \
+      -o /dev/null \
+      -w '%{url_effective}' \
+      "${GITHUB_RELEASES_URL}/latest" 2>/dev/null || true
+  )
+  tag=$(printf '%s\n' "$effective_url" | sed -n 's#.*/releases/tag/\([^/?#]*\).*#\1#p' | sed -n '1p')
+  [[ -n "$tag" ]] || return 1
+  printf '%s\n' "$tag"
+}
+
+resolve_version() {
+  local tag
+
+  if [[ -n "$VERSION" ]]; then
+    RESOLVED_VERSION="$VERSION"
+    VERSION_SOURCE="flag"
+    return 0
+  fi
+
+  if tag=$(github_api_latest_tag); then
+    RESOLVED_VERSION="$tag"
+    VERSION_SOURCE="GitHub API"
+    return 0
+  fi
+
+  if tag=$(github_redirect_latest_tag); then
+    RESOLVED_VERSION="$tag"
+    VERSION_SOURCE="GitHub redirect"
+    return 0
+  fi
+
+  RESOLVED_VERSION="$PINNED_FALLBACK_VERSION"
+  VERSION_SOURCE="pinned fallback"
+}
+
 create_temp_dir() {
   local temp_parent
   temp_parent="${TMPDIR:-/tmp}"
@@ -241,10 +362,19 @@ create_temp_dir() {
 print_plan() {
   info "Repository: ${OWNER}/${REPO}"
   info "Install dir: $BIN_DIR"
-  if [[ -n "$VERSION" ]]; then
-    info "Version: $VERSION"
+  if [[ "$FROM_SOURCE" -eq 1 ]]; then
+    warn "No prebuilt target selected: $TARGET_REASON"
+    info "Target: build from source"
   else
-    info "Version: latest release"
+    info "Target: $TARGET"
+  fi
+  if [[ "$IS_WSL" -eq 1 ]]; then
+    warn "WSL detected; continuing with Linux static target $TARGET"
+  fi
+  if [[ -n "$RESOLVED_VERSION" ]]; then
+    info "Version: ${RESOLVED_VERSION} (${VERSION_SOURCE})"
+  else
+    info "Version: unresolved"
   fi
   if [[ -n "$OFFLINE_TARBALL" ]]; then
     info "Offline tarball: $OFFLINE_TARBALL"
@@ -263,6 +393,8 @@ print_plan() {
 main() {
   parse_args "$@"
   detect_gum
+  detect_platform
+  resolve_version
   create_temp_dir
   show_header
   print_plan
