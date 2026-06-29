@@ -85,6 +85,7 @@ jobs:
           key: antlr-generated-drift
       - name: Regenerate ANTLR source into temp dir
         env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/antlr-generated-drift-target
           PLSQL_ANTLR_REGEN: "1"
           PLSQL_ANTLR_REGEN_DIR: ${{ runner.temp }}/plsql-parser-antlr-generated
         run: cargo +stable build -p plsql-parser-antlr --features antlr-codegen
