@@ -992,7 +992,7 @@ mod tests {
 
     #[test]
     fn read_only_predicate_uses_oraclemcp_guard_0_4_udf_baseline() {
-        // B.5 rebaseline: oraclemcp-guard 0.4.0 classifies schema-qualified
+        // B.5 rebaseline: oraclemcp-guard 0.4.1 classifies schema-qualified
         // routine calls as Guarded under the default UnknownOracle, including
         // names that collide with SQL keywords or builtins. The old lexical
         // SELECT/WITH predicate would have accepted them; the MCP query gate
@@ -1007,7 +1007,7 @@ mod tests {
             assert_eq!(
                 decision.danger,
                 DangerLevel::Guarded,
-                "0.4.0 guard baseline shifted this query to Guarded: {sql:?}"
+                "0.4.1 guard baseline shifted this query to Guarded: {sql:?}"
             );
             assert!(
                 legacy_read_only_sql(sql),

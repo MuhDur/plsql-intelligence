@@ -100,14 +100,14 @@ degradation responses inherited from the `oraclemcp-*` core.
 
 ## Status
 
-The latest completed release is `v0.6.2`, the patch line for trio
+The latest completed release is `v0.6.3`, the patch line for trio
 stack-doctor provenance, agent doctor parity, stable default workspace
 gates, and publication metadata. The project is still pre-1.0, so APIs can
 change before the 1.0 line. `plan.md`
 remains the authoritative specification and `docs/ARCHITECTURE.md` is the
 technical architecture snapshot.
 
-- The `v0.6.2` line completes the `plsql-mcp` doctor contract needed for
+- The `v0.6.3` line completes the `plsql-mcp` doctor contract needed for
   stack-wide parity with `oraclemcp` and `rust-oracledb`: `doctor`,
   `doctor fix`, `doctor explain <finding-id>`, `doctor health`,
   `doctor capabilities`, `doctor robot-docs`, `doctor ls`, `doctor diff`,
@@ -134,13 +134,15 @@ technical architecture snapshot.
   `plsql-accretion` library, the `usr-loop` tool, the sha-pinned
   conformance gate, the monotone tripwire, and the re-runnable acceptance
   proof `scripts/usr_acceptance.sh`.
-- The post-`v0.5.0` fast-follow lane is closed in the `v0.6.x` line: upstream
-  driver gaps needed by `plsql-mcp` are filed as
+- The post-`v0.5.0` fast-follow lane is closed in the `v0.6.x` line:
+  `plsql-mcp` now consumes `oraclemcp-* 0.4.1`, which carries
+  `oracledb 0.5.1`. Remaining upstream driver and adapter gaps are filed as
   [`rust-oracledb#13`](https://github.com/MuhDur/rust-oracledb/issues/13),
+  [`rust-oracledb#14`](https://github.com/MuhDur/rust-oracledb/issues/14),
   [`oraclemcp#2`](https://github.com/MuhDur/oraclemcp/issues/2), and
-  [`oraclemcp#3`](https://github.com/MuhDur/oraclemcp/issues/3). The live
-  timeout adapter gap found during release testing is tracked as
-  [`oraclemcp#4`](https://github.com/MuhDur/oraclemcp/issues/4). The
+  [`oraclemcp#3`](https://github.com/MuhDur/oraclemcp/issues/3). The
+  oraclemcp doctor handoff gap is tracked as
+  [`oraclemcp#6`](https://github.com/MuhDur/oraclemcp/issues/6). The
   `plsql-mcp doctor` JSON includes these issue URLs so agents can see that
   the gaps belong upstream and should not be reimplemented privately here.
   The `plsql-*` crates are published on crates.io with explicit versioned

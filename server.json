@@ -3,7 +3,7 @@
   "name": "io.github.MuhDur/plsql-mcp",
   "title": "PL/SQL Intelligence",
   "description": "Oracle MCP with PL/SQL analysis, lineage, SAST, and change-impact tools.",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "repository": {
     "url": "https://github.com/MuhDur/plsql-intelligence",
     "source": "github"
@@ -11,7 +11,7 @@
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/muhdur/plsql-mcp:0.6.2",
+      "identifier": "ghcr.io/muhdur/plsql-mcp:0.6.3",
       "transport": {
         "type": "stdio"
       }

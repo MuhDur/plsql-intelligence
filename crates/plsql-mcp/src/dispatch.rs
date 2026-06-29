@@ -153,7 +153,7 @@ impl DispatchError {
     }
 }
 
-/// Stateless adapter implementing the 0.4.0 `oraclemcp-core` dispatch trait.
+/// Stateless adapter implementing the 0.4.1 `oraclemcp-core` dispatch trait.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PlsqlToolDispatch;
 
@@ -173,7 +173,7 @@ impl ToolDispatch for PlsqlToolDispatch {
 ///
 /// `oraclemcp-core` owns the public [`ToolDispatch`] trait and its transport
 /// [`DispatchContext`]. B.6 keeps that upstream contract intact while giving the
-/// PL/SQL dispatcher a local place to carry the adopted 0.4.0 request budget and
+/// PL/SQL dispatcher a local place to carry the adopted 0.4.1 request budget and
 /// read-path capability surface. Later Phase C/D work can consume this context
 /// without changing the MCP transport or forking the upstream trait.
 #[derive(Clone, Copy, Debug)]
@@ -884,7 +884,7 @@ async fn run_current_database(
     let adapter =
         OraclemcpCatalogConnection::new(BorrowedOracleConnection::new(session.connection()));
     let read_cx = context.narrow_to_read_path(cx);
-    // oraclemcp-db 0.4.0 still accepts `&Cx`, so keep passing the upstream
+    // oraclemcp-db 0.4.1 still accepts `&Cx`, so keep passing the upstream
     // trait shape while narrowing any ambient `Cx::current()` lookups during
     // the catalog read.
     let _read_path_guard = read_cx.set_current_restricted();
@@ -1503,7 +1503,7 @@ async fn run_query_live(
     let adapter = OraclemcpCatalogConnection::new(BorrowedOracleConnection::new(connection));
     let read_cx = context.narrow_to_read_path(cx);
     let rows_result = async {
-        // oraclemcp-db 0.4.0 still accepts `&Cx`, so keep passing the upstream
+        // oraclemcp-db 0.4.1 still accepts `&Cx`, so keep passing the upstream
         // trait shape while narrowing any ambient `Cx::current()` lookups during
         // the live read.
         let _read_path_guard = read_cx.set_current_restricted();

@@ -164,7 +164,7 @@ where
         cx: &Cx,
         key: &ObjectKey,
     ) -> Result<bool, CatalogError> {
-        // oraclemcp-db 0.4.0 currently decides query prefetch from the first
+        // oraclemcp-db 0.4.1 currently decides query prefetch from the first
         // SQL keyword. Keep the metadata probe SELECT-led while preserving the
         // CTE shape Oracle accepts.
         let sql = "

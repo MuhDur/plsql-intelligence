@@ -1564,9 +1564,9 @@ dependencies = [
 
 [[package]]
 name = "oracledb"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c34b5e993db86eab59a1754f43dbdb492d17fcbb2f1b3375d9f6f6f66a633d30"
+checksum = "8a7f68d5c3d684ed47875646baef121af518305f1384b89a098efae6d78f2779"
 dependencies = [
  "asupersync",
  "oracledb-protocol",
@@ -1580,9 +1580,9 @@ dependencies = [
 
 [[package]]
 name = "oracledb-protocol"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05f714cd2517e30229b6ce137fe1cf3199723e73a10c24db9a4c3eff6b5174db"
+checksum = "10eab61f39524533014d43d9a650490b282fb9d89973683f17bff23ab65bf3ee"
 dependencies = [
  "aes",
  "hex",
@@ -1598,9 +1598,9 @@ dependencies = [
 
 [[package]]
 name = "oraclemcp-audit"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8ad5c6e2b0f2e2c753984a5fcb1f64c764e3836f2e63660a9bc653257acf9e0"
+checksum = "3e028d987682c829ca5aa10791d6a5f6771631909befc22a28376c9e9ebb8192"
 dependencies = [
  "oraclemcp-error",
  "serde",
@@ -1612,9 +1612,9 @@ dependencies = [
 
 [[package]]
 name = "oraclemcp-auth"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14d0c121cdade0c1bcd141052724e31643571a4121dd0a47ec0063f073f4045e"
+checksum = "468645af6c96af145dd893a68e42dfbaadb83b2f3395fd0cbbf0ba6a358a388e"
 dependencies = [
  "oraclemcp-audit",
  "oraclemcp-error",
@@ -1628,9 +1628,9 @@ dependencies = [
 
 [[package]]
 name = "oraclemcp-config"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4222e0df1aaad2ee7830468ea933de66654ddff87ae4900264d01980ba5ea64a"
+checksum = "4816fb7865fe2420e78e656c7647d9b5aee6b02a16767c945e9d6ffc336338f0"
 dependencies = [
  "figment",
  "oraclemcp-error",
@@ -1642,9 +1642,9 @@ dependencies = [
 
 [[package]]
 name = "oraclemcp-core"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "240002602a478782dc3a52b7f963ea3831e9c2ad31c112d12a4618bf9220936e"
+checksum = "a24092051d1eb2e2bbce048084728c9a16f60c3271c3da5b4f518288c6bf0360"
 dependencies = [
  "asupersync",
  "async-trait",
@@ -1668,9 +1668,9 @@ dependencies = [
 
 [[package]]
 name = "oraclemcp-db"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6956ec044d7b0bd1ba813caea96f5525de348b5038b2b1cecf7dd592525da812"
+checksum = "9d973842c9ca40fe5029aff524878f6a0c0245cfd855042bb0f45bc143e4f692"
 dependencies = [
  "asupersync",
  "async-trait",
@@ -1685,9 +1685,9 @@ dependencies = [
 
 [[package]]
 name = "oraclemcp-error"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69152ba5cda0f1a1397332904d1ed20b00a13ce3edca833e9e2eae139a21e2ab"
+checksum = "2ffa8df50daede4c66a6d965d9e2cc96eea85b4a5dc3920890645826bdda24d3"
 dependencies = [
  "serde",
  "serde_json",
@@ -1696,9 +1696,9 @@ dependencies = [
 
 [[package]]
 name = "oraclemcp-guard"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed296f48a0b76f76eba7ab04f74d27c276ac0c4e3271b56a42906bcb606f0498"
+checksum = "4f415f87a8e201df992690a0e028e346ee5f544562c6e23348c1235ab7adc42b"
 dependencies = [
  "oraclemcp-audit",
  "oraclemcp-error",
@@ -1712,9 +1712,9 @@ dependencies = [
 
 [[package]]
 name = "oraclemcp-telemetry"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e590578593a7a08c136d7700cfdffb38750a5893a33bea56c109d8ccd3ef30d5"
+checksum = "d42e21cc9a42a134a1ec25c3bf9b827b42c2312e910acbcfde598e9440ff24e6"
 dependencies = [
  "asupersync",
  "oraclemcp-error",
@@ -1915,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "plsql-catalog"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "asupersync",
  "async-trait",
@@ -2041,7 +2041,7 @@ dependencies = [
 
 [[package]]
 name = "plsql-mcp"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "asupersync",
  "async-trait",

@@ -894,9 +894,10 @@ Trio stack:
   plsql-mcp -> oraclemcp-* {oraclemcp_version} -> oracledb {oracledb_version}
   Known upstream gaps are emitted as INFO findings with issue URLs:
     RUST_ORACLEDB_ROUTINE_CALL_API
+    RUST_ORACLEDB_CONNECTION_RESILIENCY
     ORACLEMCP_ROUTINE_OUT_INOUT
     ORACLEMCP_CATALOG_NONLOSSY_VALUES
-    ORACLEMCP_TIMEOUT_CANCELLATION
+    ORACLEMCP_TRIO_STACK_DOCTOR_HANDOFF
 
 Run artifacts:
   Diagnose writes {runs_dir}/<run-id>/ with report.json, actions.jsonl,
@@ -2233,7 +2234,7 @@ mod tests {
                 .as_array()
                 .is_some_and(|gaps| {
                     gaps.iter()
-                        .any(|gap| gap["id"] == "ORACLEMCP_TIMEOUT_CANCELLATION")
+                        .any(|gap| gap["id"] == "ORACLEMCP_TRIO_STACK_DOCTOR_HANDOFF")
                 })
         );
 

@@ -157,7 +157,10 @@ mod live {
         // Scope extraction to the DEMO schema by name so that it works
         // regardless of whether the current schema in the session is DEMO.
         let request = CatalogLoadRequest::for_named_schemas(["DEMO"]);
+        let reactor =
+            asupersync::runtime::reactor::create_reactor().expect("PLSQL-CAT-008: native reactor");
         let snapshot = RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
             .build()
             .expect("PLSQL-CAT-008: asupersync runtime")
             .block_on(async {

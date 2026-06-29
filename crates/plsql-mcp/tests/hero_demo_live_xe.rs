@@ -96,7 +96,10 @@ mod live {
     }
 
     fn run_live_future<F: Future>(future: F) -> F::Output {
+        let reactor =
+            asupersync::runtime::reactor::create_reactor().expect("live-xe native reactor");
         RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
             .build()
             .expect("live-xe asupersync runtime")
             .block_on(future)

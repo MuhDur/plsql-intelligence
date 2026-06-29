@@ -34,10 +34,10 @@
 //!
 //! ### (b) Chained-flow: `preview_sql` → `run_execute_approved` → DDL execution
 //!
-//! Creates a scratch table `MCP_T_<pid>` under SYSTEM, uses `preview_sql` to
+//! Creates a scratch view `MCP_T_<pid>` under SYSTEM, uses `preview_sql` to
 //! mint an approval token, `run_execute_approved` to verify the plan, and
-//! `conn.execute(&plan.ddl_bytes)` to actually run the DDL.  Then verifies the
-//! table exists in ALL_OBJECTS and drops it in teardown.
+//! `conn.execute(&plan.ddl_bytes)` to actually run the DDL. Then verifies the
+//! view exists in ALL_OBJECTS and drops it in teardown.
 //!
 //! ### (c) Refusal matrix
 //!
@@ -214,8 +214,22 @@ mod live {
         let _ = execute_sql(conn, &sql);
     }
 
+    /// Drop the scratch view if it still exists (best-effort teardown).
+    fn drop_scratch_view_if_exists(conn: &LiveConnection, name: &str) {
+        let sql = format!(
+            "BEGIN \
+               EXECUTE IMMEDIATE 'DROP VIEW SYSTEM.{name}'; \
+             EXCEPTION WHEN OTHERS THEN NULL; \
+             END;"
+        );
+        let _ = execute_sql(conn, &sql);
+    }
+
     fn run_live_future<F: Future>(future: F) -> F::Output {
+        let reactor =
+            asupersync::runtime::reactor::create_reactor().expect("live-xe native reactor");
         RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
             .build()
             .expect("live-xe asupersync runtime")
             .block_on(future)
@@ -1359,22 +1373,24 @@ mod live {
     /// Chained flow test: `preview_sql` → `run_execute_approved` → DDL against
     /// Oracle.
     ///
-    /// Creates a scratch table `MCP_T_<pid>_CHAIN` under SYSTEM, verifies the
-    /// full approval chain, executes the DDL against Oracle, confirms the table
+    /// Creates a scratch view `MCP_T_<pid>_CHAIN` under SYSTEM, verifies the
+    /// full approval chain, executes the DDL against Oracle, confirms the view
     /// exists in ALL_OBJECTS, then drops it.
     #[test]
-    fn chained_flow_preview_then_execute_approved_creates_table() {
+    fn chained_flow_preview_then_execute_approved_creates_view() {
         let conn = system_conn();
-        let table = format!("{}_CHAIN", scratch_table_name());
+        let view = format!("{}_CHAIN", scratch_table_name());
         let connection_name = "xe-system";
 
-        eprintln!("[PLSQL-MCP-LIVE-018] chained-flow scratch table: {table}");
+        eprintln!("[PLSQL-MCP-LIVE-018] chained-flow scratch view: {view}");
 
         // Clean slate.
-        drop_scratch_table_if_exists(&conn, &table);
+        drop_scratch_view_if_exists(&conn, &view);
 
         // The DDL we want to preview and execute.
-        let ddl = format!("CREATE TABLE SYSTEM.{table} (ID NUMBER NOT NULL, LABEL VARCHAR2(50))");
+        let ddl = format!(
+            "CREATE OR REPLACE VIEW SYSTEM.{view} AS SELECT 1 AS ID, 'CHAIN' AS LABEL FROM dual"
+        );
         let token_value = random_approval_text("mcp-live-test");
 
         // Step 1: preview_sql — mint the approval token.
@@ -1382,7 +1398,7 @@ mod live {
         let preview = registry
             .preview_sql(
                 connection_name,
-                format!("CREATE scratch table SYSTEM.{table}"),
+                format!("CREATE OR REPLACE scratch view SYSTEM.{view}"),
                 &ddl,
                 &token_value,
             )
@@ -1430,37 +1446,37 @@ mod live {
             "registry must be empty after consume_approved"
         );
 
-        // Step 5: verify the table exists in ALL_OBJECTS.
+        // Step 5: verify the view exists in ALL_OBJECTS.
         let rows = query_rows(
             &conn,
             "SELECT object_name FROM all_objects \
-             WHERE owner = 'SYSTEM' AND object_name = :1 AND object_type = 'TABLE'",
-            &[OracleBind::from(table.clone())],
+             WHERE owner = 'SYSTEM' AND object_name = :1 AND object_type = 'VIEW'",
+            &[OracleBind::from(view.clone())],
         )
         .expect("PLSQL-MCP-LIVE-018: existence check query should succeed");
 
         assert_eq!(
             rows.len(),
             1,
-            "table {table} must exist in ALL_OBJECTS after DDL execution; got {} rows",
+            "view {view} must exist in ALL_OBJECTS after DDL execution; got {} rows",
             rows.len()
         );
-        eprintln!("[PLSQL-MCP-LIVE-018] table {table} confirmed in ALL_OBJECTS. PASS.");
+        eprintln!("[PLSQL-MCP-LIVE-018] view {view} confirmed in ALL_OBJECTS. PASS.");
 
         // Teardown.
-        drop_scratch_table_if_exists(&conn, &table);
+        drop_scratch_view_if_exists(&conn, &view);
 
         // Verify teardown.
         let rows_after = query_rows(
             &conn,
             "SELECT object_name FROM all_objects \
-             WHERE owner = 'SYSTEM' AND object_name = :1 AND object_type = 'TABLE'",
-            &[OracleBind::from(table.clone())],
+             WHERE owner = 'SYSTEM' AND object_name = :1 AND object_type = 'VIEW'",
+            &[OracleBind::from(view.clone())],
         )
         .expect("PLSQL-MCP-LIVE-018: teardown check query should succeed");
         assert!(
             rows_after.is_empty(),
-            "scratch table {table} must be dropped in teardown"
+            "scratch view {view} must be dropped in teardown"
         );
     }
 
@@ -1637,7 +1653,7 @@ mod live {
     #[test]
     fn chained_flow_expired_preview_token_refused_by_execute_approved() {
         let mut registry = PreviewRegistry::new();
-        let ddl = "CREATE TABLE SYSTEM.MCP_T_FAKE (ID NUMBER)";
+        let ddl = "CREATE OR REPLACE VIEW SYSTEM.MCP_T_FAKE AS SELECT 1 AS ID FROM dual";
         let preview_text = random_approval_text("expired-preview");
         let preview = registry
             .preview_sql("xe-system", "fake op", ddl, &preview_text)
@@ -1662,10 +1678,10 @@ mod live {
     #[test]
     fn chained_flow_mismatched_ddl_refused_by_execute_approved() {
         let mut registry = PreviewRegistry::new();
-        let ddl = "CREATE TABLE SYSTEM.MCP_T_FAKE (ID NUMBER)";
+        let ddl = "CREATE OR REPLACE VIEW SYSTEM.MCP_T_FAKE AS SELECT 1 AS ID FROM dual";
         let preview_text = random_approval_text("drift-preview");
         registry
-            .preview_sql("xe-system", "create fake table", ddl, &preview_text)
+            .preview_sql("xe-system", "create fake view", ddl, &preview_text)
             .expect("preview_sql must succeed");
 
         let req = ExecuteApprovedRequest {
@@ -1694,11 +1710,11 @@ mod live {
     #[test]
     fn chained_flow_wrong_token_refused_by_execute_approved() {
         let mut registry = PreviewRegistry::new();
-        let ddl = "CREATE TABLE SYSTEM.MCP_T_FAKE (ID NUMBER)";
+        let ddl = "CREATE OR REPLACE VIEW SYSTEM.MCP_T_FAKE AS SELECT 1 AS ID FROM dual";
         let preview_text = random_approval_text("real-preview");
         let wrong_text = random_approval_text("wrong-preview");
         registry
-            .preview_sql("xe-system", "create fake table", ddl, &preview_text)
+            .preview_sql("xe-system", "create fake view", ddl, &preview_text)
             .expect("preview_sql must succeed");
 
         let req = ExecuteApprovedRequest {

@@ -130,6 +130,16 @@ mod live {
         Ok(())
     }
 
+    async fn drop_large_package_fixture<C: CatalogOracleConnection>(cx: &Cx, conn: &C) {
+        let sql = format!(
+            "BEGIN \
+               EXECUTE IMMEDIATE 'DROP PACKAGE {FIXTURE_OWNER}.{FIXTURE_PACKAGE}'; \
+             EXCEPTION WHEN OTHERS THEN NULL; \
+             END;"
+        );
+        let _ = conn.execute(cx, &sql, &[]).await;
+    }
+
     async fn load_snapshot_with_ddl<C: CatalogOracleConnection>(
         cx: &Cx,
         conn: &C,
@@ -219,6 +229,7 @@ mod live {
             let thin = OraclemcpCatalogConnection::connect(&cx, thin_options())
                 .await
                 .expect("oraclemcp-db thin SYSTEM connection to local XE must succeed");
+            drop_large_package_fixture(&cx, &thin).await;
             install_large_package_fixture(&cx, &thin)
                 .await
                 .expect("large-CLOB fixture installation failed");
@@ -249,6 +260,7 @@ mod live {
                     .as_ref()
                     .map_or(0, |xml| xml.chars().count())
             );
+            drop_large_package_fixture(&cx, &thin).await;
         });
     }
 }

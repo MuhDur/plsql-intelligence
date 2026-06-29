@@ -13,8 +13,9 @@ use crate::connections::ConnectionRegistry;
 use crate::safety::SafetyProfile;
 use crate::tools::ToolRegistry;
 
-pub const ORACLEMCP_STACK_VERSION: &str = "0.4.0";
-pub const RUST_ORACLEDB_STACK_VERSION: &str = "0.5.0";
+pub const ORACLEMCP_STACK_VERSION: &str = "0.4.1";
+/// Active driver version reached through `oraclemcp-db 0.4.1`.
+pub const RUST_ORACLEDB_STACK_VERSION: &str = "0.5.1";
 
 /// Top-level doctor report.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -326,6 +327,18 @@ pub fn known_upstream_gaps() -> Vec<UpstreamGap> {
             ),
         },
         UpstreamGap {
+            id: String::from("RUST_ORACLEDB_CONNECTION_RESILIENCY"),
+            repository: String::from("MuhDur/rust-oracledb"),
+            issue_url: String::from("https://github.com/MuhDur/rust-oracledb/issues/14"),
+            title: String::from(
+                "Thin connection resiliency: EXPIRE_TIME keepalive and timeout semantics",
+            ),
+            status: String::from("open"),
+            impact: String::from(
+                "plsql-mcp live calls still need driver-owned steady-state keepalive/dead-connection detection; v0.5.1 partially fixed bounded connect timeout behavior.",
+            ),
+        },
+        UpstreamGap {
             id: String::from("ORACLEMCP_ROUTINE_OUT_INOUT"),
             repository: String::from("MuhDur/oraclemcp"),
             issue_url: String::from("https://github.com/MuhDur/oraclemcp/issues/2"),
@@ -348,13 +361,15 @@ pub fn known_upstream_gaps() -> Vec<UpstreamGap> {
             ),
         },
         UpstreamGap {
-            id: String::from("ORACLEMCP_TIMEOUT_CANCELLATION"),
+            id: String::from("ORACLEMCP_TRIO_STACK_DOCTOR_HANDOFF"),
             repository: String::from("MuhDur/oraclemcp"),
-            issue_url: String::from("https://github.com/MuhDur/oraclemcp/issues/4"),
-            title: String::from("Thin live query can hang after Oracle TNS timeout / CLOSE-WAIT"),
+            issue_url: String::from("https://github.com/MuhDur/oraclemcp/issues/6"),
+            title: String::from(
+                "Carry plsql-mcp trio-stack doctor provenance into oraclemcp doctor",
+            ),
             status: String::from("open"),
             impact: String::from(
-                "Live plsql-mcp tests need adapter/driver calls to return typed timeout/cancellation errors instead of hanging indefinitely.",
+                "As oraclemcp becomes the MCP owner for PL/SQL intelligence, its doctor must carry stack versions and upstream gap ownership so agents file runtime work in the right repository.",
             ),
         },
     ]
@@ -842,7 +857,7 @@ fn describe_oracle_backend(live_db_feature_enabled: bool) -> OracleConnectionBac
         name: String::from("oraclemcp-db"),
         compiled_in: true,
         notes: String::from(
-            "oraclemcp-db 0.4.0 thin backend over oracledb; no Oracle Instant Client required for the normal live-DB path.",
+            "oraclemcp-db 0.4.1 thin backend over oracledb 0.5.1; no Oracle Instant Client required for the normal live-DB path.",
         ),
     }
 }
@@ -1097,9 +1112,10 @@ mod tests {
         );
         for expected in [
             "RUST_ORACLEDB_ROUTINE_CALL_API",
+            "RUST_ORACLEDB_CONNECTION_RESILIENCY",
             "ORACLEMCP_ROUTINE_OUT_INOUT",
             "ORACLEMCP_CATALOG_NONLOSSY_VALUES",
-            "ORACLEMCP_TIMEOUT_CANCELLATION",
+            "ORACLEMCP_TRIO_STACK_DOCTOR_HANDOFF",
         ] {
             assert!(
                 report
