@@ -19,6 +19,7 @@ env:
   # Public binaries (i.e., those intended for end users). Internal-only
   # dev tools like `plan-lint` and `corpus-license-check` stay out of the
   # release archive.
+  RELEASE_PACKAGES: "plsql-depgraph plsql-mcp plsql-cicd"
   RELEASE_BINS: "plsql-depgraph plsql-mcp plsql"
 
 jobs:
@@ -68,6 +69,9 @@ jobs:
           # (plan-lint, corpus-license-check) stay out of the release
           # path so a cross-compile failure there can't block a release.
           args=""
+          for package in $RELEASE_PACKAGES; do
+            args="$args -p $package"
+          done
           for bin in $RELEASE_BINS; do
             args="$args --bin $bin"
           done
@@ -78,6 +82,9 @@ jobs:
         run: |
           set -euo pipefail
           args=""
+          for package in $RELEASE_PACKAGES; do
+            args="$args -p $package"
+          done
           for bin in $RELEASE_BINS; do
             args="$args --bin $bin"
           done
