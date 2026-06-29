@@ -4359,7 +4359,7 @@ pub enum CatalogObject {
 
 #[cfg(test)]
 mod builder_tests {
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
     use plsql_core::AnalysisProfile;
 
     use crate::{
@@ -4376,11 +4376,22 @@ mod builder_tests {
         row
     }
 
+    fn fixed_generated_at() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-06-29T00:00:00Z")
+            .expect("fixed timestamp")
+            .with_timezone(&Utc)
+    }
+
     fn builder() -> CatalogSnapshotBuilder {
         CatalogSnapshotBuilder::new(
             AnalysisProfile::default(),
             CatalogCapabilities {
+                can_query_all_views: true,
+                can_query_dba_views: true,
+                can_use_dbms_metadata: true,
+                can_read_source: true,
                 plscope_enabled: true,
+                can_query_scheduler: true,
                 can_query_roles_and_grants: true,
                 ..CatalogCapabilities::default()
             },
@@ -4389,15 +4400,13 @@ mod builder_tests {
                 description: Some(String::from("synthetic external extractor")),
                 ..CatalogSource::default()
             },
-            Utc::now(),
+            fixed_generated_at(),
         )
     }
 
-    #[test]
-    fn catalog_snapshot_builder_applies_synthetic_dictionary_rows_on_stable()
-    -> Result<(), crate::CatalogError> {
-        let mut builder = builder();
-
+    fn apply_synthetic_builder_rows(
+        builder: &mut CatalogSnapshotBuilder,
+    ) -> Result<(), crate::CatalogError> {
         builder.apply_row(
             CatalogRowSet::Objects,
             &oracle_row(&[
@@ -4458,6 +4467,14 @@ mod builder_tests {
                 ("COL", "NUMBER", Some("12")),
             ]),
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_snapshot_builder_applies_synthetic_dictionary_rows_on_stable()
+    -> Result<(), crate::CatalogError> {
+        let mut builder = builder();
+        apply_synthetic_builder_rows(&mut builder)?;
 
         let snapshot = builder.finish()?;
         let report = snapshot.doctor_report();
@@ -4492,6 +4509,20 @@ mod builder_tests {
                 .sum::<usize>(),
             1
         );
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_snapshot_builder_doctor_report_matches_golden() -> Result<(), crate::CatalogError> {
+        let mut builder = builder();
+        apply_synthetic_builder_rows(&mut builder)?;
+
+        let actual = serde_json::to_value(builder.finish()?.doctor_report())?;
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/golden/catalog_snapshot_builder_doctor_report.json"
+        ))?;
+
+        assert_eq!(actual, expected);
         Ok(())
     }
 

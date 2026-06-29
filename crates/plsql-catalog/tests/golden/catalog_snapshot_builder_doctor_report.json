@@ -1,0 +1,40 @@
+{
+  "source_description": "synthetic external extractor",
+  "source_kind": "LiveConnection",
+  "generated_at": "2026-06-29T00:00:00Z",
+  "totals": {
+    "schemas_observed": 1,
+    "objects_total": 1,
+    "columns_total": 1,
+    "indexes_total": 0,
+    "constraints_total": 0,
+    "triggers_total": 0,
+    "synonyms_total": 0,
+    "grants_total": 1,
+    "dependencies_total": 0
+  },
+  "object_counts": [
+    {
+      "object_type": "Table",
+      "total": 1,
+      "valid": 1,
+      "invalid": 0,
+      "other": 0
+    }
+  ],
+  "capability_warnings": [],
+  "missing_permissions": [],
+  "plscope_availability_per_schema": [
+    {
+      "schema_name": "BILLING",
+      "availability": "IdentifiersAndStatements"
+    }
+  ],
+  "can_query_dba_views": true,
+  "can_query_all_views": true,
+  "can_use_dbms_metadata": true,
+  "can_read_source": true,
+  "plscope_enabled": true,
+  "can_query_scheduler": true,
+  "can_query_roles_and_grants": true
+}
