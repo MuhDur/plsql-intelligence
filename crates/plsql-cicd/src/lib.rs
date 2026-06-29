@@ -28,6 +28,7 @@ pub mod inspector;
 pub mod plan;
 pub mod post_pr_comment;
 pub mod predict;
+#[cfg(feature = "live-xe")]
 pub mod verify;
 
 // Re-export the post-pr-comment library (PLSQL-CICD-015 / oracle-0ean)
@@ -42,7 +43,9 @@ pub use gate::{
     GateDecision, GateError, GateFailure, GatePolicy, GatePolicySummary, MinConfidence, PrComment,
     PrCommentEnvelope, parse_policy, render_pr_comment, run_gate,
 };
-pub use inspector::{CicdOracleInspector, is_read_only_sql};
+#[cfg(feature = "live-xe")]
+pub use inspector::CicdOracleInspector;
+pub use inspector::is_read_only_sql;
 pub use plan::plan_changeset;
 pub use post_pr_comment::{
     Platform, PostPrCommentRequest, PrCommentCheck, PrCoordinates, PrIntegrationDoctorInputs,
@@ -55,6 +58,7 @@ pub use predict::{
     ChangeImpactRecompileItem, ChangeImpactSummary, ChangeImpactUncertainty, LineageObjectMetadata,
     change_impact_envelope, change_impact_payload, predict, predict_with_lineage,
 };
+#[cfg(feature = "live-xe")]
 pub use verify::{
     ScratchSchemaGuard, StatementOutcome, VerifyChangeset, VerifyError, VerifyOptions,
     VerifyReport, VerifyReportRow, VerifyStatement, create_scratch_schema, is_scratch_schema,

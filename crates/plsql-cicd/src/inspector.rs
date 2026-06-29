@@ -11,12 +11,15 @@
 //! and emit `CicdError::DisallowedWriteSqlInInspector` for any caller that
 //! passes a DDL/DML body.
 
+#[cfg(feature = "live-xe")]
 use asupersync::Cx;
+#[cfg(feature = "live-xe")]
 use plsql_catalog::{
     DbmsMetadataDdl, ObjectType, OracleBind, OracleConnection,
     fetch_dbms_metadata_ddl as catalog_fetch_dbms_metadata_ddl,
 };
 
+#[cfg(feature = "live-xe")]
 use crate::CicdError;
 
 /// A read-only inspector wrapped around an [`OracleConnection`]. All calls
@@ -29,11 +32,13 @@ use crate::CicdError;
 /// Direct DDL/DML through the inspector is rejected with
 /// [`CicdError::DisallowedWriteSqlInInspector`] — this is enforced at the
 /// helper boundary, not just by convention.
+#[cfg(feature = "live-xe")]
 pub struct CicdOracleInspector<'conn, C: OracleConnection> {
     cx: &'conn Cx,
     conn: &'conn C,
 }
 
+#[cfg(feature = "live-xe")]
 impl<'conn, C: OracleConnection> CicdOracleInspector<'conn, C> {
     /// Build a new inspector for an already-connected `conn`.
     pub fn new(cx: &'conn Cx, conn: &'conn C) -> Self {
@@ -127,7 +132,8 @@ pub fn is_read_only_sql(sql: &str) -> bool {
     matches!(token.as_str(), "SELECT" | "WITH")
 }
 
-fn preview_sql(sql: &str) -> String {
+#[must_use]
+pub fn preview_sql(sql: &str) -> String {
     let trimmed = sql.trim();
     let mut preview: String = trimmed.chars().take(72).collect();
     if trimmed.len() > 72 {
@@ -139,17 +145,22 @@ fn preview_sql(sql: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "live-xe")]
     use asupersync::{Cx, runtime::RuntimeBuilder};
+    #[cfg(feature = "live-xe")]
     use plsql_catalog::{
         OracleBackend, OracleBind, OracleConnection, OracleConnectionInfo, OracleRow,
     };
+    #[cfg(feature = "live-xe")]
     use std::future::Future;
 
+    #[cfg(feature = "live-xe")]
     #[derive(Default)]
     struct StubConn {
         rows: Vec<OracleRow>,
     }
 
+    #[cfg(feature = "live-xe")]
     #[async_trait::async_trait(?Send)]
     impl OracleConnection for StubConn {
         fn backend(&self) -> OracleBackend {
@@ -198,6 +209,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "live-xe")]
     fn run_inspector_future<F: Future>(future: F) -> F::Output {
         RuntimeBuilder::current_thread()
             .build()
@@ -229,6 +241,15 @@ mod tests {
     }
 
     #[test]
+    fn preview_sql_truncates_long_statements() {
+        let sql = format!("select {} from dual", "x".repeat(100));
+        let preview = preview_sql(&sql);
+        assert!(preview.len() < sql.len());
+        assert!(preview.ends_with('…'));
+    }
+
+    #[cfg(feature = "live-xe")]
+    #[test]
     fn inspector_query_rows_rejects_writes() {
         let stub = StubConn::default();
         let err = run_inspector_future(async {
@@ -243,6 +264,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "live-xe")]
     #[test]
     fn inspector_query_rows_accepts_selects() {
         let stub = StubConn::default();

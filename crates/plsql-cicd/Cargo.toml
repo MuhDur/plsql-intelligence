@@ -12,11 +12,11 @@ default = []
 ## Enable the live Oracle XE 23ai integration tests for `verify`
 ## (oracle-m941 / PLSQL-CICD-005). Requires the `plsql-intelligence-xe`
 ## container running at localhost:1521/FREEPDB1.
-live-xe = ["plsql-catalog/live-xe"]
+live-xe = ["dep:asupersync", "plsql-catalog/live-xe"]
 
 [dependencies]
 async-trait = "0.1"
-asupersync = "=0.3.4"
+asupersync = { version = "=0.3.4", optional = true }
 clap = { version = "4.5", features = ["derive"] }
 getrandom = "0.3"
 plsql-catalog = { path = "../plsql-catalog", version = "0.1.0" }
