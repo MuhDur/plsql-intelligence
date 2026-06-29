@@ -36,10 +36,10 @@ version = "=0.3.4"
 version = "0.1"
 
 [dependencies.oraclemcp-core]
-version = "=0.4.0"
+version = "=0.4.1"
 
 [dependencies.oraclemcp-db]
-version = "=0.4.0"
+version = "=0.4.1"
 
 [dependencies.serde_json]
 version = "1"

@@ -255,6 +255,48 @@ flag.
   in `lib.rs`, (d) re-solving the same Class D predicate problem. No benefit over fixing the
   current setup.
 
+#### 2026-06-29 D14 re-probe
+
+Bead `oracle-jfqh.11` re-checked the 0.5.x path after the offline-pivot plan
+made it an explicit non-blocking spike. The narrowest possible dependency
+change was tested first:
+
+```toml
+antlr-rust = { package = "antlr4rust", version = "0.5.2", optional = true }
+```
+
+That package alias keeps the existing generated `antlr_rust::...` imports
+resolvable, so the import-style issue above is not the first blocker. The
+actual blocker is a broad runtime/codegen API mismatch between the committed
+ANTLR 4.8 / Rust0.3 generated source and `antlr4rust` 0.5.2:
+
+- `Actions::sempred` now expects `i32` `rule_index` / `pred_index`, while the
+  generated lexer and parser emit `isize`.
+- `TokenSource` now requires `get_dfa_string`.
+- `ParserRuleContext::enter` / `exit` now return
+  `Result<(), antlr_rust::errors::ANTLRError>`, while the generated listener
+  glue returns `()`.
+- Token constants, parser states, `la(1)` results, `match_token`, and
+  `get_token` calls disagree across `isize` vs `i32` throughout the generated
+  parser.
+
+Reproduction:
+
+```bash
+CARGO_TARGET_DIR=target-offline-pivot cargo +stable check \
+  -p plsql-parser-antlr --features antlr-codegen
+```
+
+with the alias above emitted thousands of `E0053`, `E0046`, and `E0308`
+instances before the probe was manually interrupted after the failure classes
+were clear. Restoring `antlr-rust = "0.3.0-beta"` and rerunning the same check
+finished green in 54.22s.
+
+**D14 fallback applied:** keep `antlr-rust 0.3.0-beta` for the 0.7.0 offline
+pivot. A real `antlr4rust 0.5.x` migration should be a fresh parser-codegen
+upgrade bead that brings in the matching 4.13.2 Rust ANTLR tool, regenerates
+the committed source, and re-baselines conformance / never-panic / fuzz gates.
+
 ### git log evidence
 
 ```
