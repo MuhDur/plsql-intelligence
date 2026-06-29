@@ -59,6 +59,10 @@ PROXY_ARGS=()
 RELEASE_BINS=(plsql plsql-depgraph)
 DOWNLOADED_BINS=()
 DOWNLOADED_PATHS=()
+LOCK_DIR=""
+LOCK_HELD=0
+PATH_STATUS=""
+COMPLETIONS_STATUS=""
 
 usage() {
   cat <<'USAGE'
@@ -82,6 +86,7 @@ USAGE
 }
 
 cleanup() {
+  release_lock || true
   if [[ -n "${TEMP_DIR:-}" && -d "$TEMP_DIR" ]]; then
     rm -rf "$TEMP_DIR"
   fi
@@ -766,6 +771,270 @@ install_binaries() {
   write_install_marker
 }
 
+install_lock_dir() {
+  local safe_bin_dir
+
+  safe_bin_dir=$(printf '%s' "$BIN_DIR" | sed 's#[^A-Za-z0-9_.-]#_#g')
+  printf '%s/plsql-intelligence-install-%s.lock\n' "${TMPDIR:-/tmp}" "$safe_bin_dir"
+}
+
+process_is_alive() {
+  local pid="$1"
+
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" >/dev/null 2>&1
+}
+
+release_lock() {
+  [[ "$LOCK_HELD" -eq 1 && -n "$LOCK_DIR" ]] || return 0
+  rm -f "$LOCK_DIR/pid"
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+  LOCK_HELD=0
+}
+
+acquire_install_lock() {
+  local pid
+
+  LOCK_DIR=$(install_lock_dir)
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" > "$LOCK_DIR/pid"
+    LOCK_HELD=1
+    return 0
+  fi
+
+  if [[ -f "$LOCK_DIR/pid" ]]; then
+    pid=$(sed -n '1p' "$LOCK_DIR/pid")
+    if process_is_alive "$pid"; then
+      err "Another installer is running for $BIN_DIR (pid $pid)"
+      return 1
+    fi
+    warn "Removing stale installer lock for $BIN_DIR"
+    rm -f "$LOCK_DIR/pid"
+    if rmdir "$LOCK_DIR" 2>/dev/null && mkdir "$LOCK_DIR" 2>/dev/null; then
+      printf '%s\n' "$$" > "$LOCK_DIR/pid"
+      LOCK_HELD=1
+      return 0
+    fi
+  fi
+
+  err "Could not acquire installer lock: $LOCK_DIR"
+  return 1
+}
+
+available_kb_for_path() {
+  local path="$1"
+
+  while [[ ! -e "$path" && "$path" != "/" ]]; do
+    path=$(dirname "$path")
+  done
+  df -Pk "$path" 2>/dev/null | awk 'NR == 2 { print $4 }'
+}
+
+network_reachable() {
+  command -v curl >/dev/null 2>&1 || return 1
+  curl -fsSI \
+    "${PROXY_ARGS[@]}" \
+    --connect-timeout 5 \
+    --retry 1 \
+    -H "User-Agent: ${PROJECT_NAME}-installer" \
+    "$GITHUB_RELEASES_URL" >/dev/null 2>&1
+}
+
+version_line_for_binary() {
+  local binary="$1"
+
+  if [[ -x "$binary" ]]; then
+    "$binary" --version 2>/dev/null | sed -n '1p'
+  fi
+}
+
+report_existing_install() {
+  local bin path version
+
+  for bin in "${RELEASE_BINS[@]}"; do
+    path="$BIN_DIR/$bin$ASSET_EXT"
+    if [[ -x "$path" ]]; then
+      version=$(version_line_for_binary "$path")
+      if [[ -n "$version" ]]; then
+        info "Existing $bin: $version"
+      else
+        info "Existing $bin: present, version unavailable"
+      fi
+    else
+      info "Existing $bin: not installed"
+    fi
+  done
+}
+
+preflight_checks() {
+  local available_kb
+
+  info "Running preflight checks"
+  mkdir -p "$BIN_DIR" || {
+    err "Could not create install directory: $BIN_DIR"
+    return 1
+  }
+  [[ -w "$BIN_DIR" ]] || {
+    err "Install directory is not writable: $BIN_DIR"
+    return 1
+  }
+
+  available_kb=$(available_kb_for_path "$BIN_DIR")
+  if [[ -n "$available_kb" && "$available_kb" -lt 10240 ]]; then
+    err "At least 10 MB free space is required in $BIN_DIR"
+    return 1
+  fi
+  if [[ -n "$available_kb" ]]; then
+    info "Free space: $((available_kb / 1024)) MB"
+  else
+    warn "Could not determine free disk space for $BIN_DIR"
+  fi
+
+  if [[ -z "$OFFLINE_TARBALL" ]]; then
+    if network_reachable; then
+      info "Network: GitHub reachable"
+    else
+      warn "Network preflight could not reach GitHub; installer will continue and may fall back to source"
+    fi
+  else
+    info "Network: skipped for offline install"
+  fi
+
+  report_existing_install
+}
+
+path_has_bin_dir() {
+  case ":$PATH:" in
+    *":$BIN_DIR:"*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+append_path_to_rc() {
+  local rc_file="$1"
+  local line
+
+  line="export PATH=\"$BIN_DIR:\$PATH\""
+  touch "$rc_file"
+  if grep -Fxq "$line" "$rc_file"; then
+    return 0
+  fi
+  printf '\n%s\n' "$line" >> "$rc_file"
+}
+
+maybe_add_path() {
+  local updated=()
+  local rc_file
+
+  if path_has_bin_dir; then
+    PATH_STATUS="$BIN_DIR is already on PATH"
+    return 0
+  fi
+
+  if [[ "$EASY_MODE" -eq 1 ]]; then
+    for rc_file in "$HOME/.zshrc" "$HOME/.bashrc"; do
+      append_path_to_rc "$rc_file"
+      updated+=("$rc_file")
+    done
+    PATH_STATUS="PATH export added to shell rc files"
+    ok "Added PATH export to ${updated[*]}"
+  else
+    PATH_STATUS="$BIN_DIR is not on PATH"
+    warn "$PATH_STATUS; add: export PATH=\"$BIN_DIR:\$PATH\""
+  fi
+}
+
+completion_paths_for_shell() {
+  local shell_name="$1"
+  local data_home config_home
+
+  data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+  config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+  case "$shell_name" in
+    bash)
+      printf '%s/bash-completion/completions/plsql\n' "$data_home"
+      ;;
+    zsh)
+      printf '%s/zsh/site-functions/_plsql\n' "$data_home"
+      ;;
+    fish)
+      printf '%s/fish/completions/plsql.fish\n' "$config_home"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+install_completions() {
+  local plsql_bin="$BIN_DIR/plsql$ASSET_EXT"
+  local shell_name destination installed=()
+
+  [[ -x "$plsql_bin" ]] || {
+    COMPLETIONS_STATUS="skipped; plsql binary not found"
+    warn "Shell completions skipped; plsql binary not found"
+    return 0
+  }
+
+  if ! "$plsql_bin" completions bash >/dev/null 2>&1; then
+    COMPLETIONS_STATUS="not supported by installed plsql"
+    warn "Shell completions skipped; installed plsql has no completions subcommand"
+    return 0
+  fi
+
+  for shell_name in bash zsh fish; do
+    destination=$(completion_paths_for_shell "$shell_name")
+    mkdir -p "$(dirname "$destination")"
+    if "$plsql_bin" completions "$shell_name" > "$destination"; then
+      installed+=("$shell_name")
+    else
+      warn "Could not generate $shell_name completions"
+    fi
+  done
+
+  if [[ "${#installed[@]}" -gt 0 ]]; then
+    COMPLETIONS_STATUS="installed for ${installed[*]}"
+    ok "Shell completions $COMPLETIONS_STATUS"
+  else
+    COMPLETIONS_STATUS="not installed"
+  fi
+}
+
+summary_line_for_binary() {
+  local bin="$1"
+  local path="$BIN_DIR/$bin$ASSET_EXT"
+  local version
+
+  if [[ -x "$path" ]]; then
+    version=$(version_line_for_binary "$path")
+    if [[ -n "$version" ]]; then
+      printf '%s: %s\n' "$bin" "$version"
+      return 0
+    fi
+    printf '%s: installed\n' "$bin"
+    return 0
+  fi
+  printf '%s: missing\n' "$bin"
+}
+
+final_summary() {
+  local uninstall
+
+  [[ "$QUIET" -eq 0 ]] || return 0
+  uninstall="remove plsql, plsql-depgraph, .plsql-intelligence-install from bin dir"
+  draw_box "36" \
+    "Installed $(summary_line_for_binary plsql)" \
+    "Installed $(summary_line_for_binary plsql-depgraph)" \
+    "Bin dir: $BIN_DIR" \
+    "PATH: ${PATH_STATUS:-not checked}" \
+    "Completions: ${COMPLETIONS_STATUS:-not checked}" \
+    "Uninstall: $uninstall"
+}
+
 create_temp_dir() {
   local temp_parent
   temp_parent="${TMPDIR:-/tmp}"
@@ -810,9 +1079,14 @@ main() {
   detect_platform
   resolve_version
   create_temp_dir
+  acquire_install_lock
   show_header
+  preflight_checks
   print_plan
   install_binaries
+  maybe_add_path
+  install_completions
+  final_summary
   ok "Installation complete"
 }
 
