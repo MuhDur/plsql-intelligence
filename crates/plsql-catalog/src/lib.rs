@@ -292,6 +292,248 @@ impl CatalogSnapshot {
     }
 }
 
+/// Dictionary row family accepted by [`CatalogSnapshotBuilder`].
+///
+/// Each variant corresponds to one Oracle dictionary query shape used by the
+/// live extractor. The enum is intentionally stable and DB-free so
+/// `oraclemcp` can own live querying while this crate owns row normalization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum CatalogRowSet {
+    Objects,
+    Columns,
+    Constraints,
+    Indexes,
+    Triggers,
+    Synonyms,
+    Routines,
+    RoutineArguments,
+    Views,
+    MaterializedViews,
+    Sequences,
+    TypeAttributes,
+    Users,
+    Grants,
+    DatabaseLinks,
+    TableComments,
+    ColumnComments,
+    Editions,
+    EditioningViews,
+    VpdPolicies,
+    Dependencies,
+    PlScopeAvailability,
+    PlScopeIdentifiers,
+}
+
+impl CatalogRowSet {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Objects => "objects",
+            Self::Columns => "columns",
+            Self::Constraints => "constraints",
+            Self::Indexes => "indexes",
+            Self::Triggers => "triggers",
+            Self::Synonyms => "synonyms",
+            Self::Routines => "routines",
+            Self::RoutineArguments => "routine_arguments",
+            Self::Views => "views",
+            Self::MaterializedViews => "materialized_views",
+            Self::Sequences => "sequences",
+            Self::TypeAttributes => "type_attributes",
+            Self::Users => "users",
+            Self::Grants => "grants",
+            Self::DatabaseLinks => "database_links",
+            Self::TableComments => "table_comments",
+            Self::ColumnComments => "column_comments",
+            Self::Editions => "editions",
+            Self::EditioningViews => "editioning_views",
+            Self::VpdPolicies => "vpd_policies",
+            Self::Dependencies => "dependencies",
+            Self::PlScopeAvailability => "plscope_availability",
+            Self::PlScopeIdentifiers => "plscope_identifiers",
+        }
+    }
+}
+
+/// Stable, offline builder for Oracle dictionary rows.
+///
+/// The builder accepts already-fetched [`OracleRow`] values and applies the
+/// same normalization used by the live loader. It performs no network or
+/// database I/O; callers such as `oraclemcp` own extraction and feed rows into
+/// this crate through [`CatalogRowSet`].
+///
+/// ```
+/// use chrono::Utc;
+/// use plsql_catalog::{
+///     CatalogCapabilities, CatalogRowSet, CatalogSnapshotBuilder, CatalogSource,
+///     CatalogSourceKind, ObjectType, OracleRow,
+/// };
+/// use plsql_core::AnalysisProfile;
+///
+/// fn row(columns: &[(&str, &str, Option<&str>)]) -> OracleRow {
+///     let mut row = OracleRow::default();
+///     for (name, oracle_type, value) in columns {
+///         row.insert(*name, *oracle_type, value.map(String::from));
+///     }
+///     row
+/// }
+///
+/// let mut builder = CatalogSnapshotBuilder::new(
+///     AnalysisProfile::default(),
+///     CatalogCapabilities::default(),
+///     CatalogSource {
+///         kind: CatalogSourceKind::LiveConnection,
+///         description: Some("synthetic rows from an external extractor".to_string()),
+///         ..CatalogSource::default()
+///     },
+///     Utc::now(),
+/// );
+///
+/// builder.apply_row(
+///     CatalogRowSet::Objects,
+///     &row(&[
+///         ("OWNER", "VARCHAR2(128)", Some("BILLING")),
+///         ("OBJECT_NAME", "VARCHAR2(128)", Some("INVOICES")),
+///         ("OBJECT_TYPE", "VARCHAR2(30)", Some("TABLE")),
+///         ("STATUS", "VARCHAR2(7)", Some("VALID")),
+///     ]),
+/// )?;
+///
+/// let snapshot = builder.finish()?;
+/// let report = snapshot.doctor_report();
+/// assert_eq!(report.totals.schemas_observed, 1);
+/// assert_eq!(
+///     report.object_counts.first().map(|count| count.object_type),
+///     Some(ObjectType::Table),
+/// );
+/// # Ok::<(), plsql_catalog::CatalogError>(())
+/// ```
+pub struct CatalogSnapshotBuilder {
+    snapshot: CatalogSnapshot,
+    routines: HashMap<RoutineLocator, RoutineAccumulator>,
+    plscope_tallies: HashMap<SchemaName, PlScopeTally>,
+}
+
+impl CatalogSnapshotBuilder {
+    #[must_use]
+    #[instrument(level = "trace", skip(profile, capabilities, source))]
+    pub fn new(
+        profile: AnalysisProfile,
+        capabilities: CatalogCapabilities,
+        source: CatalogSource,
+        generated_at: DateTime<Utc>,
+    ) -> Self {
+        Self::from_snapshot(CatalogSnapshot::new(
+            profile,
+            capabilities,
+            source,
+            generated_at,
+        ))
+    }
+
+    #[must_use]
+    #[instrument(level = "trace", skip(snapshot))]
+    pub fn from_snapshot(snapshot: CatalogSnapshot) -> Self {
+        Self {
+            snapshot,
+            routines: HashMap::new(),
+            plscope_tallies: HashMap::new(),
+        }
+    }
+
+    #[must_use]
+    #[instrument(level = "trace", skip(self))]
+    pub fn snapshot(&self) -> &CatalogSnapshot {
+        &self.snapshot
+    }
+
+    #[must_use]
+    #[instrument(level = "trace", skip(self))]
+    pub fn snapshot_mut(&mut self) -> &mut CatalogSnapshot {
+        &mut self.snapshot
+    }
+
+    #[instrument(level = "trace", skip(self, row), fields(row_set = row_set.as_str()))]
+    pub fn apply_row(
+        &mut self,
+        row_set: CatalogRowSet,
+        row: &OracleRow,
+    ) -> Result<&mut Self, CatalogError> {
+        match row_set {
+            CatalogRowSet::Objects => apply_object_row(&mut self.snapshot, row)?,
+            CatalogRowSet::Columns => apply_column_row(&mut self.snapshot, row)?,
+            CatalogRowSet::Constraints => apply_constraint_row(&mut self.snapshot, row)?,
+            CatalogRowSet::Indexes => apply_index_row(&mut self.snapshot, row)?,
+            CatalogRowSet::Triggers => apply_trigger_row(&mut self.snapshot, row)?,
+            CatalogRowSet::Synonyms => apply_synonym_row(&mut self.snapshot, row)?,
+            CatalogRowSet::Routines => {
+                apply_routine_row(&mut self.snapshot, row, &mut self.routines)?;
+            }
+            CatalogRowSet::RoutineArguments => {
+                apply_argument_row(&mut self.snapshot, row, &mut self.routines)?;
+            }
+            CatalogRowSet::Views => apply_view_row(&mut self.snapshot, row)?,
+            CatalogRowSet::MaterializedViews => apply_mview_row(&mut self.snapshot, row)?,
+            CatalogRowSet::Sequences => apply_sequence_row(&mut self.snapshot, row)?,
+            CatalogRowSet::TypeAttributes => apply_type_attr_row(&mut self.snapshot, row)?,
+            CatalogRowSet::Users => apply_user_row(&mut self.snapshot, row)?,
+            CatalogRowSet::Grants => apply_grant_row(&mut self.snapshot, row)?,
+            CatalogRowSet::DatabaseLinks => apply_db_link_row(&mut self.snapshot, row)?,
+            CatalogRowSet::TableComments => apply_table_comment_row(&mut self.snapshot, row)?,
+            CatalogRowSet::ColumnComments => apply_column_comment_row(&mut self.snapshot, row)?,
+            CatalogRowSet::Editions => apply_edition_row(&mut self.snapshot, row)?,
+            CatalogRowSet::EditioningViews => apply_editioning_view_row(&mut self.snapshot, row)?,
+            CatalogRowSet::VpdPolicies => apply_vpd_policy_row(&mut self.snapshot, row)?,
+            CatalogRowSet::Dependencies => apply_dependency_row(&mut self.snapshot, row)?,
+            CatalogRowSet::PlScopeAvailability => {
+                apply_plscope_availability_row(&mut self.snapshot, row, &mut self.plscope_tallies)?;
+            }
+            CatalogRowSet::PlScopeIdentifiers => {
+                apply_plscope_identifier_row(&mut self.snapshot, row)?;
+            }
+        }
+        Ok(self)
+    }
+
+    #[instrument(level = "trace", skip(self, rows), fields(row_set = row_set.as_str()))]
+    pub fn apply_rows<'a, I>(
+        &mut self,
+        row_set: CatalogRowSet,
+        rows: I,
+    ) -> Result<&mut Self, CatalogError>
+    where
+        I: IntoIterator<Item = &'a OracleRow>,
+    {
+        if row_set.eq(&CatalogRowSet::Users) {
+            self.snapshot.known_users.get_or_insert_with(HashSet::new);
+        }
+        for row in rows {
+            self.apply_row(row_set, row)?;
+        }
+        Ok(self)
+    }
+
+    #[instrument(level = "trace", skip(self))]
+    pub fn finish(mut self) -> Result<CatalogSnapshot, CatalogError> {
+        let routines = std::mem::take(&mut self.routines);
+        finalize_routines(&mut self.snapshot, routines)?;
+        let plscope_tallies = std::mem::take(&mut self.plscope_tallies);
+        finalize_plscope_availability(&mut self.snapshot, plscope_tallies);
+        Ok(self.snapshot)
+    }
+}
+
+impl Default for CatalogSnapshotBuilder {
+    fn default() -> Self {
+        Self::new(
+            AnalysisProfile::default(),
+            CatalogCapabilities::default(),
+            CatalogSource::default(),
+            Utc::now(),
+        )
+    }
+}
+
 pub const CATALOG_SNAPSHOT_SCHEMA_ID: &str = "plsql.catalog.snapshot";
 pub const CATALOG_SNAPSHOT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 1, 0);
 
@@ -1577,14 +1819,12 @@ struct Segment {
     quoted: bool,
 }
 
-#[cfg(feature = "oraclemcp-db")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 enum RoutineKind {
     Procedure,
     Function,
 }
 
-#[cfg(feature = "oraclemcp-db")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 struct RoutineLocator {
     owner: SchemaName,
@@ -1594,13 +1834,19 @@ struct RoutineLocator {
     overload: Option<u32>,
 }
 
-#[cfg(feature = "oraclemcp-db")]
 #[derive(Clone, Debug, Default)]
 struct RoutineAccumulator {
     signature: Option<RoutineSignature>,
     kind_hint: Option<RoutineKind>,
     deterministic: bool,
     pipelined: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PlScopeTally {
+    total: usize,
+    with_identifiers: usize,
+    with_statements: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -1765,7 +2011,6 @@ fn oracle_bind_placeholders(count: usize, start_index: usize) -> String {
         .join(", ")
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn hash_text(text: &str) -> Hash {
     use sha2::{Digest as _, Sha256};
     let mut hasher = Sha256::new();
@@ -1792,7 +2037,6 @@ fn schema_filter_params(schema_names: &[String]) -> Vec<OracleBind> {
         .collect::<Vec<_>>()
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn apply_object_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<(), CatalogError> {
     let owner_text = row.require_text("OWNER")?;
     let object_name_text = row.require_text("OBJECT_NAME")?;
@@ -1861,7 +2105,6 @@ fn apply_object_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<(
     Ok(())
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn apply_dependency_row(
     snapshot: &mut CatalogSnapshot,
     row: &OracleRow,
@@ -1929,7 +2172,6 @@ fn apply_dependency_row(
     Ok(())
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn parse_dictionary_timestamp(text: &str) -> Option<DateTime<Utc>> {
     // Expected shape from the loader query: `YYYY-MM-DD"T"HH24:MI:SS`.
     chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S")
@@ -1937,7 +2179,6 @@ fn parse_dictionary_timestamp(text: &str) -> Option<DateTime<Utc>> {
         .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn catalog_dependency_kind_from_dictionary_value(text: &str) -> CatalogDependencyKind {
     match text.to_ascii_uppercase().as_str() {
         "HARD" => CatalogDependencyKind::Hard,
@@ -1947,7 +2188,6 @@ fn catalog_dependency_kind_from_dictionary_value(text: &str) -> CatalogDependenc
     }
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn apply_column_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<(), CatalogError> {
     let owner_text = row.require_text("OWNER")?;
     let table_name_text = row.require_text("TABLE_NAME")?;
@@ -2031,7 +2271,6 @@ fn apply_column_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<(
     Ok(())
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn apply_constraint_row(
     snapshot: &mut CatalogSnapshot,
     row: &OracleRow,
@@ -2151,7 +2390,6 @@ fn apply_constraint_row(
     Ok(())
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn apply_index_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<(), CatalogError> {
     let owner_text = row.require_text("OWNER")?;
     let index_name_text = row.require_text("INDEX_NAME")?;
@@ -2236,7 +2474,6 @@ fn apply_index_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<()
     Ok(())
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn apply_trigger_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<(), CatalogError> {
     let owner_text = row.require_text("OWNER")?;
     let trigger_name_text = row.require_text("TRIGGER_NAME")?;
@@ -2320,7 +2557,6 @@ fn apply_trigger_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<
     Ok(())
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn apply_synonym_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<(), CatalogError> {
     let owner_text = row.require_text("OWNER")?;
     let synonym_name_text = row.require_text("SYNONYM_NAME")?;
@@ -2373,7 +2609,6 @@ fn apply_synonym_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<
     Ok(())
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn apply_view_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<(), CatalogError> {
     let owner_text = row.require_text("OWNER")?;
     let view_name_text = row.require_text("VIEW_NAME")?;
@@ -2411,7 +2646,6 @@ fn apply_view_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<(),
     Ok(())
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn apply_mview_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<(), CatalogError> {
     let owner_text = row.require_text("OWNER")?;
     let mview_name_text = row.require_text("MVIEW_NAME")?;
@@ -2451,7 +2685,6 @@ fn apply_mview_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<()
     Ok(())
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn apply_sequence_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<(), CatalogError> {
     let owner_text = row.require_text("SEQUENCE_OWNER")?;
     let sequence_name_text = row.require_text("SEQUENCE_NAME")?;
@@ -2503,7 +2736,6 @@ fn apply_sequence_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result
     Ok(())
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn apply_type_attr_row(
     snapshot: &mut CatalogSnapshot,
     row: &OracleRow,
@@ -2591,7 +2823,6 @@ fn apply_type_attr_row(
 /// owning schema entry exists (lazily creates it) so a `PUBLIC` row
 /// lands even when no other catalog object has been recorded for that
 /// synthetic schema.
-#[cfg(feature = "oraclemcp-db")]
 fn apply_db_link_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<(), CatalogError> {
     let owner_text = row.require_text("OWNER")?;
     let link_name_text = row.require_text("DB_LINK")?;
@@ -2619,7 +2850,6 @@ fn apply_db_link_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<
 }
 
 /// Apply a single `ALL_POLICIES` row.
-#[cfg(feature = "oraclemcp-db")]
 fn apply_vpd_policy_row(
     snapshot: &mut CatalogSnapshot,
     row: &OracleRow,
@@ -2680,7 +2910,6 @@ fn apply_vpd_policy_row(
 }
 
 /// Apply a single `ALL_EDITIONS` row.
-#[cfg(feature = "oraclemcp-db")]
 fn apply_edition_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<(), CatalogError> {
     let edition_name = row.require_text("EDITION_NAME")?.to_string();
     let parent_edition_name = optional_nonblank_text(row, "PARENT_EDITION_NAME").map(String::from);
@@ -2697,7 +2926,6 @@ fn apply_edition_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<
 }
 
 /// Apply a single `ALL_EDITIONING_VIEWS` row.
-#[cfg(feature = "oraclemcp-db")]
 fn apply_editioning_view_row(
     snapshot: &mut CatalogSnapshot,
     row: &OracleRow,
@@ -2738,7 +2966,6 @@ fn apply_editioning_view_row(
 }
 
 /// Apply a single `ALL_TAB_COMMENTS` row into the snapshot.
-#[cfg(feature = "oraclemcp-db")]
 fn apply_table_comment_row(
     snapshot: &mut CatalogSnapshot,
     row: &OracleRow,
@@ -2774,7 +3001,6 @@ fn apply_table_comment_row(
 }
 
 /// Apply a single `ALL_COL_COMMENTS` row into the snapshot.
-#[cfg(feature = "oraclemcp-db")]
 fn apply_column_comment_row(
     snapshot: &mut CatalogSnapshot,
     row: &OracleRow,
@@ -2816,7 +3042,121 @@ fn apply_column_comment_row(
     Ok(())
 }
 
-#[cfg(feature = "oraclemcp-db")]
+fn apply_user_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<(), CatalogError> {
+    let username = row.require_text("USERNAME")?;
+    let Some(user) = snapshot.intern_user_name(username) else {
+        return Err(CatalogError::InvalidColumnValue {
+            column: String::from("USERNAME"),
+            expected: "interned user name",
+            value: String::from(username),
+        });
+    };
+    snapshot
+        .known_users
+        .get_or_insert_with(HashSet::new)
+        .insert(user);
+    Ok(())
+}
+
+fn apply_plscope_availability_row(
+    snapshot: &mut CatalogSnapshot,
+    row: &OracleRow,
+    tallies: &mut HashMap<SchemaName, PlScopeTally>,
+) -> Result<(), CatalogError> {
+    let Some(owner_text) = optional_nonblank_text(row, "OWNER") else {
+        return Ok(());
+    };
+    let settings = row
+        .text("PLSCOPE_SETTINGS")
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    let Some(owner) = snapshot.intern_schema_name(owner_text) else {
+        return Ok(());
+    };
+    let tally = tallies.entry(owner).or_default();
+    tally.total = tally.total.saturating_add(1);
+    if settings.contains("STATEMENTS:") && !settings.contains("STATEMENTS:NONE") {
+        tally.with_statements = tally.with_statements.saturating_add(1);
+    }
+    if settings.contains("IDENTIFIERS:") && !settings.contains("IDENTIFIERS:NONE") {
+        tally.with_identifiers = tally.with_identifiers.saturating_add(1);
+    }
+    Ok(())
+}
+
+fn finalize_plscope_availability(
+    snapshot: &mut CatalogSnapshot,
+    tallies: HashMap<SchemaName, PlScopeTally>,
+) {
+    for (owner, tally) in tallies {
+        let availability = if tally.with_statements > 0 {
+            PlScopeAvailability::IdentifiersAndStatements
+        } else if tally.with_identifiers > 0 {
+            PlScopeAvailability::IdentifiersOnly
+        } else if tally.total > 0 {
+            PlScopeAvailability::AvailableButStale
+        } else {
+            PlScopeAvailability::NotAvailable
+        };
+        let schema_catalog = snapshot.schemas.entry(owner).or_default();
+        let plscope = schema_catalog
+            .plscope
+            .get_or_insert_with(PlScopeSnapshot::default);
+        plscope.availability = availability;
+        plscope.collected_at = Some(snapshot.generated_at);
+    }
+}
+
+fn apply_plscope_identifier_row(
+    snapshot: &mut CatalogSnapshot,
+    row: &OracleRow,
+) -> Result<(), CatalogError> {
+    let Some(owner_text) = optional_nonblank_text(row, "OWNER") else {
+        return Ok(());
+    };
+    let Some(object_name_text) = optional_nonblank_text(row, "OBJECT_NAME") else {
+        return Ok(());
+    };
+    let Some(identifier_name_text) = optional_nonblank_text(row, "NAME") else {
+        return Ok(());
+    };
+    let Some(owner) = snapshot.intern_schema_name(owner_text) else {
+        return Ok(());
+    };
+    let Some(object_name) = snapshot.intern_object_name(object_name_text) else {
+        return Ok(());
+    };
+    let Some(identifier_name) = snapshot.intern_member_name(identifier_name_text) else {
+        return Ok(());
+    };
+    let identifier = CompilerIdentifier {
+        owner,
+        object_name,
+        identifier_name,
+        identifier_type: optional_nonblank_text(row, "TYPE")
+            .map(String::from)
+            .unwrap_or_default(),
+        usage: optional_nonblank_text(row, "USAGE")
+            .map(String::from)
+            .unwrap_or_default(),
+        line: optional_u32(row, "LINE")?.unwrap_or(0),
+        column: optional_u32(row, "COL")?.unwrap_or(0),
+    };
+
+    let plscope = snapshot
+        .schemas
+        .entry(owner)
+        .or_default()
+        .plscope
+        .get_or_insert_with(|| PlScopeSnapshot {
+            availability: PlScopeAvailability::IdentifiersOnly,
+            collected_at: Some(snapshot.generated_at),
+            ..PlScopeSnapshot::default()
+        });
+    plscope.identifiers.push(identifier);
+    Ok(())
+}
+
 fn apply_grant_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<(), CatalogError> {
     let owner_text = row.require_text("TABLE_SCHEMA")?;
     let object_name_text = row.require_text("TABLE_NAME")?;
@@ -2889,7 +3229,6 @@ fn apply_grant_row(snapshot: &mut CatalogSnapshot, row: &OracleRow) -> Result<()
 ///   high-confidence direct user grant (a fail-toward-permissive result in
 ///   a privilege/SAST product); treating it as a role routes it through the
 ///   runtime-ambiguity downgrade instead of over-claiming certainty.
-#[cfg(feature = "oraclemcp-db")]
 fn grantee_from_dictionary_value(
     snapshot: &mut CatalogSnapshot,
     text: &str,
@@ -2915,7 +3254,6 @@ fn grantee_from_dictionary_value(
     }
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn grant_privilege_from_dictionary_value(text: &str) -> GrantPrivilege {
     match text.to_ascii_uppercase().as_str() {
         "SELECT" => GrantPrivilege::Select,
@@ -2931,7 +3269,6 @@ fn grant_privilege_from_dictionary_value(text: &str) -> GrantPrivilege {
     }
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn apply_routine_row(
     snapshot: &mut CatalogSnapshot,
     row: &OracleRow,
@@ -2957,7 +3294,6 @@ fn apply_routine_row(
     Ok(())
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn apply_argument_row(
     snapshot: &mut CatalogSnapshot,
     row: &OracleRow,
@@ -3002,7 +3338,6 @@ fn apply_argument_row(
     Ok(())
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn finalize_routines(
     snapshot: &mut CatalogSnapshot,
     routines: HashMap<RoutineLocator, RoutineAccumulator>,
@@ -3040,7 +3375,6 @@ fn finalize_routines(
     Ok(())
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn object_type_from_dictionary_value(text: &str) -> Option<ObjectType> {
     match text.trim().to_ascii_uppercase().as_str() {
         "TABLE" => Some(ObjectType::Table),
@@ -3057,7 +3391,6 @@ fn object_type_from_dictionary_value(text: &str) -> Option<ObjectType> {
     }
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn object_status_from_dictionary_value(text: &str) -> ObjectStatus {
     match text.trim().to_ascii_uppercase().as_str() {
         "VALID" => ObjectStatus::Valid,
@@ -3068,7 +3401,6 @@ fn object_status_from_dictionary_value(text: &str) -> ObjectStatus {
     }
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn routine_kind_from_dictionary_value(text: Option<&str>) -> Option<RoutineKind> {
     match text.map(|value| value.trim().to_ascii_uppercase()) {
         Some(value) if value.eq("FUNCTION") => Some(RoutineKind::Function),
@@ -3077,7 +3409,6 @@ fn routine_kind_from_dictionary_value(text: Option<&str>) -> Option<RoutineKind>
     }
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn constraint_type_from_dictionary_value(
     text: &str,
     search_condition: Option<&str>,
@@ -3108,7 +3439,6 @@ fn constraint_type_from_dictionary_value(
     }
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn trigger_timing_from_dictionary_value(text: &str) -> TriggerTiming {
     let normalized = text.trim().to_ascii_uppercase();
     if normalized.contains("INSTEAD OF") {
@@ -3122,7 +3452,6 @@ fn trigger_timing_from_dictionary_value(text: &str) -> TriggerTiming {
     }
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn trigger_level_from_dictionary_value(text: &str) -> TriggerLevel {
     let normalized = text.trim().to_ascii_uppercase();
     if normalized.contains("EACH ROW") {
@@ -3134,7 +3463,6 @@ fn trigger_level_from_dictionary_value(text: &str) -> TriggerLevel {
     }
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn trigger_events_from_dictionary_value(text: &str) -> Vec<TriggerEvent> {
     let normalized = text.trim().to_ascii_uppercase();
     let mut events = Vec::<TriggerEvent>::new();
@@ -3165,14 +3493,12 @@ fn trigger_events_from_dictionary_value(text: &str) -> Vec<TriggerEvent> {
     events
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn push_unique_column(columns: &mut Vec<ColumnName>, column_name: ColumnName) {
     if !columns.contains(&column_name) {
         columns.push(column_name);
     }
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn routine_locator_from_procedure_row(
     snapshot: &mut CatalogSnapshot,
     row: &OracleRow,
@@ -3219,7 +3545,6 @@ fn routine_locator_from_procedure_row(
     })
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn routine_locator_from_argument_row(
     snapshot: &mut CatalogSnapshot,
     row: &OracleRow,
@@ -3262,7 +3587,6 @@ fn routine_locator_from_argument_row(
     })
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn upsert_packaged_routine(
     snapshot: &mut CatalogSnapshot,
     owner: SchemaName,
@@ -3300,7 +3624,6 @@ fn upsert_packaged_routine(
     Ok(())
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn upsert_top_level_routine(
     snapshot: &mut CatalogSnapshot,
     owner: SchemaName,
@@ -3343,7 +3666,6 @@ fn upsert_top_level_routine(
     Ok(())
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn upsert_signature(signatures: &mut Vec<RoutineSignature>, signature: RoutineSignature) {
     if let Some(existing) = signatures.iter_mut().find(|candidate| {
         candidate.routine_name.eq(&signature.routine_name)
@@ -3355,7 +3677,6 @@ fn upsert_signature(signatures: &mut Vec<RoutineSignature>, signature: RoutineSi
     }
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn data_type_ref_from_argument_row(
     snapshot: &mut CatalogSnapshot,
     row: &OracleRow,
@@ -3385,7 +3706,6 @@ fn data_type_ref_from_argument_row(
     })
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn parameter_mode_from_dictionary_value(text: Option<&str>) -> ParameterMode {
     match text.map(|value| value.trim().to_ascii_uppercase()) {
         Some(value) if value.eq("OUT") => ParameterMode::Out,
@@ -3394,7 +3714,6 @@ fn parameter_mode_from_dictionary_value(text: Option<&str>) -> ParameterMode {
     }
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn blank_catalog_object(common: ObjectCommon) -> Option<CatalogObject> {
     match common.object_type {
         ObjectType::Table => Some(CatalogObject::Table(TableMetadata {
@@ -3447,7 +3766,6 @@ fn blank_catalog_object(common: ObjectCommon) -> Option<CatalogObject> {
     }
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn data_type_ref_from_row(
     snapshot: &mut CatalogSnapshot,
     row: &OracleRow,
@@ -3477,7 +3795,6 @@ fn data_type_ref_from_row(
     })
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn optional_bool(row: &OracleRow, column: &str) -> Result<Option<bool>, CatalogError> {
     match row.text(column) {
         Some(_) => row.parse_bool(column).map(Some),
@@ -3485,14 +3802,12 @@ fn optional_bool(row: &OracleRow, column: &str) -> Result<Option<bool>, CatalogE
     }
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn optional_nonblank_text<'a>(row: &'a OracleRow, column: &str) -> Option<&'a str> {
     row.text(column)
         .map(str::trim)
         .filter(|value| !value.is_empty())
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn optional_u32(row: &OracleRow, column: &str) -> Result<Option<u32>, CatalogError> {
     match row.text(column) {
         Some(_) => {
@@ -3509,7 +3824,6 @@ fn optional_u32(row: &OracleRow, column: &str) -> Result<Option<u32>, CatalogErr
     }
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn required_u32(row: &OracleRow, column: &str) -> Result<u32, CatalogError> {
     let parsed = row.parse_u64(column)?;
     u32::try_from(parsed).map_err(|_| CatalogError::InvalidColumnValue {
@@ -3519,7 +3833,6 @@ fn required_u32(row: &OracleRow, column: &str) -> Result<u32, CatalogError> {
     })
 }
 
-#[cfg(feature = "oraclemcp-db")]
 fn optional_i32(row: &OracleRow, column: &str) -> Result<Option<i32>, CatalogError> {
     match row.text(column) {
         Some(_) => {
@@ -4042,6 +4355,156 @@ pub enum CatalogObject {
     Trigger(TriggerMetadata),
     SchedulerJob(SchedulerJobMetadata),
     EditioningView(EditioningViewMetadata),
+}
+
+#[cfg(test)]
+mod builder_tests {
+    use chrono::Utc;
+    use plsql_core::AnalysisProfile;
+
+    use crate::{
+        CatalogCapabilities, CatalogRowSet, CatalogSnapshotBuilder, CatalogSource,
+        CatalogSourceKind, CatalogSourceKind::LiveConnection, GrantPrivilege, Grantee, ObjectType,
+        OracleRow, PlScopeAvailability,
+    };
+
+    fn oracle_row(columns: &[(&str, &str, Option<&str>)]) -> OracleRow {
+        let mut row = OracleRow::default();
+        for (name, oracle_type, value) in columns {
+            row.insert(*name, *oracle_type, value.map(String::from));
+        }
+        row
+    }
+
+    fn builder() -> CatalogSnapshotBuilder {
+        CatalogSnapshotBuilder::new(
+            AnalysisProfile::default(),
+            CatalogCapabilities {
+                plscope_enabled: true,
+                can_query_roles_and_grants: true,
+                ..CatalogCapabilities::default()
+            },
+            CatalogSource {
+                kind: LiveConnection,
+                description: Some(String::from("synthetic external extractor")),
+                ..CatalogSource::default()
+            },
+            Utc::now(),
+        )
+    }
+
+    #[test]
+    fn catalog_snapshot_builder_applies_synthetic_dictionary_rows_on_stable()
+    -> Result<(), crate::CatalogError> {
+        let mut builder = builder();
+
+        builder.apply_row(
+            CatalogRowSet::Objects,
+            &oracle_row(&[
+                ("OWNER", "VARCHAR2(128)", Some("BILLING")),
+                ("OBJECT_NAME", "VARCHAR2(128)", Some("INVOICES")),
+                ("OBJECT_TYPE", "VARCHAR2(30)", Some("TABLE")),
+                ("STATUS", "VARCHAR2(7)", Some("VALID")),
+            ]),
+        )?;
+        builder.apply_row(
+            CatalogRowSet::Columns,
+            &oracle_row(&[
+                ("OWNER", "VARCHAR2(128)", Some("BILLING")),
+                ("TABLE_NAME", "VARCHAR2(128)", Some("INVOICES")),
+                ("COLUMN_NAME", "VARCHAR2(128)", Some("INVOICE_ID")),
+                ("COLUMN_POSITION", "NUMBER", Some("1")),
+                ("DATA_TYPE", "VARCHAR2(30)", Some("NUMBER")),
+                ("DATA_PRECISION", "NUMBER", Some("10")),
+                ("DATA_SCALE", "NUMBER", Some("0")),
+                ("NULLABLE", "VARCHAR2(1)", Some("N")),
+            ]),
+        )?;
+        builder.apply_row(
+            CatalogRowSet::Users,
+            &oracle_row(&[("USERNAME", "VARCHAR2(128)", Some("APP_USER"))]),
+        )?;
+        builder.apply_row(
+            CatalogRowSet::Grants,
+            &oracle_row(&[
+                ("TABLE_SCHEMA", "VARCHAR2(128)", Some("BILLING")),
+                ("TABLE_NAME", "VARCHAR2(128)", Some("INVOICES")),
+                ("GRANTEE", "VARCHAR2(128)", Some("APP_USER")),
+                ("PRIVILEGE", "VARCHAR2(40)", Some("SELECT")),
+                ("GRANTABLE", "VARCHAR2(3)", Some("NO")),
+                ("HIERARCHY", "VARCHAR2(3)", Some("NO")),
+            ]),
+        )?;
+        builder.apply_row(
+            CatalogRowSet::PlScopeAvailability,
+            &oracle_row(&[
+                ("OWNER", "VARCHAR2(128)", Some("BILLING")),
+                (
+                    "PLSCOPE_SETTINGS",
+                    "VARCHAR2(4000)",
+                    Some("IDENTIFIERS:ALL, STATEMENTS:ALL"),
+                ),
+            ]),
+        )?;
+        builder.apply_row(
+            CatalogRowSet::PlScopeIdentifiers,
+            &oracle_row(&[
+                ("OWNER", "VARCHAR2(128)", Some("BILLING")),
+                ("OBJECT_NAME", "VARCHAR2(128)", Some("INVOICES_PKG")),
+                ("NAME", "VARCHAR2(128)", Some("INVOICE_ID")),
+                ("TYPE", "VARCHAR2(128)", Some("VARIABLE")),
+                ("USAGE", "VARCHAR2(128)", Some("DECLARATION")),
+                ("LINE", "NUMBER", Some("7")),
+                ("COL", "NUMBER", Some("12")),
+            ]),
+        )?;
+
+        let snapshot = builder.finish()?;
+        let report = snapshot.doctor_report();
+        assert_eq!(report.source_kind, CatalogSourceKind::LiveConnection);
+        assert_eq!(report.totals.schemas_observed, 1);
+        assert_eq!(report.totals.objects_total, 1);
+        assert_eq!(report.totals.columns_total, 1);
+        assert_eq!(report.totals.grants_total, 1);
+        assert_eq!(
+            report.object_counts.first().map(|count| count.object_type),
+            Some(ObjectType::Table)
+        );
+        assert_eq!(
+            report
+                .plscope_availability_per_schema
+                .first()
+                .map(|entry| entry.availability),
+            Some(PlScopeAvailability::IdentifiersAndStatements)
+        );
+        assert!(snapshot.schemas.values().any(|schema| {
+            schema.grants.iter().any(|grant| {
+                grant.privilege == GrantPrivilege::Select
+                    && matches!(grant.grantee, Grantee::User(_))
+            })
+        }));
+        assert_eq!(
+            snapshot
+                .schemas
+                .values()
+                .filter_map(|schema| schema.plscope.as_ref())
+                .map(|plscope| plscope.identifiers.len())
+                .sum::<usize>(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_snapshot_builder_can_mark_user_universe_known_empty()
+    -> Result<(), crate::CatalogError> {
+        let mut builder = builder();
+        let rows: Vec<OracleRow> = Vec::new();
+        builder.apply_rows(CatalogRowSet::Users, &rows)?;
+        let snapshot = builder.finish()?;
+        assert_eq!(snapshot.known_users, Some(Default::default()));
+        Ok(())
+    }
 }
 
 #[cfg(all(test, feature = "oraclemcp-db"))]
