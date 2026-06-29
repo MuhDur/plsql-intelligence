@@ -20,13 +20,25 @@ use plsql_cicd::{
 use plsql_core::{ObjectName, SchemaName, SymbolId, SymbolInterner};
 use plsql_lineage::LineageResult;
 use plsql_output::{RobotJsonEnvelope, SchemaDescriptor, SchemaVersion};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 const ERROR_ENVELOPE_SCHEMA: SchemaDescriptor = SchemaDescriptor {
     id: "plsql.cicd.error_envelope",
     version: SchemaVersion::new(1, 0, 0),
     description: "plsql CLI runtime error envelope",
+};
+
+const DOC_RENDER_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+    id: "plsql.doc.render",
+    version: SchemaVersion::new(1, 0, 0),
+    description: "plsql CLI documentation render payload",
+};
+
+const SAST_RENDER_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+    id: "plsql.sast.report",
+    version: SchemaVersion::new(1, 0, 0),
+    description: "plsql CLI SAST report render payload",
 };
 
 const CAPABILITIES_CONTRACT_VERSION: u32 = 1;
@@ -53,6 +65,10 @@ struct Cli {
 enum Command {
     /// Predict invalidations for a proposed PL/SQL changeset.
     Predict(PredictArgs),
+    /// Render or inspect a plsql-doc DocSet JSON artifact.
+    Doc(DocArgs),
+    /// Render or inspect a plsql-sast ScanReport JSON artifact.
+    Sast(SastArgs),
     /// Print a diagnostic report. With a changeset, includes changeset health.
     Doctor(DoctorArgs),
     /// Print the machine-readable agent contract as JSON.
@@ -122,6 +138,120 @@ struct DoctorArgs {
     /// Repository path used with --git-range.
     #[arg(long, value_name = "DIR", default_value = ".")]
     repo: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct DocArgs {
+    /// DocSet source JSON, either raw DocSet or a robot-json envelope whose
+    /// payload is a DocSet.
+    #[arg(value_name = "DOCSET_JSON")]
+    docset_source: PathBuf,
+    /// Render format.
+    #[arg(long, value_enum, default_value_t = DocFormatArg::Markdown)]
+    format: DocFormatArg,
+    /// Label used in generated index headings.
+    #[arg(long, value_name = "LABEL", default_value = "plsql")]
+    project_label: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum DocFormatArg {
+    #[default]
+    Markdown,
+    Html,
+    Json,
+    Doctor,
+}
+
+impl DocFormatArg {
+    const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Markdown => "markdown",
+            Self::Html => "html",
+            Self::Json => "json",
+            Self::Doctor => "doctor",
+        }
+    }
+
+    const fn media_type(self) -> &'static str {
+        match self {
+            Self::Markdown => "text/markdown",
+            Self::Html => "text/html",
+            Self::Json | Self::Doctor => "application/json",
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct SastArgs {
+    /// ScanReport source JSON, either raw ScanReport or a robot-json envelope
+    /// whose payload is a ScanReport.
+    #[arg(value_name = "SCAN_REPORT_JSON")]
+    scan_report_source: PathBuf,
+    /// Render format.
+    #[arg(long, value_enum, default_value_t = SastFormatArg::Sarif)]
+    format: SastFormatArg,
+    /// SARIF tool name.
+    #[arg(long, value_name = "NAME", default_value = "plsql-sast")]
+    tool_name: String,
+    /// SARIF semantic version. Defaults to the plsql CLI crate version.
+    #[arg(long, value_name = "VERSION")]
+    tool_version: Option<String>,
+    /// JUnit test suite name.
+    #[arg(long, value_name = "NAME", default_value = "plsql-sast")]
+    suite_name: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum SastFormatArg {
+    #[default]
+    Sarif,
+    Json,
+    Junit,
+    Histogram,
+}
+
+impl SastFormatArg {
+    const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Sarif => "sarif",
+            Self::Json => "json",
+            Self::Junit => "junit",
+            Self::Histogram => "histogram",
+        }
+    }
+
+    const fn media_type(self) -> &'static str {
+        match self {
+            Self::Sarif | Self::Json | Self::Histogram => "application/json",
+            Self::Junit => "application/junit+xml",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct DocRenderPayload {
+    command: &'static str,
+    format: &'static str,
+    media_type: &'static str,
+    project_label: String,
+    object_count: usize,
+    coverage: plsql_doc::DocCoverageReport,
+    artifact: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct SastRenderPayload {
+    command: &'static str,
+    format: &'static str,
+    media_type: &'static str,
+    finding_count: usize,
+    skipped_count: usize,
+    rules_run: usize,
+    rules_gated: usize,
+    max_severity: Option<plsql_sast::Severity>,
+    histogram: plsql_sast::RuleFiringHistogram,
+    artifact: Value,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -216,6 +346,8 @@ fn main() -> ExitCode {
     } else {
         match cli.command {
             Some(Command::Predict(args)) => run_predict(args, robot_json),
+            Some(Command::Doc(args)) => run_doc(args, robot_json),
+            Some(Command::Sast(args)) => run_sast(args, robot_json),
             Some(Command::Doctor(args)) => run_doctor(args, robot_json),
             Some(Command::Capabilities) => run_capabilities(robot_json),
             Some(Command::RobotDocs) => {
@@ -228,7 +360,7 @@ fn main() -> ExitCode {
                 let _ = writeln!(std::io::stderr());
                 let _ = writeln!(
                     std::io::stderr(),
-                    "no subcommand given - try `plsql predict --robot-json <changeset>`, `plsql doctor`, or `plsql --robot-triage`."
+                    "no subcommand given - try `plsql predict --robot-json <changeset>`, `plsql doc --robot-json <docset>`, `plsql sast --robot-json <scan-report>`, `plsql doctor`, or `plsql --robot-triage`."
                 );
                 Ok(ExitCode::from(2))
             }
@@ -286,6 +418,76 @@ fn run_predict(args: PredictArgs, robot_json: bool) -> Result<ExitCode, CliError
     Ok(ExitCode::SUCCESS)
 }
 
+fn run_doc(args: DocArgs, robot_json: bool) -> Result<ExitCode, CliError> {
+    let docset = load_doc_set(&args.docset_source)?;
+    let coverage = plsql_doc::doctor_report(&docset);
+    let artifact = match args.format {
+        DocFormatArg::Markdown => Value::String(plsql_doc::render_full_markdown_bundle(
+            &docset,
+            &args.project_label,
+        )),
+        DocFormatArg::Html => Value::String(plsql_doc::render_full_html_bundle(
+            &docset,
+            &args.project_label,
+        )),
+        DocFormatArg::Json => serde_json::to_value(&docset)?,
+        DocFormatArg::Doctor => serde_json::to_value(&coverage)?,
+    };
+    let payload = DocRenderPayload {
+        command: "doc",
+        format: args.format.wire_name(),
+        media_type: args.format.media_type(),
+        project_label: args.project_label,
+        object_count: docset.objects.len(),
+        coverage,
+        artifact,
+    };
+    if robot_json {
+        let envelope = RobotJsonEnvelope::new(DOC_RENDER_SCHEMA, payload);
+        println!("{}", serialize_compact(&envelope)?);
+    } else {
+        print_artifact(&payload.artifact)?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_sast(args: SastArgs, robot_json: bool) -> Result<ExitCode, CliError> {
+    let report = load_scan_report(&args.scan_report_source)?;
+    let histogram = plsql_sast::rule_firing_histogram(&report);
+    let tool_version = args
+        .tool_version
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+    let artifact = match args.format {
+        SastFormatArg::Sarif => serde_json::to_value(plsql_sast::to_sarif(
+            &report,
+            &args.tool_name,
+            &tool_version,
+        ))?,
+        SastFormatArg::Json => serde_json::to_value(&report)?,
+        SastFormatArg::Junit => Value::String(plsql_sast::to_junit_xml(&report, &args.suite_name)),
+        SastFormatArg::Histogram => serde_json::to_value(&histogram)?,
+    };
+    let payload = SastRenderPayload {
+        command: "sast",
+        format: args.format.wire_name(),
+        media_type: args.format.media_type(),
+        finding_count: report.findings.len(),
+        skipped_count: report.skipped.len(),
+        rules_run: report.rules_run,
+        rules_gated: report.rules_gated,
+        max_severity: report.max_severity(),
+        histogram,
+        artifact,
+    };
+    if robot_json {
+        let envelope = RobotJsonEnvelope::new(SAST_RENDER_SCHEMA, payload);
+        println!("{}", serialize_compact(&envelope)?);
+    } else {
+        print_artifact(&payload.artifact)?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn run_doctor(args: DoctorArgs, robot_json: bool) -> Result<ExitCode, CliError> {
     let changeset_report = match args.changeset_source {
         Some(changeset_source) => {
@@ -315,9 +517,17 @@ fn run_doctor(args: DoctorArgs, robot_json: bool) -> Result<ExitCode, CliError> 
             "error_envelope": {
                 "id": ERROR_ENVELOPE_SCHEMA.id,
                 "version": ERROR_ENVELOPE_SCHEMA.version.to_string()
+            },
+            "doc_render": {
+                "id": DOC_RENDER_SCHEMA.id,
+                "version": DOC_RENDER_SCHEMA.version.to_string()
+            },
+            "sast_report": {
+                "id": SAST_RENDER_SCHEMA.id,
+                "version": SAST_RENDER_SCHEMA.version.to_string()
             }
         },
-        "commands": ["predict", "doctor", "capabilities", "robot-docs"],
+        "commands": ["predict", "doc", "sast", "doctor", "capabilities", "robot-docs"],
         "changeset": changeset_report,
     });
     if robot_json {
@@ -355,6 +565,14 @@ fn run_robot_triage(robot_json: bool) -> Result<ExitCode, CliError> {
             "change_impact": {
                 "id": CHANGE_IMPACT_SCHEMA.id,
                 "version": CHANGE_IMPACT_SCHEMA.version.to_string()
+            },
+            "doc_render": {
+                "id": DOC_RENDER_SCHEMA.id,
+                "version": DOC_RENDER_SCHEMA.version.to_string()
+            },
+            "sast_report": {
+                "id": SAST_RENDER_SCHEMA.id,
+                "version": SAST_RENDER_SCHEMA.version.to_string()
             }
         }
     });
@@ -366,6 +584,14 @@ fn run_robot_triage(robot_json: bool) -> Result<ExitCode, CliError> {
         {
             "description": "predict with offline lineage impact JSON",
             "invocation": "plsql predict --robot-json --lineage-impact impact.json --lineage-metadata metadata.json --compile-error-flags compile-errors.json --source-kind changeset-json changeset.json"
+        },
+        {
+            "description": "render a plsql-doc DocSet artifact",
+            "invocation": "plsql doc --robot-json --format markdown docset.json"
+        },
+        {
+            "description": "render a plsql-sast ScanReport as SARIF",
+            "invocation": "plsql sast --robot-json --format sarif scan-report.json"
         },
         {
             "description": "machine-readable health check",
@@ -400,6 +626,8 @@ fn capabilities_json() -> Value {
         },
         "commands": {
             "predict": "wrap ChangeSet construction, predict or predict_with_lineage, and emit plsql.cicd.change_impact",
+            "doc": "render or inspect an offline plsql-doc DocSet artifact as markdown, html, json, or doctor coverage",
+            "sast": "render or inspect an offline plsql-sast ScanReport artifact as SARIF, JUnit, JSON, or a rule histogram",
             "doctor": "report binary/schema health and optional changeset health",
             "capabilities": "print this machine-readable agent contract",
             "robot-docs": "print a concise agent handbook"
@@ -421,6 +649,14 @@ fn capabilities_json() -> Value {
             "change_impact": {
                 "id": CHANGE_IMPACT_SCHEMA.id,
                 "version": CHANGE_IMPACT_SCHEMA.version.to_string()
+            },
+            "doc_render": {
+                "id": DOC_RENDER_SCHEMA.id,
+                "version": DOC_RENDER_SCHEMA.version.to_string()
+            },
+            "sast_report": {
+                "id": SAST_RENDER_SCHEMA.id,
+                "version": SAST_RENDER_SCHEMA.version.to_string()
             },
             "error_envelope": {
                 "id": ERROR_ENVELOPE_SCHEMA.id,
@@ -446,6 +682,8 @@ WHAT IT DOES
   shipped surface is `predict`: construct a ChangeSet, run the CI/CD
   invalidation predictor, optionally compose offline lineage impact
   results, and emit the stable plsql.cicd.change_impact payload.
+  `doc` renders offline plsql-doc DocSet artifacts. `sast` renders
+  offline plsql-sast ScanReport artifacts.
 
 CANONICAL INVOCATIONS
   plsql predict --robot-json <changeset-source>
@@ -456,6 +694,8 @@ CANONICAL INVOCATIONS
   plsql predict --robot-json --source-kind changeset-json changeset.json \
       --lineage-impact impact.json --lineage-metadata metadata.json \
       --compile-error-flags compile-errors.json
+  plsql doc --robot-json --format markdown docset.json
+  plsql sast --robot-json --format sarif scan-report.json
   plsql doctor --robot-json
   plsql --robot-triage
 
@@ -464,6 +704,8 @@ ROBOT-JSON
     format:         plsql-robot-json
     schema_id:      {schema_id}
     schema_version: {schema_version}
+  doc emits schema_id:  {doc_schema_id}
+  sast emits schema_id: {sast_schema_id}
 
 EXIT CODES
   0 success
@@ -476,6 +718,8 @@ DISCOVERY
 "#,
         schema_id = CHANGE_IMPACT_SCHEMA.id,
         schema_version = CHANGE_IMPACT_SCHEMA.version,
+        doc_schema_id = DOC_RENDER_SCHEMA.id,
+        sast_schema_id = SAST_RENDER_SCHEMA.id,
     )
 }
 
@@ -592,6 +836,42 @@ fn load_changeset_json(path: &Path) -> Result<ChangeSet, CliError> {
             .with_path(path)
             .with_exit_code(2)
     })
+}
+
+fn load_doc_set(path: &Path) -> Result<plsql_doc::DocSet, CliError> {
+    let raw = read_input_file(path, "docset_read_failed")?;
+    parse_json_or_envelope(&raw).map_err(|err| {
+        CliError::new("docset_json_invalid", err.to_string())
+            .with_path(path)
+            .with_exit_code(2)
+    })
+}
+
+fn load_scan_report(path: &Path) -> Result<plsql_sast::ScanReport, CliError> {
+    let raw = read_input_file(path, "scan_report_read_failed")?;
+    parse_json_or_envelope(&raw).map_err(|err| {
+        CliError::new("scan_report_json_invalid", err.to_string())
+            .with_path(path)
+            .with_exit_code(2)
+    })
+}
+
+fn read_input_file(path: &Path, code: &'static str) -> Result<String, CliError> {
+    std::fs::read_to_string(path).map_err(|err| {
+        CliError::new(code, err.to_string())
+            .with_path(path)
+            .with_exit_code(2)
+    })
+}
+
+fn parse_json_or_envelope<T>(raw: &str) -> Result<T, serde_json::Error>
+where
+    T: DeserializeOwned,
+{
+    if let Ok(envelope) = serde_json::from_str::<RobotJsonEnvelope<T>>(raw) {
+        return Ok(envelope.payload);
+    }
+    serde_json::from_str(raw)
 }
 
 fn validate_dir(path: &Path) -> Result<(), CliError> {
@@ -790,6 +1070,18 @@ fn print_predict_human(envelope: &ChangeImpactEnvelope) {
         summary.uncertainty_count,
         summary.max_distance
     );
+}
+
+fn print_artifact(artifact: &Value) -> Result<(), CliError> {
+    if let Some(text) = artifact.as_str() {
+        print!("{text}");
+        if !text.ends_with('\n') {
+            println!();
+        }
+    } else {
+        println!("{}", serde_json::to_string_pretty(artifact)?);
+    }
+    Ok(())
 }
 
 fn serialize_compact<T: serde::Serialize>(value: &T) -> Result<String, CliError> {

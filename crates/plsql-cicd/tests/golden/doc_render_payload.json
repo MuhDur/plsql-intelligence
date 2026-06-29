@@ -1,0 +1,36 @@
+{
+  "format": "plsql-robot-json",
+  "schema_id": "plsql.doc.render",
+  "schema_version": {
+    "major": 1,
+    "minor": 0,
+    "patch": 0
+  },
+  "payload": {
+    "command": "doc",
+    "format": "markdown",
+    "media_type": "text/markdown",
+    "project_label": "billing",
+    "object_count": 1,
+    "coverage": {
+      "objects_total": 1,
+      "documented": 1,
+      "tagged_only": 0,
+      "undocumented": 0,
+      "documented_percent": 100,
+      "by_kind": [
+        {
+          "kind": "package",
+          "total": 1,
+          "documented": 1,
+          "tagged_only": 0,
+          "undocumented": 0
+        }
+      ],
+      "undocumented_sample": [],
+      "posture": "Clean",
+      "remediation_hints": []
+    },
+    "artifact": "# billing object index\n\n**Total objects:** 1\n\n## package\n\n| ID | Name | Summary |\n|----|------|---------|\n| `billing.pkg_customer_report` | PKG_CUSTOMER_REPORT | Customer reporting package. |\n\n\n---\n\n# PKG_CUSTOMER_REPORT\n\n**Kind:** package  \n**ID:** `billing.pkg_customer_report`\n\n> Customer reporting package.\n\n## Description\n\nGenerates customer billing reports.\n\n\n---\n\n"
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "format": "plsql-robot-json",
+  "schema_id": "plsql.sast.report",
+  "schema_version": {
+    "major": 1,
+    "minor": 0,
+    "patch": 0
+  },
+  "payload": {
+    "command": "sast",
+    "format": "sarif",
+    "media_type": "application/json",
+    "finding_count": 0,
+    "skipped_count": 0,
+    "rules_run": 3,
+    "rules_gated": 1,
+    "max_severity": null,
+    "histogram": {
+      "schema_id": "plsql.sast.rule_firing_histogram",
+      "schema_version": 1,
+      "rows": [],
+      "total_findings": 0,
+      "total_skipped": 0,
+      "rules_gated": 1
+    },
+    "artifact": {
+      "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+      "runs": [
+        {
+          "results": [],
+          "tool": {
+            "driver": {
+              "name": "plsql-sast",
+              "rules": [],
+              "semanticVersion": "0.6.2"
+            }
+          }
+        }
+      ],
+      "version": "2.1.0"
+    }
+  }
+}

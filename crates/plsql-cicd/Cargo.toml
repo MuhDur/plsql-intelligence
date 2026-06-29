@@ -21,8 +21,10 @@ clap = { version = "4.5", features = ["derive"] }
 getrandom = "0.3"
 plsql-catalog = { path = "../plsql-catalog", version = "0.1.2" }
 plsql-core = { path = "../plsql-core", version = "0.1.0" }
+plsql-doc = { path = "../plsql-doc", version = "0.1.0" }
 plsql-lineage = { path = "../plsql-lineage", version = "0.1.0" }
 plsql-output = { path = "../plsql-output", version = "0.1.0" }
+plsql-sast = { path = "../plsql-sast", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

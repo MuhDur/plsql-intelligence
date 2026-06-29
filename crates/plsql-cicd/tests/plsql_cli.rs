@@ -331,6 +331,108 @@ fn predict_robot_json_matches_change_impact_golden_snapshot() {
 }
 
 #[test]
+fn doc_robot_json_matches_doc_render_golden_snapshot() {
+    let root = fixture_root("doc");
+    std::fs::create_dir_all(&root).expect("fixture root");
+    let docset = root.join("docset.json");
+    std::fs::write(
+        &docset,
+        r#"{
+  "objects": [
+    {
+      "object_id": "billing.pkg_customer_report",
+      "name": "PKG_CUSTOMER_REPORT",
+      "kind": "package",
+      "summary": "Customer reporting package.",
+      "comments": [
+        {
+          "tag": null,
+          "text": "Generates customer billing reports.",
+          "source_span": null
+        }
+      ],
+      "source_span": null
+    }
+  ]
+}
+"#,
+    )
+    .expect("write docset");
+
+    let out = Command::new(bin())
+        .args([
+            "doc",
+            "--robot-json",
+            "--format",
+            "markdown",
+            "--project-label",
+            "billing",
+            docset.to_str().expect("utf8 docset"),
+        ])
+        .output()
+        .expect("run plsql doc");
+
+    assert!(out.status.success(), "doc exits 0");
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    let trimmed = stdout.trim_end();
+    assert!(
+        !trimmed.contains('\n'),
+        "doc --robot-json must be single-line: {trimmed:?}"
+    );
+    let actual: serde_json::Value = serde_json::from_str(trimmed).expect("json stdout");
+    let expected: serde_json::Value = serde_json::from_str(&repo_file(
+        "crates/plsql-cicd/tests/golden/doc_render_payload.json",
+    ))
+    .expect("golden json");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn sast_robot_json_matches_sast_render_golden_snapshot() {
+    let root = fixture_root("sast");
+    std::fs::create_dir_all(&root).expect("fixture root");
+    let scan_report = root.join("scan-report.json");
+    std::fs::write(
+        &scan_report,
+        r#"{
+  "findings": [],
+  "skipped": [],
+  "rules_run": 3,
+  "rules_gated": 1
+}
+"#,
+    )
+    .expect("write scan report");
+
+    let out = Command::new(bin())
+        .args([
+            "sast",
+            "--robot-json",
+            "--format",
+            "sarif",
+            scan_report.to_str().expect("utf8 scan report"),
+        ])
+        .output()
+        .expect("run plsql sast");
+
+    assert!(out.status.success(), "sast exits 0");
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    let trimmed = stdout.trim_end();
+    assert!(
+        !trimmed.contains('\n'),
+        "sast --robot-json must be single-line: {trimmed:?}"
+    );
+    let actual: serde_json::Value = serde_json::from_str(trimmed).expect("json stdout");
+    let expected: serde_json::Value = serde_json::from_str(&repo_file(
+        "crates/plsql-cicd/tests/golden/sast_render_payload.json",
+    ))
+    .expect("golden json");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn doctor_robot_json_is_single_json_object() {
     let out = Command::new(bin())
         .args(["doctor", "--robot-json"])
