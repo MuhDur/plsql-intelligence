@@ -54,11 +54,11 @@ jobs:
       # OOM/thrashes (the nightly died ~7 min into `land_tripwire` while the same
       # test passes in ~18 s locally). Cap concurrency to the runner's core count.
       - name: Adversarial gate self-test (suppression/leak/rt-break)
-        run: cargo test -p plsql-accretion --test gate_selftest -- --test-threads=2
+        run: cargo +nightly-2026-05-11 test -p plsql-accretion --test gate_selftest -- --test-threads=2
       - name: P6 land + tripwire hermetic tests
-        run: cargo test -p plsql-accretion --test land_tripwire -- --test-threads=2
+        run: cargo +nightly-2026-05-11 test -p plsql-accretion --test land_tripwire -- --test-threads=2
       - name: Proposer→gate e2e (P5 keystone, real gate)
-        run: cargo test -p plsql-accretion --test proposer_gate_e2e -- --test-threads=2
+        run: cargo +nightly-2026-05-11 test -p plsql-accretion --test proposer_gate_e2e -- --test-threads=2
 
   # ----------------------------------------------------------------
   # REQUIRED PR CHECK 2 — the §4 accretion monotonic tripwire.

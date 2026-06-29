@@ -82,7 +82,7 @@ jobs:
 
       - name: Generate bindings
         run: |
-          cargo run -p plsql-bindgen -- \
+          cargo +nightly-2026-05-11 run -p plsql-bindgen -- \
             --package SYSTEM.PKG_EMPLOYEE_MGMT \
             --output target/generated-bindings \
             --target rust
@@ -91,7 +91,7 @@ jobs:
         env:
           ORACLE_PWD: ${{ secrets.ORACLE_XE_PWD }}
         run: |
-          cargo test -p plsql-bindgen --test xe_roundtrip \
+          cargo +nightly-2026-05-11 test -p plsql-bindgen --test xe_roundtrip \
             --features live-roundtrip -- --nocapture
         continue-on-error: false
 
@@ -106,7 +106,7 @@ jobs:
       - name: Upload coverage doctor report
         if: always()
         run: |
-          cargo run -p plsql-bindgen -- \
+          cargo +nightly-2026-05-11 run -p plsql-bindgen -- \
             --package SYSTEM.PKG_EMPLOYEE_MGMT \
             --output target/generated-bindings \
             --target rust \

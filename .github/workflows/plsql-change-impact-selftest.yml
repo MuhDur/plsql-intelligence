@@ -35,7 +35,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build plsql CLI
-        run: cargo build -p plsql-cicd --bin plsql
+        run: cargo +nightly-2026-05-11 build -p plsql-cicd --bin plsql
 
       - name: Write fixture changeset
         run: |
