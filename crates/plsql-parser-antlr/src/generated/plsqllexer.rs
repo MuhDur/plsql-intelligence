@@ -1,4 +1,4 @@
-// Generated from /home/durakovic/projects/plsql-intelligence/crates/plsql-parser-antlr/grammars/PlSqlLexer.g4 by ANTLR 4.8
+// Generated from grammars/PlSqlLexer.g4 by ANTLR 4.8
 #[allow(dead_code)]
 #[allow(nonstandard_style)]
 #[allow(unused_imports)]

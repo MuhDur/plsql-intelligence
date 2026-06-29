@@ -215,12 +215,21 @@ fn run_antlr_with_listener(jar: &Path, grammar: &Path, out_dir: &Path, allow_err
 ///    `recog.isVersion10()`, `recog.IsNotNumericFunction()` (parser) and
 ///    `recog.IsNewlineAtPos()` (lexer).  Inject extension traits providing
 ///    permissive defaults.
+///
+/// 6. Absolute-path generated headers — ANTLR writes the local checkout path
+///    into the first comment. Normalize it so CI and developer workstations
+///    produce byte-identical generated files.
+///
+/// 7. Trailing newline count — codegen can leave an extra blank line at EOF.
+///    Normalize to exactly one final newline for byte-stable drift checks.
 fn post_process(path: &Path, label: &str) {
     let content = fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("Failed to read generated {label}: {e}"));
 
     let original_len = content.len();
 
+    // Class E: normalize local checkout paths in ANTLR's generated header.
+    let content = normalize_generated_header(&content, label);
     // Class A: inner attributes → outer attributes.
     let content = fix_inner_attributes(&content);
     // Class B: `fn` keyword collisions (field access + definitions).
@@ -231,6 +240,8 @@ fn post_process(path: &Path, label: &str) {
     let content = fix_this_references(&content);
     // Class D: inject missing semantic-predicate extension traits.
     let content = inject_predicate_traits(&content, label);
+    // Class F: keep EOF newline normalization stable across platforms.
+    let content = normalize_trailing_newline(&content);
 
     let changes = original_len != content.len();
 
@@ -240,6 +251,36 @@ fn post_process(path: &Path, label: &str) {
     if changes {
         println!("cargo:warning=Post-processed {label}: applied antlr4rust compatibility patches");
     }
+}
+
+fn normalize_trailing_newline(content: &str) -> String {
+    let mut normalized = content.trim_end_matches('\n').to_owned();
+    normalized.push('\n');
+    normalized
+}
+
+fn normalize_generated_header(content: &str, label: &str) -> String {
+    let grammar = match label {
+        "lexer" => "PlSqlLexer.g4",
+        "parser" | "listener" => "PlSqlParser.g4",
+        other => panic!("unknown generated ANTLR label: {other}"),
+    };
+    let suffix = format!("{grammar} by ANTLR 4.8");
+    let canonical = format!("// Generated from grammars/{grammar} by ANTLR 4.8");
+
+    let mut normalized = String::with_capacity(content.len());
+    for line in content.lines() {
+        if line.starts_with("// Generated from ") && line.ends_with(&suffix) {
+            normalized.push_str(&canonical);
+        } else {
+            normalized.push_str(line);
+        }
+        normalized.push('\n');
+    }
+    if !content.ends_with('\n') {
+        normalized.pop();
+    }
+    normalized
 }
 
 /// Class A fix: convert inner `#![allow(...)]` to outer `#[allow(...)]`.

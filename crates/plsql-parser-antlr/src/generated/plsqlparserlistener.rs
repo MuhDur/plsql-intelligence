@@ -1,5 +1,5 @@
 #[allow(nonstandard_style)]
-// Generated from /home/durakovic/projects/plsql-intelligence/crates/plsql-parser-antlr/grammars/PlSqlParser.g4 by ANTLR 4.8
+// Generated from grammars/PlSqlParser.g4 by ANTLR 4.8
 use antlr_rust::tree::ParseTreeListener;
 use super::plsqlparser::*;
 
@@ -12084,5 +12084,3 @@ fn exit_non_reserved_keywords_pre12c(&mut self, _ctx: &Non_reserved_keywords_pre
 }
 
 antlr_rust::coerce_from!{ 'input : PlSqlParserListener<'input> }
-
-
