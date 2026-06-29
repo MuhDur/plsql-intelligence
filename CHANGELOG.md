@@ -9,6 +9,43 @@ work.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-29
+
+- **Offline-pivot release track.** The 0.7.0 work is now tracked under
+  the `oracle-jfqh` bead tree, with sign-off-gated retirement work kept
+  separate from the stable offline engine and CLI work. The transitional
+  `plsql-mcp` crate remains excluded from stable defaults until the
+  explicit removal/deprecation gates are complete.
+- **Stable offline CLI expansion.** The `plsql` CLI now exposes offline
+  `doc` and `sast` subcommands backed by `plsql-doc` and `plsql-sast`,
+  so documentation and static-analysis outputs are available without the
+  MCP/live-DB stack.
+- **Parser backend cleanup.** The retired Java-worker backend choice was
+  removed from the engine surface, while the ANTLR runtime upgrade was
+  re-probed and deliberately deferred: the current generated parser stays
+  on `antlr-rust 0.3.0-beta`, with the `antlr4rust 0.5.x` migration filed
+  as future parser-codegen work instead of blocking the 0.7.0 ship.
+- **oraclemcp handoff.** `oraclemcp` now has a `plsql-intelligence`
+  feature, catalog rowset extraction for the PL/SQL engine seam,
+  feature-gated intelligence tools, and migrated live-XE hero coverage
+  for the `DROP COLUMN customers.legacy_segment` scenario.
+- **Cargo lockfile and CI proof.** `Cargo.lock` was checked with
+  `cargo metadata --locked`; no lockfile delta was needed. The
+  `plsql-change-impact-selftest.yml` workflow is green on `main`.
+
+## [0.6.3] - 2026-06-29
+
+- **Generated parser sources.** ANTLR-generated Rust parser output is now
+  committed under the parser crate, so normal parser builds no longer
+  require Java. Regeneration is an explicit drift-check path.
+- **Stable pivot gates.** The stable workspace checks were verified with
+  `plsql-mcp` outside the default member set, preserving the nightly-only
+  MCP/live transition while keeping the offline engine buildable on
+  stable Rust.
+- **Catalog snapshot seam.** `plsql-catalog` exposes the stable
+  `CatalogSnapshotBuilder`/rowset API used by the downstream oraclemcp
+  integration path.
+
 ## [0.6.2] - 2026-06-29
 
 - **Trio stack doctor provenance.** `plsql-mcp doctor` now reports the
