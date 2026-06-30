@@ -45,6 +45,48 @@ jobs:
       - run: cargo test --workspace --all-targets
       - run: cargo test --workspace --doc
 
+  install-matrix:
+    name: release installer (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            shell: bash
+            script: install.sh
+          - os: macos-latest
+            shell: bash
+            script: install.sh
+          - os: windows-latest
+            shell: pwsh
+            script: install.ps1
+    steps:
+      - name: Install from latest release (Unix)
+        if: matrix.shell == 'bash'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin_dir="${RUNNER_TEMP}/plsql-install-bin"
+          curl -fsSL "https://github.com/MuhDur/plsql-intelligence/releases/latest/download/${{ matrix.script }}?${{ github.run_id }}" \
+            | bash -s -- --bin-dir "$bin_dir" --force --no-gum
+          "$bin_dir/plsql" --version
+          "$bin_dir/plsql-depgraph" --version
+      - name: Install from latest release (Windows)
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $binDir = Join-Path $env:RUNNER_TEMP "plsql-install-bin"
+          $installer = Join-Path $env:RUNNER_TEMP "install.ps1"
+          Invoke-WebRequest `
+            -Uri "https://github.com/MuhDur/plsql-intelligence/releases/latest/download/${{ matrix.script }}?${{ github.run_id }}" `
+            -OutFile $installer `
+            -UseBasicParsing
+          & $installer -BinDir $binDir -Force
+          & (Join-Path $binDir "plsql.exe") --version
+          & (Join-Path $binDir "plsql-depgraph.exe") --version
+
   antlr-generated-drift:
     name: ANTLR generated drift check
     runs-on: ubuntu-latest

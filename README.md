@@ -342,7 +342,24 @@ The workspace MSRV is recorded in `Cargo.toml` as `rust-version = "1.96"`.
 Normal installation does not require Java. Java is only needed when a
 maintainer explicitly regenerates the ANTLR parser output.
 
-### From source (recommended)
+### Install Released CLIs
+
+Linux and macOS:
+
+```sh
+curl -fsSL "https://github.com/MuhDur/plsql-intelligence/releases/latest/download/install.sh?$(date +%s)" | bash
+```
+
+Windows PowerShell:
+
+```powershell
+irm "https://github.com/MuhDur/plsql-intelligence/releases/latest/download/install.ps1?$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" | iex
+```
+
+The installers fetch the latest GitHub release, verify `SHA256SUMS`, install
+`plsql` and `plsql-depgraph`, and print uninstall instructions.
+
+### From source
 
 ```sh
 git clone https://github.com/MuhDur/plsql-intelligence
@@ -506,9 +523,8 @@ cargo run -p plan-lint -- --doctor     # health summary
 - Pre-1.0: the API can move at any time before 1.0.
 - This repository is not the MCP server anymore. Use `oraclemcp` for MCP
   serving, Oracle sessions, and guarded live database access.
-- The offline pivot is still in progress. A feature-gated legacy live
-  extraction path remains until `oracle-jfqh.15` lands; it is not part of
-  the normal source install or default test profile.
+- Live Oracle extraction is not in this repository. Use `oraclemcp` for
+  Oracle sessions, live catalog snapshots, and guarded database access.
 - The USR Loop proposer does not auto-merge. It produces proven
   candidates; the proof is automatic and complete, the landing decision is
   gated by that proof and the repo's normal review (per `D3`).

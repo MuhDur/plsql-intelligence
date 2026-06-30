@@ -3,10 +3,10 @@
 # plsql-intelligence installer
 #
 # One-liner install with cache buster:
-#   curl -fsSL "https://raw.githubusercontent.com/MuhDur/plsql-intelligence/main/install.sh?$(date +%s)" | bash
+#   curl -fsSL "https://github.com/MuhDur/plsql-intelligence/releases/latest/download/install.sh?$(date +%s)" | bash
 #
-# Or without cache buster:
-#   curl -fsSL https://raw.githubusercontent.com/MuhDur/plsql-intelligence/main/install.sh | bash
+# Or from the development branch:
+#   curl -fsSL "https://raw.githubusercontent.com/MuhDur/plsql-intelligence/main/install.sh?$(date +%s)" | bash
 #
 # Options:
 #   --quiet             Suppress non-error output
@@ -71,7 +71,7 @@ plsql-intelligence installer
 
 Usage:
   bash install.sh [options]
-  curl -fsSL "https://raw.githubusercontent.com/MuhDur/plsql-intelligence/main/install.sh?$(date +%s)" | bash
+  curl -fsSL "https://github.com/MuhDur/plsql-intelligence/releases/latest/download/install.sh?$(date +%s)" | bash
 
 Options:
   --quiet             Suppress non-error output

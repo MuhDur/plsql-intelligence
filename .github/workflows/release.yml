@@ -126,6 +126,12 @@ jobs:
           path: release-artifacts
           pattern: plsql-intelligence-*
           merge-multiple: true
+      - name: Stage installer assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 0644 install.sh release-artifacts/install.sh
+          install -m 0644 install.ps1 release-artifacts/install.ps1
       - name: Generate SHA256 manifest
         shell: bash
         run: |

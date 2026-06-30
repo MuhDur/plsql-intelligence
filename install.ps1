@@ -12,10 +12,10 @@ param(
 plsql-intelligence Windows installer
 
 One-liner install with cache buster:
-  irm "https://raw.githubusercontent.com/MuhDur/plsql-intelligence/main/install.ps1?$(Get-Date -UFormat %s)" | iex
+  irm "https://github.com/MuhDur/plsql-intelligence/releases/latest/download/install.ps1?$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" | iex
 
-Or without cache buster:
-  irm https://raw.githubusercontent.com/MuhDur/plsql-intelligence/main/install.ps1 | iex
+Or from the development branch:
+  irm "https://raw.githubusercontent.com/MuhDur/plsql-intelligence/main/install.ps1?$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" | iex
 
 Options:
   -Quiet              Suppress non-error output
@@ -51,7 +51,7 @@ function Show-Usage {
 plsql-intelligence Windows installer
 
 Usage:
-  irm https://raw.githubusercontent.com/MuhDur/plsql-intelligence/main/install.ps1 | iex
+  irm "https://github.com/MuhDur/plsql-intelligence/releases/latest/download/install.ps1?$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" | iex
   powershell -ExecutionPolicy Bypass -File install.ps1 [options]
 
 Options:
