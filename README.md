@@ -132,7 +132,8 @@ The default local profile is offline and stable-channel:
 - `cargo bench --workspace --no-run`
 - `cargo deny check`
 - `plan-lint`, corpus license checks, parse-success checks, lab goldens,
-  demo-no-db, honesty grep, boundary lint, and the USR accretion gates.
+  demo-no-db, offline honesty grep, offline boundary lint, and the USR
+  accretion gates.
 
 The remaining live extraction tests are transition coverage, not the
 normal product path. They stay isolated behind explicit features until

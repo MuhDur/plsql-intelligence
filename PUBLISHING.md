@@ -13,9 +13,8 @@ This tree has been prepared for an open-source release:
 - Every crate is dual-licensed `Apache-2.0 OR MIT`. There is no
   source-available or commercial-tier code; the MCP server is a single
   unified crate (`plsql-mcp`).
-- The whole workspace is `#![forbid(unsafe_code)]` and builds, tests, and
-  clippy-clean on the pinned nightly toolchain documented in
-  `rust-toolchain.toml`.
+- The offline workspace is `#![forbid(unsafe_code)]` and builds, tests, and
+  clippy-clean on the stable toolchain used by the default CI profile.
 
 If this tree was assembled as a fresh repository, its git history begins
 at the initial commit and carries none of the above either:

@@ -1,29 +1,32 @@
 #!/usr/bin/env bash
-# plsql-mcp honesty-grep gate (oracle-plsql-converge-0lnu.15.13).
+# Offline engine honesty-grep gate (oracle-jfqh.23).
 #
-# Fails if over-claiming or stale release framing appears in release-visible
-# text: README, publishing/checklist docs, docs, package metadata, shipped Rust
-# source docs, and GitHub workflow text. Tests, fuzz targets, and draft plans are
-# excluded because they may intentionally carry negative examples.
+# Fails if release-visible text drifts back into stale server/runtime claims or
+# over-claims. Tests, fuzz targets, and draft plans are excluded because they
+# may intentionally carry negative examples.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
-PATTERN='read[- ]only binary|read[- ]only[- ]only|safe[- ]by[- ]default|safe by construction|fully audited|independently[- ]audited dependencies|stable rust|rust 1\.85\+|1\.0-frozen|tamper[- ]evident audit|\bPAM\b'
+PATTERN='read[- ]only binary|read[- ]only[- ]only|safe[- ]by[- ]default|safe by construction|fully audited|independently[- ]audited dependencies|1\.0-frozen|tamper[- ]evident audit|\bPAM\b|(^|[^[:alnum:]_])requires?([^[:alnum:]_]|$)[^.]*nightly|(^|[^[:alnum:]_])requires?([^[:alnum:]_]|$)[^.]*asupersync|(^|[^[:alnum:]_])requires?([^[:alnum:]_]|$)[^.]*instant[- ]client|(^|[^[:alnum:]_])requires?([^[:alnum:]_]|$)[^.]*two[- ]servers?|two[- ]server architecture|dual[- ]server architecture|plsql-mcp server|plsql-mcp mcp server'
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/plsql_mcp_honesty_grep.sh [--self-test]
+Usage: scripts/offline_honesty_grep.sh [--self-test]
 
 Fails on forbidden release-visible framing:
   read-only binary / read-only only
   safe-by-default / safe by construction
   fully audited / independently-audited dependencies
-  stable Rust / Rust 1.85+
   1.0-frozen
   uncaveated tamper-evident audit / PAM
+  requires nightly
+  requires asupersync
+  requires Instant Client
+  requires two servers / two-server architecture / dual-server architecture
+  plsql-mcp server / plsql-mcp MCP server
 
 Append `honesty-allow: <reason>` to the same line only for historical notes,
 pattern definitions, or negative examples that must quote forbidden wording.
@@ -82,12 +85,13 @@ scan_file() {
 self_test() {
   if scan_stream "self-test" <<'EOF'
 This product is a safe-by-default, fully audited, 1.0-frozen read-only binary.
+It requires nightly, asupersync, Instant Client, and two servers.
 EOF
   then
-    echo "plsql-mcp-honesty-grep: SELF-TEST FAIL — planted violation was accepted." >&2
+    echo "offline-honesty-grep: SELF-TEST FAIL - planted violation was accepted." >&2
     return 1
   fi
-  echo "plsql-mcp-honesty-grep: SELF-TEST PASS — planted violation rejected."
+  echo "offline-honesty-grep: SELF-TEST PASS - planted violation rejected."
 }
 
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
@@ -121,9 +125,9 @@ for f in "${FILES[@]}"; do
 done
 
 if [ "${violations}" -gt 0 ]; then
-  echo "plsql-mcp-honesty-grep: FAIL — forbidden framing in ${violations} file(s)."
+  echo "offline-honesty-grep: FAIL - forbidden framing in ${violations} file(s)."
   echo "Reframe the claim, or add a same-line 'honesty-allow: <reason>' marker for historical/negative-test text."
   exit 1
 fi
 
-echo "plsql-mcp-honesty-grep: OK — no forbidden release-visible framing."
+echo "offline-honesty-grep: OK - no forbidden release-visible framing."

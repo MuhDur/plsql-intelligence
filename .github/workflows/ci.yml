@@ -68,33 +68,31 @@ jobs:
       - name: Compare generated source with committed copy
         run: diff -ru crates/plsql-parser-antlr/src/generated "${RUNNER_TEMP}/plsql-parser-antlr-generated"
 
-  # `oracle-plsql-converge-0lnu.15.12` — keep the PL/SQL layer from reaching
-  # around the offline engine boundary into Oracle drivers or async/server
-  # runtimes directly.
-  plsql-mcp-boundary-lint:
-    name: plsql-mcp boundary lint
+  # Keep the offline PL/SQL engine from reaching into Oracle drivers, MCP
+  # adapters, or async/server runtimes directly.
+  offline-boundary-lint:
+    name: offline boundary lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run forbidden dependency boundary lint
-        run: scripts/plsql_mcp_boundary_lint.sh
+        run: scripts/offline_boundary_lint.sh
       - name: Prove planted violation fails
-        run: scripts/plsql_mcp_boundary_lint.sh --self-test
+        run: scripts/offline_boundary_lint.sh --self-test
 
-  # `oracle-plsql-converge-0lnu.15.13` — keep release-visible docs, package
-  # metadata, source docs, and workflow text from drifting back into stale
-  # overclaims after the truth-up pass.
-  plsql-mcp-honesty-grep:
-    name: plsql-mcp honesty grep
+  # Keep release-visible docs, package metadata, source docs, and workflow text
+  # from drifting back into stale runtime or server framing.
+  offline-honesty-grep:
+    name: offline honesty grep
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Run honesty-grep gate
-        run: scripts/plsql_mcp_honesty_grep.sh
+        run: scripts/offline_honesty_grep.sh
       - name: Prove planted forbidden string fails
-        run: scripts/plsql_mcp_honesty_grep.sh --self-test
+        run: scripts/offline_honesty_grep.sh --self-test
 
   # `oracle-plsql-converge-0lnu.15.14` — keep plsql-mcp's published
   # oraclemcp-* spine pins current with crates.io so the adapter cannot
