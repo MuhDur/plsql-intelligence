@@ -248,10 +248,10 @@ fn run_unix(cache_dir_arg: &str) -> ExitCode {
     eprintln!("plsqld: listening on {}", sock_path.display());
 
     // Connections are served sequentially (single-stream by design). Like
-    // the sibling local transports — `plsql_doc::serve` (serve.rs:164) and
-    // `plsql_mcp::tcp` (tcp.rs:13) — this is a dev/local daemon that mirrors
-    // the "one agent per process" posture, so the per-store state machine
-    // never sees concurrent requests. Concurrent connection fan-out
+    // the sibling local preview transport in `plsql_doc::serve`, this is a
+    // dev/local daemon that mirrors the "one agent per process" posture, so
+    // the per-store state machine never sees concurrent requests.
+    // Concurrent connection fan-out
     // (thread-per-connection + `Arc<Store>`) is intentionally out of scope
     // until a real multi-client UDS consumer exists (none does today).
     //

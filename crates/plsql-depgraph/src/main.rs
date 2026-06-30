@@ -52,7 +52,7 @@ struct Cli {
     /// One-shot agent bootstrap. Emits {capabilities, health, quick_ref}
     /// in a single JSON mega-object on stdout and exits — short-circuits
     /// any subcommand. Exit 0 normally; reserved exit 2 if a future
-    /// blocker is wired. Mirrors `plsql-mcp --robot-triage`.
+    /// blocker is wired. Mirrors the workspace CLI `--robot-triage` convention.
     #[arg(long, global = true)]
     robot_triage: bool,
     #[command(subcommand)]
@@ -306,8 +306,8 @@ fn run() -> std::result::Result<(), CliError> {
 
 /// `--robot-triage` mega-bootstrap. Combine `capabilities` + a light
 /// health summary + a quick-ref of canonical invocations into a single
-/// JSON object on stdout. Mirrors `plsql-mcp --robot-triage`. Always
-/// exits 0 in the current build (no blockers wired); the exit-2 path
+/// JSON object on stdout. Mirrors the workspace CLI `--robot-triage`
+/// convention. Always exits 0 in the current build (no blockers wired); the exit-2 path
 /// is reserved for future blocker conditions.
 fn run_robot_triage(robot_json: bool) -> std::result::Result<(), CliError> {
     let health = serde_json::json!({

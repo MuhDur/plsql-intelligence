@@ -66,9 +66,9 @@ identifying named-notation callers that break).
 3. Querying `ALL_OBJECTS.STATUS` — Oracle itself confirmed the three dependents are INVALID.
 4. Transcribing the Oracle-verified breakage set into the golden.
 
-The live test `crates/plsql-mcp/tests/hero_demo_dropcol_live_xe.rs`
-repeats this end-to-end and asserts the agent-discovered breakage set
-matches this golden.
+The downstream live replay in `oraclemcp` repeats this end-to-end and
+asserts the live-discovered breakage set matches this golden. This repo's
+normal proof remains the offline golden.
 
 ## /oracle skill anchors
 

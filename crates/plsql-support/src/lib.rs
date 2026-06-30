@@ -213,8 +213,7 @@ impl SupportBundleBuilder {
 
 /// Render an `sha256:<hex>` string from arbitrary bytes. Centralised
 /// so the sha2 0.11+ digest type (`Array<u8, …>`, no `LowerHex`) is
-/// formatted byte-by-byte in exactly one place (mirrors the
-/// `plsql-mcp::preview` helper).
+/// formatted byte-by-byte in exactly one place.
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(7 + digest.len() * 2);

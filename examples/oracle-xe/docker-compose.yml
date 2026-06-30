@@ -1,9 +1,10 @@
 # Oracle XE 23ai container for plsql-intelligence lab demos.
 #
 # Spins up a local Oracle XE 23ai instance with the synthetic-lab L1/L2/L3
-# fixtures pre-loaded so `plsql-mcp` (live-DB feature) can talk to a real
-# Oracle without a paid license. Drop into a downstream consumer or run
-# from this repo via `make demo-oracle-xe`.
+# fixtures pre-loaded so downstream live consumers such as `oraclemcp`
+# can talk to a real Oracle without a paid license. This repo uses the
+# same lab corpus offline; run the container only when exercising live
+# extraction outside the normal engine path.
 #
 # License note: Oracle XE 23ai is licensed under the Oracle Free Use Terms
 # and Conditions (FUTC). Read https://www.oracle.com/database/free/ before

@@ -5,8 +5,8 @@
 //! `analyze` runs the canonical pipeline over a project tree and
 //! emits a reusable, versioned `AnalysisRun` artifact (shared
 //! robot-JSON envelope, schema `plsql.engine.analysis_run`).
-//! Every downstream CLI — the SAST scan harness, MCP foundation
-//! tools, `doctor` — consumes that artifact instead of re-running
+//! Every downstream CLI or external host — the SAST scan harness,
+//! `doctor`, or `oraclemcp` — consumes that artifact instead of re-running
 //! analysis, so a single analyze pass is amortised across tools.
 //!
 //! `doctor` loads an emitted artifact, verifies its schema is
@@ -50,7 +50,7 @@ struct Cli {
     /// One-shot agent bootstrap. Emits {capabilities, health, quick_ref}
     /// in a single JSON mega-object on stdout and exits — short-circuits
     /// any subcommand. Exit 0 normally; reserved exit 2 if a future
-    /// blocker is wired. Mirrors `plsql-mcp --robot-triage`.
+    /// blocker is wired. Mirrors the workspace CLI `--robot-triage` convention.
     #[arg(long, global = true)]
     robot_triage: bool,
     #[command(subcommand)]
@@ -249,8 +249,8 @@ fn run() -> Result<(), CliError> {
 
 /// `--robot-triage` mega-bootstrap. Combine `capabilities` + a light
 /// health summary + a quick-ref of canonical invocations into a single
-/// JSON object on stdout. Mirrors `plsql-mcp --robot-triage` so agents
-/// can use the same bootstrap recipe for every CLI. Always exits 0 in
+/// JSON object on stdout. Mirrors the workspace CLI `--robot-triage`
+/// convention so agents can use the same bootstrap recipe for every CLI. Always exits 0 in
 /// the current build (no blockers wired); the exit-2 path is reserved
 /// for future blocker conditions.
 fn run_robot_triage(robot_json: bool) -> Result<(), CliError> {

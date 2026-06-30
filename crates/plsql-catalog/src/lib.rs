@@ -565,8 +565,8 @@ pub struct MissingPermissionReport {
 
 /// Structured doctor report for a `CatalogSnapshot`.
 ///
-/// Consumers (`plsql catalog doctor --robot-json`, `plsql-mcp` foundation
-/// tools, and the planned `plsql doctor` umbrella surface) can render the
+/// Consumers (`plsql catalog doctor --robot-json`, external MCP hosts such
+/// as `oraclemcp`, and the planned `plsql doctor` umbrella surface) can render the
 /// report directly or wrap it in a `RobotJsonEnvelope` for stable,
 /// versioned output.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

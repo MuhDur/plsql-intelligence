@@ -33,11 +33,8 @@
 //! link-local (`169.254/16`), IPv6 unique-local (`fc00::/7`) and
 //! link-local (`fe80::/10`), and every routable public address —
 //! unless the caller passes `allow_public_bind = true`. This
-//! mirrors the deliberate public-bind refusal in
-//! `plsql-mcp::tcp::parse_listen_target` so the two TCP-serving
-//! crates in this workspace share one bind-safety posture; the
-//! `is_safe_bind` predicates in both crates are kept byte-aligned
-//! (loopback-only).
+//! mirrors the deliberate public-bind refusal used by the workspace's
+//! local-only tools: only loopback is accepted without an explicit override.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -91,10 +88,8 @@ impl From<BindGuardError> for std::io::Error {
 /// and link-local (`fe80::/10`), and any public address — requires
 /// the explicit `allow_public_bind` opt-in.
 ///
-/// This is the same predicate `plsql-mcp::tcp::is_safe_bind`
-/// applies to the MCP TCP transport, kept deliberately identical
-/// so the two TCP-serving crates never diverge on what counts as
-/// a "local" bind. Rationale: this preview server is *unauthenticated*
+/// This predicate is deliberately stricter than "private network":
+/// only loopback counts as a local bind. Rationale: this preview server is *unauthenticated*
 /// (no token, no TLS, no peer check) and serves rendered PL/SQL
 /// source and schema docs. On a shared LAN, corporate VPN subnet,
 /// cloud VPC, or multi-tenant container network, "private" is not
@@ -506,12 +501,9 @@ mod tests {
 
     // ── Bind-safety guard ─────────────────────────────────────────────────
     //
-    // The preview server has no authentication; the guard mirrors
-    // `plsql-mcp::tcp::parse_listen_target` so the two TCP-serving crates
-    // in this workspace agree on what counts as a "local" bind. The
-    // adversarial address set below is kept identical to the set the
-    // plsql-mcp tcp tests run against, so neither crate can quietly
-    // drift looser than the other.
+    // The preview server has no authentication. The adversarial address
+    // set below pins the local-only policy so this crate cannot quietly
+    // drift looser over time.
 
     use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -527,8 +519,7 @@ mod tests {
 
     #[test]
     fn is_safe_bind_rejects_rfc1918_private() {
-        // Mirrors plsql-mcp::tcp::private_rfc1918_refused_without_override:
-        // shared LAN / VPC / container network co-residents must not
+        // Shared LAN / VPC / container network co-residents must not
         // reach the unauthenticated preview surface by default.
         for ip in [
             IpAddr::V4(Ipv4Addr::new(10, 0, 1, 5)),
@@ -607,7 +598,6 @@ mod tests {
 
     #[test]
     fn guard_bind_allows_rfc1918_and_link_local_with_override() {
-        // Symmetric with plsql-mcp::tcp::rfc1918_and_link_local_bind_with_override.
         // We resolve only; we do not bind, so the address need not be
         // assigned to this host.
         for raw in [

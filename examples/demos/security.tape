@@ -17,17 +17,17 @@ Type "cargo test --quiet -p plsql-privileges --lib doctor 2>&1 | tail -8"
 Enter
 Sleep 4s
 
-Type "# K18 sanitizer: prompt-injection markers"
+Type "# dynamic SQL sanitizer semantics: DBMS_ASSERT.NOOP is not a cleanse"
 Enter
 Sleep 600ms
-Type "cargo test --quiet -p plsql-mcp sanitize 2>&1 | tail -3"
+Type "cargo test --quiet -p plsql-ir dbms_assert_noop_is_not_a_sanitizer 2>&1 | tail -3"
 Enter
 Sleep 3s
 
-Type "# is_read_only_sql: FOR UPDATE + multi-statement reject"
+Type "# offline SQL preview guard: DDL/DML/anonymous blocks reject"
 Enter
 Sleep 600ms
-Type "cargo test --quiet -p plsql-mcp read_only_predicate 2>&1 | tail -3"
+Type "cargo test --quiet -p plsql-cicd is_read_only_sql_rejects 2>&1 | tail -3"
 Enter
 Sleep 3s
 

@@ -28,8 +28,9 @@ guard).
 ## Hero diff corpus
 
 The scenario golden (before/after/change.diff/expected_what_breaks.json)
-lives in `corpus/lab/hero_diff_dropcol/`.  The live integration test is
-`crates/plsql-mcp/tests/hero_demo_dropcol_live_xe.rs`.
+lives in `corpus/lab/hero_diff_dropcol/`. Live Oracle replay now belongs
+in `oraclemcp`; this repo keeps the offline corpus and expected impact
+artifact.
 
 ## Two heroes in `corpus/lab/`
 

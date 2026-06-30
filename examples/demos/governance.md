@@ -48,42 +48,39 @@ variants — every blind spot in the analysis pipeline is one of them:
 - `UnsupportedDialectFeature` — Oracle feature outside the parser's
   current support window (with per-feature remediation)
 - `ParserRecoveryRegion` — region recovered by error-tolerant parse
-- `ResponseSanitized` — K18 sanitizer rewrote a tool-call marker
+- `ResponseSanitized` — an upstream agent-facing host reports that a
+  response was scrubbed before returning it to an agent
 
 Compliance posture: every `UnknownReason` is a logged, citable gap.
 
-## Step 3 — Trust Block (planned)
+## Step 3 — Trust Block
 
-`plsql-mcp` will wire a `meta.trust_block` field into every MCP
-response (`PLSQL-MCP-007`). The block carries `analysis_profile`,
-`completeness_report`, and the diagnostic count by `UnknownReason`
-so an agent consuming `plsql-mcp` output can decide whether to act
-on the data or escalate.
+The CLI/reporting surfaces carry the same trust ingredients:
+`analysis_profile`, `completeness_report`, and the diagnostic count by
+`UnknownReason`. An external MCP host such as `oraclemcp` should forward
+those structured fields rather than inventing a second confidence model.
 
-State: gated on PLSQL-ENG-005 (engine doctor). Track via
-`oracle-ic04`.
+State: engine and CI/CD doctor surfaces expose typed uncertainty and
+remediation hints; MCP presentation belongs in `oraclemcp`.
 
-## Step 4 — MCP audit log
+## Step 4 — External live audit ownership
 
-Every live-DB tool call routes through `plsql-mcp::audit::AuditPlan`
-which records:
+Every live-DB tool call is now owned outside this repository. The live
+host should record:
 - Operation name (e.g. `compile_with_warnings`).
 - Connection DSN (redacted to `host:port/service` form).
 - Caller program (`V$SESSION.MODULE` marker).
 - Timestamp + outcome.
 
-The audit log writer is currently in-memory; a rotating disk-backed
-sink is a documented follow-up (filed during /mcp-server-design
-audit, oracle-3tff). For 1.0 the audit-plan-only surface is the
-compliance evidence; the rotating sink lands before GA.
+This repo contributes the offline impact facts and typed uncertainty
+records; `oraclemcp` owns durable live audit sinks and write guards.
 
-## Step 5 — K18 prompt-injection sanitization
+## Step 5 — Agent-facing response sanitization
 
-`plsql-mcp::query::sanitize` scrubs MCP / tool-call / chat-template
-markers from query results before they're returned to the agent.
-Coverage (33 marker families): `tool_call`, `tool_use`, antml:*
-family, OpenAI tokenizer-control tokens, Llama `<<SYS>>` / `[INST]`,
-chat-role prefixes. Audit-flagged: PLSQL-MCP-SEC-1.
+`UnknownReason::ResponseSanitized` remains in the shared output model so
+an external host can state when it scrubbed tool-call or chat-template
+markers before returning data to an agent. The actual live-result
+scrubbing implementation belongs with that host.
 
 ## Notes
 
