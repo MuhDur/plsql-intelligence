@@ -56,7 +56,7 @@ RESOLVED_VERSION=""
 VERSION_SOURCE=""
 SHA256SUMS_FILE=""
 NO_VERIFY_WARNED=0
-PROXY_ARGS=()
+PROXY_URL=""
 RELEASE_BINS=(plsql plsql-depgraph)
 DOWNLOADED_BINS=()
 DOWNLOADED_PATHS=()
@@ -103,13 +103,21 @@ detect_gum() {
 }
 
 setup_proxy() {
-  PROXY_ARGS=()
+  PROXY_URL=""
   if [[ -n "${HTTPS_PROXY:-}" ]]; then
-    PROXY_ARGS=(--proxy "$HTTPS_PROXY")
+    PROXY_URL="$HTTPS_PROXY"
     info "Using HTTPS proxy: $HTTPS_PROXY"
   elif [[ -n "${HTTP_PROXY:-}" ]]; then
-    PROXY_ARGS=(--proxy "$HTTP_PROXY")
+    PROXY_URL="$HTTP_PROXY"
     info "Using HTTP proxy: $HTTP_PROXY"
+  fi
+}
+
+curl_with_proxy() {
+  if [[ -n "$PROXY_URL" ]]; then
+    curl --proxy "$PROXY_URL" "$@"
+  else
+    curl "$@"
   fi
 }
 
@@ -337,8 +345,7 @@ github_api_latest_tag() {
 
   command -v curl >/dev/null 2>&1 || return 1
   response=$(
-    curl -fsSL \
-      "${PROXY_ARGS[@]}" \
+    curl_with_proxy -fsSL \
       -H "Accept: application/vnd.github+json" \
       -H "User-Agent: ${PROJECT_NAME}-installer" \
       "${GITHUB_API_BASE}/releases/latest" 2>/dev/null || true
@@ -353,8 +360,7 @@ github_redirect_latest_tag() {
 
   command -v curl >/dev/null 2>&1 || return 1
   effective_url=$(
-    curl -fsSIL \
-      "${PROXY_ARGS[@]}" \
+    curl_with_proxy -fsSIL \
       -H "User-Agent: ${PROJECT_NAME}-installer" \
       -o /dev/null \
       -w '%{url_effective}' \
@@ -401,8 +407,7 @@ download_file() {
   local output="$2"
 
   command -v curl >/dev/null 2>&1 || return 1
-  curl -fsSL \
-    "${PROXY_ARGS[@]}" \
+  curl_with_proxy -fsSL \
     --connect-timeout 10 \
     --retry 2 \
     --retry-delay 1 \
@@ -867,8 +872,7 @@ available_kb_for_path() {
 
 network_reachable() {
   command -v curl >/dev/null 2>&1 || return 1
-  curl -fsSI \
-    "${PROXY_ARGS[@]}" \
+  curl_with_proxy -fsSI \
     --connect-timeout 5 \
     --retry 1 \
     -H "User-Agent: ${PROJECT_NAME}-installer" \
