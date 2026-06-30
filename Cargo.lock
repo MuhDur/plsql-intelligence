@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "plsql-accretion"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "fs2",
  "plsql-core",
@@ -748,7 +748,7 @@ dependencies = [
 
 [[package]]
 name = "plsql-bindgen"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "plsql-core",
  "serde",
@@ -757,7 +757,7 @@ dependencies = [
 
 [[package]]
 name = "plsql-catalog"
-version = "0.1.2"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "plsql-core",
@@ -772,7 +772,7 @@ dependencies = [
 
 [[package]]
 name = "plsql-cicd"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "clap",
  "getrandom 0.3.4",
@@ -792,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "plsql-core"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "miette",
  "serde",
@@ -802,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "plsql-depgraph"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "clap",
  "miette",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "plsql-doc"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "plsql-core",
  "serde",
@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "plsql-engine"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "clap",
  "miette",
@@ -850,7 +850,7 @@ dependencies = [
 
 [[package]]
 name = "plsql-ir"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "plsql-catalog",
  "plsql-core",
@@ -864,7 +864,7 @@ dependencies = [
 
 [[package]]
 name = "plsql-lineage"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "plsql-catalog",
  "plsql-core",
@@ -880,7 +880,7 @@ dependencies = [
 
 [[package]]
 name = "plsql-output"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "plsql-core",
  "serde",
@@ -890,7 +890,7 @@ dependencies = [
 
 [[package]]
 name = "plsql-parser"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "plsql-core",
  "proptest",
@@ -901,7 +901,7 @@ dependencies = [
 
 [[package]]
 name = "plsql-parser-antlr"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "antlr-rust",
  "plsql-core",
@@ -911,7 +911,7 @@ dependencies = [
 
 [[package]]
 name = "plsql-privileges"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "plsql-catalog",
  "plsql-core",
@@ -924,7 +924,7 @@ dependencies = [
 
 [[package]]
 name = "plsql-project"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "plsql-core",
  "serde",
@@ -935,14 +935,14 @@ dependencies = [
 
 [[package]]
 name = "plsql-render"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "tracing",
 ]
 
 [[package]]
 name = "plsql-sast"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "plsql-core",
  "plsql-ir",
@@ -953,7 +953,7 @@ dependencies = [
 
 [[package]]
 name = "plsql-store"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -966,7 +966,7 @@ dependencies = [
 
 [[package]]
 name = "plsql-support"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "plsql-core",
  "serde",
@@ -977,7 +977,7 @@ dependencies = [
 
 [[package]]
 name = "plsql-symbols"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "plsql-core",
  "plsql-ir",
@@ -1517,7 +1517,7 @@ checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
 name = "usr-loop"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "clap",
  "plsql-accretion",

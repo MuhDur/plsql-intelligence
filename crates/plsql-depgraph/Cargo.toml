@@ -1,6 +1,6 @@
 [package]
 name = "plsql-depgraph"
-version = "0.6.0"
+version = "0.7.0"
 description = "Typed dependency-graph IR for plsql-intelligence"
 edition.workspace = true
 license.workspace = true
@@ -10,10 +10,10 @@ homepage.workspace = true
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 miette.workspace = true
-plsql-catalog = { path = "../plsql-catalog", version = "0.1.0" }
-plsql-core = { path = "../plsql-core", version = "0.1.0" }
-plsql-output = { path = "../plsql-output", version = "0.1.0" }
-plsql-render = { path = "../plsql-render", version = "0.1.0" }
+plsql-catalog = { path = "../plsql-catalog", version = "0.7.0" }
+plsql-core = { path = "../plsql-core", version = "0.7.0" }
+plsql-output = { path = "../plsql-output", version = "0.7.0" }
+plsql-render = { path = "../plsql-render", version = "0.7.0" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

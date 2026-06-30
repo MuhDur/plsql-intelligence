@@ -32,7 +32,7 @@
             "driver": {
               "name": "plsql-sast",
               "rules": [],
-              "semanticVersion": "0.6.2"
+              "semanticVersion": "0.7.0"
             }
           }
         }

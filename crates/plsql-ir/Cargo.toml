@@ -1,6 +1,6 @@
 [package]
 name = "plsql-ir"
-version = "0.1.0"
+version = "0.7.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -8,10 +8,10 @@ homepage.workspace = true
 description = "Typed semantic intermediate representation for plsql-intelligence"
 
 [dependencies]
-plsql-catalog = { path = "../plsql-catalog", version = "0.1.0" }
-plsql-core = { path = "../plsql-core", version = "0.1.0" }
-plsql-parser = { path = "../plsql-parser", version = "0.1.0" }
-plsql-privileges = { path = "../plsql-privileges", version = "0.1.0" }
+plsql-catalog = { path = "../plsql-catalog", version = "0.7.0" }
+plsql-core = { path = "../plsql-core", version = "0.7.0" }
+plsql-parser = { path = "../plsql-parser", version = "0.7.0" }
+plsql-privileges = { path = "../plsql-privileges", version = "0.7.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

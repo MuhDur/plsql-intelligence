@@ -1,6 +1,6 @@
 [package]
 name = "plsql-render"
-version = "0.1.0"
+version = "0.7.0"
 description = "Low-level HTML, Markdown, and SVG render helpers for plsql-intelligence"
 edition.workspace = true
 license.workspace = true

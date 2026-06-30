@@ -61,8 +61,8 @@ historical versions remain a compatibility path until the distribution
 retirement beads finish; new PL/SQL intelligence work should flow through
 the library crates and the `plsql` / `plsql-depgraph` / `usr-loop` CLIs.
 
-> _Independent open-source project; not affiliated with Oracle. The Docker images
-> ship the project binaries only; Oracle client libraries are not included._
+> _Independent open-source project; not affiliated with Oracle. Oracle client
+> libraries are not included or required for the offline engine._
 
 ### Why use it?
 
@@ -109,10 +109,6 @@ retirement plan for the MCP split.
   parser, semantic model, catalog snapshot model, dependency graph,
   lineage, documentation, SAST, change-impact, and USR Loop library
   surfaces that `oraclemcp` can consume.
-- A temporary feature-gated live extraction path still exists while the
-  offline pivot is being completed. Its removal is tracked by
-  `oracle-jfqh.15`; until that bead lands, the README describes the product
-  direction without claiming every legacy live file is already gone.
 - The **USR Loop** is implemented end to end: the `plsql-accretion`
   library, the `usr-loop` tool, the sha-pinned conformance gate, the
   monotone tripwire, and the re-runnable acceptance proof
@@ -134,10 +130,6 @@ The default local profile is offline and stable-channel:
 - `plan-lint`, corpus license checks, parse-success checks, lab goldens,
   demo-no-db, offline honesty grep, offline boundary lint, and the USR
   accretion gates.
-
-The remaining live extraction tests are transition coverage, not the
-normal product path. They stay isolated behind explicit features until
-`oracle-jfqh.15` removes the live code from this repository.
 
 Do not read the test suite as "there are no test doubles anywhere." The
 repo contains deliberate test doubles where they pin a boundary: feature

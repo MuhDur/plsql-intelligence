@@ -11,8 +11,9 @@ This tree has been prepared for an open-source release:
   source, docs, scripts, corpus, or configuration. The private estate is
   addressed only through the `PLSQL_PRIVATE_ESTATE` environment variable.
 - Every crate is dual-licensed `Apache-2.0 OR MIT`. There is no
-  source-available or commercial-tier code; the MCP server is a single
-  unified crate (`plsql-mcp`).
+  source-available or commercial-tier code. MCP serving belongs in the
+  separate `oraclemcp` repository; this tree publishes only the offline
+  PL/SQL engine crates and CLIs.
 - The offline workspace is `#![forbid(unsafe_code)]` and builds, tests, and
   clippy-clean on the stable toolchain used by the default CI profile.
 
@@ -61,7 +62,8 @@ runners (no private estate) and is only fully exercised on a host where
 
 The workspace is pre-1.0; the API can still move. If you publish to
 crates.io, publish in dependency order, leaves first (`plsql-core`,
-`plsql-output`, `plsql-render`, `plsql-store`, then the parser, IR,
-catalog, engine, product, and MCP layers last). The vendored ANTLR
-grammar under `crates/plsql-parser-antlr/grammars/` is Apache-2.0 and is
-already declared in that crate's `include` list.
+`plsql-render`, `plsql-store`, then output/parser/catalog foundations,
+semantic crates, and product crates such as `plsql-engine`,
+`plsql-depgraph`, `plsql-cicd`, and `plsql-accretion` last). The
+vendored ANTLR grammar under `crates/plsql-parser-antlr/grammars/` is
+Apache-2.0 and is already declared in that crate's `include` list.

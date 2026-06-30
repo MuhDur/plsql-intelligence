@@ -1,6 +1,6 @@
 [package]
 name = "plsql-catalog"
-version = "0.1.2"
+version = "0.7.0"
 description = "Offline-first Oracle catalog snapshot model for plsql-intelligence"
 edition.workspace = true
 license.workspace = true
@@ -12,8 +12,8 @@ default = []
 
 [dependencies]
 chrono = { version = "0.4.44", features = ["serde"] }
-plsql-core = { path = "../plsql-core", version = "0.1.0" }
-plsql-output = { path = "../plsql-output", version = "0.1.0" }
+plsql-core = { path = "../plsql-core", version = "0.7.0" }
+plsql-output = { path = "../plsql-output", version = "0.7.0" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

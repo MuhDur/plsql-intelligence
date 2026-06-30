@@ -9,18 +9,18 @@ work.
 
 ## [Unreleased]
 
-- **MCP crate removed.** The sign-off-gated P2.1 offline-pivot step removed
-  `crates/plsql-mcp` from the workspace and release binary list. MCP serving
-  now belongs in the separate `oraclemcp` repository; this repo keeps the
-  offline PL/SQL engine and CLI crates.
+- No unreleased changes.
 
-## [0.7.0] - 2026-06-29
+## [0.7.0] - 2026-06-30
 
-- **Offline-pivot release track.** The 0.7.0 work is now tracked under
-  the `oracle-jfqh` bead tree, with sign-off-gated retirement work kept
-  separate from the stable offline engine and CLI work. The transitional
-  `plsql-mcp` crate remains excluded from stable defaults until the
-  explicit removal/deprecation gates are complete.
+- **Offline-pivot release.** The `plsql-mcp` workspace crate, live Oracle
+  catalog/CICD code, MCP server build workflows, Dockerfile, and server
+  manifest were removed from this repository. MCP serving now belongs in
+  the separate `oraclemcp` repository; this repo ships only the offline
+  PL/SQL engine and CLI crates.
+- **Version alignment.** The product crates and the `usr-loop` CLI are now
+  aligned on `0.7.0`, with internal path dependency constraints updated
+  for crates.io publication and `Cargo.lock` regenerated.
 - **Stable offline CLI expansion.** The `plsql` CLI now exposes offline
   `doc` and `sast` subcommands backed by `plsql-doc` and `plsql-sast`,
   so documentation and static-analysis outputs are available without the
@@ -34,9 +34,6 @@ work.
   feature, catalog rowset extraction for the PL/SQL engine seam,
   feature-gated intelligence tools, and migrated live-XE hero coverage
   for the `DROP COLUMN customers.legacy_segment` scenario.
-- **Cargo lockfile and CI proof.** `Cargo.lock` was checked with
-  `cargo metadata --locked`; no lockfile delta was needed. The
-  `plsql-change-impact-selftest.yml` workflow is green on `main`.
 
 ## [0.6.3] - 2026-06-29
 

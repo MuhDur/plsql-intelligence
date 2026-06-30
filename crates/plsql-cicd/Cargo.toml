@@ -1,6 +1,6 @@
 [package]
 name = "plsql-cicd"
-version = "0.6.2"
+version = "0.7.0"
 description = "CI/CD recompilation cascade types and operations for plsql-intelligence"
 edition.workspace = true
 license.workspace = true
@@ -13,12 +13,12 @@ default = []
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 getrandom = "0.3"
-plsql-catalog = { path = "../plsql-catalog", version = "0.1.2" }
-plsql-core = { path = "../plsql-core", version = "0.1.0" }
-plsql-doc = { path = "../plsql-doc", version = "0.1.0" }
-plsql-lineage = { path = "../plsql-lineage", version = "0.1.0" }
-plsql-output = { path = "../plsql-output", version = "0.1.0" }
-plsql-sast = { path = "../plsql-sast", version = "0.1.0" }
+plsql-catalog = { path = "../plsql-catalog", version = "0.7.0" }
+plsql-core = { path = "../plsql-core", version = "0.7.0" }
+plsql-doc = { path = "../plsql-doc", version = "0.7.0" }
+plsql-lineage = { path = "../plsql-lineage", version = "0.7.0" }
+plsql-output = { path = "../plsql-output", version = "0.7.0" }
+plsql-sast = { path = "../plsql-sast", version = "0.7.0" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -26,7 +26,7 @@ toml = "1.1"
 tracing.workspace = true
 
 [dev-dependencies]
-plsql-depgraph = { path = "../plsql-depgraph", version = "0.6.0" }
+plsql-depgraph = { path = "../plsql-depgraph", version = "0.7.0" }
 
 [[bin]]
 name = "plsql"

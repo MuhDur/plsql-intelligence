@@ -1,6 +1,6 @@
 [package]
 name = "plsql-accretion"
-version = "0.1.0"
+version = "0.7.0"
 description = "USR loop library (Layer 5): GapRecord capture from honest-uncertainty exhaust (PLSQL-USR-001)"
 edition.workspace = true
 license.workspace = true
@@ -9,14 +9,14 @@ homepage.workspace = true
 
 [dependencies]
 fs2 = { workspace = true }
-plsql-core = { path = "../plsql-core", version = "0.1.0" }
-plsql-engine = { path = "../plsql-engine", version = "0.1.0" }
-plsql-output = { path = "../plsql-output", version = "0.1.0" }
-plsql-parser = { path = "../plsql-parser", version = "0.1.0" }
-plsql-parser-antlr = { path = "../plsql-parser-antlr", version = "0.1.0", features = [
+plsql-core = { path = "../plsql-core", version = "0.7.0" }
+plsql-engine = { path = "../plsql-engine", version = "0.7.0" }
+plsql-output = { path = "../plsql-output", version = "0.7.0" }
+plsql-parser = { path = "../plsql-parser", version = "0.7.0" }
+plsql-parser-antlr = { path = "../plsql-parser-antlr", version = "0.7.0", features = [
     "antlr-codegen",
 ] }
-plsql-support = { path = "../plsql-support", version = "0.1.0" }
+plsql-support = { path = "../plsql-support", version = "0.7.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

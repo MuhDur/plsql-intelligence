@@ -1,6 +1,6 @@
 [package]
 name = "plsql-parser-antlr"
-version = "0.1.0"
+version = "0.7.0"
 description = "ANTLR4-based PL/SQL parser backend (grammar + codegen)"
 edition.workspace = true
 license.workspace = true
@@ -26,8 +26,8 @@ default = []
 antlr-codegen = ["antlr-rust"]
 
 [dependencies]
-plsql-core = { path = "../plsql-core", version = "0.1.0" }
-plsql-parser = { path = "../plsql-parser", version = "0.1.0" }
+plsql-core = { path = "../plsql-core", version = "0.7.0" }
+plsql-parser = { path = "../plsql-parser", version = "0.7.0" }
 # antlr-rust runtime — only used when antlr-codegen feature is enabled.
 antlr-rust = { version = "0.3.0-beta", optional = true }
 

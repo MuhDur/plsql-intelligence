@@ -1,6 +1,6 @@
 [package]
 name = "usr-loop"
-version = "0.1.0"
+version = "0.7.0"
 edition.workspace = true
 license.workspace = true
 description = "USR loop orchestrator: capture honest-uncertainty gaps from an Oracle estate (PLSQL-USR-001)"
@@ -10,9 +10,9 @@ name = "usr-loop"
 path = "src/main.rs"
 
 [dependencies]
-plsql-accretion = { path = "../../crates/plsql-accretion", version = "0.1.0" }
-plsql-engine = { path = "../../crates/plsql-engine", version = "0.1.0" }
-plsql-output = { path = "../../crates/plsql-output", version = "0.1.0" }
+plsql-accretion = { path = "../../crates/plsql-accretion", version = "0.7.0" }
+plsql-engine = { path = "../../crates/plsql-engine", version = "0.7.0" }
+plsql-output = { path = "../../crates/plsql-output", version = "0.7.0" }
 clap = { version = "4.5", features = ["derive"] }
 serde_json = { workspace = true }
 
