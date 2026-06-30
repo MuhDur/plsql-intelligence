@@ -896,8 +896,15 @@ fn check_stale_section_refs(doc: &PlanDoc) -> Vec<Finding> {
 }
 
 fn check_component_coverage(doc: &PlanDoc) -> Vec<Finding> {
-    // Subset of components routed to a future plan; not required to have beads.
-    let future_components: HashSet<&str> = ["plsql-subset"].into_iter().collect();
+    // Components not required to have historical plan bead-seed rows.
+    let future_components: HashSet<&str> = [
+        "plsql-subset",
+        // Accretion/USR work is tracked in the live Beads graph, not the
+        // older plan seed tables this check audits.
+        "plsql-accretion",
+    ]
+    .into_iter()
+    .collect();
     // Component aliases that mean "the same thing" as a bead-table family.
     let component_to_bead_family: HashMap<&str, &str> = [
         ("plsql-core", "PLSQL-CORE"),
@@ -916,6 +923,7 @@ fn check_component_coverage(doc: &PlanDoc) -> Vec<Finding> {
         ("plsql-depgraph", "PLSQL-DEP"),
         ("plsql-engine", "PLSQL-ENG"),
         ("plsql-scan", "PLSQL-SAST"),
+        ("plsql-sast", "PLSQL-SAST"),
         ("plsql-doc", "PLSQL-DOC"),
         ("plsql-bindgen", "PLSQL-BG"),
         ("plsql-lineage", "PLSQL-LIN"),
@@ -1340,8 +1348,8 @@ mod tests {
     #[test]
     fn version_flag_parses_long_and_short() {
         for arg in ["--version", "-V"] {
-            let parsed = parse_args(vec![arg.to_string()])
-                .unwrap_or_else(|e| panic!("{arg} should parse, got: {e}"));
+            let parsed =
+                parse_args(vec![arg.to_string()]).expect("version flag should parse cleanly");
             assert!(parsed.version, "{arg} should set version flag");
         }
     }
