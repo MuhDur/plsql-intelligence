@@ -2,7 +2,9 @@
 //!
 //! When `PLSQL_ANTLR_REGEN=1` is set, this script:
 //!
-//! 1. Locates the vendored `antlr4-rust.jar` codegen tool
+//! 1. Locates the vendored `antlr4-rust.jar` codegen tool, or the
+//!    `PLSQL_ANTLR_TOOL_JAR` override when set. Relative overrides resolve
+//!    from the workspace root when it can be found.
 //! 2. Runs `java -jar <jar> -Dlanguage=Rust` on `PlSqlLexer.g4` and
 //!    `PlSqlParser.g4`
 //! 3. Applies post-processing fixes for known antlr4rust blockers:
@@ -10,32 +12,51 @@
 //!    - Replaces Java-style `this.` with Rust-style `recog.` in embedded
 //!      actions
 //! 4. Writes the generated Rust source into `src/generated/`, or into
-//!    `PLSQL_ANTLR_REGEN_DIR` when that environment variable is set
+//!    `PLSQL_ANTLR_REGEN_DIR` when that environment variable is set. Relative
+//!    override directories resolve from the workspace root when it can be found.
 //!
 //! Normal builds never require Java. They compile the committed generated
 //! source under `src/generated/`.
 
 use std::env;
+use std::error::Error;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn main() {
+type BuildResult<T> = Result<T, Box<dyn Error>>;
+
+fn main() -> BuildResult<()> {
     println!("cargo:rerun-if-env-changed=PLSQL_ANTLR_REGEN");
     println!("cargo:rerun-if-env-changed=PLSQL_ANTLR_REGEN_DIR");
+    println!("cargo:rerun-if-env-changed=PLSQL_ANTLR_TOOL_JAR");
 
     // Only validate or regenerate generated code when the feature is enabled.
     if env::var("CARGO_FEATURE_ANTLR_CODEGEN").is_err() {
         println!("cargo:warning=antlr-codegen feature not enabled, skipping ANTLR codegen");
-        return;
+        return Ok(());
     }
 
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").map_err(|e| {
+        build_error(format!(
+            "CARGO_MANIFEST_DIR must be set by Cargo for ANTLR codegen: {e}"
+        ))
+    })?);
+    let workspace_root = find_workspace_root(&manifest_dir);
     let committed_generated_dir = manifest_dir.join("src/generated");
 
-    let jar_path = manifest_dir.join("tools/antlr4-rust.jar");
-    let lexer_grammar = manifest_dir.join("grammars/PlSqlLexer.g4");
-    let parser_grammar = manifest_dir.join("grammars/PlSqlParser.g4");
+    let grammar_dir = manifest_dir.join("grammars");
+    let jar_path = env::var_os("PLSQL_ANTLR_TOOL_JAR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| manifest_dir.join("tools/antlr4-rust.jar"));
+    let jar_path = if jar_path.is_absolute() {
+        jar_path
+    } else {
+        workspace_root.join(jar_path)
+    };
+    let lexer_grammar = grammar_dir.join("PlSqlLexer.g4");
+    let parser_grammar = grammar_dir.join("PlSqlParser.g4");
 
     // Re-run if inputs or committed generated files change.
     println!("cargo:rerun-if-changed={}", lexer_grammar.display());
@@ -49,70 +70,91 @@ fn main() {
     }
 
     if !regen_requested() {
-        verify_generated_files(&committed_generated_dir);
+        verify_generated_files(&committed_generated_dir)?;
         println!(
             "cargo:warning=Using committed ANTLR generated source from {}",
             committed_generated_dir.display()
         );
-        return;
+        return Ok(());
     }
 
     // Verify generator inputs exist only for explicit regeneration.
-    assert!(
-        jar_path.exists(),
-        "antlr4-rust.jar not found at {}",
-        jar_path.display()
-    );
-    assert!(
-        lexer_grammar.exists(),
-        "PlSqlLexer.g4 not found at {}",
-        lexer_grammar.display()
-    );
-    assert!(
-        parser_grammar.exists(),
-        "PlSqlParser.g4 not found at {}",
-        parser_grammar.display()
-    );
+    require_existing_path(&jar_path, "antlr4-rust.jar")?;
+    require_existing_path(&lexer_grammar, "PlSqlLexer.g4")?;
+    require_existing_path(&parser_grammar, "PlSqlParser.g4")?;
 
     let out_dir = env::var_os("PLSQL_ANTLR_REGEN_DIR")
         .map(PathBuf::from)
         .unwrap_or(committed_generated_dir);
-    fs::create_dir_all(&out_dir)
-        .unwrap_or_else(|e| panic!("Failed to create generated output dir: {e}"));
+    let out_dir = if out_dir.is_absolute() {
+        out_dir
+    } else {
+        workspace_root.join(out_dir)
+    };
+    fs::create_dir_all(&out_dir).map_err(|e| {
+        build_error(format!(
+            "failed to create generated output dir {}: {e}",
+            out_dir.display()
+        ))
+    })?;
 
     // --- Generate lexer ---
     println!("cargo:warning=Generating Rust lexer from PlSqlLexer.g4...");
-    run_antlr(&jar_path, &lexer_grammar, &out_dir, false);
+    run_antlr(&jar_path, &grammar_dir, "PlSqlLexer.g4", &out_dir, false)?;
 
     // --- Generate parser + listener ---
     // NOTE: The parser grammar has known non-fatal errors (fn keyword collision).
     // antlr4rust still generates valid output despite reporting these errors.
     // We pass `allow_errors=true` to tolerate the non-zero exit code.
     println!("cargo:warning=Generating Rust parser from PlSqlParser.g4...");
-    run_antlr_with_listener(&jar_path, &parser_grammar, &out_dir, true);
+    run_antlr_with_listener(&jar_path, &grammar_dir, "PlSqlParser.g4", &out_dir, true)?;
 
     // Verify output files were generated.
     for name in generated_file_names() {
         let path = out_dir.join(name);
-        assert!(
-            path.exists(),
-            "Expected generated file {} not found at {}",
-            name,
-            path.display()
-        );
-        let size = fs::metadata(&path).unwrap().len();
+        require_existing_path(&path, &format!("generated file {name}"))?;
+        let size = fs::metadata(&path)
+            .map_err(|e| build_error(format!("failed to stat {}: {e}", path.display())))?
+            .len();
         println!("cargo:warning=Generated {name}: {size} bytes");
     }
 
     // --- Post-process generated code ---
-    post_process(&out_dir.join("plsqllexer.rs"), "lexer");
-    post_process(&out_dir.join("plsqlparser.rs"), "parser");
-    post_process(&out_dir.join("plsqlparserlistener.rs"), "listener");
+    post_process(&out_dir.join("plsqllexer.rs"), "lexer")?;
+    post_process(&out_dir.join("plsqlparser.rs"), "parser")?;
+    post_process(&out_dir.join("plsqlparserlistener.rs"), "listener")?;
 
     println!(
         "cargo:warning=ANTLR codegen complete. Output in {}",
         out_dir.display()
     );
+    Ok(())
+}
+
+fn build_error(message: impl Into<String>) -> Box<dyn Error> {
+    Box::new(io::Error::other(message.into()))
+}
+
+fn require_existing_path(path: &Path, description: &str) -> BuildResult<()> {
+    if path.exists() {
+        return Ok(());
+    }
+
+    Err(build_error(format!(
+        "{description} not found at {}",
+        path.display()
+    )))
+}
+
+fn find_workspace_root(manifest_dir: &Path) -> PathBuf {
+    let mut current = Some(manifest_dir);
+    while let Some(dir) = current {
+        if dir.join("Cargo.lock").exists() && dir.join("Cargo.toml").exists() {
+            return dir.to_path_buf();
+        }
+        current = dir.parent();
+    }
+    manifest_dir.to_path_buf()
 }
 
 fn regen_requested() -> bool {
@@ -125,21 +167,30 @@ fn generated_file_names() -> [&'static str; 3] {
     ["plsqllexer.rs", "plsqlparser.rs", "plsqlparserlistener.rs"]
 }
 
-fn verify_generated_files(dir: &Path) {
+fn verify_generated_files(dir: &Path) -> BuildResult<()> {
     for name in generated_file_names() {
         let path = dir.join(name);
-        assert!(
-            path.exists(),
-            "Committed ANTLR generated file missing at {}. \
-             Restore it from git, or run `PLSQL_ANTLR_REGEN=1 cargo build -p plsql-parser-antlr --features antlr-codegen` to regenerate it.",
-            path.display()
-        );
+        if !path.exists() {
+            return Err(build_error(format!(
+                "committed ANTLR generated file missing at {}. \
+                 Restore it from git, or run `PLSQL_ANTLR_REGEN=1 cargo build -p plsql-parser-antlr --features antlr-codegen` to regenerate it.",
+                path.display()
+            )));
+        }
     }
+    Ok(())
 }
 
 /// Run ANTLR codegen for a lexer grammar.
-fn run_antlr(jar: &Path, grammar: &Path, out_dir: &Path, allow_errors: bool) {
+fn run_antlr(
+    jar: &Path,
+    grammar_dir: &Path,
+    grammar_name: &str,
+    out_dir: &Path,
+    allow_errors: bool,
+) -> BuildResult<()> {
     let output = Command::new("java")
+        .current_dir(grammar_dir)
         .args([
             "-jar",
             &jar.to_string_lossy(),
@@ -148,10 +199,10 @@ fn run_antlr(jar: &Path, grammar: &Path, out_dir: &Path, allow_errors: bool) {
             &out_dir.to_string_lossy(),
             "-no-listener",
             "-no-visitor",
-            &grammar.to_string_lossy(),
+            grammar_name,
         ])
         .output()
-        .expect("Failed to run java — is Java 11+ on PATH?");
+        .map_err(|e| build_error(format!("failed to run java; is Java 11+ on PATH? {e}")))?;
 
     // Print stderr warnings/errors from ANTLR.
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -160,25 +211,39 @@ fn run_antlr(jar: &Path, grammar: &Path, out_dir: &Path, allow_errors: bool) {
     }
 
     if !output.status.success() && !allow_errors {
-        panic!("ANTLR codegen failed for {}", grammar.display());
+        return Err(build_error(format!(
+            "ANTLR codegen failed for {}",
+            grammar_dir.join(grammar_name).display()
+        )));
     }
+
+    Ok(())
 }
 
 /// Run ANTLR codegen for a parser grammar (with listener).
-fn run_antlr_with_listener(jar: &Path, grammar: &Path, out_dir: &Path, allow_errors: bool) {
+fn run_antlr_with_listener(
+    jar: &Path,
+    grammar_dir: &Path,
+    grammar_name: &str,
+    out_dir: &Path,
+    allow_errors: bool,
+) -> BuildResult<()> {
     let output = Command::new("java")
+        .current_dir(grammar_dir)
         .args([
             "-jar",
             &jar.to_string_lossy(),
             "-Dlanguage=Rust",
             "-o",
             &out_dir.to_string_lossy(),
+            "-lib",
+            &out_dir.to_string_lossy(),
             "-listener",
             "-no-visitor",
-            &grammar.to_string_lossy(),
+            grammar_name,
         ])
         .output()
-        .expect("Failed to run java — is Java 11+ on PATH?");
+        .map_err(|e| build_error(format!("failed to run java; is Java 11+ on PATH? {e}")))?;
 
     // Print stderr warnings/errors from ANTLR.
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -187,8 +252,13 @@ fn run_antlr_with_listener(jar: &Path, grammar: &Path, out_dir: &Path, allow_err
     }
 
     if !output.status.success() && !allow_errors {
-        panic!("ANTLR codegen failed for {}", grammar.display());
+        return Err(build_error(format!(
+            "ANTLR codegen failed for {}",
+            grammar_dir.join(grammar_name).display()
+        )));
     }
+
+    Ok(())
 }
 
 /// Apply post-processing fixes for known antlr4rust blockers.
@@ -222,14 +292,18 @@ fn run_antlr_with_listener(jar: &Path, grammar: &Path, out_dir: &Path, allow_err
 ///
 /// 7. Trailing newline count — codegen can leave an extra blank line at EOF.
 ///    Normalize to exactly one final newline for byte-stable drift checks.
-fn post_process(path: &Path, label: &str) {
-    let content = fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("Failed to read generated {label}: {e}"));
+fn post_process(path: &Path, label: &str) -> BuildResult<()> {
+    let content = fs::read_to_string(path).map_err(|e| {
+        build_error(format!(
+            "failed to read generated {label} at {}: {e}",
+            path.display()
+        ))
+    })?;
 
     let original_len = content.len();
 
     // Class E: normalize local checkout paths in ANTLR's generated header.
-    let content = normalize_generated_header(&content, label);
+    let content = normalize_generated_header(&content, label)?;
     // Class A: inner attributes → outer attributes.
     let content = fix_inner_attributes(&content);
     // Class B: `fn` keyword collisions (field access + definitions).
@@ -245,12 +319,18 @@ fn post_process(path: &Path, label: &str) {
 
     let changes = original_len != content.len();
 
-    fs::write(path, &content)
-        .unwrap_or_else(|e| panic!("Failed to write post-processed {label}: {e}"));
+    fs::write(path, &content).map_err(|e| {
+        build_error(format!(
+            "failed to write post-processed {label} at {}: {e}",
+            path.display()
+        ))
+    })?;
 
     if changes {
         println!("cargo:warning=Post-processed {label}: applied antlr4rust compatibility patches");
     }
+
+    Ok(())
 }
 
 fn normalize_trailing_newline(content: &str) -> String {
@@ -259,18 +339,26 @@ fn normalize_trailing_newline(content: &str) -> String {
     normalized
 }
 
-fn normalize_generated_header(content: &str, label: &str) -> String {
+fn normalize_generated_header(content: &str, label: &str) -> BuildResult<String> {
     let grammar = match label {
         "lexer" => "PlSqlLexer.g4",
         "parser" | "listener" => "PlSqlParser.g4",
-        other => panic!("unknown generated ANTLR label: {other}"),
+        other => {
+            return Err(build_error(format!(
+                "unknown generated ANTLR label: {other}"
+            )));
+        }
     };
-    let suffix = format!("{grammar} by ANTLR 4.8");
-    let canonical = format!("// Generated from grammars/{grammar} by ANTLR 4.8");
+    let marker = format!("{grammar} by ANTLR ");
 
     let mut normalized = String::with_capacity(content.len());
     for line in content.lines() {
-        if line.starts_with("// Generated from ") && line.ends_with(&suffix) {
+        if line.starts_with("// Generated from ") && line.contains(&marker) {
+            let version = line
+                .rsplit_once(" by ANTLR ")
+                .map(|(_, version)| version)
+                .unwrap_or("unknown");
+            let canonical = format!("// Generated from grammars/{grammar} by ANTLR {version}");
             normalized.push_str(&canonical);
         } else {
             normalized.push_str(line);
@@ -280,7 +368,7 @@ fn normalize_generated_header(content: &str, label: &str) -> String {
     if !content.ends_with('\n') {
         normalized.pop();
     }
-    normalized
+    Ok(normalized)
 }
 
 /// Class A fix: convert inner `#![allow(...)]` to outer `#[allow(...)]`.
@@ -357,6 +445,7 @@ fn fix_this_references(content: &str) -> String {
 ///   - `From<'a>` = `<CommonTokenFactory as TokenFactory<'a>>::From` = `Cow<'a, str>`
 ///   - Lexer impl needs `Input: CharStream<From<'input>>` = `CharStream<Cow<'input, str>>`
 fn inject_predicate_traits(content: &str, label: &str) -> String {
+    let runtime = generated_runtime_crate(content);
     match label {
         "parser" => {
             // There are two call-site contexts for predicate methods:
@@ -398,8 +487,8 @@ trait PlSqlParserPredicates {
 #[allow(non_snake_case)]
 impl<'input, I> PlSqlParserPredicates for BaseParserType<'input, I>
 where
-    I: antlr_rust::token_stream::TokenStream<'input, TF = LocalTokenFactory<'input>>
-        + antlr_rust::TidAble<'input>,
+    I: __ANTLR_RUNTIME__::token_stream::TokenStream<'input, TF = LocalTokenFactory<'input>>
+        + __ANTLR_RUNTIME__::TidAble<'input>,
 {
     fn isVersion12(&mut self) -> bool { true }
     fn isVersion11(&mut self) -> bool { true }
@@ -415,9 +504,9 @@ where
 #[allow(non_snake_case)]
 impl<'input, I, H> PlSqlParserPredicates for PlSqlParser<'input, I, H>
 where
-    I: antlr_rust::token_stream::TokenStream<'input, TF = LocalTokenFactory<'input>>
-        + antlr_rust::TidAble<'input>,
-    H: antlr_rust::error_strategy::ErrorStrategy<'input, BaseParserType<'input, I>>,
+    I: __ANTLR_RUNTIME__::token_stream::TokenStream<'input, TF = LocalTokenFactory<'input>>
+        + __ANTLR_RUNTIME__::TidAble<'input>,
+    H: __ANTLR_RUNTIME__::error_strategy::ErrorStrategy<'input, BaseParserType<'input, I>>,
 {
     fn isVersion12(&mut self) -> bool { true }
     fn isVersion11(&mut self) -> bool { true }
@@ -426,7 +515,10 @@ where
     fn isNotStartOfJoin(&mut self) -> bool { false }
 }
 "#;
-            format!("{content}{trait_code}")
+            format!(
+                "{content}{}",
+                trait_code.replace("__ANTLR_RUNTIME__", runtime)
+            )
         }
         "lexer" => {
             // The sempred functions receive `recog: &mut BaseLexer<'input, PlSqlLexerActions, Input, LocalTokenFactory<'input>>`.
@@ -448,20 +540,31 @@ trait PlSqlLexerPredicates {
 
 #[allow(non_snake_case)]
 impl<'input, Input> PlSqlLexerPredicates
-    for antlr_rust::lexer::BaseLexer<
+    for __ANTLR_RUNTIME__::lexer::BaseLexer<
         'input,
         PlSqlLexerActions,
         Input,
         LocalTokenFactory<'input>,
     >
 where
-    Input: antlr_rust::char_stream::CharStream<From<'input>>,
+    Input: __ANTLR_RUNTIME__::char_stream::CharStream<From<'input>>,
 {
     fn IsNewlineAtPos(&mut self, _pos: isize) -> bool { false }
 }
 "#;
-            format!("{content}{trait_code}")
+            format!(
+                "{content}{}",
+                trait_code.replace("__ANTLR_RUNTIME__", runtime)
+            )
         }
         _ => content.to_string(),
+    }
+}
+
+fn generated_runtime_crate(content: &str) -> &'static str {
+    if content.contains("use antlr4rust::") {
+        "antlr4rust"
+    } else {
+        "antlr_rust"
     }
 }
