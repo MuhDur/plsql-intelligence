@@ -468,7 +468,7 @@ plsql-parser-antlr/
 │   ├── PlSqlLexer.g4   # 2,618 lines — vendored from antlr/grammars-v4
 │   └── PlSqlParser.g4  # 10,011 lines — vendored from antlr/grammars-v4
 ├── tools/
-│   └── antlr4-rust.jar # ANTLR4 Rust codegen tool
+│   └── antlr4-4.13.3-SNAPSHOT-complete.jar # ANTLR4 Rust codegen tool
 ├── src/
 │   ├── lib.rs          # Generated code modules (behind antlr-codegen feature)
 │   ├── lower/mod.rs    # Source text → Ast lowering
@@ -499,5 +499,5 @@ plsql-parser-antlr/
   (no silent uncertainty), R20 (parser backend isolation)
 - **ANTLR grammar source:** <https://github.com/antlr/grammars-v4/tree/master/sql/plsql>
 - **Grammar license:** Apache-2.0 (per-file headers)
-- **antlr4rust runtime:** <https://github.com/rrevenantt/antlr4rust>
+- **antlr4rust runtime:** <https://github.com/antlr4rust/antlr4>
 - **Decision artifact:** `docs/decisions/D1-parser-backend-spike.md`

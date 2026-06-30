@@ -20,16 +20,16 @@ include = [
 [features]
 default = []
 # Enable the generated ANTLR backend.
-# Pulls in the antlr-rust runtime so committed generated code can compile.
+# Pulls in the antlr4rust runtime so committed generated code can compile.
 # Java regeneration is explicit only: PLSQL_ANTLR_REGEN=1.
 # Without this feature, the crate exposes only the grammar files and docs.
-antlr-codegen = ["antlr-rust"]
+antlr-codegen = ["antlr4rust"]
 
 [dependencies]
 plsql-core = { path = "../plsql-core", version = "0.7.0" }
 plsql-parser = { path = "../plsql-parser", version = "0.7.0" }
-# antlr-rust runtime — only used when antlr-codegen feature is enabled.
-antlr-rust = { version = "0.3.0-beta", optional = true }
+# antlr4rust runtime — only used when antlr-codegen feature is enabled.
+antlr4rust = { version = "0.5.2", optional = true }
 
 [dev-dependencies]
 # Used by the antlr4rust_backend test suite (never-panic / proptest fuzzing).

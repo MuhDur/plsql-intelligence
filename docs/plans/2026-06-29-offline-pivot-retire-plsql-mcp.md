@@ -35,23 +35,22 @@ clean stable dependency.
 
 ---
 
-## 2. Grounded technical facts (verified 2026-06-29 against committed `main` — a fresh agent can trust these)
+## 2. Grounded technical facts (verified 2026-06-29 against committed `main`; parser-runtime status updated 2026-06-30)
 
 1. **The repo's own code uses ZERO nightly language features** (`grep -r '#![feature('` across
    `crates/*/src` + `tools/*/src` = none).
 2. **`asupersync` is the ONLY nightly dep** (fails on stable: `#![feature(try_trait_v2)]`). Full external
-   dep set across engine crates: `antlr-rust, async-trait, chrono, clap, fs2, miette, oraclemcp-db,
+   dep set across engine crates: `antlr4rust, async-trait, chrono, clap, fs2, miette, oraclemcp-db,
    rusqlite, serde, serde_json, sha2, thiserror, toml, tracing` — only `asupersync` (+ `oraclemcp-db`,
    which pulls it) is nightly. The real ANTLR parser compiles on **stable 1.96** (`cargo +stable check -p
    plsql-parser-antlr --features antlr-codegen` green; `plsql-engine` enables `antlr-codegen`
    unconditionally; `ParserBackendChoice` defaults to `Antlr4Rust`).
-3. **A maintained ANTLR Rust runtime exists:** the repo pins stale `antlr-rust 0.3.0-beta` (~2022); the
-   maintained successor is **`antlr4rust 0.5.x`** (updated 2026-03; slated for official ANTLR4). Migration
-   de-risks the runtime (D14, Phase 1P).
-4. **Build-time Java 11+ for ANTLR codegen (pre-existing, removable):** `build.rs` runs the vendored jar
-   (`tools/antlr4-rust.jar`, 2.2 MB) → ~**15.4 MB / 284k lines** of Rust into **`OUT_DIR`** each build
-   (`src/lib.rs:37-43`). **No Java at runtime.** Committing the generated code (D13/Q-JAVA=A, P1P.2)
-   removes build-time Java. The Dockerfile installs `java-17-openjdk-headless` for this.
+3. **The ANTLR Rust runtime is on the maintained line:** `oracle-lldm` moved the parser backend to
+   `antlr4rust 0.5.2` and the paired ANTLR 4.13.2 Rust tool on 2026-06-30.
+4. **Build-time Java 11+ for ANTLR codegen is regeneration-only:** `build.rs` runs the vendored jar
+   (`tools/antlr4-4.13.3-SNAPSHOT-complete.jar`, 2.1 MB) only when `PLSQL_ANTLR_REGEN=1` is set.
+   **No Java is required for normal builds or runtime.** The committed generated code (D13/Q-JAVA=A,
+   P1P.2) remains the normal build path; CI drift-check regenerates to a temp directory and diffs.
 5. **The live path is already feature-aware (corrects the v3 "invent a `live` feature" mistake).**
    `plsql-catalog` HAS features `oraclemcp-db = ["dep:oraclemcp-db"]` and `live-xe = ["oraclemcp-db"]`
    (`Cargo.toml:11-13`); `oraclemcp-db` is `optional = true`. The concrete `OraclemcpDbConnection` adapter
@@ -124,7 +123,7 @@ deliverable, §9); CLIs cover non-MCP offline use.
   serialized `CatalogSnapshot` (stable `CatalogSnapshotBuilder` here; live querying in oraclemcp). The
   catalog live loaders + the `oraclemcp-db`/`live-xe` features are *gated* in P1.1 (transition), then
   *removed* in P2.3 once oraclemcp owns extraction.
-- **D3 — Toolchain → stable + MSRV** (empirical, ≥ what antlr-rust/edition-2024 need; 1.96 known-good).
+- **D3 — Toolchain → stable + MSRV** (empirical, ≥ what antlr4rust/edition-2024 need; 1.96 known-good).
   During the transition, a nightly CI job (invoked via explicit `cargo +nightly-…`/`RUSTUP_TOOLCHAIN`,
   because the stable `rust-toolchain.toml` otherwise wins) builds the gated `oraclemcp-db` feature +
   `antlr-codegen`. `plsql-mcp` is **excluded from `default-members`** so stable `cargo build` skips it
@@ -151,11 +150,10 @@ deliverable, §9); CLIs cover non-MCP offline use.
 - **D13 / Q-JAVA = A: commit the generated parser code** (P1P.2). Build uses committed Rust; Java only on
   grammar change; CI drift-check asserts `regenerate == committed`. *Why:* frictionless install (no nightly
   AND no Java). **P1P.2 GATES the 0.7.0 ship** (the no-Java guarantee is a committed promise) and is
-  independent of P1P.1 — it commits whatever the current runtime generates (post-P1P.1 if landed, else
-  0.3.0-beta). (crates.io 10 MiB limit OK: gzipped tarball; generated Rust compresses heavily.)
-- **D14 — Migrate `antlr-rust 0.3.0-beta` → `antlr4rust 0.5.x`** (P1P.1), **spike-first, NON-blocking**:
-  it does NOT gate the 0.7.0 ship (the current runtime already compiles on stable); fallback = stay on
-  0.3.0-beta. (Distinct from P1P.2, which DOES gate the ship — D13.)
+  independent of P1P.1 — it commits whatever the current runtime generates. (crates.io 10 MiB limit OK:
+  gzipped tarball; generated Rust compresses heavily.)
+- **D14 — Migrate `antlr-rust 0.3.0-beta` → `antlr4rust 0.5.x`** (P1P.1), **completed 2026-06-30**:
+  `oracle-lldm` moved the committed parser output and backend runtime to `antlr4rust 0.5.2` on stable.
 
 ---
 
@@ -215,11 +213,10 @@ Tasks are phrased by symbol/file (lines drift) with verifiable acceptance criter
 > build & test on **stable**; the gated live feature + `plsql-mcp` build on the nightly job.
 
 ### Phase 1P — Parser de-risk (P1P.1 NON-blocking; P1P.2 GATES the ship)
-- **P1P.1 Migrate `antlr-rust 0.3.0-beta` → `antlr4rust 0.5.x` (D14) — NON-blocking.** Spike first: swap
-  dep + jar, regenerate, adapt the `build.rs` post-process patches + the `Antlr4RustBackend: ParseBackend`
-  impl. **Accept:** `--features antlr-codegen` green on stable; `plsql-parser/tests/conformance.rs` +
-  never-panic/fuzz suites pass unchanged. **Fallback:** if unbounded, document + stay on 0.3.0-beta (does
-  NOT block the ship). [needs: P1.4]
+- **P1P.1 Migrate `antlr-rust 0.3.0-beta` → `antlr4rust 0.5.x` (D14) — completed 2026-06-30.** Swapped
+  the dep + jar, regenerated committed output, adapted the `build.rs` post-process patches + the
+  `Antlr4RustBackend: ParseBackend` impl. **Accept:** `--features antlr-codegen` green on stable;
+  `plsql-parser/tests/conformance.rs` + never-panic/fuzz suites pass unchanged. [needs: P1.4]
 - **P1P.2 Commit the generated parser code (Q-JAVA=A, D13) — GATES the ship.** Independent of P1P.1: run
   codegen once with whichever runtime is current, move output to
   `crates/plsql-parser-antlr/src/generated/`; switch `lib.rs` `include!` from `OUT_DIR` →
@@ -357,8 +354,8 @@ P1P.2 → PX.6 → PS.1 runs in parallel and also gates PS.1).
 ## 8. Risks & mitigations
 - **RISK-1 — live coverage lost at P2.3.** *Mitigation:* DAG-enforced — P2.3 needs P5.2 (extraction works
   in oraclemcp) AND P5.6 (tests migrated). No silent drop.
-- **RISK-2 — stale `antlr-rust 0.3.0-beta`.** *Mitigation:* D14/P1P.1 migrates to `antlr4rust 0.5.x`,
-  spike-first + non-blocking with a documented fallback.
+- **RISK-2 — stale `antlr-rust 0.3.0-beta`.** *Mitigation:* closed by D14/P1P.1 on 2026-06-30; the
+  parser backend now uses `antlr4rust 0.5.2`.
 - **RISK-3 — catalog untangle (P1.1).** *Mitigation:* hand-move to `live.rs` (no codemod), compile-iterate
   stable+nightly; offline ingestion stays in `lib.rs`.
 - **RISK-4 — registry/GHCR retirement mechanics uncertain.** *Mitigation:* P3.3 confirms the exact

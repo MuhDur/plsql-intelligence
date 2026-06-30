@@ -33,13 +33,13 @@ mod imp {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use antlr_rust::TokenSource; // re-exported from antlr_rust crate root
-    use antlr_rust::error_listener::ErrorListener;
-    use antlr_rust::errors::ANTLRError;
-    use antlr_rust::input_stream::InputStream;
-    use antlr_rust::recognizer::Recognizer;
-    use antlr_rust::token::{TOKEN_EOF, TOKEN_HIDDEN_CHANNEL, Token as AntlrToken};
-    use antlr_rust::token_factory::TokenFactory;
+    use antlr4rust::TokenSource; // re-exported from antlr4rust crate root
+    use antlr4rust::error_listener::ErrorListener;
+    use antlr4rust::errors::ANTLRError;
+    use antlr4rust::input_stream::InputStream;
+    use antlr4rust::recognizer::Recognizer;
+    use antlr4rust::token::{TOKEN_EOF, TOKEN_HIDDEN_CHANNEL, Token as AntlrToken};
+    use antlr4rust::token_factory::TokenFactory;
 
     use plsql_core::{Diagnostic, FileId, Severity};
     use plsql_parser::ast::{CstNodeId, SourceMap};
@@ -105,44 +105,41 @@ mod imp {
     /// The mapping is coarse — see [`TokenKind`] docs.  All token types not
     /// explicitly listed fall through to [`TokenKind::Keyword`], which is the
     /// safe default for any on-channel token.
-    fn map_token_kind(token_type: isize) -> TokenKind {
-        match token_type {
-            t if t == lexer_consts::CHAR_STRING || t == lexer_consts::NATIONAL_CHAR_STRING_LIT => {
+    fn map_token_kind(kind_id: i32) -> TokenKind {
+        match kind_id {
+            lexer_consts::CHAR_STRING | lexer_consts::NATIONAL_CHAR_STRING_LIT => {
                 TokenKind::StringLiteral
             }
 
-            t if t == lexer_consts::UNSIGNED_INTEGER || t == lexer_consts::APPROXIMATE_NUM_LIT => {
+            lexer_consts::UNSIGNED_INTEGER | lexer_consts::APPROXIMATE_NUM_LIT => {
                 TokenKind::NumericLiteral
             }
 
-            t if t == lexer_consts::DELIMITED_ID => TokenKind::QuotedIdentifier,
+            lexer_consts::DELIMITED_ID => TokenKind::QuotedIdentifier,
 
-            t if t == lexer_consts::REGULAR_ID
-                || t == lexer_consts::INQUIRY_DIRECTIVE
-                || t == lexer_consts::BINDVAR =>
-            {
+            lexer_consts::REGULAR_ID | lexer_consts::INQUIRY_DIRECTIVE | lexer_consts::BINDVAR => {
                 TokenKind::Identifier
             }
 
-            t if t == lexer_consts::SEMICOLON => TokenKind::Semicolon,
-            t if t == lexer_consts::SOLIDUS => TokenKind::Slash,
-            t if t == lexer_consts::PERIOD => TokenKind::Dot,
-            t if t == lexer_consts::COMMA => TokenKind::Comma,
-            t if t == lexer_consts::LEFT_PAREN => TokenKind::LParen,
-            t if t == lexer_consts::RIGHT_PAREN => TokenKind::RParen,
-            t if t == lexer_consts::ASSIGN_OP => TokenKind::Assign,
+            lexer_consts::SEMICOLON => TokenKind::Semicolon,
+            lexer_consts::SOLIDUS => TokenKind::Slash,
+            lexer_consts::PERIOD => TokenKind::Dot,
+            lexer_consts::COMMA => TokenKind::Comma,
+            lexer_consts::LEFT_PAREN => TokenKind::LParen,
+            lexer_consts::RIGHT_PAREN => TokenKind::RParen,
+            lexer_consts::ASSIGN_OP => TokenKind::Assign,
 
             // `=>` is the association/fat-arrow operator.  The grammar uses
             // GREATER_THAN_OP + EQUALS_OP or a compound token depending on
             // dialect.  Map the EQUALS_OP followed by GREATER to Arrow best-effort.
-            t if t == lexer_consts::EQUALS_OP => TokenKind::Operator,
+            lexer_consts::EQUALS_OP => TokenKind::Operator,
 
             // Concatenation operator `||` = BAR BAR (each BAR is a separate token
             // in the ANTLR grammar; the semantic meaning is in the parser rule, not
             // a single lexer token).  Map BAR → Operator.
-            t if t == lexer_consts::BAR => TokenKind::Operator,
+            lexer_consts::BAR => TokenKind::Operator,
 
-            t if t == lexer_consts::AT_SIGN => TokenKind::IncludeDirective,
+            lexer_consts::AT_SIGN => TokenKind::IncludeDirective,
 
             // Unclassified on-channel tokens → Keyword (keywords are overwhelmingly
             // the most common on-channel token; this is the safe default).
@@ -204,9 +201,9 @@ mod imp {
             // the `&CommonToken` needed to call the `Token` trait methods.
             let tok_box = lexer.next_token();
             let tok_ref: &dyn AntlrToken<Data = str> = &*tok_box;
-            let token_type = tok_ref.get_token_type();
+            let kind_id = tok_ref.get_token_type();
 
-            if token_type == TOKEN_EOF {
+            if matches!(kind_id, TOKEN_EOF) {
                 break;
             }
 
@@ -223,7 +220,7 @@ mod imp {
             // `get_text()` on a CommonToken returns &str backed by the input.
             let text: String = tok_ref.get_text().to_string();
 
-            if channel == TOKEN_HIDDEN_CHANNEL {
+            if matches!(channel, TOKEN_HIDDEN_CHANNEL) {
                 pending_trivia.push(classify_trivia(&text));
                 trivia_count += 1;
             } else {
@@ -233,7 +230,7 @@ mod imp {
                     trivia_table.push(tok_index, t);
                 }
 
-                let kind = map_token_kind(token_type);
+                let kind = map_token_kind(kind_id);
                 let span = make_span(file_id, start_off, end_off);
                 tape.push(Token::new(kind, span, text));
             }
@@ -307,7 +304,7 @@ mod imp {
         }
 
         fn parse(&self, input: &str, file_id: FileId, _opts: &ParseOptions) -> BackendParseResult {
-            // Wrap in catch_unwind so even a bug deep in antlr-rust cannot
+            // Wrap in catch_unwind so even a bug deep in antlr4rust cannot
             // propagate a panic through the API boundary.
             let lex_result = std::panic::catch_unwind(|| lex_all(input, file_id));
 

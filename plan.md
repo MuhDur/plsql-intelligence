@@ -1008,12 +1008,12 @@ plsql-parser/
 | Bead | Title | Depends | Effort |
 |------|-------|---------|--------|
 | `PLSQL-PARSE-000` | Define `ParseBackend` trait + backend conformance test suite (every backend must pass the same fixture set) | Layer 0 | S |
-| `PLSQL-PARSE-000A` | Spike `antlr-rust` codegen against full PL/SQL grammar; record blockers (parse-time, panics, missing features); decision artifact at `docs/decisions/D1-parser-backend-spike.md` | PARSE-000 | M |
+| `PLSQL-PARSE-000A` | Spike ANTLR Rust codegen against full PL/SQL grammar; record blockers (parse-time, panics, missing features); decision artifact at `docs/decisions/D1-parser-backend-spike.md` | PARSE-000 | M |
 | `PLSQL-PARSE-000B` | **Retired 2026-06-28:** former Java ANTLR subprocess spike; removed from the workspace after D2 selected `antlr4rust` | PARSE-000 | M |
 | `PLSQL-PARSE-000C` | Parser backend tournament: record the `antlr4rust` decision and no-go/retirement evidence for the Java ANTLR spike; close decision artifact at `docs/decisions/D1-backend-tournament-result.md` | PARSE-000A + PARSE-000B | L |
 | `PLSQL-PARSE-000D` | **Retired 2026-06-28:** former neutral wire-protocol sketch for the Java worker; no active implementation path remains | PARSE-000B | M |
-| `PLSQL-PARSE-001` | Vendor antlr/grammars-v4 PL/SQL `.g4` files into the antlr-rust backend crate with attribution + license preserved | PARSE-000A | S |
-| `PLSQL-PARSE-002` | Author `build.rs` that invokes `antlr-rust` codegen (inside backend crate, NOT public) | PARSE-001 | M |
+| `PLSQL-PARSE-001` | Vendor antlr/grammars-v4 PL/SQL `.g4` files into the antlr4rust backend crate with attribution + license preserved | PARSE-000A | S |
+| `PLSQL-PARSE-002` | Author `build.rs` that invokes antlr4rust codegen (inside backend crate, NOT public) | PARSE-001 | M |
 | `PLSQL-PARSE-003` | Define public `Ast` + `ConcreteSyntaxTree` + `TokenTape` + `TriviaTable` node hierarchies | Layer 0 | M |
 | `PLSQL-PARSE-004` | Implement `lower.rs`: ANTLR parse-tree → public `Ast` for top-level declarations (packages, procedures, functions, triggers, views) | PARSE-002, PARSE-003 | L |
 | `PLSQL-PARSE-005` | Implement `lower.rs` for statement bodies (assignments, control flow, EXECUTE IMMEDIATE) | PARSE-004 | L |
@@ -3365,7 +3365,7 @@ This keeps the LSP door open without distracting GA work.
 
 | R# | Risk | Probability | Impact | Mitigation |
 |----|------|-------------|--------|------------|
-| K1 | `antlr-rust` proves unworkable in practice (panics, perf, runtime missing features) | Medium | High | D2 selected `antlr4rust` with explicit production-eligibility criteria and backend isolation. If it fails those criteria, the mitigation is a new parser decision and bead set, not a retained Java fallback. |
+| K1 | `antlr4rust` proves unworkable in practice (panics, perf, runtime missing features) | Medium | High | D2 selected `antlr4rust` with explicit production-eligibility criteria and backend isolation. If it fails those criteria, the mitigation is a new parser decision and bead set, not a retained Java fallback. |
 | K2 | Parser coverage stalls below 95% on real-world corpus | Medium | High | Front-load corpus testing; agents continuously author edge-case patterns; weekly corpus-coverage report. |
 | K3 | Symbol resolution complexity exceeds estimates (synonyms + DB links + dynamic SQL) | Medium | Medium | Each strategy is independently shippable; ship resolution incrementally with confidence markers. |
 | K4 | False-positive rate on SAST rules drives customer churn | Medium | Medium | Per-rule positive + negative corpora; FPR measured as acceptance criterion; baseline mode for incremental adoption. |
@@ -3452,7 +3452,7 @@ Use the `beads-workflow` skill to convert this plan to beads in one pass. After 
 |-------|----------|---------|
 | Initial ideas doc | `/home/md/carriercall/workspace/initial-ideas.md` | Strategic context, the 12 gaps, the speed ranking |
 | antlr/grammars-v4 PL/SQL | https://github.com/antlr/grammars-v4/tree/master/sql/plsql | Starting grammar (BSD-3) |
-| antlr-rust runtime | https://github.com/rrevenantt/antlr4rust | Rust runtime for ANTLR |
+| antlr4rust runtime | https://github.com/antlr4rust/antlr4 | Rust runtime for ANTLR |
 | Trivadis PL/SQL Cop CLI | https://github.com/Trivadis/plsql-cop-cli | Behavioral inspiration only; **license is CC BY-NC-ND 3.0** — do NOT copy code or test assets |
 | Trivadis PL/SQL & SQL Coding Guidelines | https://github.com/Trivadis/plsql-and-sql-coding-guidelines | Rule inspiration; guidelines repository is Apache-2.0 |
 | Z PL/SQL Analyzer (ZPA) | https://github.com/felipebz/zpa | SonarQube plugin; PL/SQL static-analysis reference. **LGPL-3.0** — useful for behavioral comparison, avoid code copying into permissive crates without legal review |

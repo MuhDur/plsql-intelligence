@@ -185,7 +185,7 @@ mod gated {
         // omits NUL characters — it is NOT byte-for-byte identical to the
         // original.
         //
-        // This is a hard limitation of the antlr-rust 0.3.0-beta runtime and
+        // This is a hard limitation of the antlr4rust runtime and
         // cannot be fixed without patching the runtime or pre-processing the
         // input to escape NULs.  The ANTLR grammar itself does not define a
         // rule for U+0000, so there is no token to place in the tape.
@@ -376,16 +376,17 @@ mod gated {
         );
 
         // Check the first declaration is a PackageSpec named "employee_mgmt".
-        let first = &r.ast.root.declarations[0];
-        match first {
-            AstDecl::PackageSpec { name, .. } => {
-                assert_eq!(
-                    name.to_ascii_lowercase(),
-                    "employee_mgmt",
-                    "unexpected package name"
-                );
-            }
-            other => panic!("expected PackageSpec, got: {other:?}"),
+        let first = r.ast.root.declarations.first();
+        assert!(
+            matches!(first, Some(AstDecl::PackageSpec { .. })),
+            "expected PackageSpec, got: {first:?}"
+        );
+        if let Some(AstDecl::PackageSpec { name, .. }) = first {
+            assert_eq!(
+                name.to_ascii_lowercase(),
+                "employee_mgmt",
+                "unexpected package name"
+            );
         }
     }
 
@@ -399,9 +400,9 @@ mod gated {
             "expected at least one top-level declaration"
         );
 
-        let first = &r.ast.root.declarations[0];
+        let first = r.ast.root.declarations.first();
         assert!(
-            matches!(first, AstDecl::PackageBody { .. }),
+            matches!(first, Some(AstDecl::PackageBody { .. })),
             "expected PackageBody, got: {first:?}"
         );
     }

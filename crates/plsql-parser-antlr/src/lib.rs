@@ -31,8 +31,8 @@ mod generated {
     #![allow(warnings)]
     #![allow(clippy::all)]
 
-    // Re-export the antlr-rust runtime so generated code can find it.
-    extern crate antlr_rust;
+    // Re-export the antlr4rust runtime so generated code can find it.
+    extern crate antlr4rust;
 
     pub mod plsqllexer {
         include!(concat!(
@@ -50,6 +50,12 @@ mod generated {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/generated/plsqlparserlistener.rs"
+        ));
+    }
+    pub mod plsqlparserbaselistener {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/generated/plsqlparserbaselistener.rs"
         ));
     }
 }

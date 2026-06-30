@@ -1,6 +1,6 @@
 #[allow(nonstandard_style)]
-// Generated from grammars/PlSqlParser.g4 by ANTLR 4.8
-use antlr_rust::tree::ParseTreeListener;
+// Generated from grammars/PlSqlParser.g4 by ANTLR 4.13.2
+use antlr4rust::tree::ParseTreeListener;
 use super::plsqlparser::*;
 
 pub trait PlSqlParserListener<'input> : ParseTreeListener<'input,PlSqlParserContextType>{
@@ -12083,4 +12083,4 @@ fn exit_non_reserved_keywords_pre12c(&mut self, _ctx: &Non_reserved_keywords_pre
 
 }
 
-antlr_rust::coerce_from!{ 'input : PlSqlParserListener<'input> }
+antlr4rust::coerce_from!{ 'input : PlSqlParserListener<'input> }

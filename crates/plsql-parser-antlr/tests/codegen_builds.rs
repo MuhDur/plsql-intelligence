@@ -3,7 +3,7 @@
 //!
 //! This test is only compiled when the `antlr-codegen` feature is active.
 //! Its purpose is to serve as a CI sentinel: if the generated code stops
-//! compiling (due to a grammar change, antlr-rust API change, or a regression
+//! compiling (due to a grammar change, antlr4rust API change, or a regression
 //! in build.rs post-processing), this test will fail to compile.
 //!
 //! The generated modules are intentionally private (`mod generated { ... }`)
@@ -17,9 +17,9 @@
 #[cfg(feature = "antlr-codegen")]
 #[test]
 fn antlr_codegen_crate_builds() {
-    // The three generated files are included in the `generated` module of
-    // `plsql_parser_antlr`.  If this test binary compiled, all three files
-    // (plsqllexer.rs, plsqlparser.rs, plsqlparserlistener.rs) compiled too.
+    // The generated files are included in the `generated` module of
+    // `plsql_parser_antlr`.  If this test binary compiled, the lexer, parser,
+    // listener, and base listener compiled too.
     //
     // No runtime assertion is needed: successful compilation IS the test.
     // The assertion below is trivially true and exists only to give the test

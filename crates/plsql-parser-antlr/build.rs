@@ -2,7 +2,7 @@
 //!
 //! When `PLSQL_ANTLR_REGEN=1` is set, this script:
 //!
-//! 1. Locates the vendored `antlr4-rust.jar` codegen tool, or the
+//! 1. Locates the vendored `antlr4-4.13.3-SNAPSHOT-complete.jar` codegen tool, or the
 //!    `PLSQL_ANTLR_TOOL_JAR` override when set. Relative overrides resolve
 //!    from the workspace root when it can be found.
 //! 2. Runs `java -jar <jar> -Dlanguage=Rust` on `PlSqlLexer.g4` and
@@ -49,7 +49,7 @@ fn main() -> BuildResult<()> {
     let grammar_dir = manifest_dir.join("grammars");
     let jar_path = env::var_os("PLSQL_ANTLR_TOOL_JAR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| manifest_dir.join("tools/antlr4-rust.jar"));
+        .unwrap_or_else(|| manifest_dir.join("tools/antlr4-4.13.3-SNAPSHOT-complete.jar"));
     let jar_path = if jar_path.is_absolute() {
         jar_path
     } else {
@@ -79,7 +79,7 @@ fn main() -> BuildResult<()> {
     }
 
     // Verify generator inputs exist only for explicit regeneration.
-    require_existing_path(&jar_path, "antlr4-rust.jar")?;
+    require_existing_path(&jar_path, "antlr4-4.13.3-SNAPSHOT-complete.jar")?;
     require_existing_path(&lexer_grammar, "PlSqlLexer.g4")?;
     require_existing_path(&parser_grammar, "PlSqlParser.g4")?;
 
@@ -123,6 +123,7 @@ fn main() -> BuildResult<()> {
     post_process(&out_dir.join("plsqllexer.rs"), "lexer")?;
     post_process(&out_dir.join("plsqlparser.rs"), "parser")?;
     post_process(&out_dir.join("plsqlparserlistener.rs"), "listener")?;
+    post_process(&out_dir.join("plsqlparserbaselistener.rs"), "base_listener")?;
 
     println!(
         "cargo:warning=ANTLR codegen complete. Output in {}",
@@ -163,8 +164,13 @@ fn regen_requested() -> bool {
         .unwrap_or(false)
 }
 
-fn generated_file_names() -> [&'static str; 3] {
-    ["plsqllexer.rs", "plsqlparser.rs", "plsqlparserlistener.rs"]
+fn generated_file_names() -> [&'static str; 4] {
+    [
+        "plsqllexer.rs",
+        "plsqlparser.rs",
+        "plsqlparserlistener.rs",
+        "plsqlparserbaselistener.rs",
+    ]
 }
 
 fn verify_generated_files(dir: &Path) -> BuildResult<()> {
@@ -342,7 +348,7 @@ fn normalize_trailing_newline(content: &str) -> String {
 fn normalize_generated_header(content: &str, label: &str) -> BuildResult<String> {
     let grammar = match label {
         "lexer" => "PlSqlLexer.g4",
-        "parser" | "listener" => "PlSqlParser.g4",
+        "parser" | "listener" | "base_listener" => "PlSqlParser.g4",
         other => {
             return Err(build_error(format!(
                 "unknown generated ANTLR label: {other}"
@@ -373,7 +379,7 @@ fn normalize_generated_header(content: &str, label: &str) -> BuildResult<String>
 
 /// Class A fix: convert inner `#![allow(...)]` to outer `#[allow(...)]`.
 ///
-/// The ANTLR 4.8 Rust codegen emits `#![allow(...)]` at the top of each
+/// The ANTLR Rust codegen emits `#![allow(...)]` at the top of each
 /// generated file.  These files are included via `include!()` inside a `mod`
 /// block, where inner crate-level attributes are not permitted.  Converting
 /// them to outer attributes (`#[allow(...)]`) makes them annotate the next
@@ -445,7 +451,6 @@ fn fix_this_references(content: &str) -> String {
 ///   - `From<'a>` = `<CommonTokenFactory as TokenFactory<'a>>::From` = `Cow<'a, str>`
 ///   - Lexer impl needs `Input: CharStream<From<'input>>` = `CharStream<Cow<'input, str>>`
 fn inject_predicate_traits(content: &str, label: &str) -> String {
-    let runtime = generated_runtime_crate(content);
     match label {
         "parser" => {
             // There are two call-site contexts for predicate methods:
@@ -456,7 +461,7 @@ fn inject_predicate_traits(content: &str, label: &str) -> String {
             //                               dyn PlSqlParserListener<'input> + 'input>
             //
             // 2. In individual parser rule methods: `let mut recog = self` where
-            //    `self: &mut PlSqlParser<'input, I, H>`.
+            //    `self: &mut PlSqlParser<'input, I>`.
             //
             // We must implement the trait for both types.  Rust does not propagate
             // trait method lookups through `Deref` when calling via `recog.method()`.
@@ -467,7 +472,7 @@ fn inject_predicate_traits(content: &str, label: &str) -> String {
 //
 // The grammar embeds semantic predicates like `{recog.isVersion12()}?` that
 // call user-defined methods on the parser.  These are not defined in
-// antlr-rust's BaseParser; they were expected from a Java subclass.
+// ANTLR Rust runtime's BaseParser; they were expected from a Java subclass.
 // We provide permissive defaults so the parser accepts the maximum set of
 // PL/SQL syntax regardless of database version.
 //
@@ -502,11 +507,10 @@ where
 }
 
 #[allow(non_snake_case)]
-impl<'input, I, H> PlSqlParserPredicates for PlSqlParser<'input, I, H>
+impl<'input, I> PlSqlParserPredicates for PlSqlParser<'input, I>
 where
     I: __ANTLR_RUNTIME__::token_stream::TokenStream<'input, TF = LocalTokenFactory<'input>>
         + __ANTLR_RUNTIME__::TidAble<'input>,
-    H: __ANTLR_RUNTIME__::error_strategy::ErrorStrategy<'input, BaseParserType<'input, I>>,
 {
     fn isVersion12(&mut self) -> bool { true }
     fn isVersion11(&mut self) -> bool { true }
@@ -517,7 +521,7 @@ where
 "#;
             format!(
                 "{content}{}",
-                trait_code.replace("__ANTLR_RUNTIME__", runtime)
+                trait_code.replace("__ANTLR_RUNTIME__", "antlr4rust")
             )
         }
         "lexer" => {
@@ -554,17 +558,9 @@ where
 "#;
             format!(
                 "{content}{}",
-                trait_code.replace("__ANTLR_RUNTIME__", runtime)
+                trait_code.replace("__ANTLR_RUNTIME__", "antlr4rust")
             )
         }
         _ => content.to_string(),
-    }
-}
-
-fn generated_runtime_crate(content: &str) -> &'static str {
-    if content.contains("use antlr4rust::") {
-        "antlr4rust"
-    } else {
-        "antlr_rust"
     }
 }

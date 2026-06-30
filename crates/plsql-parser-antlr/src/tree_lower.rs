@@ -23,10 +23,10 @@
 
 #![cfg(feature = "antlr-codegen")]
 
-use antlr_rust::common_token_stream::CommonTokenStream;
-use antlr_rust::input_stream::InputStream;
-use antlr_rust::parser_rule_context::ParserRuleContext;
-use antlr_rust::token::Token;
+use antlr4rust::common_token_stream::CommonTokenStream;
+use antlr4rust::input_stream::InputStream;
+use antlr4rust::parser_rule_context::ParserRuleContext;
+use antlr4rust::token::Token;
 
 use plsql_core::{Diagnostic, FileId, Position, Severity, Span};
 use plsql_parser::ast::{Ast, AstDecl, AstStatement, SourceFile, SourceMap};
