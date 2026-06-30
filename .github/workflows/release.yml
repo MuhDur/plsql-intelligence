@@ -16,6 +16,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  PLSQL_RELEASE_VERSION: ${{ inputs.tag || github.ref_name }}
   # Public binaries (i.e., those intended for end users). Internal-only
   # dev tools like `plan-lint` and `corpus-license-check` stay out of the
   # release archive. `plsql-mcp` remains a transitional nightly-only artifact

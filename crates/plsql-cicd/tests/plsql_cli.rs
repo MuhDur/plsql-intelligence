@@ -10,6 +10,13 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_plsql")
 }
 
+fn expected_cli_version() -> &'static str {
+    match option_env!("PLSQL_RELEASE_VERSION") {
+        Some(version) if !version.is_empty() => version,
+        _ => env!("CARGO_PKG_VERSION"),
+    }
+}
+
 fn fixture_root(label: &str) -> PathBuf {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
@@ -31,6 +38,25 @@ fn repo_file(path: &str) -> String {
             .join(path),
     )
     .expect("read repository file")
+}
+
+#[test]
+fn version_flag_reports_effective_cli_version() {
+    let out = Command::new(bin())
+        .arg("--version")
+        .output()
+        .expect("run plsql --version");
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    assert!(
+        stdout.contains(expected_cli_version()),
+        "--version must print the effective CLI version; got stdout={stdout:?}"
+    );
 }
 
 #[test]
@@ -448,6 +474,7 @@ fn doctor_robot_json_is_single_json_object() {
     );
     let value: serde_json::Value = serde_json::from_str(trimmed).expect("json stdout");
     assert_eq!(value["binary"], "plsql");
+    assert_eq!(value["version"], expected_cli_version());
     assert_eq!(value["status"], "ok");
     assert_eq!(
         value["schemas"]["change_impact"]["id"],

@@ -23,6 +23,13 @@ use plsql_output::{RobotJsonEnvelope, SchemaDescriptor, SchemaVersion};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
+fn cli_version() -> &'static str {
+    match option_env!("PLSQL_RELEASE_VERSION") {
+        Some(version) if !version.is_empty() => version,
+        _ => env!("CARGO_PKG_VERSION"),
+    }
+}
+
 const ERROR_ENVELOPE_SCHEMA: SchemaDescriptor = SchemaDescriptor {
     id: "plsql.cicd.error_envelope",
     version: SchemaVersion::new(1, 0, 0),
@@ -45,7 +52,7 @@ const CAPABILITIES_CONTRACT_VERSION: u32 = 1;
 
 #[derive(Debug, Parser)]
 #[command(name = "plsql")]
-#[command(version)]
+#[command(version = cli_version())]
 #[command(about = "PL/SQL Intelligence release-assurance CLI")]
 #[command(
     after_help = "DISCOVERY:\n  plsql capabilities       machine-readable agent contract (JSON)\n  plsql robot-docs         agent handbook\n  plsql --robot-triage     one-shot bootstrap"
@@ -456,7 +463,7 @@ fn run_sast(args: SastArgs, robot_json: bool) -> Result<ExitCode, CliError> {
     let histogram = plsql_sast::rule_firing_histogram(&report);
     let tool_version = args
         .tool_version
-        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+        .unwrap_or_else(|| cli_version().to_string());
     let artifact = match args.format {
         SastFormatArg::Sarif => serde_json::to_value(plsql_sast::to_sarif(
             &report,
@@ -506,7 +513,7 @@ fn run_doctor(args: DoctorArgs, robot_json: bool) -> Result<ExitCode, CliError> 
     };
     let report = serde_json::json!({
         "binary": "plsql",
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": cli_version(),
         "status": "ok",
         "blockers": [],
         "schemas": {
@@ -533,10 +540,7 @@ fn run_doctor(args: DoctorArgs, robot_json: bool) -> Result<ExitCode, CliError> 
     if robot_json {
         println!("{}", serialize_compact(&report)?);
     } else {
-        eprintln!(
-            "plsql {} (plsql-cicd release-assurance CLI)",
-            env!("CARGO_PKG_VERSION")
-        );
+        eprintln!("plsql {} (plsql-cicd release-assurance CLI)", cli_version());
         println!(
             "doctor: blockers=0 schemas=change_impact:{}",
             CHANGE_IMPACT_SCHEMA.version
@@ -558,7 +562,7 @@ fn run_capabilities(robot_json: bool) -> Result<ExitCode, CliError> {
 fn run_robot_triage(robot_json: bool) -> Result<ExitCode, CliError> {
     let health = serde_json::json!({
         "binary": "plsql",
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": cli_version(),
         "status": "ok",
         "blockers": [],
         "schemas": {
@@ -619,7 +623,7 @@ fn capabilities_json() -> Value {
     serde_json::json!({
         "binary": "plsql",
         "contract_version": CAPABILITIES_CONTRACT_VERSION,
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": cli_version(),
         "global_flags": {
             "--robot-json": "emit compact single-line JSON on stdout; diagnostics always go to stderr",
             "--robot-triage": "one-shot bootstrap: emit {capabilities, health, quick_ref} on stdout and exit"

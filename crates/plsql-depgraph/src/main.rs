@@ -21,9 +21,16 @@ use plsql_depgraph::{
 };
 use thiserror::Error;
 
+fn cli_version() -> &'static str {
+    match option_env!("PLSQL_RELEASE_VERSION") {
+        Some(version) if !version.is_empty() => version,
+        _ => env!("CARGO_PKG_VERSION"),
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "plsql-depgraph")]
-#[command(version)]
+#[command(version = cli_version())]
 #[command(about = "Query and diagnose plsql-intelligence dependency graph artifacts")]
 #[command(
     after_help = "DISCOVERY:\n  plsql-depgraph capabilities   machine-readable agent contract (JSON)\n  plsql-depgraph robot-docs     agent handbook — start here if you are an AI\n  plsql-depgraph --robot-triage one-shot bootstrap (capabilities + health + quick_ref)"
@@ -212,7 +219,7 @@ fn capabilities_json() -> serde_json::Value {
     serde_json::json!({
         "binary": "plsql-depgraph",
         "contract_version": CAPABILITIES_CONTRACT_VERSION,
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": cli_version(),
         "global_flags": {
             "--robot-json": "emit versioned machine-readable output using the shared robot-JSON envelope",
             "--graph": "path to a serialized DepGraph JSON artifact, or '-' to read from stdin",
@@ -305,7 +312,7 @@ fn run() -> std::result::Result<(), CliError> {
 fn run_robot_triage(robot_json: bool) -> std::result::Result<(), CliError> {
     let health = serde_json::json!({
         "binary": "plsql-depgraph",
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": cli_version(),
         "requires": "a DepGraph artifact (passed via --graph <PATH|->) for query/doctor/explain",
         "blockers": Vec::<&str>::new(),
         "status": "ok",
@@ -772,7 +779,7 @@ mod tests {
         let c = capabilities_json();
         assert_eq!(c["binary"], "plsql-depgraph");
         assert_eq!(c["contract_version"], 1u32);
-        assert_eq!(c["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(c["version"], cli_version());
         for key in ["global_flags", "commands", "exit_codes", "stdout_contract"] {
             assert!(c.get(key).is_some(), "capabilities missing key `{key}`");
         }
