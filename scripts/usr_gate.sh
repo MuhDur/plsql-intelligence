@@ -164,11 +164,13 @@ g3_conformance() {
 g4_golden() {
   # The committed stable-default golden suites live under
   # crates/plsql-catalog/tests/golden, crates/plsql-cicd/tests/golden, and
-  # corpus/golden. Re-render = re-run the golden-bearing test crates;
-  # golden tests FAIL on any unaccepted churn (their own bar).
+  # corpus/golden. Re-render = re-run the golden-bearing tests; golden
+  # tests FAIL on any unaccepted churn (their own bar). Catalog goldens are
+  # now library tests after the offline pivot removed the live integration
+  # target.
   local declared=""
   declared="$(grep -E '^# *usr-gate: *golden-delta=' "${CANDIDATE}" 2>/dev/null | head -1 | sed 's/^.*golden-delta=//')"
-  if cargo test -q -p plsql-catalog --test '*' 2>>/tmp/usr_gate_g4.log >/tmp/usr_gate_g4.out \
+  if cargo test -q -p plsql-catalog --lib catalog_snapshot_builder_doctor_report_matches_golden 2>>/tmp/usr_gate_g4.log >/tmp/usr_gate_g4.out \
      && cargo test -q -p plsql-cicd --test plsql_cli predict_robot_json_matches_change_impact_golden_snapshot 2>>/tmp/usr_gate_g4.log >>/tmp/usr_gate_g4.out; then
     if [[ -n "${declared}" ]]; then
       pass G4 "goldens re-rendered byte-identical; declared+justified golden-delta: ${declared}"

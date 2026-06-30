@@ -28,8 +28,6 @@ pub mod inspector;
 pub mod plan;
 pub mod post_pr_comment;
 pub mod predict;
-#[cfg(feature = "live-xe")]
-pub mod verify;
 
 // Re-export the post-pr-comment library (PLSQL-CICD-015 / oracle-0ean)
 // + idempotent find-existing helper (PLSQL-CICD-016 / oracle-usq7)
@@ -43,8 +41,6 @@ pub use gate::{
     GateDecision, GateError, GateFailure, GatePolicy, GatePolicySummary, MinConfidence, PrComment,
     PrCommentEnvelope, parse_policy, render_pr_comment, run_gate,
 };
-#[cfg(feature = "live-xe")]
-pub use inspector::CicdOracleInspector;
 pub use inspector::is_read_only_sql;
 pub use plan::plan_changeset;
 pub use post_pr_comment::{
@@ -57,12 +53,6 @@ pub use predict::{
     ChangeImpactInvalidation, ChangeImpactKindCount, ChangeImpactLineageNote, ChangeImpactPayload,
     ChangeImpactRecompileItem, ChangeImpactSummary, ChangeImpactUncertainty, LineageObjectMetadata,
     change_impact_envelope, change_impact_payload, predict, predict_with_lineage,
-};
-#[cfg(feature = "live-xe")]
-pub use verify::{
-    ScratchSchemaGuard, StatementOutcome, VerifyChangeset, VerifyError, VerifyOptions,
-    VerifyReport, VerifyReportRow, VerifyStatement, create_scratch_schema, is_scratch_schema,
-    scratch_schema_name, scratch_schema_name_for_pid, verify,
 };
 
 /// Where a `ChangeSet` was derived from.
@@ -777,10 +767,6 @@ pub enum CicdError {
     Classify(#[from] plsql_lineage::ClassifyError),
     #[error("symbol table overflow while interning `{name}`")]
     SymbolInterningFailed { name: String },
-    #[error("CicdOracleInspector refuses non-read-only SQL (preview: `{preview}`)")]
-    DisallowedWriteSqlInInspector { preview: String },
-    #[error("oracle backend error: {message}")]
-    OracleBackendError { message: String },
 }
 
 #[cfg(test)]

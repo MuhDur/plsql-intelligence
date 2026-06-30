@@ -45,28 +45,6 @@ jobs:
       - run: cargo test --workspace --all-targets
       - run: cargo test --workspace --doc
 
-  # Offline pivot transition job: stable is the default everywhere else; this
-  # job keeps the remaining live/codegen surfaces compiling on the pinned
-  # nightly until live extraction is complete.
-  nightly-transition:
-    name: nightly transition (live/codegen)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          toolchain: nightly-2026-05-11
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: nightly-transition
-      - name: Check gated catalog live adapter
-        run: cargo +nightly-2026-05-11 check -p plsql-catalog --features oraclemcp-db
-      - name: Check gated CI/CD live adapter
-        run: cargo +nightly-2026-05-11 check -p plsql-cicd --features live-xe
-      - name: Build committed ANTLR backend
-        run: cargo +nightly-2026-05-11 build -p plsql-parser-antlr --features antlr-codegen
-
   antlr-generated-drift:
     name: ANTLR generated drift check
     runs-on: ubuntu-latest
@@ -91,7 +69,7 @@ jobs:
         run: diff -ru crates/plsql-parser-antlr/src/generated "${RUNNER_TEMP}/plsql-parser-antlr-generated"
 
   # `oracle-plsql-converge-0lnu.15.12` — keep the PL/SQL layer from reaching
-  # around the published oraclemcp-db adapter into Oracle drivers or async/server
+  # around the offline engine boundary into Oracle drivers or async/server
   # runtimes directly.
   plsql-mcp-boundary-lint:
     name: plsql-mcp boundary lint

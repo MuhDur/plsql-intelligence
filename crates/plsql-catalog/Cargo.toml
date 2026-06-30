@@ -9,18 +9,9 @@ homepage.workspace = true
 
 [features]
 default = []
-live-xe = ["oraclemcp-db"]
-# The live-DB extraction path (the `OracleConnection` trait + the `oraclemcp-db`
-# thin backend) is the ONLY thing that pulls the nightly-only `asupersync`
-# runtime. Gating it keeps the default, offline-first catalog model on stable
-# Rust. See docs/plans (offline-brain decomposition).
-oraclemcp-db = ["dep:oraclemcp-db", "dep:asupersync"]
 
 [dependencies]
-async-trait = "0.1"
-asupersync = { version = "=0.3.4", optional = true }
 chrono = { version = "0.4.44", features = ["serde"] }
-oraclemcp-db = { version = "=0.4.1", optional = true }
 plsql-core = { path = "../plsql-core", version = "0.1.0" }
 plsql-output = { path = "../plsql-output", version = "0.1.0" }
 serde.workspace = true
