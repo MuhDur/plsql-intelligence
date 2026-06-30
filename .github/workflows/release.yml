@@ -21,8 +21,8 @@ env:
   # dev tools like `plan-lint` and `corpus-license-check` stay out of the
   # release archive.
   RELEASE_STABLE_PACKAGES: "plsql-depgraph plsql-cicd"
-  RELEASE_STABLE_BINS: "plsql-depgraph plsql"
-  RELEASE_BINS: "plsql-depgraph plsql"
+  RELEASE_STABLE_BINS: "plsql plsql-depgraph"
+  RELEASE_BINS: "plsql plsql-depgraph"
 
 jobs:
   build:
