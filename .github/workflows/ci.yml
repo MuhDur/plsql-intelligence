@@ -33,7 +33,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --exclude plsql-mcp --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     name: cargo test
@@ -42,14 +42,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --exclude plsql-mcp --all-targets
-      - run: cargo test --workspace --exclude plsql-mcp --doc
+      - run: cargo test --workspace --all-targets
+      - run: cargo test --workspace --doc
 
   # Offline pivot transition job: stable is the default everywhere else; this
-  # job keeps the remaining live/codegen/MCP surfaces compiling on the pinned
-  # nightly until Phase 2/5 removes or relocates them.
+  # job keeps the remaining live/codegen surfaces compiling on the pinned
+  # nightly until live extraction is complete.
   nightly-transition:
-    name: nightly transition (live/codegen/plsql-mcp)
+    name: nightly transition (live/codegen)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -66,8 +66,6 @@ jobs:
         run: cargo +nightly-2026-05-11 check -p plsql-cicd --features live-xe
       - name: Build committed ANTLR backend
         run: cargo +nightly-2026-05-11 build -p plsql-parser-antlr --features antlr-codegen
-      - name: Build transitional plsql-mcp
-        run: cargo +nightly-2026-05-11 build -p plsql-mcp --all-targets
 
   antlr-generated-drift:
     name: ANTLR generated drift check
@@ -163,7 +161,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo bench --workspace --exclude plsql-mcp --no-run
+      - run: cargo bench --workspace --no-run
 
   corpus-license-check:
     name: corpus license check

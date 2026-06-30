@@ -18,14 +18,12 @@ members = [
     "crates/plsql-lineage",
     "crates/plsql-sast",
     "crates/plsql-cicd",
-    "crates/plsql-mcp",
     "crates/plsql-support",
     "crates/plsql-accretion",
     # The engine-free oraclemcp-* MCP spine (8 crates) + the lean `oraclemcp`
     # binary were extracted to the standalone MuhDur/oraclemcp repo and published
-    # to crates.io (Phase-E depend-back). plsql-mcp now consumes the published
-    # `oraclemcp-core`/`-error`/`-guard` crates; the in-workspace copies were
-    # removed. plsql-mcp remains the full superset (DB tools + PL/SQL intelligence).
+    # to crates.io (Phase-E depend-back). The in-workspace copies were removed;
+    # this repo now ships only the offline PL/SQL engine and CLIs.
     "tools/corpus-bench",
     "tools/corpus-grow",
     "tools/corpus-license-check",

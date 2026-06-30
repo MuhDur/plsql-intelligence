@@ -9,6 +9,11 @@ work.
 
 ## [Unreleased]
 
+- **MCP crate removed.** The sign-off-gated P2.1 offline-pivot step removed
+  `crates/plsql-mcp` from the workspace and release binary list. MCP serving
+  now belongs in the separate `oraclemcp` repository; this repo keeps the
+  offline PL/SQL engine and CLI crates.
+
 ## [0.7.0] - 2026-06-29
 
 - **Offline-pivot release track.** The 0.7.0 work is now tracked under
@@ -41,7 +46,7 @@ work.
 - **Stable pivot gates.** The stable workspace checks were verified with
   `plsql-mcp` outside the default member set, preserving the nightly-only
   MCP/live transition while keeping the offline engine buildable on
-  stable Rust.
+  the stable toolchain.
 - **Catalog snapshot seam.** `plsql-catalog` exposes the stable
   `CatalogSnapshotBuilder`/rowset API used by the downstream oraclemcp
   integration path.
