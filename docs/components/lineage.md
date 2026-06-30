@@ -327,5 +327,5 @@ schema this crate emits. Each is registered in the workspace's
 - Cargo.toml: `crates/plsql-lineage/Cargo.toml`
 - Plan: `plan.md` §14 (Layer 4 Lineage), §1.5 (Trust Block), §10 (depgraph)
 - Upstream: `plsql-depgraph`, `plsql-render`, `plsql-output`, `plsql-core`, `plsql-catalog`
-- Downstream: `plsql-cicd`, MCP `plsql-mcp`, lineage CLI
+- Downstream: `plsql-cicd`, lineage CLI, and external MCP integrations
 - Schemas: 14 versioned descriptors (`LINEAGE_SCHEMAS` const)

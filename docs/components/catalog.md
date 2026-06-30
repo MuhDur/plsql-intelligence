@@ -28,16 +28,17 @@ that captures the structural shape of one or more Oracle schemas at a point in t
 snapshot carries its own `SymbolInterner` so exported JSON remains reloadable without ambient
 process state.
 
-Three ingestion paths produce the same `CatalogSnapshot` type:
+Three offline ingestion paths produce the same `CatalogSnapshot` type:
 
 | Path | Function | Source |
 |------|----------|--------|
 | JSON snapshot | `load_snapshot_from_json()` | Pre-exported `.json` file |
-| Live connection | `load_snapshot_from_connection()` | Oracle DB via `OracleConnection` trait |
 | DBMS_METADATA files | `load_from_dbms_metadata_dir()` | Directory of `.sql` DDL exports |
+| Rowset builder | `CatalogSnapshotBuilder` | Structured dictionary rows supplied by a caller |
 
-All three paths produce identical downstream behavior — the rest of the engine does not
-know or care which path was used.
+Live extraction is an external producer of those rowsets or JSON snapshots.
+The rest of the engine does not know or care which source produced the
+snapshot.
 
 ### 1.3 Structural, not row-level
 
@@ -324,32 +325,15 @@ pub fn export_snapshot_to_json(snapshot: &CatalogSnapshot, path: &Path) -> Resul
 Validates schema ID (`plsql.catalog.snapshot`) and schema version (currently 1.1.0)
 before accepting. This is the path used by CI, tests, and the no-database demo workflow.
 
-### 6.2 Live connection
+### 6.2 Rowset builder
 
 ```rust
-pub fn load_snapshot_from_connection<C: OracleConnection>(
-    conn: &C,
-    request: &CatalogLoadRequest,
-) -> Result<CatalogSnapshot, CatalogError>;
+pub struct CatalogSnapshotBuilder;
 ```
 
-Queries `ALL_*` / `DBA_*` dictionary views, `DBMS_METADATA`, and PL/Scope tables.
-The `CatalogLoadRequest` specifies which schemas to extract:
-
-```rust
-pub struct CatalogLoadRequest {
-    pub schema_filters: Vec<CatalogSchemaFilter>,
-}
-
-pub enum CatalogSchemaFilter {
-    CurrentSchema,
-    Named(String),      // text-backed, safe across CLI/JSON boundaries
-}
-```
-
-The `OracleConnection` trait abstracts the database driver. `plsql-catalog` stays
-offline-first and does not carry a direct Oracle client dependency; the live
-`plsql-mcp` path adapts `oraclemcp-db` connections into this trait.
+`CatalogSnapshotBuilder` accepts structured dictionary row families and
+produces a `CatalogSnapshot`. It is the integration point for external
+live extractors without adding a database driver dependency to this crate.
 
 ### 6.3 DBMS_METADATA files
 
