@@ -734,25 +734,72 @@ fn recognise_unary(text: &str, depth: usize) -> Option<Expr> {
 }
 
 fn is_dotted_name(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    if bytes.is_empty() {
-        return false;
-    }
-    if !(bytes[0].is_ascii_alphabetic() || bytes[0] == b'_') {
-        return false;
-    }
-    bytes
-        .iter()
-        .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'#' || b == b'.')
-        && !text.contains("..")
+    exact_name_parts(text).is_some()
 }
 
 fn name_ref_from(text: &str) -> NameRef {
-    let parts: Vec<String> = text.split('.').map(|p| p.to_ascii_uppercase()).collect();
+    let parts = exact_name_parts(text).unwrap_or_default();
     NameRef {
         parts,
         display: text.to_string(),
     }
+}
+
+/// Oracle folds only unquoted identifiers. A quoted component retains its
+/// exact bytes (including escaped double quotes) and cannot collide with an
+/// unquoted spelling during closure resolution.
+fn exact_name_parts(text: &str) -> Option<Vec<String>> {
+    let bytes = text.as_bytes();
+    let mut pos = 0;
+    let mut parts = Vec::new();
+    while pos < bytes.len() {
+        if bytes[pos] == b'"' {
+            pos += 1;
+            let mut part = String::new();
+            let mut closed = false;
+            while pos < bytes.len() {
+                if bytes[pos] == b'"' {
+                    if bytes.get(pos + 1) == Some(&b'"') {
+                        part.push('"');
+                        pos += 2;
+                    } else {
+                        pos += 1;
+                        closed = true;
+                        break;
+                    }
+                } else {
+                    let ch = text[pos..].chars().next()?;
+                    part.push(ch);
+                    pos += ch.len_utf8();
+                }
+            }
+            if !closed || part.is_empty() {
+                return None;
+            }
+            parts.push(part);
+        } else {
+            let start = pos;
+            let first = *bytes.get(pos)?;
+            if !(first.is_ascii_alphabetic() || first == b'_') {
+                return None;
+            }
+            pos += 1;
+            while pos < bytes.len()
+                && (bytes[pos].is_ascii_alphanumeric() || matches!(bytes[pos], b'_' | b'$' | b'#'))
+            {
+                pos += 1;
+            }
+            parts.push(text[start..pos].to_ascii_uppercase());
+        }
+        if pos == bytes.len() {
+            break;
+        }
+        if bytes[pos] != b'.' || pos + 1 == bytes.len() {
+            return None;
+        }
+        pos += 1;
+    }
+    (!parts.is_empty()).then_some(parts)
 }
 
 #[cfg(test)]

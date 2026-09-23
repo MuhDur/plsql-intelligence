@@ -420,6 +420,7 @@ pub struct PackageUnits {
     pub part: PackagePart,
     pub lowered: bool,
     pub members: Vec<PackageMember>,
+    pub state_variables: Vec<String>,
     pub initializers: Vec<PackageInitializer>,
     pub cursors: Vec<PackageCursor>,
     pub init_section: Option<PackageInitSection>,

@@ -24,9 +24,16 @@
 #![cfg(feature = "antlr-codegen")]
 
 use antlr4rust::common_token_stream::CommonTokenStream;
+use antlr4rust::error_listener::ErrorListener;
+use antlr4rust::errors::ANTLRError;
 use antlr4rust::input_stream::InputStream;
+use antlr4rust::parser::Parser;
 use antlr4rust::parser_rule_context::ParserRuleContext;
+use antlr4rust::recognizer::Recognizer;
 use antlr4rust::token::Token;
+use antlr4rust::token_factory::TokenFactory;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use plsql_core::{Diagnostic, FileId, Position, Severity, Span};
 use plsql_parser::ast::{
@@ -56,6 +63,29 @@ use crate::generated::plsqlparser::{
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
+
+struct ParserErrors(Rc<RefCell<Vec<Diagnostic>>>);
+
+impl<'a, T: Recognizer<'a>> ErrorListener<'a, T> for ParserErrors {
+    fn syntax_error(
+        &self,
+        _recognizer: &T,
+        _offending_symbol: Option<&<T::TF as TokenFactory<'a>>::Inner>,
+        line: isize,
+        column: isize,
+        _msg: &str,
+        _error: Option<&ANTLRError>,
+    ) {
+        // The generated parser's default console listener emits enormous
+        // expected-token lists and does not feed BackendParseResult. Capture
+        // a bounded diagnostic instead: recovery must never look Clean.
+        self.0.borrow_mut().push(Diagnostic::new(
+            ANTLR4RUST_DIAG_CODE,
+            Severity::Error,
+            format!("ANTLR syntax error at {line}:{column}"),
+        ));
+    }
+}
 
 /// Lower an ANTLR parse tree for `source` into an [`Ast`].
 ///
@@ -89,12 +119,14 @@ pub fn lower_parse_tree(source: &str, file_id: FileId, diagnostics: &mut Vec<Dia
     let lexer = PlSqlLexer::new(input);
     let token_stream = CommonTokenStream::new(lexer);
     let mut parser = PlSqlParser::new(token_stream);
-    // Silence ANTLR's default stderr console listener.
-    // Parser trait provides `remove_parse_listeners`.
-    parser.remove_parse_listeners();
+    let parser_errors = Rc::new(RefCell::new(Vec::new()));
+    parser.remove_error_listeners();
+    parser.add_error_listener(Box::new(ParserErrors(Rc::clone(&parser_errors))));
 
     // Parse the top-level sql_script rule.
-    let script_ctx = match parser.sql_script() {
+    let parsed_script = parser.sql_script();
+    diagnostics.extend(parser_errors.borrow_mut().drain(..));
+    let script_ctx = match parsed_script {
         Ok(ctx) => ctx,
         Err(e) => {
             diagnostics.push(Diagnostic::new(
@@ -356,10 +388,15 @@ fn lower_create_package(
             push_initializer(&mut units, &var, source, file_id);
         } else if let Some(cur) = obj.cursor_declaration() {
             push_cursor(&mut units, &cur, source, file_id);
+        } else if obj.pragma_declaration().is_some() {
+            // A package-level pragma can change invocation semantics. Keep
+            // it visible to closure analysis instead of declaring it inert.
+            units
+                .unattributed
+                .push(unattributed(&**obj, "package_pragma", file_id, source));
         } else if obj.type_declaration().is_none()
             && obj.subtype_declaration().is_none()
             && obj.exception_declaration().is_none()
-            && obj.pragma_declaration().is_none()
         {
             units
                 .unattributed
@@ -368,7 +405,7 @@ fn lower_create_package(
     }
     assign_positional_overloads(&mut units.members, true);
     AstDecl::PackageSpec {
-        name: node_name_upper(source, ctx.package_name(0)),
+        name: node_name_exact(source, ctx.package_name(0)),
         span: non_empty(node_span(ctx, file_id, source), fallback_span),
         units,
     }
@@ -388,11 +425,12 @@ fn lower_create_package_body(
     diagnostics: &mut Vec<Diagnostic>,
 ) -> (AstDecl, Vec<AstStatement>) {
     let span = node_span(ctx, file_id, source);
-    let name = node_name_upper(source, ctx.package_name(0));
+    let name = node_name_exact(source, ctx.package_name(0));
     let mut units = AstPackageUnits {
         lowered: true,
         ..AstPackageUnits::default()
     };
+    let mut package_pragmas = Vec::new();
 
     for obj in &ctx.package_obj_body_all() {
         if let Some(pb) = obj.procedure_body() {
@@ -464,12 +502,17 @@ fn lower_create_package_body(
                 file_id,
                 source,
             ));
+        } else if let Some(pragma) = obj.pragma_declaration() {
+            package_pragmas.push(AstStatement::Sql {
+                verb: "PRAGMA".to_string(),
+                raw_text: node_text(source, &*pragma),
+                span: node_span(&*pragma, file_id, source),
+            });
         } else if obj.procedure_spec().is_none()
             && obj.function_spec().is_none()
             && obj.type_declaration().is_none()
             && obj.subtype_declaration().is_none()
             && obj.exception_declaration().is_none()
-            && obj.pragma_declaration().is_none()
         {
             // Forward declarations, types, subtypes, exceptions and pragmas
             // have no executable effect; anything else is not attributable.
@@ -484,10 +527,12 @@ fn lower_create_package_body(
     let seq = ctx.seq_of_statements();
     let handlers = ctx.exception_handler_all();
     if seq.is_some() || !handlers.is_empty() {
-        let mut statements = seq
-            .as_ref()
-            .map(|seq| lower_seq_of_statements(seq, source, file_id, diagnostics))
-            .unwrap_or_default();
+        let mut statements = package_pragmas.clone();
+        statements.extend(
+            seq.as_ref()
+                .map(|seq| lower_seq_of_statements(seq, source, file_id, diagnostics))
+                .unwrap_or_default(),
+        );
         for handler in &handlers {
             if let Some(hseq) = handler.seq_of_statements() {
                 statements.extend(lower_seq_of_statements(&hseq, source, file_id, diagnostics));
@@ -500,6 +545,11 @@ fn lower_create_package_body(
         units.init_section = Some(AstInitSection {
             statements,
             span: section_span,
+        });
+    } else if !package_pragmas.is_empty() {
+        units.init_section = Some(AstInitSection {
+            statements: package_pragmas,
+            span,
         });
     }
     assign_positional_overloads(&mut units.members, false);
@@ -522,11 +572,23 @@ fn lower_create_procedure_body(
     diagnostics: &mut Vec<Diagnostic>,
 ) -> (AstDecl, Vec<AstStatement>) {
     // The procedure name may be schema-qualified; take the last component.
-    let name = last_component(node_name_upper(source, ctx.procedure_name()));
-    let stmts = ctx
-        .body()
-        .map(|b| lower_body_stmts(&b, source, file_id, diagnostics))
-        .unwrap_or_default();
+    let name = last_component(node_name_exact(source, ctx.procedure_name()));
+    let mut unattributed = Vec::new();
+    let mut stmts = lower_declare_specs(
+        ctx.seq_of_declare_specs(),
+        source,
+        file_id,
+        diagnostics,
+        &mut unattributed,
+    );
+    if !unattributed.is_empty() {
+        stmts.push(AstStatement::Unknown {
+            span: node_span(ctx, file_id, source),
+        });
+    }
+    if let Some(body) = ctx.body() {
+        stmts.extend(lower_body_stmts(&body, source, file_id, diagnostics));
+    }
     (
         AstDecl::Procedure {
             name,
@@ -543,11 +605,23 @@ fn lower_create_function_body(
     fallback_span: Span,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> (AstDecl, Vec<AstStatement>) {
-    let name = last_component(node_name_upper(source, ctx.function_name()));
-    let stmts = ctx
-        .body()
-        .map(|b| lower_body_stmts(&b, source, file_id, diagnostics))
-        .unwrap_or_default();
+    let name = last_component(node_name_exact(source, ctx.function_name()));
+    let mut unattributed = Vec::new();
+    let mut stmts = lower_declare_specs(
+        ctx.seq_of_declare_specs(),
+        source,
+        file_id,
+        diagnostics,
+        &mut unattributed,
+    );
+    if !unattributed.is_empty() {
+        stmts.push(AstStatement::Unknown {
+            span: node_span(ctx, file_id, source),
+        });
+    }
+    if let Some(body) = ctx.body() {
+        stmts.extend(lower_body_stmts(&body, source, file_id, diagnostics));
+    }
     (
         AstDecl::Function {
             name,
@@ -564,7 +638,7 @@ fn lower_create_trigger(
     fallback_span: Span,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> (AstDecl, Vec<AstStatement>) {
-    let name = last_component(node_name_upper(source, ctx.trigger_name()));
+    let name = last_component(node_name_exact(source, ctx.trigger_name()));
     // Trigger body: trigger_body → trigger_block → body.
     let stmts = ctx
         .trigger_body()
@@ -590,8 +664,8 @@ fn lower_create_view(
     // View name: stored in ctx.v (the first id_expression after VIEW keyword),
     // falling back to the first positional id_expression.
     let name = match ctx.v.clone() {
-        Some(ie) => node_name_upper(source, Some(ie)),
-        None => node_name_upper(source, ctx.id_expression(0)),
+        Some(ie) => node_name_exact(source, Some(ie)),
+        None => node_name_exact(source, ctx.id_expression(0)),
     };
     AstDecl::View {
         name,
@@ -609,13 +683,13 @@ fn lower_create_type(
 
     if let Some(td) = ctx.type_definition() {
         return AstDecl::TypeSpec {
-            name: node_name_upper(source, td.type_name()),
+            name: node_name_exact(source, td.type_name()),
             span: span(),
         };
     }
     if let Some(tb) = ctx.type_body() {
         return AstDecl::TypeBody {
-            name: node_name_upper(source, tb.type_name()),
+            name: node_name_exact(source, tb.type_name()),
             span: span(),
         };
     }
@@ -778,10 +852,15 @@ fn lower_declare_specs(
                 file_id,
                 source,
             ));
+        } else if let Some(pragma) = spec.pragma_declaration() {
+            out.push(AstStatement::Sql {
+                verb: "PRAGMA".to_string(),
+                raw_text: node_text(source, &*pragma),
+                span: node_span(&*pragma, file_id, source),
+            });
         } else if spec.type_declaration().is_some()
             || spec.subtype_declaration().is_some()
             || spec.exception_declaration().is_some()
-            || spec.pragma_declaration().is_some()
             || spec.procedure_spec().is_some()
             || spec.function_spec().is_some()
         {
@@ -809,9 +888,11 @@ fn push_initializer(
     source: &str,
     file_id: FileId,
 ) {
+    let name = ident_of(source, var.identifier());
+    units.state_variables.push(name.clone());
     if let Some(init) = var.default_value_part().and_then(|d| d.expression()) {
         units.initializers.push(AstInitializer {
-            name: ident_of(source, var.identifier()),
+            name,
             initializer_text: node_text(source, &*init).trim().to_string(),
             span: node_span(var, file_id, source),
         });
@@ -1048,7 +1129,12 @@ fn lower_statement(
                 .expression()
                 .map(|e| node_text(source, &*e))
                 .unwrap_or_default();
-            let has_using = exec_imm.using_clause().is_some();
+            // USING expressions and INTO targets can themselves carry
+            // effects. Until those AST children are modeled, the IR must
+            // retain an uncertainty marker for either clause.
+            let has_using = exec_imm.using_clause().is_some()
+                || exec_imm.into_clause().is_some()
+                || exec_imm.dynamic_returning_clause().is_some();
             return Some(AstStatement::ExecuteImmediate {
                 sql_text,
                 has_using,
@@ -1092,7 +1178,11 @@ fn lower_statement(
     // Call statement.
     if let Some(call_s) = stmt.call_statement() {
         let callee = build_call_callee(&call_s, source);
-        return Some(AstStatement::Call { callee, span });
+        return Some(AstStatement::Call {
+            callee,
+            raw_text: node_text(source, &*call_s),
+            span,
+        });
     }
 
     // CASE statement, nested body, forall, pipe_row, etc. → Unknown.
@@ -1282,21 +1372,18 @@ where
     extract_text(source, s, e)
 }
 
-/// Source text covering one parse-tree node, trimmed and upper-cased —
-/// the canonical way object/identifier names are extracted from a child
-/// context. Returns `""` when `node` is `None`.
-fn node_name_upper<'i, N, P>(source: &str, node: Option<P>) -> String
+/// Oracle-canonical name from a parse-tree node: unquoted identifiers fold
+/// to upper case; a quoted identifier retains its exact case.
+fn node_name_exact<'i, N, P>(source: &str, node: Option<P>) -> String
 where
     N: ParserRuleContext<'i> + ?Sized,
     P: std::ops::Deref<Target = N>,
 {
-    node.map(|n| {
+    let raw = node.map(|n| {
         let (s, e) = node_offsets(&*n);
         extract_text(source, s, e)
-    })
-    .unwrap_or_default()
-    .trim()
-    .to_ascii_uppercase()
+    });
+    exact_ident(raw.unwrap_or_default().trim())
 }
 
 /// [`ctx_span`] for a whole parse-tree node (start..=stop).

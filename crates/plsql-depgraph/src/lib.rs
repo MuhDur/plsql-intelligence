@@ -557,6 +557,17 @@ pub enum EdgeKind {
     OpaqueDynamic,
     DbLink,
     References,
+    TransactionControl,
+    Autonomous,
+    SequenceAdvance,
+    RowLock,
+    SessionState,
+    Ddl,
+    Admin,
+    OperatorOnly,
+    UnresolvedDynamicSql,
+    ExternalIo,
+    UnresolvedCallee,
 }
 
 impl EdgeKind {
@@ -579,6 +590,17 @@ impl EdgeKind {
             Self::OpaqueDynamic => "OpaqueDynamic",
             Self::DbLink => "DbLink",
             Self::References => "References",
+            Self::TransactionControl => "TransactionControl",
+            Self::Autonomous => "Autonomous",
+            Self::SequenceAdvance => "SequenceAdvance",
+            Self::RowLock => "RowLock",
+            Self::SessionState => "SessionState",
+            Self::Ddl => "Ddl",
+            Self::Admin => "Admin",
+            Self::OperatorOnly => "OperatorOnly",
+            Self::UnresolvedDynamicSql => "UnresolvedDynamicSql",
+            Self::ExternalIo => "ExternalIo",
+            Self::UnresolvedCallee => "UnresolvedCallee",
         }
     }
 }

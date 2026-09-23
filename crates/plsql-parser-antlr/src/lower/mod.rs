@@ -775,8 +775,17 @@ fn classify_statement(raw: &str, file_id: FileId, start: usize, end: usize) -> A
     }
     if let Some(body_start) = execute_immediate_body_start(u) {
         let after = &text[body_start..];
-        let sql_text = extract_first_quoted(after).unwrap_or_default();
-        let has_using = after.to_ascii_uppercase().contains(" USING ");
+        let expression = after.trim().trim_end_matches(';').trim();
+        let upper_expression = expression.to_ascii_uppercase();
+        let sql_text = upper_expression
+            .find(" USING ")
+            .map(|pos| &expression[..pos])
+            .unwrap_or(expression)
+            .trim()
+            .to_string();
+        let has_using = after.to_ascii_uppercase().contains(" USING ")
+            || after.to_ascii_uppercase().contains(" INTO ")
+            || after.to_ascii_uppercase().contains(" RETURNING ");
         return AstStatement::ExecuteImmediate {
             sql_text,
             has_using,
@@ -825,35 +834,13 @@ fn classify_statement(raw: &str, file_id: FileId, start: usize, end: usize) -> A
         && text[head.len()..].trim_start().starts_with('(')
         && head.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
     {
-        return AstStatement::Call { callee: head, span };
+        return AstStatement::Call {
+            callee: head,
+            raw_text: text.to_string(),
+            span,
+        };
     }
     AstStatement::Unknown { span }
-}
-
-fn extract_first_quoted(s: &str) -> Option<String> {
-    let mut it = s.chars().peekable();
-    while let Some(c) = it.next() {
-        if c == '\'' {
-            let mut buf = String::new();
-            while let Some(nc) = it.next() {
-                if nc == '\'' {
-                    // Oracle doubled-`''` escape: `''` is a single literal `'`,
-                    // not the end of the literal. Without this the captured SQL
-                    // text is truncated at the first inner escaped quote (e.g.
-                    // EXECUTE IMMEDIATE 'SELECT ''x'' FROM dual'). (oracle-ajm2.20)
-                    if it.peek() == Some(&'\'') {
-                        it.next();
-                        buf.push('\'');
-                        continue;
-                    }
-                    return Some(buf);
-                }
-                buf.push(nc);
-            }
-            return Some(buf);
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -2612,7 +2599,7 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
                 has_using,
                 ..
             } => {
-                assert_eq!(sql_text, "UPDATE t SET a = :1");
+                assert_eq!(sql_text, "'UPDATE t SET a = :1'");
                 assert!(*has_using);
             }
             other => panic!("{other:?}"),
@@ -2621,14 +2608,12 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
 
     #[test]
     fn parse005_execute_immediate_honors_doubled_quote_escape() {
-        // oracle-ajm2.20: `extract_first_quoted` returned at the first lone `'`,
-        // truncating the captured literal at an inner doubled-`''` escape
-        // (`'SELECT ''x'' FROM dual'` -> "SELECT "). Honouring `''` captures
-        // the full SQL with escapes un-doubled to single quotes.
+        // Preserve the full expression, including doubled quote escapes,
+        // so the IR can prove whether it is one literal.
         let s = stmts("EXECUTE IMMEDIATE 'SELECT ''x'' FROM dual';");
         match &s[0] {
             AstStatement::ExecuteImmediate { sql_text, .. } => {
-                assert_eq!(sql_text, "SELECT 'x' FROM dual");
+                assert_eq!(sql_text, "'SELECT ''x'' FROM dual'");
             }
             other => panic!("{other:?}"),
         }

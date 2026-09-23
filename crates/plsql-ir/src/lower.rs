@@ -201,6 +201,7 @@ fn lower_package_units(units: &AstPackageUnits, part: PackagePart) -> PackageUni
     PackageUnits {
         part,
         lowered: units.lowered,
+        state_variables: units.state_variables.clone(),
         members: units
             .members
             .iter()
@@ -457,21 +458,18 @@ pub fn lower_ast_statements(
                         verb,
                         raw_text: raw_text.clone(),
                     }],
-                    None => vec![Statement::Unrecognized {
-                        raw_text: raw_text.clone(),
-                        unknown_reason: UnknownStatementReason::UnrecognizedKeyword,
-                    }],
+                    None => crate::lower_statement_body(raw_text),
                 }
             }
-            AstStatement::Call { callee, .. } => {
-                // A call statement: emit as Unrecognized with raw_text of the
-                // form "callee()" so that `lower_expression` recognises it as
-                // an `Expr::Call` and `extract_call_sites` can resolve the
-                // callee. If the callee already contains `(`, trust it as-is.
-                let raw = if callee.contains('(') {
-                    callee.clone()
-                } else {
+            AstStatement::Call {
+                callee, raw_text, ..
+            } => {
+                // Preserve arguments: replacing a call with `callee()` loses
+                // evaluated defaults and makes overload selection unsound.
+                let raw = if raw_text.trim().is_empty() {
                     format!("{callee}()")
+                } else {
+                    raw_text.clone()
                 };
                 vec![Statement::Unrecognized {
                     raw_text: raw,
@@ -519,6 +517,7 @@ mod tests {
     /// signal and minted a spurious `Reads t` edge (EXPLAIN writes PLAN_TABLE
     /// and does not read `t`). It must now lower to `Statement::Unrecognized`
     /// and yield zero table accesses — matching the sibling text-scanner.
+    /// Transaction control instead retains its dedicated IR variant.
     #[test]
     fn unknown_sql_verb_lowers_to_unrecognized_not_spurious_read() {
         use crate::{Statement, UnknownStatementReason, extract_table_accesses};
@@ -527,8 +526,6 @@ mod tests {
             "EXPLAIN PLAN FOR SELECT col FROM t",
             "LOCK TABLE t IN EXCLUSIVE MODE",
             "OPEN c FOR SELECT col FROM t",
-            "COMMIT",
-            "ROLLBACK TO sp",
             "FETCH c INTO v",
             "CLOSE c",
         ] {
@@ -550,6 +547,14 @@ mod tests {
                 "`{raw}` must mint zero table accesses (no spurious Read), got {:?}",
                 extract_table_accesses(&ir)
             );
+        }
+        for raw in ["COMMIT", "ROLLBACK TO sp"] {
+            let ir = lower_ast_statements(&[sql_sentinel(raw)]);
+            assert!(
+                matches!(ir.as_slice(), [Statement::TransactionControl { .. }]),
+                "`{raw}` must retain transaction control; got {ir:?}"
+            );
+            assert!(extract_table_accesses(&ir).is_empty());
         }
     }
 

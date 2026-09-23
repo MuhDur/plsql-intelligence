@@ -70,9 +70,11 @@ pub enum Statement {
     Return { value_text: Option<String> },
     /// `EXIT [WHEN cond];`.
     Exit { when_text: Option<String> },
-    /// `EXECUTE IMMEDIATE 'sql' [USING binds] [INTO targets];`.
-    /// The lowering captures the SQL literal verbatim plus a
-    /// boolean for whether the call had bind variables.
+    /// `EXECUTE IMMEDIATE expr [USING binds] [INTO targets];`.
+    /// `sql_literal` retains the entire SQL expression (including
+    /// quotes when literal), so a literal prefix followed by a variable
+    /// cannot be mistaken for compile-time SQL. `has_bind_variables`
+    /// also marks an INTO target whose effects are not modeled yet.
     ExecuteImmediate {
         sql_literal: String,
         has_bind_variables: bool,
@@ -560,8 +562,19 @@ fn classify(text: &str) -> Statement {
     // (oracle-rwjl.3)
     if let Some(body_off) = execute_immediate_body_offset(text) {
         let after = &text[body_off..];
-        let sql_literal = extract_quoted(after).unwrap_or_default();
-        let has_bind_variables = after.to_ascii_uppercase().contains("USING ");
+        // Keep the *whole expression*. Extracting the first quoted span
+        // would misclassify `'CREATE ...' || user_input` as a literal.
+        let expression = after.trim().trim_end_matches(';').trim();
+        let upper_expression = expression.to_ascii_uppercase();
+        let sql_literal = upper_expression
+            .find(" USING ")
+            .map(|pos| &expression[..pos])
+            .unwrap_or(expression)
+            .trim()
+            .to_string();
+        let has_bind_variables = after.to_ascii_uppercase().contains(" USING ")
+            || after.to_ascii_uppercase().contains(" INTO ")
+            || after.to_ascii_uppercase().contains(" RETURNING ");
         return Statement::ExecuteImmediate {
             sql_literal,
             has_bind_variables,
@@ -600,6 +613,7 @@ fn classify(text: &str) -> Statement {
     if starts_with_keyword(trimmed, "COMMIT")
         || starts_with_keyword(trimmed, "ROLLBACK")
         || starts_with_keyword(trimmed, "SAVEPOINT")
+        || starts_with_keyword(trimmed, "SET TRANSACTION")
     {
         let verb = trimmed.split_whitespace().next().unwrap_or("").to_string();
         return Statement::TransactionControl { verb };
@@ -763,34 +777,6 @@ fn classify_loop(text: &str) -> Statement {
             .to_string()
     };
     Statement::BareLoop { body_text: body }
-}
-
-fn extract_quoted(text: &str) -> Option<String> {
-    let mut iter = text.chars().peekable();
-    while let Some(c) = iter.next() {
-        if c == '\'' {
-            let mut buf = String::new();
-            while let Some(nc) = iter.next() {
-                if nc == '\'' {
-                    // Oracle doubled-`''` escape: a `'` immediately followed by
-                    // another `'` is a single literal `'`, not the end of the
-                    // literal. Mirror `string_literal_end`'s handling so the
-                    // captured SQL text is not truncated at the first inner
-                    // escaped quote (e.g. EXECUTE IMMEDIATE 'SELECT ''x''…').
-                    // (oracle-ajm2.20)
-                    if iter.peek() == Some(&'\'') {
-                        iter.next();
-                        buf.push('\'');
-                        continue;
-                    }
-                    return Some(buf);
-                }
-                buf.push(nc);
-            }
-            return Some(buf);
-        }
-    }
-    None
 }
 
 fn find_keyword(text: &str, keyword: &str, start: usize) -> Option<usize> {
@@ -992,7 +978,7 @@ mod tests {
                 sql_literal,
                 has_bind_variables,
             } => {
-                assert_eq!(sql_literal, "UPDATE t SET a = :1");
+                assert_eq!(sql_literal, "'UPDATE t SET a = :1'");
                 assert!(*has_bind_variables);
             }
             other => panic!("expected ExecuteImmediate, got {other:?}"),
@@ -1001,15 +987,12 @@ mod tests {
 
     #[test]
     fn execute_immediate_honors_doubled_quote_escape() {
-        // oracle-ajm2.20: `extract_quoted` returned at the first lone `'`,
-        // truncating the captured literal at an inner doubled-`''` escape
-        // (`'SELECT ''x'' FROM dual'` -> "SELECT "). Mirroring
-        // `string_literal_end`'s `''` handling captures the full SQL with the
-        // escapes un-doubled to single quotes.
+        // Preserve the full source expression including doubled quote
+        // escapes; the effect walker proves literal status separately.
         let r = lower_statement_body("EXECUTE IMMEDIATE 'SELECT ''x'' FROM dual';");
         match &r[0] {
             Statement::ExecuteImmediate { sql_literal, .. } => {
-                assert_eq!(sql_literal, "SELECT 'x' FROM dual");
+                assert_eq!(sql_literal, "'SELECT ''x'' FROM dual'");
             }
             other => panic!("expected ExecuteImmediate, got {other:?}"),
         }
@@ -1043,7 +1026,7 @@ mod tests {
         ] {
             let r = lower_statement_body(src);
             assert!(
-                matches!(r.first(), Some(Statement::ExecuteImmediate { sql_literal, .. }) if sql_literal == "DROP TABLE t"),
+                matches!(r.first(), Some(Statement::ExecuteImmediate { sql_literal, .. }) if sql_literal == "'DROP TABLE t'"),
                 "non-canonical EXECUTE IMMEDIATE must classify as dynamic SQL: {src:?} -> {r:?}"
             );
         }

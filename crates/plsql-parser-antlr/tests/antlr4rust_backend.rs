@@ -337,6 +337,20 @@ mod gated {
     }
 
     #[test]
+    fn parser_recovery_cannot_report_clean_ddl() {
+        // The lexer accepts these tokens and the AST text fallback can still
+        // mint `AstDecl::Ddl`, but ANTLR rejects the missing object name.
+        // A caller folding literal dynamic SQL must see that recovery.
+        let r = backend().parse("CREATE TABLE;", fid(), &opts());
+        assert!(r.recovered);
+        assert!(
+            r.diagnostics
+                .iter()
+                .any(|d| d.severity >= plsql_core::Severity::Error)
+        );
+    }
+
+    #[test]
     fn lexer_error_token_sequence_yields_diagnostic() {
         // Inject a character sequence the lexer genuinely rejects.
         // The `@` outside a bind-var context may produce errors on some inputs.

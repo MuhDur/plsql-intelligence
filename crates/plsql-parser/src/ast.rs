@@ -289,6 +289,8 @@ pub enum AstStatement {
     /// `EXECUTE IMMEDIATE '<sql>' [USING …];`
     ExecuteImmediate {
         sql_text: String,
+        /// USING expressions or INTO targets are present; later passes
+        /// must preserve uncertainty until they are modeled.
         has_using: bool,
         span: Span,
     },
@@ -303,7 +305,12 @@ pub enum AstStatement {
         span: Span,
     },
     /// A procedure / function call statement.
-    Call { callee: String, span: Span },
+    Call {
+        callee: String,
+        /// Full call source, including arguments and named notation.
+        raw_text: String,
+        span: Span,
+    },
     /// A statement the backend could not classify (R13).
     Unknown { span: Span },
 }
@@ -549,6 +556,9 @@ pub struct AstUnattributed {
 pub struct AstPackageUnits {
     pub lowered: bool,
     pub members: Vec<AstPackageMember>,
+    /// Package variables, with or without an initializer. Assignments to
+    /// these names mutate session package state.
+    pub state_variables: Vec<String>,
     pub initializers: Vec<AstInitializer>,
     pub cursors: Vec<AstPackageCursor>,
     /// Body only.

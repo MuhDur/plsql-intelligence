@@ -3,6 +3,12 @@
 use thiserror::Error;
 use tracing::instrument;
 
+pub mod effects;
+pub use effects::{
+    InvocationArgType, InvocationClosureV1, InvocationIndexV1, InvocationShapeV1,
+    OperatorStatementClass, RoutineEffect, RoutineEffectsV1,
+};
+
 pub mod config {
     use std::path::PathBuf;
 
@@ -148,12 +154,24 @@ pub mod model {
         pub flow_summary: FlowSummary,
         pub fact_store: FactStoreSnapshot,
         pub dep_graph: DepGraph,
+        /// Source-backed effect units and exact invocation closure query.
+        #[serde(default)]
+        pub invocation_index: super::effects::InvocationIndexV1,
         pub completeness: CompletenessReport,
         pub diagnostics: Vec<Diagnostic>,
         pub artifacts: AnalysisArtifactManifest,
     }
 
     impl AnalysisRun {
+        /// Query the exact source-backed closure for one invocation shape.
+        #[must_use]
+        pub fn invocation_closure(
+            &self,
+            shape: &super::effects::InvocationShapeV1,
+        ) -> super::effects::InvocationClosureV1 {
+            self.invocation_index.closure(shape)
+        }
+
         /// Return the **compact** persisted form of this run.
         ///
         /// Drops the two heavy, fully re-derivable payloads — the
@@ -209,7 +227,8 @@ pub const ANALYSIS_RUN_SCHEMA: plsql_output::SchemaDescriptor = plsql_output::Sc
     // extracted_semantics_ratio added; structurally-unwired gap
     // metrics now serialise as `{ "unmeasured": true }` instead of
     // a misleading `0`.
-    version: plsql_output::SchemaVersion::new(1, 1, 0),
+    // 1.2.0: source-backed InvocationIndexV1 and closure effects.
+    version: plsql_output::SchemaVersion::new(1, 2, 0),
     description: "Reusable canonical AnalysisRun artifact (PLSQL-ENG-004)",
 };
 
@@ -635,7 +654,7 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
         // Stamp the embedded manifest with the single-source-of-truth
         // schema version so the producer and ANALYSIS_RUN_SCHEMA cannot
         // drift apart when the schema advances. A hardcoded literal here
-        // would mislabel a 1.1.0-field-bearing artifact as 1.0.0 and make
+        // would mislabel a 1.2.0-field-bearing artifact as 1.0.0 and make
         // a consumer that gates on the manifest (compatibility_with /
         // is_readable_by) read it as Compatible instead of ForwardCompatible.
         schema_version: ANALYSIS_RUN_SCHEMA.version,
@@ -677,7 +696,11 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
     // one wired up, a fragment cached under a permissive policy
     // must never be served to a request that asked for a stricter
     // one (which would under-redact).
+    // The invocation index is a newly materialized safety artifact. Old
+    // semantic fragments had no such index and must be recomputed rather
+    // than deserializing with an empty default that looks like an analysis.
     const CACHE_STRATEGY: &str = "semantic_fragment";
+    const CACHE_LAYOUT: &str = "invocation_v1";
     let cache_ctx: Option<(plsql_store::Store, String, String)> = (|| {
         if !req.cache.enabled {
             return None;
@@ -697,7 +720,8 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
         // cached fragment (a permissively-redacted artifact must never
         // satisfy a stricter-redaction request).
         let profile_bytes =
-            serde_json::to_vec(&(&req.analysis_profile, &req.redaction_policy)).ok()?;
+            serde_json::to_vec(&(CACHE_LAYOUT, &req.analysis_profile, &req.redaction_policy))
+                .ok()?;
         let profile_hash = plsql_store::hash_hex(&profile_bytes);
         let store =
             plsql_store::Store::open(&dir.join("cache.db"), plsql_store::StoreConfig::default())
@@ -816,7 +840,7 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
             let logical_id = interner
                 .resolve(decl.common().name)
                 .unwrap_or("")
-                .to_ascii_uppercase();
+                .to_string();
             let decl_fact = mint_fact(
                 source_prov(&logical_id),
                 FactPayload::Declaration {
@@ -853,6 +877,61 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
             // executes them (InvocationClosureV1). Spec and body headers of
             // one member share an id, and so share a node.
             if let plsql_ir::Declaration::Package(pkg) = decl {
+                let entry = run
+                    .invocation_index
+                    .packages
+                    .entry(logical_id.clone())
+                    .or_insert_with(|| effects::PackageShape {
+                        complete: true,
+                        ..effects::PackageShape::default()
+                    });
+                // Package-wide parse attribution is shared, but one
+                // unrelated ambiguous overload must not poison every
+                // member's per-closure completeness.
+                entry.complete &= pkg.units.lowered && pkg.units.unattributed.is_empty();
+                let span = decl.common().span;
+                let start = (span.start.offset as usize).min(source.len());
+                let end = (span.end.offset as usize).min(source.len());
+                let package_source = source.get(start..end).unwrap_or("").to_ascii_uppercase();
+                if package_source.contains("AUTHID CURRENT_USER") {
+                    entry
+                        .source_reasons
+                        .insert("AUTHID CURRENT_USER".to_string());
+                }
+                if package_source.contains(" WRAPPED") || package_source.contains("\nWRAPPED") {
+                    entry.source_reasons.insert("wrapped source".to_string());
+                }
+                if logical_id.contains(['.', '#', '(', ')', '@'])
+                    || pkg.units.members.iter().any(|member| {
+                        member.name.contains(['.', '#', '(', ')', '@'])
+                            || member
+                                .params
+                                .iter()
+                                .any(|param| param.name.contains(['.', '#', '(', ')', '@']))
+                    })
+                {
+                    entry.source_reasons.insert(
+                        "flat package-unit identity cannot represent an identifier separator"
+                            .to_string(),
+                    );
+                }
+                match pkg.units.part {
+                    plsql_ir::PackagePart::Spec => {
+                        entry.has_spec = true;
+                        entry
+                            .spec_members
+                            .extend(pkg.units.members.iter().map(|m| m.unit_id(&logical_id)));
+                    }
+                    plsql_ir::PackagePart::Body => {
+                        entry.has_body = true;
+                        entry
+                            .body_members
+                            .extend(pkg.units.members.iter().map(|m| m.unit_id(&logical_id)));
+                    }
+                }
+                entry
+                    .state_variables
+                    .extend(pkg.units.state_variables.iter().cloned());
                 for unit in pkg.units.addressable_units(&logical_id) {
                     if nodes_by_logical_id.contains_key(&unit.id) {
                         continue;
@@ -927,7 +1006,7 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
             let caller_id_str = interner
                 .resolve(decl.common().name)
                 .unwrap_or("")
-                .to_ascii_uppercase();
+                .to_string();
             let Some(&decl_node_id) = nodes_by_logical_id.get(&caller_id_str) else {
                 continue;
             };
@@ -972,6 +1051,136 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
             }
 
             for (caller_id_str, caller_node_id, caller_span, body_stmts) in work {
+                let source_start = (caller_span.start.offset as usize).min(source.len());
+                let source_end = (caller_span.end.offset as usize).min(source.len());
+                let unit_source = source.get(source_start..source_end).unwrap_or("");
+                let source_upper = unit_source.to_ascii_uppercase();
+                let mut source_reasons = std::collections::BTreeSet::new();
+                for (marker, reason) in [
+                    ("AUTHID CURRENT_USER", "AUTHID CURRENT_USER"),
+                    ("LANGUAGE JAVA", "Java call spec"),
+                    ("LANGUAGE C", "external call spec"),
+                    ("EXTERNAL NAME", "external call spec"),
+                ] {
+                    if source_upper.contains(marker) {
+                        source_reasons.insert(reason.to_string());
+                    }
+                }
+                if source_upper.contains(" WRAPPED") || source_upper.contains("\nWRAPPED") {
+                    source_reasons.insert("wrapped source".to_string());
+                }
+                let (package, kind, params) = if let plsql_ir::Declaration::Package(pkg) = decl {
+                    let matching = pkg
+                        .units
+                        .addressable_units(interner.resolve(decl.common().name).unwrap_or(""))
+                        .into_iter()
+                        .find(|unit| unit.id == caller_id_str);
+                    let kind = matching.as_ref().map(|unit| unit.kind.clone());
+                    let params = pkg
+                        .units
+                        .members
+                        .iter()
+                        .find(|m| {
+                            m.unit_id(interner.resolve(decl.common().name).unwrap_or(""))
+                                == caller_id_str
+                        })
+                        .map(|m| {
+                            m.params
+                                .iter()
+                                .map(|p| effects::ParamShape {
+                                    name: p.name.clone(),
+                                    has_default: p.default.is_some(),
+                                    type_text: p.ty.as_ref().map(|ty| match ty {
+                                        plsql_ir::TypeRef::Unresolved(text) => text.clone(),
+                                        plsql_ir::TypeRef::Anchored(anchor) => anchor.raw.clone(),
+                                    }),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (
+                        Some(
+                            interner
+                                .resolve(decl.common().name)
+                                .unwrap_or("")
+                                .to_string(),
+                        ),
+                        kind,
+                        params,
+                    )
+                } else {
+                    (None, None, Vec::new())
+                };
+                run.invocation_index.insert_unit(effects::EffectUnit {
+                    id: caller_id_str.clone(),
+                    package,
+                    kind,
+                    statements: body_stmts.clone(),
+                    params,
+                    source_complete: !had_errors && !parse_result.recovered,
+                    source_reasons,
+                });
+                for effect in run.invocation_index.local_effects(&caller_id_str) {
+                    let edge_kind = match effect {
+                        effects::RoutineEffect::ReadDb | effects::RoutineEffect::Dml => continue,
+                        effects::RoutineEffect::RowLock => EdgeKind::RowLock,
+                        effects::RoutineEffect::SessionState => EdgeKind::SessionState,
+                        effects::RoutineEffect::Ddl => EdgeKind::Ddl,
+                        effects::RoutineEffect::Admin => EdgeKind::Admin,
+                        effects::RoutineEffect::SequenceAdvance => EdgeKind::SequenceAdvance,
+                        effects::RoutineEffect::OperatorOnly(_) => EdgeKind::OperatorOnly,
+                        effects::RoutineEffect::TxnControl => EdgeKind::TransactionControl,
+                        effects::RoutineEffect::Autonomous => EdgeKind::Autonomous,
+                        effects::RoutineEffect::DynamicSql => EdgeKind::UnresolvedDynamicSql,
+                        effects::RoutineEffect::ExternalIo => EdgeKind::ExternalIo,
+                        effects::RoutineEffect::Unknown => EdgeKind::Unknown,
+                    };
+                    let effect_id = format!("EFFECT::{}", edge_kind.as_str());
+                    let effect_node = if let Some(id) = nodes_by_logical_id.get(&effect_id) {
+                        *id
+                    } else {
+                        let schema_name = unknown_schema(&mut interner);
+                        let symbol = interner
+                            .intern(effect_id.clone())
+                            .unwrap_or_else(|| plsql_core::SymbolId::new(0));
+                        let id = NodeId::new(next_node_id);
+                        next_node_id += 1;
+                        dep_graph.insert_node(Node::new(
+                            id,
+                            LogicalObjectId::new(effect_id.clone()),
+                            ObjectRevisionId::new("effect"),
+                            QualifiedName::new(
+                                Some(schema_name),
+                                plsql_core::ObjectName::from(symbol),
+                            ),
+                            NodeIdentityKind::Unknown,
+                        ));
+                        nodes_by_logical_id.insert(effect_id.clone(), id);
+                        id
+                    };
+                    fact_store.push(mint_fact(
+                        source_prov(&caller_id_str),
+                        FactPayload::DependencyEdge {
+                            from_logical_id: caller_id_str.clone(),
+                            to_logical_id: effect_id,
+                            edge_kind: edge_kind.as_str().to_string(),
+                        },
+                    ));
+                    let edge = Edge::new(
+                        EdgeId::new(next_edge_id),
+                        caller_node_id,
+                        effect_node,
+                        edge_kind,
+                        Confidence::new(ConfidenceLevel::Medium, None),
+                    );
+                    next_edge_id += 1;
+                    dep_graph.insert_edge(
+                        edge,
+                        Provenance::new(file_id, caller_span, ResolutionStrategy::LocalLexical)
+                            .with_note(format!("source effect {}", edge_kind.as_str())),
+                        None,
+                    );
+                }
                 let (call_sites, call_recursion) =
                     plsql_ir::extract_call_sites_bounded(&body_stmts);
                 if call_recursion.limit_hit {
@@ -983,7 +1192,7 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
                     ));
                 }
                 for cs in &call_sites {
-                    let callee_logical = cs.callee_parts.join(".").to_ascii_uppercase();
+                    let callee_logical = cs.callee_parts.join(".");
                     // Emit a call fact.
                     let call_fact = mint_fact(
                         source_prov(&caller_id_str),
@@ -995,11 +1204,9 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
                     );
                     fact_store.push(call_fact);
 
-                    // Add a depgraph edge if callee node is known.
-                    // Resolution tries the full dotted name first (e.g. "PKG_A.DO_WORK"),
-                    // then falls back to the leading package name ("PKG_A") so that
-                    // package-qualified calls resolve to the package node when the
-                    // individual member isn't registered separately.
+                    // Add an exact member edge if known. A package node is
+                    // never a substitute for an unresolved member: that old
+                    // fallback erased the unknown-callee signal.
                     // Capture HOW the callee resolved so the edge provenance records
                     // the real resolution strategy instead of a constant, and the
                     // depgraph's queryable provenance is honestly fed (oracle-687a.3):
@@ -1007,26 +1214,24 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
                     //     (a qualified `PKG.MEMBER` resolved to the exact member)
                     //   - exact match with a single bare part   → LocalLexical
                     //     (a bare name resolved in local/same scope)
-                    //   - fell back to the leading package node → PackageMemberLookup
-                    //     (qualified call resolved to its package)
-                    let resolved = nodes_by_logical_id
-                        .get(&callee_logical)
-                        .copied()
-                        .map(|nid| {
-                            let strat = if cs.callee_parts.len() > 1 {
-                                ResolutionStrategy::PackageMemberLookup
-                            } else {
-                                ResolutionStrategy::LocalLexical
-                            };
-                            (nid, strat)
-                        })
-                        .or_else(|| {
-                            cs.callee_parts
-                                .first()
-                                .map(|p| p.to_ascii_uppercase())
-                                .and_then(|pkg| nodes_by_logical_id.get(&pkg).copied())
-                                .map(|nid| (nid, ResolutionStrategy::PackageMemberLookup))
-                        });
+                    let resolved = (!cs
+                        .callee_parts
+                        .iter()
+                        .any(|part| part.contains(['.', '#', '(', ')', '@'])))
+                    .then(|| {
+                        nodes_by_logical_id
+                            .get(&callee_logical)
+                            .copied()
+                            .map(|nid| {
+                                let strat = if cs.callee_parts.len() > 1 {
+                                    ResolutionStrategy::PackageMemberLookup
+                                } else {
+                                    ResolutionStrategy::LocalLexical
+                                };
+                                (nid, strat)
+                            })
+                    })
+                    .flatten();
                     if let Some((callee_node_id, strategy)) = resolved {
                         let confidence = Confidence::new(ConfidenceLevel::Medium, None);
                         let edge = Edge::new(
@@ -1051,6 +1256,39 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
                         )
                         .with_confidence(confidence);
                         dep_graph.insert_edge(edge, prov3, Some(evidence));
+                    } else {
+                        // Keep a graph edge even when source is unavailable.
+                        // An edge-free routine must never mean proven pure.
+                        let schema_name = unknown_schema(&mut interner);
+                        let symbol = interner
+                            .intern(callee_logical.clone())
+                            .unwrap_or_else(|| plsql_core::SymbolId::new(0));
+                        let missing_id = NodeId::new(next_node_id);
+                        next_node_id += 1;
+                        dep_graph.insert_node(Node::new(
+                            missing_id,
+                            LogicalObjectId::new(callee_logical.clone()),
+                            ObjectRevisionId::new("unresolved"),
+                            QualifiedName::new(
+                                Some(schema_name),
+                                plsql_core::ObjectName::from(symbol),
+                            ),
+                            NodeIdentityKind::Unknown,
+                        ));
+                        let edge = Edge::new(
+                            EdgeId::new(next_edge_id),
+                            caller_node_id,
+                            missing_id,
+                            EdgeKind::UnresolvedCallee,
+                            Confidence::new(ConfidenceLevel::Low, None),
+                        );
+                        next_edge_id += 1;
+                        dep_graph.insert_edge(
+                            edge,
+                            Provenance::new(file_id, caller_span, ResolutionStrategy::Unknown)
+                                .with_note(format!("unresolved call to {}", cs.callee_display)),
+                            None,
+                        );
                     }
                 }
 
@@ -1420,6 +1658,9 @@ mod tests {
         // First run: cache active but empty -> miss, stored.
         let miss = analyze_project(mk()).expect("miss ok");
         assert_eq!(miss.cache_outcome, Some(false), "first run is a miss");
+        let serialized = serde_json::to_vec(&miss).expect("analysis run must serialize for cache");
+        let _: crate::model::AnalysisRun =
+            serde_json::from_slice(&serialized).expect("analysis run must deserialize from cache");
         let d_miss = engine_full_doctor_report(&miss);
         assert_eq!(d_miss.cache_status, SectionStatus::Reported);
         assert_eq!(d_miss.cache_hit_ratio, Some(0.0));
@@ -1763,9 +2004,9 @@ mod tests {
     /// The producer must stamp the embedded `AnalysisArtifactManifest`
     /// with the single-source-of-truth `ANALYSIS_RUN_SCHEMA.version`,
     /// never a hardcoded literal. A stale stamp (e.g. 1.0.0 while the
-    /// canonical schema is 1.1.0) would make a consumer that gates on
+    /// canonical schema is 1.2.0) would make a consumer that gates on
     /// the manifest version (`compatibility_with` / `is_readable_by`)
-    /// mis-classify a real 1.1.0-field-bearing artifact as Compatible
+    /// mis-classify a real 1.2.0-field-bearing artifact as Compatible
     /// for an older minor instead of ForwardCompatible — silently
     /// trusting fields it may not understand. Guards against drift
     /// when the schema advances (oracle-ajm2.19).
