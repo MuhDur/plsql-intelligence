@@ -437,8 +437,15 @@ fn fix_this_references(content: &str) -> String {
 ///
 /// - `isVersion12/11/10` → `true` (accept maximum syntax; version-gating
 ///   can be wired later via a runtime flag)
-/// - `IsNotNumericFunction` → `false` (conservative: treat as numeric by
-///   default, which is the safe fallback in the grammars-v4 semantics)
+/// - `IsNotNumericFunction` → `true`. The grammar guards the `atom`
+///   alternative of `unary_expression` (literals, names, calls) and the
+///   `other_function` alternative of `standard_function` with it, so `false`
+///   made every expression that starts with a literal, name or call
+///   unparseable (`g NUMBER := 1;`, `RETURN 1;`, `DEFAULT f()`). grammars-v4
+///   returns false only when the next tokens form a numeric aggregate call;
+///   with `true`, such an input matches both `standard_function` and `atom`,
+///   and ANTLR resolves that ambiguity to the lower-numbered alternative,
+///   `standard_function`, which is the same parse.
 /// - `IsNewlineAtPos` → `false` (conservative: no special newline handling)
 ///
 /// The traits are injected at the end of the respective generated file so
@@ -498,7 +505,7 @@ where
     fn isVersion12(&mut self) -> bool { true }
     fn isVersion11(&mut self) -> bool { true }
     fn isVersion10(&mut self) -> bool { true }
-    fn IsNotNumericFunction(&mut self) -> bool { false }
+    fn IsNotNumericFunction(&mut self) -> bool { true }
     /// Return false to signal "this is the start of a JOIN clause" (permissive default).
     /// grammars-v4 semantics: `isNotStartOfJoin` guards alias consumption to avoid
     /// ambiguity between `tbl alias` and `tbl JOIN`.  Returning false means the parser
@@ -515,7 +522,7 @@ where
     fn isVersion12(&mut self) -> bool { true }
     fn isVersion11(&mut self) -> bool { true }
     fn isVersion10(&mut self) -> bool { true }
-    fn IsNotNumericFunction(&mut self) -> bool { false }
+    fn IsNotNumericFunction(&mut self) -> bool { true }
     fn isNotStartOfJoin(&mut self) -> bool { false }
 }
 "#;

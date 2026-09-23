@@ -299719,7 +299719,7 @@ where
     fn isVersion12(&mut self) -> bool { true }
     fn isVersion11(&mut self) -> bool { true }
     fn isVersion10(&mut self) -> bool { true }
-    fn IsNotNumericFunction(&mut self) -> bool { false }
+    fn IsNotNumericFunction(&mut self) -> bool { true }
     /// Return false to signal "this is the start of a JOIN clause" (permissive default).
     /// grammars-v4 semantics: `isNotStartOfJoin` guards alias consumption to avoid
     /// ambiguity between `tbl alias` and `tbl JOIN`.  Returning false means the parser
@@ -299736,6 +299736,6 @@ where
     fn isVersion12(&mut self) -> bool { true }
     fn isVersion11(&mut self) -> bool { true }
     fn isVersion10(&mut self) -> bool { true }
-    fn IsNotNumericFunction(&mut self) -> bool { false }
+    fn IsNotNumericFunction(&mut self) -> bool { true }
     fn isNotStartOfJoin(&mut self) -> bool { false }
 }
