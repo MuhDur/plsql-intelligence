@@ -63,6 +63,7 @@ fn build_schema() -> Schema {
         common: DeclCommon::new(pkg_sym, span()),
         members: vec![],
         body: None,
+        units: plsql_ir::PackageUnits::default(),
     }));
 
     let tax_sym = interner.intern("G_TAX_RATE").unwrap();

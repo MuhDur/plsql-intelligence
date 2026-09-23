@@ -180,10 +180,24 @@ impl Spanned for SourceFile {
 /// **Every variant MUST carry a `span` field** (Spanned invariant).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AstDecl {
-    /// A PL/SQL package specification.
-    PackageSpec { name: String, span: Span },
-    /// A PL/SQL package body.
-    PackageBody { name: String, span: Span },
+    /// A PL/SQL package specification. `units` carries its members
+    /// (with parameters and defaults), declaration initializers and
+    /// cursors as separately addressable units.
+    PackageSpec {
+        name: String,
+        span: Span,
+        #[serde(default)]
+        units: AstPackageUnits,
+    },
+    /// A PL/SQL package body. `units` carries each member (overload
+    /// identity, parameters, defaults, statements), the declaration
+    /// initializers, cursors and the initialization section.
+    PackageBody {
+        name: String,
+        span: Span,
+        #[serde(default)]
+        units: AstPackageUnits,
+    },
     /// A standalone procedure.
     Procedure { name: String, span: Span },
     /// A standalone function.
@@ -418,6 +432,130 @@ impl Spanned for AstTypeDecl {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Package units (T7.2a — InvocationClosureV1 identity)
+// ---------------------------------------------------------------------------
+
+/// Identity of a package subprogram among same-named siblings, joinable to
+/// Oracle's `ALL_ARGUMENTS.OVERLOAD` (the nth overloading by appearance in
+/// the package specification; `NULL` when the name is not overloaded).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AstOverload {
+    /// The name occurs once: `OVERLOAD` is `NULL`.
+    NotOverloaded,
+    /// The 1-based `OVERLOAD` ordinal established from the specification.
+    Ordinal(u32),
+    /// Overloaded, but the ordinal cannot be established from source alone
+    /// (body-private overload, or the spec is not in the same source).
+    /// `position` is the 1-based order among same-named members of this
+    /// part, kept only so the identity stays unique; it is not an `OVERLOAD`.
+    Ambiguous { position: u32 },
+}
+
+/// Parameter passing mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AstParamMode {
+    #[default]
+    In,
+    Out,
+    InOut,
+}
+
+/// One formal parameter of a routine.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AstParam {
+    /// Exact identity: unquoted names upper-cased, quoted names verbatim.
+    pub name: String,
+    pub mode: AstParamMode,
+    /// Raw type text (`NUMBER`, `t.col%TYPE`, …).
+    pub type_text: String,
+    /// Raw default expression (`DEFAULT expr` / `:= expr`), if any. It is
+    /// evaluated only when a call omits this argument.
+    pub default_text: Option<String>,
+    pub span: Span,
+}
+
+/// Procedure or function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AstRoutineKind {
+    Procedure,
+    Function,
+}
+
+/// One package subprogram in one package part (spec or body).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AstPackageMember {
+    /// Exact identity: unquoted names upper-cased, quoted names verbatim.
+    pub name: String,
+    pub kind: AstRoutineKind,
+    pub overload: AstOverload,
+    pub params: Vec<AstParam>,
+    /// Everything this member executes when invoked, in source order: its
+    /// local declaration initializers (as assignments), local cursor queries
+    /// and nested-subprogram bodies (attributed conservatively to the
+    /// member), its statements and its exception handlers. Empty in a spec.
+    pub statements: Vec<AstStatement>,
+    pub span: Span,
+}
+
+/// A package-level variable/constant declaration with an initializer.
+/// Initializers run once per session at package instantiation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AstInitializer {
+    /// Exact identity of the declared variable.
+    pub name: String,
+    /// Raw initializer expression.
+    pub initializer_text: String,
+    pub span: Span,
+}
+
+/// A package-level cursor declaration. Its query runs whenever any unit
+/// opens the cursor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AstPackageCursor {
+    pub name: String,
+    /// Raw query text; empty for a cursor spec without a query.
+    pub query_text: String,
+    pub span: Span,
+}
+
+/// The package body's initialization section (`BEGIN … [EXCEPTION …] END`
+/// after the members), including its exception handlers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AstInitSection {
+    pub statements: Vec<AstStatement>,
+    pub span: Span,
+}
+
+/// A package-level construct the lowerer could not attribute to a member,
+/// initializer, cursor or the init section. Downstream this makes the
+/// package's closure `Unknown` (fail closed, never silently smaller).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AstUnattributed {
+    pub span: Span,
+    /// Why: one of `conditional_compilation`, `call_spec`, `unrecognized`,
+    /// `not_lowered`.
+    pub reason: String,
+    /// Grammar rule names only (I-PRIVACY), when known.
+    pub antlr_rule_path: Option<String>,
+}
+
+/// The separately addressable units of one package part.
+///
+/// `lowered == false` (the `Default`) means nothing was attributed — the
+/// text-scanner fallback or an older serialized AST — and consumers must
+/// treat the whole package as `Unknown`, never as "no members".
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AstPackageUnits {
+    pub lowered: bool,
+    pub members: Vec<AstPackageMember>,
+    pub initializers: Vec<AstInitializer>,
+    pub cursors: Vec<AstPackageCursor>,
+    /// Body only.
+    pub init_section: Option<AstInitSection>,
+    pub unattributed: Vec<AstUnattributed>,
+}
+
 /// The typed abstract syntax tree.
 ///
 /// This is a **semantic** projection — it is NOT required to preserve
@@ -528,10 +666,12 @@ mod tests {
             AstDecl::PackageSpec {
                 name: "pkg".into(),
                 span: s,
+                units: AstPackageUnits::default(),
             },
             AstDecl::PackageBody {
                 name: "pkg".into(),
                 span: s,
+                units: AstPackageUnits::default(),
             },
             AstDecl::Procedure {
                 name: "p".into(),

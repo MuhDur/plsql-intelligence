@@ -21,7 +21,9 @@
 //! to `AstDecl::Unknown` — never silently dropped.
 
 use plsql_core::{FileId, Position, Span};
-use plsql_parser::ast::{Ast, AstDecl, AstExpr, AstStatement, AstTypeDecl, SourceFile};
+use plsql_parser::ast::{
+    Ast, AstDecl, AstExpr, AstPackageUnits, AstStatement, AstTypeDecl, SourceFile,
+};
 
 /// Lower a source file's text into an [`Ast`].
 ///
@@ -214,9 +216,19 @@ fn lower_package(
     let span = make_span(file_id, create_start as u32, end as u32);
 
     if is_body {
-        AstDecl::PackageBody { name, span }
+        // The text scanner attributes no units: `lowered == false`
+        // makes consumers treat the package as Unknown (fail closed).
+        AstDecl::PackageBody {
+            name,
+            span,
+            units: AstPackageUnits::default(),
+        }
     } else {
-        AstDecl::PackageSpec { name, span }
+        AstDecl::PackageSpec {
+            name,
+            span,
+            units: AstPackageUnits::default(),
+        }
     }
 }
 
@@ -1550,8 +1562,8 @@ mod tests {
             .iter()
             .map(|d| {
                 let (name, span) = match d {
-                    AstDecl::PackageSpec { name, span } => (name.clone(), span),
-                    AstDecl::PackageBody { name, span } => (name.clone(), span),
+                    AstDecl::PackageSpec { name, span, .. } => (name.clone(), span),
+                    AstDecl::PackageBody { name, span, .. } => (name.clone(), span),
                     AstDecl::Procedure { name, span } => (name.clone(), span),
                     AstDecl::Function { name, span } => (name.clone(), span),
                     AstDecl::Trigger { name, span } => (name.clone(), span),
@@ -2144,7 +2156,7 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
             .declarations
             .iter()
             .find_map(|d| match d {
-                AstDecl::PackageBody { name, span } if name == "pkg" => Some(*span),
+                AstDecl::PackageBody { name, span, .. } if name == "pkg" => Some(*span),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("package body pkg missing from {:?}", ast.root.declarations));
@@ -2184,7 +2196,7 @@ CREATE VIEW v1 AS SELECT 1 FROM dual;
             .declarations
             .iter()
             .find_map(|d| match d {
-                AstDecl::PackageSpec { name, span } if name == "p" => Some(*span),
+                AstDecl::PackageSpec { name, span, .. } if name == "p" => Some(*span),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("package spec p missing from {:?}", ast.root.declarations));

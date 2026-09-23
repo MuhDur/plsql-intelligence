@@ -182,6 +182,7 @@ mod tests {
             common: DeclCommon::new(SymbolId::new(name), span()),
             members: vec![],
             body: None,
+            units: plsql_ir::PackageUnits::default(),
         })
     }
 

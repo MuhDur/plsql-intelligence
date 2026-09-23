@@ -116,8 +116,8 @@ pub mod walk {
     /// Walk a declaration by dispatching to the variant-specific visitor.
     pub fn walk_decl<V: Visitor>(visitor: &mut V, decl: &AstDecl) {
         match decl {
-            AstDecl::PackageSpec { name, span } => visitor.visit_package_spec(name, span),
-            AstDecl::PackageBody { name, span } => visitor.visit_package_body(name, span),
+            AstDecl::PackageSpec { name, span, .. } => visitor.visit_package_spec(name, span),
+            AstDecl::PackageBody { name, span, .. } => visitor.visit_package_body(name, span),
             AstDecl::Procedure { name, span } => visitor.visit_procedure(name, span),
             AstDecl::Function { name, span } => visitor.visit_function(name, span),
             AstDecl::Trigger { name, span } => visitor.visit_trigger(name, span),
@@ -146,7 +146,7 @@ pub fn visit_source_file<V: Visitor>(visitor: &mut V, source_file: &SourceFile) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::AstDecl;
+    use crate::ast::{AstDecl, AstPackageUnits};
     use plsql_core::{FileId, Position};
 
     fn span(offset: u32, len: u32) -> Span {
@@ -201,10 +201,12 @@ mod tests {
                 AstDecl::PackageSpec {
                     name: "pkg_a".into(),
                     span: span(0, 50),
+                    units: AstPackageUnits::default(),
                 },
                 AstDecl::PackageBody {
                     name: "pkg_a".into(),
                     span: span(50, 50),
+                    units: AstPackageUnits::default(),
                 },
                 AstDecl::Procedure {
                     name: "standalone_p".into(),
@@ -270,6 +272,7 @@ mod tests {
                 AstDecl::PackageSpec {
                     name: "emp_pkg".into(),
                     span: span(0, 20),
+                    units: AstPackageUnits::default(),
                 },
                 AstDecl::Function {
                     name: "get_name".into(),
@@ -372,10 +375,12 @@ mod tests {
                 AstDecl::PackageSpec {
                     name: "a".into(),
                     span: span(0, 10),
+                    units: AstPackageUnits::default(),
                 },
                 AstDecl::PackageBody {
                     name: "a".into(),
                     span: span(10, 10),
+                    units: AstPackageUnits::default(),
                 },
                 AstDecl::Procedure {
                     name: "p".into(),

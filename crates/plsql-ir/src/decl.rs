@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
 use crate::DeclId;
+use crate::expr::Expr;
+use crate::stmt::Statement;
 
 /// Shared metadata carried by every declaration variant.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +156,9 @@ pub struct PackageDecl {
     pub common: DeclCommon,
     pub members: Vec<DeclId>,
     pub body: Option<DeclId>,
+    /// The part's separately addressable units (members, parameter
+    /// defaults, initializers, init section, cursors).
+    pub units: PackageUnits,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -303,6 +308,250 @@ impl Declaration {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Package units (InvocationClosureV1 identity)
+// ---------------------------------------------------------------------------
+
+/// Which part of a package a [`PackageDecl`] lowers.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum PackagePart {
+    #[default]
+    Spec,
+    Body,
+}
+
+impl PackagePart {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Spec => "spec",
+            Self::Body => "body",
+        }
+    }
+}
+
+/// Procedure or function.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum RoutineKind {
+    Procedure,
+    Function,
+}
+
+/// Identity of a package subprogram among same-named siblings, joinable to
+/// Oracle's `ALL_ARGUMENTS.OVERLOAD`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum OverloadIdentity {
+    /// The name occurs once (`OVERLOAD` is `NULL`).
+    NotOverloaded,
+    /// The 1-based `OVERLOAD` ordinal, established from the specification.
+    Ordinal(u32),
+    /// Overloaded, but the ordinal could not be established from source.
+    /// Downstream this identity is `Unknown`; `position` only keeps the
+    /// unit id unique within its part.
+    Ambiguous { position: u32 },
+}
+
+/// One formal parameter with its default expression.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutineParam {
+    /// Exact identity (quoted names keep their case).
+    pub name: String,
+    pub mode: ParamMode,
+    pub ty: Option<TypeRef>,
+    /// The default expression, evaluated only when a call omits the argument.
+    pub default: Option<Expr>,
+    pub default_text: Option<String>,
+    pub span: Span,
+}
+
+/// One package subprogram in one part, with everything it executes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageMember {
+    /// Exact identity (quoted names keep their case).
+    pub name: String,
+    pub kind: RoutineKind,
+    pub overload: OverloadIdentity,
+    pub params: Vec<RoutineParam>,
+    /// Local initializers, local cursor queries, nested subprograms,
+    /// statements and exception handlers, in source order. Empty in a spec.
+    pub body: Vec<Statement>,
+    pub span: Span,
+}
+
+/// A package-level declaration initializer (runs at instantiation).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageInitializer {
+    pub name: String,
+    pub initializer: Expr,
+    pub initializer_text: String,
+    pub span: Span,
+}
+
+/// A package-level cursor; its query runs whenever a unit opens it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageCursor {
+    pub name: String,
+    /// The query as a statement (empty for a cursor spec without a query).
+    pub query: Vec<Statement>,
+    pub span: Span,
+}
+
+/// The package body's initialization section, with its exception handlers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageInitSection {
+    pub body: Vec<Statement>,
+    pub span: Span,
+}
+
+/// A package-level construct that could not be attributed to any unit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnattributedConstruct {
+    pub span: Span,
+    /// `conditional_compilation`, `call_spec`, `unrecognized` or
+    /// `not_lowered`.
+    pub reason: String,
+}
+
+/// The separately addressable units of one package part.
+///
+/// The `Default` is `lowered == false`: nothing attributed, so consumers
+/// must treat the package as `Unknown` — never as "no members".
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageUnits {
+    pub part: PackagePart,
+    pub lowered: bool,
+    pub members: Vec<PackageMember>,
+    pub initializers: Vec<PackageInitializer>,
+    pub cursors: Vec<PackageCursor>,
+    pub init_section: Option<PackageInitSection>,
+    pub unattributed: Vec<UnattributedConstruct>,
+}
+
+/// What an addressable unit is.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum PackageUnitKind {
+    /// A subprogram (its body, in a package body; no statements in a spec).
+    Member { kind: RoutineKind },
+    /// One parameter's default expression, in this part.
+    ParamDefault { member_id: String, param: String },
+    /// All declaration initializers of this part, in source order.
+    Initializers,
+    /// The body's initialization section.
+    InitSection,
+    /// One package-level cursor query.
+    Cursor { name: String },
+}
+
+/// One addressable unit: a stable id, what it is, and what it executes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PackageUnit {
+    pub id: String,
+    pub kind: PackageUnitKind,
+    pub statements: Vec<Statement>,
+    pub span: Span,
+}
+
+impl PackageMember {
+    /// `<package>.<member>` with the overload suffix: none when not
+    /// overloaded, `#<ordinal>`, or `#?<position>` when ambiguous. Spec and
+    /// body headers of one subprogram share this id.
+    #[must_use]
+    pub fn unit_id(&self, package: &str) -> String {
+        match self.overload {
+            OverloadIdentity::NotOverloaded => format!("{package}.{}", self.name),
+            OverloadIdentity::Ordinal(n) => format!("{package}.{}#{n}", self.name),
+            OverloadIdentity::Ambiguous { position } => {
+                format!("{package}.{}#?{position}", self.name)
+            }
+        }
+    }
+}
+
+impl PackageUnits {
+    /// Every construct was attributed and every overload identity is
+    /// exact. `false` means an invocation closure over this package is
+    /// `Unknown`.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.lowered
+            && self.unattributed.is_empty()
+            && self
+                .members
+                .iter()
+                .all(|m| !matches!(m.overload, OverloadIdentity::Ambiguous { .. }))
+    }
+
+    /// Every unit of this part with its stable id and executable
+    /// statements: members; one unit per parameter default
+    /// (`<member id>(<param>)@<part>#default`, so a consumer includes only
+    /// the defaults a call shape evaluates); the declaration initializers
+    /// (`<package>#<part>_initializers`); the init section
+    /// (`<package>#init`); and each cursor (`<package>#cursor:<name>`).
+    #[must_use]
+    pub fn addressable_units(&self, package: &str) -> Vec<PackageUnit> {
+        let mut out = Vec::new();
+        let part = self.part.tag();
+        for m in &self.members {
+            let member_id = m.unit_id(package);
+            out.push(PackageUnit {
+                id: member_id.clone(),
+                kind: PackageUnitKind::Member { kind: m.kind },
+                statements: m.body.clone(),
+                span: m.span,
+            });
+            for p in &m.params {
+                if let Some(text) = &p.default_text {
+                    out.push(PackageUnit {
+                        id: format!("{member_id}({})@{part}#default", p.name),
+                        kind: PackageUnitKind::ParamDefault {
+                            member_id: member_id.clone(),
+                            param: p.name.clone(),
+                        },
+                        statements: vec![Statement::Assignment {
+                            target: p.name.clone(),
+                            rhs_text: text.clone(),
+                        }],
+                        span: p.span,
+                    });
+                }
+            }
+        }
+        if let Some(first) = self.initializers.first() {
+            out.push(PackageUnit {
+                id: format!("{package}#{part}_initializers"),
+                kind: PackageUnitKind::Initializers,
+                statements: self
+                    .initializers
+                    .iter()
+                    .map(|i| Statement::Assignment {
+                        target: i.name.clone(),
+                        rhs_text: i.initializer_text.clone(),
+                    })
+                    .collect(),
+                span: first.span,
+            });
+        }
+        if let Some(section) = &self.init_section {
+            out.push(PackageUnit {
+                id: format!("{package}#init"),
+                kind: PackageUnitKind::InitSection,
+                statements: section.body.clone(),
+                span: section.span,
+            });
+        }
+        for c in &self.cursors {
+            out.push(PackageUnit {
+                id: format!("{package}#cursor:{}", c.name),
+                kind: PackageUnitKind::Cursor {
+                    name: c.name.clone(),
+                },
+                statements: c.query.clone(),
+                span: c.span,
+            });
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +627,7 @@ mod tests {
                     common: common_with_name(6),
                     members: vec![],
                     body: None,
+                    units: PackageUnits::default(),
                 }),
                 DeclKind::Package,
             ),
@@ -466,6 +716,7 @@ mod tests {
             common: common_with_name(4),
             members: vec![],
             body: None,
+            units: PackageUnits::default(),
         });
 
         assert!(proc.is_callable());

@@ -338,6 +338,7 @@ mod tests {
             common: DeclCommon::new(pkg_sym, span()),
             members: vec![],
             body: None,
+            units: plsql_ir::PackageUnits::default(),
         }));
         let member_sym = interner.intern("CALCULATE").unwrap();
         let _member_id = table.register(Declaration::Procedure(ProcedureDecl {
@@ -489,6 +490,7 @@ mod tests {
             common: DeclCommon::new(pkg_sym, span()),
             members: vec![],
             body: None,
+            units: plsql_ir::PackageUnits::default(),
         }));
         // Package member named `X`.
         let x_sym = interner.intern("X").unwrap();

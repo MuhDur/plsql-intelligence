@@ -65,7 +65,7 @@ pub use flow_inter::{
 };
 pub use flow_intra::{FlowEnv, TaintSources, analyze_flow, analyze_flow_bounded};
 pub use flow_query::{FlowQuery, TaintAnswer};
-pub use lower::{LoweredFile, lower_top_level};
+pub use lower::{LoweredFile, leading_dml_verb, lower_ast_statements, lower_top_level};
 pub use recursion_guard::{MAX_RELOWER_DEPTH, RecursionOutcome};
 pub use sql_columns::{extract_columns, extract_columns_for_model};
 pub use sql_fact_emit::{emit_sql_use_facts, emit_sql_use_facts_for_model};
@@ -79,8 +79,10 @@ pub use table_stub::DeclLike;
 
 pub use decl::{
     AnchoredType, ColumnDecl, CursorDecl, DeclCommon, DeclKind, Declaration, FunctionDecl,
-    IndexDecl, PackageDecl, ParamDecl, ParamMode, ProcedureDecl, SequenceDecl, SynonymDecl,
-    TableDecl, TriggerDecl, TypeDecl, TypeRef, VariableDecl, ViewDecl,
+    IndexDecl, OverloadIdentity, PackageCursor, PackageDecl, PackageInitSection,
+    PackageInitializer, PackageMember, PackagePart, PackageUnit, PackageUnitKind, PackageUnits,
+    ParamDecl, ParamMode, ProcedureDecl, RoutineKind, RoutineParam, SequenceDecl, SynonymDecl,
+    TableDecl, TriggerDecl, TypeDecl, TypeRef, UnattributedConstruct, VariableDecl, ViewDecl,
 };
 
 use std::collections::{BTreeMap, HashMap};

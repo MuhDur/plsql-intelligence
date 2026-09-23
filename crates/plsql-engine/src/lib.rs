@@ -602,148 +602,6 @@ fn recursion_limit_diagnostic(
     )
 }
 
-/// Recover a typed [`plsql_ir::SqlVerb`] when the ANTLR lowerer tagged a SQL
-/// statement with the generic `"SQL"` sentinel (anything that is not one of the
-/// five DML verbs). Returns the matching verb ONLY if the raw statement text
-/// genuinely *leads* with that DML keyword on a word boundary — so a true DML
-/// statement the grammar failed to classify still yields correct table edges,
-/// while a non-DML construct (`EXPLAIN PLAN FOR …`, `LOCK TABLE …`, `OPEN c FOR
-/// …`, `COMMIT`, …) returns `None` and is routed to `Statement::Unrecognized`
-/// by the caller. The word boundary is essential: a `DELETED_FLAG := …` LHS
-/// must never be read as a `DELETE` verb. (oracle-j1ep.4)
-fn leading_dml_verb(raw_text: &str) -> Option<plsql_ir::SqlVerb> {
-    use plsql_ir::SqlVerb;
-    let trimmed = raw_text.trim_start();
-    for (kw, verb) in [
-        ("SELECT", SqlVerb::Select),
-        ("INSERT", SqlVerb::Insert),
-        ("UPDATE", SqlVerb::Update),
-        ("DELETE", SqlVerb::Delete),
-        ("MERGE", SqlVerb::Merge),
-    ] {
-        // Case-insensitive prefix match. `get(..kw.len())` is char-boundary
-        // safe: `kw` is ASCII, so byte index `kw.len()` is a valid boundary
-        // whenever it is `<= trimmed.len()`; a multibyte leading char simply
-        // fails the ASCII prefix compare and falls through.
-        if let Some(head) = trimmed.get(..kw.len()) {
-            if head.eq_ignore_ascii_case(kw) {
-                // Require a word boundary after the keyword: the next char (if
-                // any) must NOT continue an identifier, else `UPDATES_LOG` /
-                // `DELETED_FLAG` would masquerade as a verb.
-                let boundary = match trimmed[kw.len()..].chars().next() {
-                    None => true,
-                    Some(c) => !(c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '#')),
-                };
-                if boundary {
-                    return Some(verb);
-                }
-            }
-        }
-    }
-    None
-}
-
-fn ast_stmts_to_ir(ast_stmts: &[plsql_parser::ast::AstStatement]) -> Vec<plsql_ir::Statement> {
-    use plsql_ir::{SqlVerb, Statement, UnknownStatementReason};
-    use plsql_parser::ast::AstStatement;
-
-    ast_stmts
-        .iter()
-        .flat_map(|s| match s {
-            AstStatement::Null { .. } => vec![Statement::Null],
-            AstStatement::Assignment {
-                target, rhs_text, ..
-            } => vec![Statement::Assignment {
-                target: target.clone(),
-                rhs_text: rhs_text.clone(),
-            }],
-            AstStatement::Return { value_text, .. } => vec![Statement::Return {
-                value_text: value_text.clone(),
-            }],
-            AstStatement::Raise { exception, .. } => vec![Statement::Raise {
-                exception: exception.clone(),
-            }],
-            AstStatement::ExecuteImmediate {
-                sql_text,
-                has_using,
-                ..
-            } => vec![Statement::ExecuteImmediate {
-                sql_literal: sql_text.clone(),
-                has_bind_variables: *has_using,
-            }],
-            AstStatement::Sql { verb, raw_text, .. } => {
-                // Map ONLY the five DML verbs to a typed `SqlVerb`. The ANTLR
-                // lowerer (`tree_lower.rs`) tags every other SQL construct with
-                // the sentinel verb `"SQL"` — cursor manipulation (OPEN/CLOSE/
-                // FETCH), transaction control (COMMIT/ROLLBACK/LOCK TABLE), and
-                // any `data_manipulation_language_statements` the grammar could
-                // not classify (e.g. `EXPLAIN PLAN FOR SELECT … FROM t`).
-                //
-                // Coercing that sentinel to `SqlVerb::Select` (the old fallback)
-                // both DROPPED the R13 typed-uncertainty signal AND minted
-                // spurious `Reads` edges: `accesses_from_sql` scans a Select's
-                // raw text for a whole-word `FROM`/`JOIN`, so an EXPLAIN PLAN
-                // body invented a bogus `Reads t` (EXPLAIN writes PLAN_TABLE and
-                // does not read `t`). We now route unknown verbs to
-                // `Statement::Unrecognized`, matching the sibling text-scanner
-                // (`plsql_ir::stmt::classify`) and preserving typed uncertainty.
-                //
-                // To keep the one beneficial case — an unclassified statement
-                // whose text genuinely *leads* with a DML verb still yields
-                // correct table edges — we recover the verb by word-boundary
-                // matching the leading keyword of the raw text before falling
-                // back to Unrecognized. (oracle-j1ep.4)
-                let sql_verb = match verb.to_ascii_uppercase().as_str() {
-                    "SELECT" => Some(SqlVerb::Select),
-                    "INSERT" => Some(SqlVerb::Insert),
-                    "UPDATE" => Some(SqlVerb::Update),
-                    "DELETE" => Some(SqlVerb::Delete),
-                    "MERGE" => Some(SqlVerb::Merge),
-                    _ => leading_dml_verb(raw_text),
-                };
-                match sql_verb {
-                    Some(verb) => vec![Statement::Sql {
-                        verb,
-                        raw_text: raw_text.clone(),
-                    }],
-                    None => vec![Statement::Unrecognized {
-                        raw_text: raw_text.clone(),
-                        unknown_reason: UnknownStatementReason::UnrecognizedKeyword,
-                    }],
-                }
-            }
-            AstStatement::Call { callee, .. } => {
-                // A call statement: emit as Unrecognized with raw_text of the
-                // form "callee()" so that `lower_expression` recognises it as
-                // an `Expr::Call` and `extract_call_sites` can resolve the
-                // callee. If the callee already contains `(`, trust it as-is.
-                let raw = if callee.contains('(') {
-                    callee.clone()
-                } else {
-                    format!("{callee}()")
-                };
-                vec![Statement::Unrecognized {
-                    raw_text: raw,
-                    unknown_reason: UnknownStatementReason::UnrecognizedKeyword,
-                }]
-            }
-            // IF / LOOP: `cond_text` / `header_text` carry the *full*
-            // `IF … END IF;` / `LOOP … END LOOP;` source slice
-            // (the whole parse-tree node span, body included). Re-lower
-            // it through the IR statement-body parser so the nested
-            // DML becomes recursive `Statement::If`/`ForLoop`/… that
-            // `extract_table_accesses` (PLSQL-DEP-003) walks — without
-            // this the body's SELECT/INSERT/UPDATE/DELETE is invisible.
-            AstStatement::If { cond_text, .. } => plsql_ir::lower_statement_body(cond_text),
-            AstStatement::Loop { header_text, .. } => plsql_ir::lower_statement_body(header_text),
-            AstStatement::Unknown { .. } => vec![Statement::Unrecognized {
-                raw_text: String::new(),
-                unknown_reason: UnknownStatementReason::UnrecognizedKeyword,
-            }],
-        })
-        .collect()
-}
-
 /// Run the canonical analysis pipeline
 /// (`project → parse → catalog → IR → symbols → privileges →
 /// sqlsem → flow → facts → depgraph`) and emit a populated
@@ -988,6 +846,52 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
                 QualifiedName::new(Some(schema_name), obj_name),
                 kind,
             ));
+            // --- Depgraph: one node per addressable package unit -------
+            // Members, parameter defaults, declaration initializers, the
+            // init section and cursors each get their own node, so their
+            // Calls/Reads/Writes edges stay attributable to the unit that
+            // executes them (InvocationClosureV1). Spec and body headers of
+            // one member share an id, and so share a node.
+            if let plsql_ir::Declaration::Package(pkg) = decl {
+                for unit in pkg.units.addressable_units(&logical_id) {
+                    if nodes_by_logical_id.contains_key(&unit.id) {
+                        continue;
+                    }
+                    let unit_kind = match (&unit.kind, pkg.units.part) {
+                        (
+                            plsql_ir::PackageUnitKind::Member {
+                                kind: plsql_ir::RoutineKind::Procedure,
+                            },
+                            _,
+                        ) => NodeIdentityKind::PackageProcedure,
+                        (
+                            plsql_ir::PackageUnitKind::Member {
+                                kind: plsql_ir::RoutineKind::Function,
+                            },
+                            _,
+                        ) => NodeIdentityKind::PackageFunction,
+                        (_, plsql_ir::PackagePart::Spec) => NodeIdentityKind::PackageSpecification,
+                        (_, plsql_ir::PackagePart::Body) => NodeIdentityKind::PackageBody,
+                    };
+                    let unit_sym = interner
+                        .intern(unit.id.clone())
+                        .unwrap_or_else(|| plsql_core::SymbolId::new(0));
+                    let unit_schema = unknown_schema(&mut interner);
+                    let unit_node = NodeId::new(next_node_id);
+                    next_node_id += 1;
+                    dep_graph.insert_node(Node::new(
+                        unit_node,
+                        LogicalObjectId::new(unit.id.clone()),
+                        ObjectRevisionId::new("source"),
+                        QualifiedName::new(
+                            Some(unit_schema),
+                            plsql_core::ObjectName::from(unit_sym),
+                        ),
+                        unit_kind,
+                    ));
+                    nodes_by_logical_id.insert(unit.id, unit_node);
+                }
+            }
             nodes_by_logical_id.insert(logical_id, node_id);
         }
 
@@ -1024,203 +928,225 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
                 .resolve(decl.common().name)
                 .unwrap_or("")
                 .to_ascii_uppercase();
-            let Some(&caller_node_id) = nodes_by_logical_id.get(&caller_id_str) else {
+            let Some(&decl_node_id) = nodes_by_logical_id.get(&caller_id_str) else {
                 continue;
             };
 
-            // Get body statements: prefer real parse-tree lowering, fall back
-            // to text-scanner on the span slice. Look the parse-tree body up
-            // by span (not loop position) — see the note above.
-            let body_stmts: Vec<plsql_ir::Statement> = if let Some(ast_stmts) = body_by_span
-                .get(&decl.common().span)
-                .copied()
-                .filter(|s| !s.is_empty())
-            {
-                // Convert AstStatement → plsql_ir::Statement.
-                ast_stmts_to_ir(ast_stmts)
+            // A package's executable content lives in its addressable units
+            // (see plsql_ir::PackageUnits); every other declaration is one
+            // unit with its whole body.
+            let mut work: Vec<(String, NodeId, plsql_core::Span, Vec<plsql_ir::Statement>)> =
+                Vec::new();
+            if let plsql_ir::Declaration::Package(pkg) = decl {
+                for unit in pkg.units.addressable_units(&caller_id_str) {
+                    if let Some(&unit_node) = nodes_by_logical_id.get(&unit.id) {
+                        work.push((unit.id, unit_node, unit.span, unit.statements));
+                    }
+                }
             } else {
-                // Fallback: extract body slice from source and use the
-                // text-scanner statement lowerer.
-                let span = decl.common().span;
-                let s = (span.start.offset as usize).min(source.len());
-                let e = (span.end.offset as usize).min(source.len());
-                let slice = if s < e { &source[s..e] } else { "" };
-                lower_statement_body(slice)
-            };
-
-            let (call_sites, call_recursion) = plsql_ir::extract_call_sites_bounded(&body_stmts);
-            if call_recursion.limit_hit {
-                run.diagnostics.push(recursion_limit_diagnostic(
-                    &caller_id_str,
-                    &f.relative_path,
-                    "call-site extraction",
-                    call_recursion.truncated_bodies,
+                // Get body statements: prefer real parse-tree lowering, fall back
+                // to text-scanner on the span slice. Look the parse-tree body up
+                // by span (not loop position) — see the note above.
+                let body_stmts: Vec<plsql_ir::Statement> = if let Some(ast_stmts) = body_by_span
+                    .get(&decl.common().span)
+                    .copied()
+                    .filter(|s| !s.is_empty())
+                {
+                    // Convert AstStatement → plsql_ir::Statement.
+                    plsql_ir::lower_ast_statements(ast_stmts)
+                } else {
+                    // Fallback: extract body slice from source and use the
+                    // text-scanner statement lowerer.
+                    let span = decl.common().span;
+                    let s = (span.start.offset as usize).min(source.len());
+                    let e = (span.end.offset as usize).min(source.len());
+                    let slice = if s < e { &source[s..e] } else { "" };
+                    lower_statement_body(slice)
+                };
+                work.push((
+                    caller_id_str.clone(),
+                    decl_node_id,
+                    decl.common().span,
+                    body_stmts,
                 ));
             }
-            for cs in &call_sites {
-                let callee_logical = cs.callee_parts.join(".").to_ascii_uppercase();
-                // Emit a call fact.
-                let call_fact = mint_fact(
-                    source_prov(&caller_id_str),
-                    FactPayload::DependencyEdge {
-                        from_logical_id: caller_id_str.clone(),
-                        to_logical_id: callee_logical.clone(),
-                        edge_kind: "Calls".to_string(),
-                    },
-                );
-                fact_store.push(call_fact);
 
-                // Add a depgraph edge if callee node is known.
-                // Resolution tries the full dotted name first (e.g. "PKG_A.DO_WORK"),
-                // then falls back to the leading package name ("PKG_A") so that
-                // package-qualified calls resolve to the package node when the
-                // individual member isn't registered separately.
-                // Capture HOW the callee resolved so the edge provenance records
-                // the real resolution strategy instead of a constant, and the
-                // depgraph's queryable provenance is honestly fed (oracle-687a.3):
-                //   - exact dotted-name match with >1 part  → PackageMemberLookup
-                //     (a qualified `PKG.MEMBER` resolved to the exact member)
-                //   - exact match with a single bare part   → LocalLexical
-                //     (a bare name resolved in local/same scope)
-                //   - fell back to the leading package node → PackageMemberLookup
-                //     (qualified call resolved to its package)
-                let resolved = nodes_by_logical_id
-                    .get(&callee_logical)
-                    .copied()
-                    .map(|nid| {
-                        let strat = if cs.callee_parts.len() > 1 {
-                            ResolutionStrategy::PackageMemberLookup
-                        } else {
-                            ResolutionStrategy::LocalLexical
+            for (caller_id_str, caller_node_id, caller_span, body_stmts) in work {
+                let (call_sites, call_recursion) =
+                    plsql_ir::extract_call_sites_bounded(&body_stmts);
+                if call_recursion.limit_hit {
+                    run.diagnostics.push(recursion_limit_diagnostic(
+                        &caller_id_str,
+                        &f.relative_path,
+                        "call-site extraction",
+                        call_recursion.truncated_bodies,
+                    ));
+                }
+                for cs in &call_sites {
+                    let callee_logical = cs.callee_parts.join(".").to_ascii_uppercase();
+                    // Emit a call fact.
+                    let call_fact = mint_fact(
+                        source_prov(&caller_id_str),
+                        FactPayload::DependencyEdge {
+                            from_logical_id: caller_id_str.clone(),
+                            to_logical_id: callee_logical.clone(),
+                            edge_kind: "Calls".to_string(),
+                        },
+                    );
+                    fact_store.push(call_fact);
+
+                    // Add a depgraph edge if callee node is known.
+                    // Resolution tries the full dotted name first (e.g. "PKG_A.DO_WORK"),
+                    // then falls back to the leading package name ("PKG_A") so that
+                    // package-qualified calls resolve to the package node when the
+                    // individual member isn't registered separately.
+                    // Capture HOW the callee resolved so the edge provenance records
+                    // the real resolution strategy instead of a constant, and the
+                    // depgraph's queryable provenance is honestly fed (oracle-687a.3):
+                    //   - exact dotted-name match with >1 part  → PackageMemberLookup
+                    //     (a qualified `PKG.MEMBER` resolved to the exact member)
+                    //   - exact match with a single bare part   → LocalLexical
+                    //     (a bare name resolved in local/same scope)
+                    //   - fell back to the leading package node → PackageMemberLookup
+                    //     (qualified call resolved to its package)
+                    let resolved = nodes_by_logical_id
+                        .get(&callee_logical)
+                        .copied()
+                        .map(|nid| {
+                            let strat = if cs.callee_parts.len() > 1 {
+                                ResolutionStrategy::PackageMemberLookup
+                            } else {
+                                ResolutionStrategy::LocalLexical
+                            };
+                            (nid, strat)
+                        })
+                        .or_else(|| {
+                            cs.callee_parts
+                                .first()
+                                .map(|p| p.to_ascii_uppercase())
+                                .and_then(|pkg| nodes_by_logical_id.get(&pkg).copied())
+                                .map(|nid| (nid, ResolutionStrategy::PackageMemberLookup))
+                        });
+                    if let Some((callee_node_id, strategy)) = resolved {
+                        let confidence = Confidence::new(ConfidenceLevel::Medium, None);
+                        let edge = Edge::new(
+                            EdgeId::new(next_edge_id),
+                            caller_node_id,
+                            callee_node_id,
+                            EdgeKind::Calls,
+                            confidence.clone(),
+                        );
+                        next_edge_id += 1;
+                        let prov3 = Provenance::new(file_id, caller_span, strategy)
+                            .with_note(format!("call to {}", cs.callee_display));
+                        // Mint Evidence for this sub-High-confidence edge so the
+                        // justification payload (explain_edge / explain_path) is fed
+                        // exactly where confidence is uncertain (oracle-687a.4).
+                        let evidence = Evidence::new(
+                            "PLSQL-DEP-002",
+                            format!(
+                                "call `{}` resolved via {strategy:?} from {}",
+                                cs.callee_display, caller_id_str
+                            ),
+                        )
+                        .with_confidence(confidence);
+                        dep_graph.insert_edge(edge, prov3, Some(evidence));
+                    }
+                }
+
+                // --- Table-level Read/Write extraction (PLSQL-DEP-003) ----
+                // Walk the embedded SQL DML in this body and emit a
+                // Reads/Writes dep-graph edge + a DependencyEdge fact per
+                // distinct table access. Each referenced table is
+                // registered as a synthetic node (identity Unknown) so the
+                // edge has a concrete endpoint even when the table is not a
+                // declared object in this project.
+                let (accesses, dml_recursion) =
+                    plsql_ir::dml_edges::extract_table_accesses_bounded(&body_stmts);
+                if dml_recursion.limit_hit {
+                    run.diagnostics.push(recursion_limit_diagnostic(
+                        &caller_id_str,
+                        &f.relative_path,
+                        "table-access extraction",
+                        dml_recursion.truncated_bodies,
+                    ));
+                }
+                for acc in &accesses {
+                    let table_logical = match &acc.schema {
+                        Some(s) => format!(
+                            "{}.{}",
+                            s.to_ascii_uppercase(),
+                            acc.table.to_ascii_uppercase()
+                        ),
+                        None => acc.table.to_ascii_uppercase(),
+                    };
+                    if table_logical.is_empty() {
+                        continue;
+                    }
+                    let (edge_kind, edge_kind_str) = match acc.access {
+                        plsql_ir::dml_edges::AccessKind::Read => (EdgeKind::Reads, "Reads"),
+                        plsql_ir::dml_edges::AccessKind::Write => (EdgeKind::Writes, "Writes"),
+                    };
+
+                    // Emit a DependencyEdge fact (Reads/Writes).
+                    fact_store.push(mint_fact(
+                        source_prov(&caller_id_str),
+                        FactPayload::DependencyEdge {
+                            from_logical_id: caller_id_str.clone(),
+                            to_logical_id: table_logical.clone(),
+                            edge_kind: edge_kind_str.to_string(),
+                        },
+                    ));
+
+                    // Resolve (or synthesise) the table node. A hit on a registered
+                    // object means the table is a known same-schema object
+                    // (SameSchemaLookup); a miss synthesises an Unknown node — we only
+                    // have the lexical reference, so the strategy stays LocalLexical
+                    // (honest provenance, oracle-687a.3).
+                    let (table_node_id, table_strategy) =
+                        match nodes_by_logical_id.get(&table_logical).copied() {
+                            Some(id) => (id, ResolutionStrategy::SameSchemaLookup),
+                            None => {
+                                let schema_name = unknown_schema(&mut interner);
+                                let tbl_sym = interner
+                                    .intern(table_logical.clone())
+                                    .unwrap_or_else(|| plsql_core::SymbolId::new(0));
+                                let obj_name = plsql_core::ObjectName::from(tbl_sym);
+                                let nid = NodeId::new(next_node_id);
+                                next_node_id += 1;
+                                dep_graph.insert_node(Node::new(
+                                    nid,
+                                    LogicalObjectId::new(table_logical.clone()),
+                                    ObjectRevisionId::new("source"),
+                                    QualifiedName::new(Some(schema_name), obj_name),
+                                    NodeIdentityKind::Unknown,
+                                ));
+                                nodes_by_logical_id.insert(table_logical.clone(), nid);
+                                (nid, ResolutionStrategy::LocalLexical)
+                            }
                         };
-                        (nid, strat)
-                    })
-                    .or_else(|| {
-                        cs.callee_parts
-                            .first()
-                            .map(|p| p.to_ascii_uppercase())
-                            .and_then(|pkg| nodes_by_logical_id.get(&pkg).copied())
-                            .map(|nid| (nid, ResolutionStrategy::PackageMemberLookup))
-                    });
-                if let Some((callee_node_id, strategy)) = resolved {
+
                     let confidence = Confidence::new(ConfidenceLevel::Medium, None);
                     let edge = Edge::new(
                         EdgeId::new(next_edge_id),
                         caller_node_id,
-                        callee_node_id,
-                        EdgeKind::Calls,
+                        table_node_id,
+                        edge_kind,
                         confidence.clone(),
                     );
                     next_edge_id += 1;
-                    let prov3 = Provenance::new(file_id, decl.common().span, strategy)
-                        .with_note(format!("call to {}", cs.callee_display));
-                    // Mint Evidence for this sub-High-confidence edge so the
-                    // justification payload (explain_edge / explain_path) is fed
-                    // exactly where confidence is uncertain (oracle-687a.4).
+                    let provp = Provenance::new(file_id, caller_span, table_strategy)
+                        .with_note(format!("{edge_kind_str} {table_logical}"));
+                    // Feed Evidence on this sub-High-confidence edge (oracle-687a.4).
                     let evidence = Evidence::new(
-                        "PLSQL-DEP-002",
+                        "PLSQL-DEP-003",
                         format!(
-                            "call `{}` resolved via {strategy:?} from {}",
-                            cs.callee_display, caller_id_str
+                            "{edge_kind_str} of `{table_logical}` extracted from embedded SQL in {caller_id_str} (resolved via {table_strategy:?})"
                         ),
                     )
                     .with_confidence(confidence);
-                    dep_graph.insert_edge(edge, prov3, Some(evidence));
+                    dep_graph.insert_edge(edge, provp, Some(evidence));
                 }
-            }
-
-            // --- Table-level Read/Write extraction (PLSQL-DEP-003) ----
-            // Walk the embedded SQL DML in this body and emit a
-            // Reads/Writes dep-graph edge + a DependencyEdge fact per
-            // distinct table access. Each referenced table is
-            // registered as a synthetic node (identity Unknown) so the
-            // edge has a concrete endpoint even when the table is not a
-            // declared object in this project.
-            let (accesses, dml_recursion) =
-                plsql_ir::dml_edges::extract_table_accesses_bounded(&body_stmts);
-            if dml_recursion.limit_hit {
-                run.diagnostics.push(recursion_limit_diagnostic(
-                    &caller_id_str,
-                    &f.relative_path,
-                    "table-access extraction",
-                    dml_recursion.truncated_bodies,
-                ));
-            }
-            for acc in &accesses {
-                let table_logical = match &acc.schema {
-                    Some(s) => format!(
-                        "{}.{}",
-                        s.to_ascii_uppercase(),
-                        acc.table.to_ascii_uppercase()
-                    ),
-                    None => acc.table.to_ascii_uppercase(),
-                };
-                if table_logical.is_empty() {
-                    continue;
-                }
-                let (edge_kind, edge_kind_str) = match acc.access {
-                    plsql_ir::dml_edges::AccessKind::Read => (EdgeKind::Reads, "Reads"),
-                    plsql_ir::dml_edges::AccessKind::Write => (EdgeKind::Writes, "Writes"),
-                };
-
-                // Emit a DependencyEdge fact (Reads/Writes).
-                fact_store.push(mint_fact(
-                    source_prov(&caller_id_str),
-                    FactPayload::DependencyEdge {
-                        from_logical_id: caller_id_str.clone(),
-                        to_logical_id: table_logical.clone(),
-                        edge_kind: edge_kind_str.to_string(),
-                    },
-                ));
-
-                // Resolve (or synthesise) the table node. A hit on a registered
-                // object means the table is a known same-schema object
-                // (SameSchemaLookup); a miss synthesises an Unknown node — we only
-                // have the lexical reference, so the strategy stays LocalLexical
-                // (honest provenance, oracle-687a.3).
-                let (table_node_id, table_strategy) =
-                    match nodes_by_logical_id.get(&table_logical).copied() {
-                        Some(id) => (id, ResolutionStrategy::SameSchemaLookup),
-                        None => {
-                            let schema_name = unknown_schema(&mut interner);
-                            let tbl_sym = interner
-                                .intern(table_logical.clone())
-                                .unwrap_or_else(|| plsql_core::SymbolId::new(0));
-                            let obj_name = plsql_core::ObjectName::from(tbl_sym);
-                            let nid = NodeId::new(next_node_id);
-                            next_node_id += 1;
-                            dep_graph.insert_node(Node::new(
-                                nid,
-                                LogicalObjectId::new(table_logical.clone()),
-                                ObjectRevisionId::new("source"),
-                                QualifiedName::new(Some(schema_name), obj_name),
-                                NodeIdentityKind::Unknown,
-                            ));
-                            nodes_by_logical_id.insert(table_logical.clone(), nid);
-                            (nid, ResolutionStrategy::LocalLexical)
-                        }
-                    };
-
-                let confidence = Confidence::new(ConfidenceLevel::Medium, None);
-                let edge = Edge::new(
-                    EdgeId::new(next_edge_id),
-                    caller_node_id,
-                    table_node_id,
-                    edge_kind,
-                    confidence.clone(),
-                );
-                next_edge_id += 1;
-                let provp = Provenance::new(file_id, decl.common().span, table_strategy)
-                    .with_note(format!("{edge_kind_str} {table_logical}"));
-                // Feed Evidence on this sub-High-confidence edge (oracle-687a.4).
-                let evidence = Evidence::new(
-                    "PLSQL-DEP-003",
-                    format!(
-                        "{edge_kind_str} of `{table_logical}` extracted from embedded SQL in {caller_id_str} (resolved via {table_strategy:?})"
-                    ),
-                )
-                .with_confidence(confidence);
-                dep_graph.insert_edge(edge, provp, Some(evidence));
             }
         }
 
@@ -1328,112 +1254,7 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
 
 #[cfg(test)]
 mod tests {
-    use crate::{AnalysisRequest, analyze_project, ast_stmts_to_ir, leading_dml_verb};
-
-    /// Build an `AstStatement::Sql` carrying the ANTLR lowerer's generic
-    /// `"SQL"` sentinel verb (the value emitted for any SQL construct that is
-    /// not one of the five DML verbs — cursor manipulation, transaction
-    /// control, or DML the grammar cannot classify such as `EXPLAIN PLAN`).
-    fn sql_sentinel(raw_text: &str) -> plsql_parser::ast::AstStatement {
-        use plsql_core::{FileId, Position, Span};
-        let pos = Position::new(1, 1, 0);
-        plsql_parser::ast::AstStatement::Sql {
-            verb: "SQL".to_string(),
-            raw_text: raw_text.to_string(),
-            span: Span::new(FileId::new(0), pos, pos),
-        }
-    }
-
-    /// oracle-j1ep.4 regression: the ANTLR `"SQL"` sentinel verb (e.g. an
-    /// `EXPLAIN PLAN FOR SELECT … FROM t` body) must NOT be coerced to
-    /// `SqlVerb::Select`. Coercion both dropped the R13 typed-uncertainty
-    /// signal and minted a spurious `Reads t` edge (EXPLAIN writes PLAN_TABLE
-    /// and does not read `t`). It must now lower to `Statement::Unrecognized`
-    /// and yield zero table accesses — matching the sibling text-scanner.
-    #[test]
-    fn unknown_sql_verb_lowers_to_unrecognized_not_spurious_read() {
-        use plsql_ir::{Statement, UnknownStatementReason, extract_table_accesses};
-
-        for raw in [
-            "EXPLAIN PLAN FOR SELECT col FROM t",
-            "LOCK TABLE t IN EXCLUSIVE MODE",
-            "OPEN c FOR SELECT col FROM t",
-            "COMMIT",
-            "ROLLBACK TO sp",
-            "FETCH c INTO v",
-            "CLOSE c",
-        ] {
-            let ir = ast_stmts_to_ir(&[sql_sentinel(raw)]);
-            assert_eq!(ir.len(), 1, "exactly one IR statement for `{raw}`");
-            assert!(
-                matches!(
-                    ir[0],
-                    Statement::Unrecognized {
-                        unknown_reason: UnknownStatementReason::UnrecognizedKeyword,
-                        ..
-                    }
-                ),
-                "`{raw}` must be Unrecognized, not coerced to a SqlVerb; got {:?}",
-                ir[0]
-            );
-            assert!(
-                extract_table_accesses(&ir).is_empty(),
-                "`{raw}` must mint zero table accesses (no spurious Read), got {:?}",
-                extract_table_accesses(&ir)
-            );
-        }
-    }
-
-    /// The beneficial case must survive: a SQL statement the grammar tagged
-    /// generically but whose text genuinely *leads* with a DML verb still
-    /// recovers the correct typed verb and table edges.
-    #[test]
-    fn unknown_sql_verb_with_leading_dml_keyword_recovers_verb_and_reads() {
-        use plsql_ir::{AccessKind, SqlVerb, Statement, extract_table_accesses};
-
-        let ir = ast_stmts_to_ir(&[sql_sentinel("SELECT col FROM t")]);
-        assert!(
-            matches!(
-                ir[0],
-                Statement::Sql {
-                    verb: SqlVerb::Select,
-                    ..
-                }
-            ),
-            "leading SELECT recovers SqlVerb::Select, got {:?}",
-            ir[0]
-        );
-        let accesses = extract_table_accesses(&ir);
-        assert_eq!(accesses.len(), 1, "one Read on T, got {accesses:?}");
-        assert_eq!(accesses[0].table, "T");
-        assert_eq!(accesses[0].access, AccessKind::Read);
-    }
-
-    /// Word-boundary discipline: a verb prefix on an identifier must NOT match.
-    /// `DELETED_FLAG := …` and `UPDATES_LOG` are not DELETE / UPDATE verbs.
-    #[test]
-    fn leading_dml_verb_is_word_boundaried() {
-        use plsql_ir::SqlVerb;
-        assert_eq!(
-            leading_dml_verb("SELECT 1 FROM dual"),
-            Some(SqlVerb::Select)
-        );
-        assert_eq!(leading_dml_verb("  delete from t"), Some(SqlVerb::Delete));
-        assert_eq!(
-            leading_dml_verb("MERGE INTO t USING s ON (..)"),
-            Some(SqlVerb::Merge)
-        );
-        // Identifier continuations must not be read as verbs.
-        assert_eq!(leading_dml_verb("DELETED_FLAG := 1"), None);
-        assert_eq!(leading_dml_verb("UPDATES_LOG.write(x)"), None);
-        assert_eq!(leading_dml_verb("SELECTED := TRUE"), None);
-        // Non-DML constructs.
-        assert_eq!(leading_dml_verb("EXPLAIN PLAN FOR SELECT 1 FROM t"), None);
-        assert_eq!(leading_dml_verb("COMMIT"), None);
-        assert_eq!(leading_dml_verb(""), None);
-        // Multibyte leading char must not panic and must not match.
-        assert_eq!(leading_dml_verb("é := 1"), None);
-    }
+    use crate::{AnalysisRequest, analyze_project};
 
     #[test]
     fn analysis_request_default_is_constructible() {
@@ -2353,14 +2174,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Regression: analysing the minimized public
-    /// `SELECT … FOR UPDATE` fixture must NOT abort (no
-    /// stack-overflow / SIGABRT). It must complete and surface the
-    /// typed `AnalysisRecursionLimit` degradation with provenance,
-    /// and the completeness posture must NOT read Clean (no
-    /// silently hiding the truncation).
+    /// Regression: analysing the minimized public `SELECT … FOR UPDATE`
+    /// fixture must NOT abort (no stack-overflow / SIGABRT).
+    ///
+    /// History: the abort came from parser error-recovery debris. The
+    /// committed ANTLR parser could not parse an expression that starts
+    /// with a name (`IsNotNumericFunction` was stubbed `false`), so the
+    /// SELECT split at `WHERE account_id = p_id` and `FOR UPDATE` was
+    /// recovered as a bare LOOP whose text re-lowered to itself forever.
+    /// The depth guard bounded that (typed `AnalysisRecursionLimit`).
+    /// With the predicate fixed, the statement parses as the SELECT it is,
+    /// so this unit no longer degrades. It must now yield its real
+    /// Reads/Writes edges, and no recursion-limit diagnostic.
+    ///
+    /// The depth guard itself stays proven, independently of the parser,
+    /// by `plsql_ir::calls::non_shrinking_for_update_does_not_stack_overflow_and_reports_limit`
+    /// and `plsql_ir::dml_edges::non_shrinking_for_update_terminates_and_reports_limit`,
+    /// which feed the exact non-shrinking `FOR UPDATE` debris directly.
     #[test]
-    fn oracle_v4wa_for_update_degrades_instead_of_stack_overflow() {
+    fn oracle_v4wa_for_update_parses_as_select_and_does_not_abort() {
+        use plsql_depgraph::EdgeKind;
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../corpus/synthetic/regressions/oracle_v4wa_for_update");
         assert!(
@@ -2374,36 +2207,36 @@ mod tests {
             ..AnalysisRequest::default()
         };
         // The bug was a process abort — reaching this assert at
-        // all proves the recursion is now bounded.
+        // all proves the analysis terminates.
         let run = analyze_project(req).expect("analyze must not error/abort");
 
-        let recursion_diags: Vec<_> = run
-            .diagnostics
-            .iter()
-            .filter(|d| d.code == "ENG_ANALYSIS_RECURSION_LIMIT")
-            .collect();
         assert!(
-            !recursion_diags.is_empty(),
-            "the non-shrinking FOR UPDATE unit must surface a typed \
-             recursion-limit diagnostic, diagnostics={:?}",
+            !run.diagnostics
+                .iter()
+                .any(|d| d.code == "ENG_ANALYSIS_RECURSION_LIMIT"),
+            "the SELECT … FOR UPDATE now parses; no re-lowering loop may remain, diagnostics={:?}",
             run.diagnostics.iter().map(|d| &d.code).collect::<Vec<_>>()
         );
+
+        let graph = &run.dep_graph;
+        let lock_row = graph
+            .nodes
+            .values()
+            .find(|n| n.logical_id.as_str() == "PKG_FOR_UPDATE.LOCK_ROW")
+            .expect("LOCK_ROW is its own package-member unit");
+        let edges: Vec<(EdgeKind, String)> = graph
+            .edges
+            .iter()
+            .filter(|e| e.from == lock_row.id)
+            .map(|e| (e.kind, graph.nodes[&e.to].logical_id.as_str().to_string()))
+            .collect();
         assert!(
-            recursion_diags.iter().any(|d| d
-                .unknown_reasons
-                .contains(&plsql_core::UnknownReason::AnalysisRecursionLimit)),
-            "diagnostic must carry the typed UnknownReason"
+            edges.contains(&(EdgeKind::Reads, "ACCOUNTS".to_string())),
+            "the SELECT … FOR UPDATE must read ACCOUNTS: {edges:?}"
         );
         assert!(
-            recursion_diags
-                .iter()
-                .any(|d| d.message.contains("PKG_FOR_UPDATE")),
-            "diagnostic must name the offending unit (provenance)"
-        );
-        assert_ne!(
-            run.completeness.posture,
-            plsql_core::CompletenessPosture::Clean,
-            "a unit degraded at the recursion cap must NOT read Clean"
+            edges.contains(&(EdgeKind::Writes, "ACCOUNTS".to_string())),
+            "the UPDATE must write ACCOUNTS: {edges:?}"
         );
     }
 }

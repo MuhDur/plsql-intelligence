@@ -29,7 +29,11 @@ use antlr4rust::parser_rule_context::ParserRuleContext;
 use antlr4rust::token::Token;
 
 use plsql_core::{Diagnostic, FileId, Position, Severity, Span};
-use plsql_parser::ast::{Ast, AstDecl, AstStatement, SourceFile, SourceMap};
+use plsql_parser::ast::{
+    Ast, AstDecl, AstInitSection, AstInitializer, AstOverload, AstPackageCursor, AstPackageMember,
+    AstPackageUnits, AstParam, AstParamMode, AstRoutineKind, AstStatement, AstUnattributed,
+    SourceFile, SourceMap,
+};
 
 use crate::backend::ANTLR4RUST_DIAG_CODE;
 use crate::generated::plsqllexer::PlSqlLexer;
@@ -37,12 +41,16 @@ use crate::generated::plsqlparser::{
     Assignment_statementContextAttrs, BodyContextAttrs, Call_statementContextAttrs,
     Create_function_bodyContextAttrs, Create_package_bodyContextAttrs, Create_packageContextAttrs,
     Create_procedure_bodyContextAttrs, Create_triggerContextAttrs, Create_typeContextAttrs,
-    Create_viewContextAttrs, Data_manipulation_language_statementsContextAttrs,
-    Execute_immediateContextAttrs, Function_bodyContextAttrs, Package_obj_bodyContextAttrs,
-    PlSqlParser, Procedure_bodyContextAttrs, Return_statementContextAttrs,
+    Create_viewContextAttrs, Cursor_declarationContextAttrs,
+    Data_manipulation_language_statementsContextAttrs, Declare_specContextAttrs,
+    Default_value_partContextAttrs, Exception_handlerContextAttrs, Execute_immediateContextAttrs,
+    Function_bodyContextAttrs, Function_specContextAttrs, Package_obj_bodyContextAttrs,
+    Package_obj_specContextAttrs, ParameterContextAttrs, PlSqlParser, Procedure_bodyContextAttrs,
+    Procedure_specContextAttrs, Return_statementContextAttrs, Seq_of_declare_specsContextAttrs,
     Seq_of_statementsContextAttrs, Sql_scriptContextAttrs, Sql_statementContextAttrs,
     StatementContextAttrs, Trigger_blockContextAttrs, Trigger_bodyContextAttrs,
     Type_bodyContextAttrs, Type_definitionContextAttrs, Unit_statementContextAttrs,
+    Variable_declarationContextAttrs,
 };
 
 // ---------------------------------------------------------------------------
@@ -124,6 +132,8 @@ pub fn lower_parse_tree(source: &str, file_id: FileId, diagnostics: &mut Vec<Dia
             body_stmts.push(stmts);
         }
     }
+
+    resolve_body_overloads(&mut decls);
 
     Ast {
         root: SourceFile {
@@ -309,12 +319,67 @@ fn lower_create_package(
     file_id: FileId,
     fallback_span: Span,
 ) -> AstDecl {
+    let mut units = AstPackageUnits {
+        lowered: true,
+        ..AstPackageUnits::default()
+    };
+    for obj in &ctx.package_obj_spec_all() {
+        if let Some(ps) = obj.procedure_spec() {
+            units.members.push(AstPackageMember {
+                name: ident_of(source, ps.identifier()),
+                kind: AstRoutineKind::Procedure,
+                overload: AstOverload::NotOverloaded,
+                params: lower_params(&ps.parameter_all(), source, file_id),
+                statements: Vec::new(),
+                span: node_span(&*ps, file_id, source),
+            });
+            if ps.call_spec().is_some() {
+                units
+                    .unattributed
+                    .push(unattributed(&*ps, "call_spec", file_id, source));
+            }
+        } else if let Some(fs) = obj.function_spec() {
+            units.members.push(AstPackageMember {
+                name: ident_of(source, fs.identifier()),
+                kind: AstRoutineKind::Function,
+                overload: AstOverload::NotOverloaded,
+                params: lower_params(&fs.parameter_all(), source, file_id),
+                statements: Vec::new(),
+                span: node_span(&*fs, file_id, source),
+            });
+            if fs.call_spec().is_some() {
+                units
+                    .unattributed
+                    .push(unattributed(&*fs, "call_spec", file_id, source));
+            }
+        } else if let Some(var) = obj.variable_declaration() {
+            push_initializer(&mut units, &var, source, file_id);
+        } else if let Some(cur) = obj.cursor_declaration() {
+            push_cursor(&mut units, &cur, source, file_id);
+        } else if obj.type_declaration().is_none()
+            && obj.subtype_declaration().is_none()
+            && obj.exception_declaration().is_none()
+            && obj.pragma_declaration().is_none()
+        {
+            units
+                .unattributed
+                .push(unattributed(&**obj, "unrecognized", file_id, source));
+        }
+    }
+    assign_positional_overloads(&mut units.members, true);
     AstDecl::PackageSpec {
         name: node_name_upper(source, ctx.package_name(0)),
         span: non_empty(node_span(ctx, file_id, source), fallback_span),
+        units,
     }
 }
 
+/// A package body lowers to separately addressable units — one per member
+/// (with its overload identity, parameters, defaults and everything it
+/// executes), the declaration initializers, the cursors and the
+/// initialization section — instead of one flattened statement list, so
+/// an invocation closure can union exactly the units a call runs. What
+/// cannot be attributed is recorded in `units.unattributed` (fail closed).
 fn lower_create_package_body(
     ctx: &crate::generated::plsqlparser::Create_package_bodyContextAll<'_>,
     source: &str,
@@ -324,37 +389,128 @@ fn lower_create_package_body(
 ) -> (AstDecl, Vec<AstStatement>) {
     let span = node_span(ctx, file_id, source);
     let name = node_name_upper(source, ctx.package_name(0));
+    let mut units = AstPackageUnits {
+        lowered: true,
+        ..AstPackageUnits::default()
+    };
 
-    // Collect body statements from all routine members (procedure_body /
-    // function_body) inside the package body, plus the optional
-    // initialization seq_of_statements at the package level.
-    let mut all_stmts: Vec<AstStatement> = Vec::new();
     for obj in &ctx.package_obj_body_all() {
         if let Some(pb) = obj.procedure_body() {
-            if let Some(body_ctx) = pb.body() {
-                let stmts = lower_body_stmts(&body_ctx, source, file_id, diagnostics);
-                all_stmts.extend(stmts);
+            let mut statements = lower_declare_specs(
+                pb.seq_of_declare_specs(),
+                source,
+                file_id,
+                diagnostics,
+                &mut units.unattributed,
+            );
+            if let Some(body) = pb.body() {
+                statements.extend(lower_body_with_handlers(
+                    &body,
+                    source,
+                    file_id,
+                    diagnostics,
+                ));
             }
-        }
-        if let Some(fb) = obj.function_body() {
-            if let Some(body_ctx) = fb.body() {
-                let stmts = lower_body_stmts(&body_ctx, source, file_id, diagnostics);
-                all_stmts.extend(stmts);
+            if pb.call_spec().is_some() {
+                units
+                    .unattributed
+                    .push(unattributed(&*pb, "call_spec", file_id, source));
             }
+            units.members.push(AstPackageMember {
+                name: ident_of(source, pb.identifier()),
+                kind: AstRoutineKind::Procedure,
+                overload: AstOverload::NotOverloaded,
+                params: lower_params(&pb.parameter_all(), source, file_id),
+                statements,
+                span: node_span(&*pb, file_id, source),
+            });
+        } else if let Some(fb) = obj.function_body() {
+            let mut statements = lower_declare_specs(
+                fb.seq_of_declare_specs(),
+                source,
+                file_id,
+                diagnostics,
+                &mut units.unattributed,
+            );
+            if let Some(body) = fb.body() {
+                statements.extend(lower_body_with_handlers(
+                    &body,
+                    source,
+                    file_id,
+                    diagnostics,
+                ));
+            }
+            if fb.call_spec().is_some() {
+                units
+                    .unattributed
+                    .push(unattributed(&*fb, "call_spec", file_id, source));
+            }
+            units.members.push(AstPackageMember {
+                name: ident_of(source, fb.identifier()),
+                kind: AstRoutineKind::Function,
+                overload: AstOverload::NotOverloaded,
+                params: lower_params(&fb.parameter_all(), source, file_id),
+                statements,
+                span: node_span(&*fb, file_id, source),
+            });
+        } else if let Some(var) = obj.variable_declaration() {
+            push_initializer(&mut units, &var, source, file_id);
+        } else if let Some(cur) = obj.cursor_declaration() {
+            push_cursor(&mut units, &cur, source, file_id);
+        } else if obj.selection_directive().is_some() {
+            units.unattributed.push(unattributed(
+                &**obj,
+                "conditional_compilation",
+                file_id,
+                source,
+            ));
+        } else if obj.procedure_spec().is_none()
+            && obj.function_spec().is_none()
+            && obj.type_declaration().is_none()
+            && obj.subtype_declaration().is_none()
+            && obj.exception_declaration().is_none()
+            && obj.pragma_declaration().is_none()
+        {
+            // Forward declarations, types, subtypes, exceptions and pragmas
+            // have no executable effect; anything else is not attributable.
+            units
+                .unattributed
+                .push(unattributed(&**obj, "unrecognized", file_id, source));
         }
     }
-    // Package-level initialization block (after `BEGIN` at the package level).
-    if let Some(seq) = ctx.seq_of_statements() {
-        let stmts = lower_seq_of_statements(&seq, source, file_id, diagnostics);
-        all_stmts.extend(stmts);
+
+    // The initialization section (`BEGIN … [EXCEPTION …] END` after the
+    // members) runs once per session at instantiation, with its handlers.
+    let seq = ctx.seq_of_statements();
+    let handlers = ctx.exception_handler_all();
+    if seq.is_some() || !handlers.is_empty() {
+        let mut statements = seq
+            .as_ref()
+            .map(|seq| lower_seq_of_statements(seq, source, file_id, diagnostics))
+            .unwrap_or_default();
+        for handler in &handlers {
+            if let Some(hseq) = handler.seq_of_statements() {
+                statements.extend(lower_seq_of_statements(&hseq, source, file_id, diagnostics));
+            }
+        }
+        let section_span = seq
+            .as_ref()
+            .map(|seq| node_span(&**seq, file_id, source))
+            .unwrap_or(span);
+        units.init_section = Some(AstInitSection {
+            statements,
+            span: section_span,
+        });
     }
+    assign_positional_overloads(&mut units.members, false);
 
     (
         AstDecl::PackageBody {
             name,
             span: non_empty(span, fallback_span),
+            units,
         },
-        all_stmts,
+        Vec::new(),
     )
 }
 
@@ -469,6 +625,311 @@ fn lower_create_type(
     AstDecl::Unknown {
         span: fallback_span,
         antlr_rule_path: rule_path_of(ctx),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Package units (members, initializers, cursors, init section)
+// ---------------------------------------------------------------------------
+
+type ParameterCtx<'i> = std::rc::Rc<crate::generated::plsqlparser::ParameterContextAll<'i>>;
+
+/// Exact identity of a PL/SQL identifier: a quoted name keeps its case
+/// verbatim (without the quotes); an unquoted name folds to upper case.
+fn exact_ident(text: &str) -> String {
+    let t = text.trim();
+    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+        t[1..t.len() - 1].to_string()
+    } else {
+        t.to_ascii_uppercase()
+    }
+}
+
+fn lower_params(params: &[ParameterCtx<'_>], source: &str, file_id: FileId) -> Vec<AstParam> {
+    params
+        .iter()
+        .map(|p| {
+            let name = p
+                .parameter_name()
+                .map(|n| exact_ident(&node_text(source, &*n)))
+                .unwrap_or_default();
+            let mode = if !p.INOUT_all().is_empty()
+                || (!p.IN_all().is_empty() && !p.OUT_all().is_empty())
+            {
+                AstParamMode::InOut
+            } else if !p.OUT_all().is_empty() {
+                AstParamMode::Out
+            } else {
+                AstParamMode::In
+            };
+            let type_text = p
+                .type_spec()
+                .map(|t| node_text(source, &*t).trim().to_string())
+                .unwrap_or_default();
+            let default_text = p
+                .default_value_part()
+                .and_then(|d| d.expression())
+                .map(|e| node_text(source, &*e).trim().to_string())
+                .filter(|s| !s.is_empty());
+            AstParam {
+                name,
+                mode,
+                type_text,
+                default_text,
+                span: node_span(&**p, file_id, source),
+            }
+        })
+        .collect()
+}
+
+fn unattributed<'i, N>(node: &N, reason: &str, file_id: FileId, source: &str) -> AstUnattributed
+where
+    N: ParserRuleContext<'i, Ctx = crate::generated::plsqlparser::PlSqlParserContextType> + ?Sized,
+{
+    AstUnattributed {
+        span: node_span(node, file_id, source),
+        reason: reason.to_string(),
+        antlr_rule_path: rule_path_of(node),
+    }
+}
+
+/// A `body` (BEGIN … [EXCEPTION …] END) lowered with its exception
+/// handlers: a handler's statements run as part of the same unit.
+fn lower_body_with_handlers(
+    body: &crate::generated::plsqlparser::BodyContextAll<'_>,
+    source: &str,
+    file_id: FileId,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<AstStatement> {
+    let mut out = lower_body_stmts(body, source, file_id, diagnostics);
+    for handler in &body.exception_handler_all() {
+        if let Some(seq) = handler.seq_of_statements() {
+            out.extend(lower_seq_of_statements(&seq, source, file_id, diagnostics));
+        }
+    }
+    out
+}
+
+/// Statements a routine's local declaration section contributes to the
+/// routine's own execution: variable initializers (as assignments), cursor
+/// queries (as SELECTs, conservatively: they run when opened) and nested
+/// subprograms (conservatively attributed to the enclosing member).
+fn lower_declare_specs(
+    specs: Option<std::rc::Rc<crate::generated::plsqlparser::Seq_of_declare_specsContextAll<'_>>>,
+    source: &str,
+    file_id: FileId,
+    diagnostics: &mut Vec<Diagnostic>,
+    unattributed_out: &mut Vec<AstUnattributed>,
+) -> Vec<AstStatement> {
+    let mut out = Vec::new();
+    let Some(specs) = specs else { return out };
+    for spec in &specs.declare_spec_all() {
+        if let Some(var) = spec.variable_declaration() {
+            if let Some(init) = var.default_value_part().and_then(|d| d.expression()) {
+                out.push(AstStatement::Assignment {
+                    target: var
+                        .identifier()
+                        .map(|i| exact_ident(&node_text(source, &*i)))
+                        .unwrap_or_default(),
+                    rhs_text: node_text(source, &*init).trim().to_string(),
+                    span: node_span(&*var, file_id, source),
+                });
+            }
+        } else if let Some(cur) = spec.cursor_declaration() {
+            if let Some(q) = cur.select_statement() {
+                out.push(AstStatement::Sql {
+                    verb: "SELECT".to_string(),
+                    raw_text: node_text(source, &*q),
+                    span: node_span(&*cur, file_id, source),
+                });
+            }
+        } else if let Some(pb) = spec.procedure_body() {
+            out.extend(lower_declare_specs(
+                pb.seq_of_declare_specs(),
+                source,
+                file_id,
+                diagnostics,
+                unattributed_out,
+            ));
+            if let Some(b) = pb.body() {
+                out.extend(lower_body_with_handlers(&b, source, file_id, diagnostics));
+            }
+            if pb.call_spec().is_some() {
+                unattributed_out.push(unattributed(&*pb, "call_spec", file_id, source));
+            }
+        } else if let Some(fb) = spec.function_body() {
+            out.extend(lower_declare_specs(
+                fb.seq_of_declare_specs(),
+                source,
+                file_id,
+                diagnostics,
+                unattributed_out,
+            ));
+            if let Some(b) = fb.body() {
+                out.extend(lower_body_with_handlers(&b, source, file_id, diagnostics));
+            }
+            if fb.call_spec().is_some() {
+                unattributed_out.push(unattributed(&*fb, "call_spec", file_id, source));
+            }
+        } else if spec.selection_directive().is_some() {
+            unattributed_out.push(unattributed(
+                &**spec,
+                "conditional_compilation",
+                file_id,
+                source,
+            ));
+        } else if spec.type_declaration().is_some()
+            || spec.subtype_declaration().is_some()
+            || spec.exception_declaration().is_some()
+            || spec.pragma_declaration().is_some()
+            || spec.procedure_spec().is_some()
+            || spec.function_spec().is_some()
+        {
+            // No executable effect.
+        } else {
+            unattributed_out.push(unattributed(&**spec, "unrecognized", file_id, source));
+        }
+    }
+    out
+}
+
+/// Exact identity of an optional identifier node (see [`exact_ident`]).
+fn ident_of<'i, N, P>(source: &str, node: Option<P>) -> String
+where
+    N: ParserRuleContext<'i> + ?Sized,
+    P: std::ops::Deref<Target = N>,
+{
+    node.map(|n| exact_ident(&node_text(source, &*n)))
+        .unwrap_or_default()
+}
+
+fn push_initializer(
+    units: &mut AstPackageUnits,
+    var: &crate::generated::plsqlparser::Variable_declarationContextAll<'_>,
+    source: &str,
+    file_id: FileId,
+) {
+    if let Some(init) = var.default_value_part().and_then(|d| d.expression()) {
+        units.initializers.push(AstInitializer {
+            name: ident_of(source, var.identifier()),
+            initializer_text: node_text(source, &*init).trim().to_string(),
+            span: node_span(var, file_id, source),
+        });
+    }
+}
+
+fn push_cursor(
+    units: &mut AstPackageUnits,
+    cur: &crate::generated::plsqlparser::Cursor_declarationContextAll<'_>,
+    source: &str,
+    file_id: FileId,
+) {
+    units.cursors.push(AstPackageCursor {
+        name: ident_of(source, cur.identifier()),
+        query_text: cur
+            .select_statement()
+            .map(|q| node_text(source, &*q))
+            .unwrap_or_default(),
+        span: node_span(cur, file_id, source),
+    });
+}
+
+/// Overload identity within one package part, by order of appearance.
+///
+/// In a specification this *is* Oracle's `ALL_ARGUMENTS.OVERLOAD`: the nth
+/// overloading by appearance, `NULL` for a name that occurs once. In a body
+/// the order is not Oracle's (it may interleave private subprograms), so an
+/// overloaded body name is provisionally `Ambiguous` until
+/// [`resolve_body_overloads`] joins it to the specification.
+fn assign_positional_overloads(members: &mut [AstPackageMember], is_spec: bool) {
+    let mut totals: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for m in members.iter() {
+        *totals.entry(m.name.clone()).or_default() += 1;
+    }
+    let mut seen: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for m in members.iter_mut() {
+        let position = {
+            let e = seen.entry(m.name.clone()).or_default();
+            *e += 1;
+            *e
+        };
+        m.overload = if totals[&m.name] == 1 {
+            AstOverload::NotOverloaded
+        } else if is_spec {
+            AstOverload::Ordinal(position)
+        } else {
+            AstOverload::Ambiguous { position }
+        };
+    }
+}
+
+/// The conformance key Oracle requires between a spec header and its body:
+/// kind plus each parameter's name, mode and (case/space-normalized) type.
+fn signature_key(m: &AstPackageMember) -> (AstRoutineKind, Vec<(String, AstParamMode, String)>) {
+    (
+        m.kind,
+        m.params
+            .iter()
+            .map(|p| {
+                (
+                    p.name.clone(),
+                    p.mode,
+                    p.type_text
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .to_ascii_uppercase(),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// Join each body member to its specification header when the spec is in
+/// the same source: a body member whose name the spec declares takes the
+/// spec's overload identity if exactly one spec header conforms to it, and
+/// is `Ambiguous` otherwise (never guessed). Body-private members keep
+/// their positional identity. Without a spec in this source, positional
+/// identities stand.
+fn resolve_body_overloads(decls: &mut [AstDecl]) {
+    let specs: Vec<(String, Vec<AstPackageMember>)> = decls
+        .iter()
+        .filter_map(|d| match d {
+            AstDecl::PackageSpec { name, units, .. } if units.lowered => {
+                Some((name.clone(), units.members.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    for decl in decls.iter_mut() {
+        let AstDecl::PackageBody { name, units, .. } = decl else {
+            continue;
+        };
+        let Some((_, spec_members)) = specs.iter().find(|(n, _)| n == name) else {
+            continue;
+        };
+        let mut seen: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        for m in units.members.iter_mut() {
+            let position = {
+                let e = seen.entry(m.name.clone()).or_default();
+                *e += 1;
+                *e
+            };
+            let same_name: Vec<&AstPackageMember> =
+                spec_members.iter().filter(|s| s.name == m.name).collect();
+            if same_name.is_empty() {
+                continue;
+            }
+            let key = signature_key(m);
+            let conforming: Vec<&&AstPackageMember> = same_name
+                .iter()
+                .filter(|s| signature_key(s) == key)
+                .collect();
+            m.overload = match conforming.as_slice() {
+                [only] => only.overload,
+                _ => AstOverload::Ambiguous { position },
+            };
+        }
     }
 }
 
@@ -952,13 +1413,15 @@ fn adjust_span(decl: AstDecl, base_offset: u32, file_id: FileId) -> AstDecl {
         )
     };
     match decl {
-        AstDecl::PackageSpec { name, span } => AstDecl::PackageSpec {
+        AstDecl::PackageSpec { name, span, units } => AstDecl::PackageSpec {
             name,
             span: shift(span),
+            units,
         },
-        AstDecl::PackageBody { name, span } => AstDecl::PackageBody {
+        AstDecl::PackageBody { name, span, units } => AstDecl::PackageBody {
             name,
             span: shift(span),
+            units,
         },
         AstDecl::Procedure { name, span } => AstDecl::Procedure {
             name,

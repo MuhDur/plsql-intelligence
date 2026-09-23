@@ -63,6 +63,7 @@ fn build_schema() -> Schema {
             common: DeclCommon::new(pkg_sym, span()).with_schema(hr),
             members: vec![],
             body: None,
+            units: plsql_ir::PackageUnits::default(),
         }));
         packages.push(pkg_id);
 
