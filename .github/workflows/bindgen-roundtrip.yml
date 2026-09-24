@@ -70,6 +70,11 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y libaio1t64 || sudo apt-get install -y libaio1
+          if [ -e /usr/lib/x86_64-linux-gnu/libaio.so.1t64 ]; then
+            sudo ln -sf libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1
+            sudo ldconfig
+          fi
+          ldconfig -p | grep -q 'libaio\.so\.1 '
           curl -L -o /tmp/instantclient.zip \
             https://download.oracle.com/otn_software/linux/instantclient/2370000/instantclient-basic-linux.x64-23.7.0.25.01.zip
           sudo unzip -q /tmp/instantclient.zip -d /opt/oracle
