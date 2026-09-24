@@ -73,6 +73,9 @@ jobs:
           curl -L -o /tmp/instantclient.zip \
             https://download.oracle.com/otn_software/linux/instantclient/2370000/instantclient-basic-linux.x64-23.7.0.25.01.zip
           sudo unzip -q /tmp/instantclient.zip -d /opt/oracle
+          curl -L -o /tmp/instantclient-sqlplus.zip \
+            https://download.oracle.com/otn_software/linux/instantclient/2370000/instantclient-sqlplus-linux.x64-23.7.0.25.01.zip
+          sudo unzip -q /tmp/instantclient-sqlplus.zip -d /opt/oracle
           sudo ln -sf /opt/oracle/instantclient_23_7 /opt/oracle/instantclient
           echo "LD_LIBRARY_PATH=/opt/oracle/instantclient" >> "$GITHUB_ENV"
 
