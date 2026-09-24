@@ -41,7 +41,7 @@ jobs:
         ports:
           - 1521:1521
         env:
-          ORACLE_PWD: ${{ secrets.ORACLE_XE_PWD }}
+          ORACLE_PWD: ${{ secrets.ORACLE_XE_PWD || format('X{0}Zz8!', github.run_id) }}
           ORACLE_CHARACTERSET: AL32UTF8
           ENABLE_ARCHIVELOG: "false"
         # The health-cmd runs INSIDE the service container, which already has
@@ -86,7 +86,7 @@ jobs:
 
       - name: Deploy synthetic test package
         env:
-          ORACLE_PWD: ${{ secrets.ORACLE_XE_PWD }}
+          ORACLE_PWD: ${{ secrets.ORACLE_XE_PWD || format('X{0}Zz8!', github.run_id) }}
         run: |
           /opt/oracle/instantclient/sqlplus -s \
             "system/${ORACLE_PWD}@//localhost:1521/FREEPDB1" <<'SQL'
@@ -104,7 +104,7 @@ jobs:
 
       - name: Run round-trip integration test
         env:
-          ORACLE_PWD: ${{ secrets.ORACLE_XE_PWD }}
+          ORACLE_PWD: ${{ secrets.ORACLE_XE_PWD || format('X{0}Zz8!', github.run_id) }}
         run: |
           cargo +nightly-2026-05-11 test -p plsql-bindgen --test xe_roundtrip \
             --features live-roundtrip -- --nocapture
