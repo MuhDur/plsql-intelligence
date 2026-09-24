@@ -151,7 +151,7 @@ pub fn rename_with_reserved(source: &str, salt: &str, reserved: &[&str]) -> (Str
             let line_end = bytes[i..]
                 .iter()
                 .position(|&b| b == b'\n')
-                .map_or(bytes.len() - i, |p| p);
+                .unwrap_or(bytes.len() - i);
             out.push_str(&source[i..i + line_end]);
             i += line_end;
             continue;
@@ -241,7 +241,7 @@ pub fn rename_with_reserved(source: &str, salt: &str, reserved: &[&str]) -> (Str
 
         // Quoted identifier: `"…"` — rename the body, keep the quotes.
         if ch == b'"' {
-            let end_rel = source[i + 1..].find('"').map_or(bytes.len() - i - 1, |p| p);
+            let end_rel = source[i + 1..].find('"').unwrap_or(bytes.len() - i - 1);
             let body = &source[i + 1..i + 1 + end_rel];
             let renamed = lookup_or_rename(&mut cache, body, salt, &reserved_set);
             out.push('"');
