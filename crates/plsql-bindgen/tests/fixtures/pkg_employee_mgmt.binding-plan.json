@@ -1,0 +1,45 @@
+{
+  "package_id": "SYSTEM.EMPLOYEE_MGMT",
+  "package_name": "pkg_employee_mgmt",
+  "routines": [
+    {
+      "name": "hire_employee",
+      "kind": "procedure",
+      "parameters": [
+        { "name": "p_name", "mode": "IN", "rust_type": { "path": "String", "nullable": false }, "has_default": false },
+        { "name": "p_salary", "mode": "IN", "rust_type": { "path": "f64", "nullable": false }, "has_default": false },
+        { "name": "p_dept_id", "mode": "IN", "rust_type": { "path": "i64", "nullable": false }, "has_default": false }
+      ],
+      "return_type": null,
+      "autonomous_transaction": false
+    },
+    {
+      "name": "fire_employee",
+      "kind": "procedure",
+      "parameters": [
+        { "name": "p_emp_id", "mode": "IN", "rust_type": { "path": "i64", "nullable": false }, "has_default": false }
+      ],
+      "return_type": null,
+      "autonomous_transaction": false
+    },
+    {
+      "name": "get_salary",
+      "kind": "function",
+      "parameters": [
+        { "name": "p_emp_id", "mode": "IN", "rust_type": { "path": "i64", "nullable": false }, "has_default": false }
+      ],
+      "return_type": { "path": "f64", "nullable": true },
+      "autonomous_transaction": false
+    },
+    {
+      "name": "count_employees",
+      "kind": "function",
+      "parameters": [
+        { "name": "p_dept_id", "mode": "IN", "rust_type": { "path": "i64", "nullable": false }, "has_default": false }
+      ],
+      "return_type": { "path": "i32", "nullable": true },
+      "autonomous_transaction": false
+    }
+  ],
+  "diagnostics": []
+}

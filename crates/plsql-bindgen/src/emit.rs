@@ -591,10 +591,17 @@ fn emit_routine(out: &mut String, package_id: &str, r: &RoutineBinding, rust_nam
         let mut exprs: Vec<String> = Vec::new();
         for (i, rt) in out_types.iter().enumerate() {
             let bind = format!("__b{i}");
-            let _ = writeln!(
-                out,
-                "    let {bind} = __out.get({i}).ok_or_else(shape_err)?;"
-            );
+            if i == 0 {
+                let _ = writeln!(
+                    out,
+                    "    let {bind} = __out.first().ok_or_else(shape_err)?;"
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "    let {bind} = __out.get({i}).ok_or_else(shape_err)?;"
+                );
+            }
             let core = scalar_out_extract(&rt.path, &bind).expect("checked by unsupported_type");
             if rt.nullable {
                 exprs.push(format!(
@@ -1402,7 +1409,7 @@ mod tests {
             "{src}"
         );
         assert!(
-            src.contains("__out.get(0)") && src.contains("__out.get(1)"),
+            src.contains("__out.first()") && src.contains("__out.get(1)"),
             "{src}"
         );
     }
