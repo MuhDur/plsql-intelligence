@@ -111,7 +111,13 @@ the offline JSON catalog snapshot parser. Any attacker-controlled snapshot
 Oracle: never panics (serde returning `Err` for invalid JSON is correct;
 only a panic/abort is the bug). Smoke: ~145 K exec/s, 0 crashes.
 
-## Target: `mcp_async_dispatch`
+## Legacy target sources (not registered in the manifest)
+
+The following source files still refer to retired adapter/runtime crates. They
+are retained in the tree, are not part of the cargo-fuzz build, and the dated
+soak results below are historical evidence only.
+
+### `mcp_async_dispatch`
 
 Drives `plsql_mcp::dispatch_tool` inside a current-thread Asupersync runtime.
 The fuzzer chooses a real `dispatch_table()` tool name (or an unknown tool)
@@ -123,7 +129,7 @@ Last local soak (2026-06-28): `cargo +nightly-2026-05-11 fuzz run
 mcp_async_dispatch -- -max_total_time=30 -timeout=10 -verbosity=0
 -print_final_stats=1` executed 17,999 units with 0 crashes.
 
-## Target: `catalog_async_loader`
+### `catalog_async_loader`
 
 Drives `plsql_mcp::OraclemcpCatalogConnection<FuzzDbConnection>` into
 `plsql_catalog::load_snapshot_from_connection`. This covers the MCP-side
@@ -136,7 +142,7 @@ Last local soak (2026-06-28): `cargo +nightly-2026-05-11 fuzz run
 catalog_async_loader -- -max_total_time=30 -timeout=10 -verbosity=0
 -print_final_stats=1` executed 21,214 units with 0 crashes.
 
-## Target: `live_runtime_ops`
+### `live_runtime_ops`
 
 Drives `plsql_mcp::LiveDbRuntime` session operations with a boxed fake
 `oraclemcp-db::OracleConnection`: insert, activate, remove, lease validation,
@@ -148,3 +154,31 @@ must never panic.
 Last local soak (2026-06-28): `cargo +nightly-2026-05-11 fuzz run
 live_runtime_ops -- -max_total_time=30 -timeout=10 -verbosity=0
 -print_final_stats=1` executed 45,778 units with 0 crashes.
+
+## Target: `package_units_lower`
+
+Runs arbitrary valid UTF-8 input (excluding non-whitespace controls) inside a
+synthetic package specification and body through the real ANTLR backend and IR
+lowerer. The fixed wrapper exercises member bodies, a parameter default, a
+package declaration initializer, and the package initialization section. A
+regression test replays a recovered package input through unit extraction.
+Inputs are capped at 64 KiB.
+
+## Target: `effects_extract`
+
+Runs arbitrary input after a fixed literal `EXECUTE IMMEDIATE` statement in a
+synthetic procedure through `analyze_project`, then queries the resulting
+invocation closure and effect set. Its shared checker refuses both a clean
+closure after parser diagnostics and an empty effect set for a routine body
+that includes an executable statement. The checker has a `fuzz_regression_*`
+unit test that supplies a deliberately inconsistent closure.
+
+## Scheduled tier-B lane
+
+`.github/workflows/fuzz.yml` builds all default fuzz targets plus the optional
+catalog JSON target on `nightly-2026-05-11`, then runs `package_units_lower`
+and `effects_extract` for five minutes each. The workflow seeds temporary fuzz
+corpora from `corpus/synthetic`. Legacy adapter/runtime target sources that
+depend on retired crates are not registered in the fuzz manifest. The scheduled
+runs are offline and do not establish semantic correctness of the extracted
+effects.

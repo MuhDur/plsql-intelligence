@@ -3,3 +3,10 @@ corpus
 artifacts
 coverage
 Cargo.lock
+
+# Keep the minimized parser regression seed; generated corpus entries stay ignored.
+!corpus/
+corpus/*
+!corpus/package_units_lower/
+corpus/package_units_lower/*
+!corpus/package_units_lower/fuzz_regression_bb7e7fd29762e3cb7132f91e8d8822ee57e7c953.sql

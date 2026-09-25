@@ -1,0 +1,50 @@
+name: scheduled-tier-b-fuzz
+
+on:
+  schedule:
+    - cron: "43 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }} (tier B, 5 minutes)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [package_units_lower, effects_extract]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-05-11
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Build every default fuzz target and catalog target
+        working-directory: fuzz
+        run: cargo +nightly-2026-05-11 fuzz build --features catalog
+      - name: Seed corpus from synthetic fixtures
+        working-directory: fuzz
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          corpus="corpus/${FUZZ_TARGET}"
+          mkdir -p "$corpus"
+          while IFS= read -r -d '' seed; do
+            digest="$(printf '%s' "$seed" | sha256sum | cut -c1-12)"
+            cp "$seed" "$corpus/seed_${digest}_$(basename "$seed")"
+          done < <(find ../corpus/synthetic -type f \( -name '*.sql' -o -name '*.pks' -o -name '*.pkb' \) -print0)
+      - name: Run bounded tier-B campaign
+        working-directory: fuzz
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+        run: cargo +nightly-2026-05-11 fuzz run "$FUZZ_TARGET" "corpus/$FUZZ_TARGET" -- -max_total_time=300 -timeout=10 -verbosity=0 -print_final_stats=1
