@@ -1,3 +1,4 @@
+# tier: B
 name: scheduled-tier-b-fuzz
 
 on:

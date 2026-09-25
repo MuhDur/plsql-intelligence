@@ -1,3 +1,4 @@
+# tier: B
 # Round-trip integration test for plsql-bindgen against Oracle XE 23ai.
 #
 # Wire path:

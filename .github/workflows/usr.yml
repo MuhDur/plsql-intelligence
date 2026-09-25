@@ -1,3 +1,4 @@
+# tier: A (also runs scheduled Tier-B acceptance checks)
 # USR Loop CI (PLSQL-USR-001 §6, §10 P6).
 #
 # Two tiers:
@@ -21,6 +22,7 @@ on:
     branches: [main, master]
   pull_request:
     branches: [main, master]
+  workflow_dispatch:
   schedule:
     # Nightly 03:17 UTC — the full acceptance proof + tripwire.
     - cron: "17 3 * * *"
@@ -84,7 +86,7 @@ jobs:
   # ----------------------------------------------------------------
   acceptance-nightly:
     name: §5 acceptance proof (nightly DoD; estate-aware)
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

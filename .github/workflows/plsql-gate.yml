@@ -1,3 +1,4 @@
+# tier: C (reference-only; no in-repository job execution)
 # Reference `.github/workflows/plsql-gate.yml` for the release-0.5.0
 # change-impact Action.
 #
