@@ -213,7 +213,7 @@ fn lower_package(
     // OBJECT/VARRAY/TABLE spec closes with `);`, not `END`, so lower_type keeps
     // depth 0 for the SPEC case.)
     let end = advance_to_decl_end_with_depth(bytes, create_start, 1);
-    let span = make_span(file_id, create_start as u32, end as u32);
+    let span = make_span(file_id, create_start, end);
 
     if is_body {
         // The text scanner attributes no units: `lowered == false`
@@ -251,7 +251,7 @@ fn lower_procedure(
         Some(begin) => advance_to_decl_end_with_depth(bytes, begin, 0),
         None => advance_to_decl_end(bytes, create_start),
     };
-    let span = make_span(file_id, create_start as u32, end as u32);
+    let span = make_span(file_id, create_start, end);
 
     AstDecl::Procedure { name, span }
 }
@@ -275,7 +275,7 @@ fn lower_function(
         Some(begin) => advance_to_decl_end_with_depth(bytes, begin, 0),
         None => advance_to_decl_end(bytes, create_start),
     };
-    let span = make_span(file_id, create_start as u32, end as u32);
+    let span = make_span(file_id, create_start, end);
 
     AstDecl::Function { name, span }
 }
@@ -300,7 +300,7 @@ fn lower_trigger(
         Some(begin) => advance_to_decl_end_with_depth(bytes, begin, 0),
         None => advance_to_decl_end(bytes, create_start),
     };
-    let span = make_span(file_id, create_start as u32, end as u32);
+    let span = make_span(file_id, create_start, end);
 
     AstDecl::Trigger { name, span }
 }
@@ -318,7 +318,7 @@ fn lower_view(
 
     let name = extract_identifier(source, pos);
     let end = advance_to_decl_end(bytes, create_start);
-    let span = make_span(file_id, create_start as u32, end as u32);
+    let span = make_span(file_id, create_start, end);
 
     AstDecl::View { name, span }
 }
@@ -354,7 +354,7 @@ fn lower_type(
     } else {
         advance_to_decl_end(bytes, create_start)
     };
-    let span = make_span(file_id, create_start as u32, end as u32);
+    let span = make_span(file_id, create_start, end);
 
     if is_body {
         AstDecl::TypeBody { name, span }
@@ -502,7 +502,7 @@ fn lower_unknown_create(
     let kind_end = scan_to_whitespace(bytes, after_create);
     let kind = String::from_utf8_lossy(&bytes[after_create..kind_end]).to_string();
     let end = advance_to_decl_end(bytes, create_start);
-    let span = make_span(file_id, create_start as u32, end as u32);
+    let span = make_span(file_id, create_start, end);
 
     // USR-loop §2.1: fine-grained, privacy-safe gap signature even
     // on the no-parse-tree path. The object keyword is classified
@@ -544,7 +544,7 @@ fn lower_simple_ddl(
     };
 
     let end = advance_past_statement_end(bytes, after_verb);
-    let span = make_span(file_id, statement_start as u32, end as u32);
+    let span = make_span(file_id, statement_start, end);
 
     // USR-loop §2.1: privacy-safe fine-grained rule path. For
     // `ALTER`/`DROP` the word after the verb is itself a grammar
@@ -741,7 +741,7 @@ fn execute_immediate_body_start(u: &str) -> Option<usize> {
 }
 
 fn classify_statement(raw: &str, file_id: FileId, start: usize, end: usize) -> AstStatement {
-    let span = make_span(file_id, start as u32, end as u32);
+    let span = make_span(file_id, start, end);
     // Strip a leading line comment run.
     let text = raw.trim();
     let upper = text.to_ascii_uppercase();
@@ -855,11 +855,7 @@ fn classify_statement(raw: &str, file_id: FileId, start: usize, end: usize) -> A
 #[must_use]
 pub fn lower_expression_text(expr: &str, file_id: FileId, base_offset: usize) -> AstExpr {
     let text = expr.trim().trim_end_matches(';').trim();
-    let span = make_span(
-        file_id,
-        base_offset as u32,
-        (base_offset + expr.len()) as u32,
-    );
+    let span = make_span(file_id, base_offset, base_offset.saturating_add(expr.len()));
     if text.is_empty() {
         return AstExpr::Literal {
             text: "NULL".to_string(),
@@ -1041,11 +1037,7 @@ fn split_top_level_bin<'a, 'b>(
 #[must_use]
 pub fn lower_type_decl(decl: &str, file_id: FileId, base_offset: usize) -> AstTypeDecl {
     let text = decl.trim();
-    let span = make_span(
-        file_id,
-        base_offset as u32,
-        (base_offset + decl.len()) as u32,
-    );
+    let span = make_span(file_id, base_offset, base_offset.saturating_add(decl.len()));
     let upper = text.to_ascii_uppercase();
 
     // PL/SQL record: `TYPE <name> IS RECORD ( … )`.
@@ -1520,12 +1512,15 @@ fn advance_past_statement_end(bytes: &[u8], pos: usize) -> usize {
     end + skip_whitespace_and_comments(bytes, end)
 }
 
-/// Create a span from byte offsets.
-fn make_span(file_id: FileId, start: u32, end: u32) -> Span {
+/// Create a span from byte offsets, saturating source positions that cannot
+/// fit the parser's `u32` wire representation instead of wrapping them.
+fn make_span(file_id: FileId, start: usize, end: usize) -> Span {
+    let start = u32::try_from(start).unwrap_or(u32::MAX);
+    let end = u32::try_from(end).unwrap_or(u32::MAX);
     Span::new(
         file_id,
-        Position::new(1, start + 1, start),
-        Position::new(1, end + 1, end),
+        Position::new(1, start.saturating_add(1), start),
+        Position::new(1, end.saturating_add(1), end),
     )
 }
 
@@ -1537,6 +1532,20 @@ fn make_span(file_id: FileId, start: u32, end: u32) -> Span {
 mod tests {
     use super::*;
     use plsql_core::FileId;
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn declaration_span_offsets_saturate_past_u32_max() {
+        // Exercise the conversion boundary directly: allocating a source past
+        // 4 GiB merely to prove source-position saturation is unnecessary.
+        let past_u32 = 4_294_967_296_usize;
+        let span = make_span(fid(), past_u32, past_u32.saturating_add(16));
+
+        assert_eq!(span.start.offset, u32::MAX);
+        assert_eq!(span.end.offset, u32::MAX);
+        assert_eq!(span.start.column, u32::MAX);
+        assert_eq!(span.end.column, u32::MAX);
+    }
 
     fn fid() -> FileId {
         FileId::new(0)
