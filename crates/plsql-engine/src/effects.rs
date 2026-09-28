@@ -704,8 +704,17 @@ fn inspect_expr(
 
 fn inspect_sql_text(text: &str, out: &mut InvocationClosureV1) {
     let upper = text.to_ascii_uppercase();
-    let words = upper.split_whitespace().collect::<Vec<_>>().join(" ");
-    if words.contains(" FOR UPDATE") || words.starts_with("LOCK TABLE") {
+    let mut words = upper.split_whitespace();
+    let mut previous = words.next();
+    let mut row_lock = matches!(previous, Some("LOCK")) && words.next() == Some("TABLE");
+    while !row_lock {
+        let Some(word) = words.next() else {
+            break;
+        };
+        row_lock = previous == Some("FOR") && word == "UPDATE";
+        previous = Some(word);
+    }
+    if row_lock {
         out.effects.effects.insert(RoutineEffect::RowLock);
     }
     if upper.contains("NEXTVAL") {
@@ -896,4 +905,28 @@ fn parsed_literal_ddl(text: &str) -> bool {
             parsed.ast.root.declarations.as_slice(),
             [AstDecl::Ddl { .. }]
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sql_effect_token_window_preserves_multiline_and_conservative_text_matches() {
+        for text in [
+            "SELECT n FROM t FOR\nUPDATE",
+            "SELECT n FROM t /* FOR UPDATE */",
+        ] {
+            let mut out = InvocationClosureV1::new("test".to_string());
+            inspect_sql_text(text, &mut out);
+            assert!(
+                out.effects.effects.contains(&RoutineEffect::RowLock),
+                "{text}"
+            );
+        }
+
+        let mut quoted = InvocationClosureV1::new("test".to_string());
+        inspect_sql_text("SELECT 'FOR UPDATE' FROM dual", &mut quoted);
+        assert!(!quoted.effects.effects.contains(&RoutineEffect::RowLock));
+    }
 }
