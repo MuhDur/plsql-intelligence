@@ -216,7 +216,7 @@ Core patterns:
 
 Common pitfalls:
 - "from_agent not registered" → call `register_agent` with correct `project_key`.
-- `FILE_RESERVATION_CONFLICT` → adjust patterns, wait for expiry, or use non-exclusive reservation.
+- `FILE_RESERVATION_CONFLICT` → message the holder and split the file or take turns (never idle-wait for expiry), adjust patterns, or use a non-exclusive reservation.
 
 ---
 
