@@ -40,7 +40,7 @@
 #   USR_GATE_FIXTURES_DIR   prior MinFixture store for G2/G8 (default: <repo>/.usr/fixtures)
 #   USR_GATE_BASELINE       §0 baseline json for G6 (default: crates/plsql-accretion/gate_baseline.json)
 #   USR_GATE_SKIP_BUILD     "1" ⇒ G1 reuses the current build (selftest speed; still a real `cargo build`)
-#   USR_GATE_FAST           "1" ⇒ G3/G5 use the regression-corpus check only (still real, bounded)
+#   USR_GATE_FAST           "1" ⇒ G3/G5 replay the corpus; G9 uses real revert-and-assert pins
 #   USR_GATE_ESTATE         optional estate path for G6 (default: unset ⇒ $PLSQL_PRIVATE_ESTATE)
 
 set -u
@@ -314,14 +314,48 @@ g8_privacy() {
 # restore. Never skip-as-pass.
 # ====================================================================
 g9_pins_behavior() {
-  local out
-  if command -v cargo-mutants >/dev/null 2>&1; then
-    if cargo mutants --no-shuffle -- 2>>/tmp/usr_gate_g9.log >/tmp/usr_gate_g9.out; then
+  local out reason="cargo-mutants unavailable"
+  # Gate tests already set FAST. They must use the real pin helper,
+  # even when cargo-mutants is installed, rather than launch a test
+  # run which invokes this gate again.
+  if [[ "${USR_GATE_FAST:-0}" != "1" ]] && command -v cargo-mutants >/dev/null 2>&1; then
+    if [[ "${USR_GATE_MUTANTS_ACTIVE:-0}" != "0" || "${INSIDE_MUTANTS:-0}" != "0" ]]; then
+      fail_stop G9 "refusing a nested cargo-mutants run"
+    fi
+    local header file
+    local -a files=()
+    while IFS= read -r header; do
+      case "${header}" in
+        "+++ b/"*)
+          file="${header#+++ b/}"
+          [[ "${file}" == *.rs ]] || continue
+          # --file takes a glob: accept only literal repository paths.
+          # Never turn an unsupported diff header into a broad run.
+          if [[ ! "${file}" =~ ^[a-zA-Z0-9_./-]+\.rs$ || "${file}" != */* ]] \
+            || [[ "${file}" == /* || "/${file}/" == *"/../"* || "/${file}/" == *"/./"* ]] \
+            || [[ ! -f "${REPO_ROOT}/${file}" ]]; then
+            fail_stop G9 "unsupported Rust candidate path: ${file}"
+          fi
+          files+=(--file "${file}")
+          ;;
+        "+++ /dev/null") ;;
+        "+++ "*) fail_stop G9 "unsupported candidate diff header: ${header}" ;;
+      esac
+    done <"${CANDIDATE}"
+    if [[ "${#files[@]}" == "0" ]]; then
+      fail_stop G9 "no Rust candidate files to scope cargo-mutants"
+    fi
+    # This marker is inherited by the tests run by cargo-mutants;
+    # non-test re-entry must refuse before launching another run.
+    if USR_GATE_MUTANTS_ACTIVE=1 cargo mutants --no-shuffle "${files[@]}" -- 2>>/tmp/usr_gate_g9.log >/tmp/usr_gate_g9.out; then
       pass G9 "cargo-mutants: added regression test is mutation-killed"
     else
       fail_stop G9 "cargo-mutants: surviving mutant or vacuous test (see /tmp/usr_gate_g9.log)"
     fi
     return 0
+  fi
+  if [[ "${USR_GATE_FAST:-0}" == "1" ]]; then
+    reason="USR_GATE_FAST=1 avoids recursive mutation runs"
   fi
   # Honest degraded equivalent: revert-and-assert-test-fails. The Rust
   # helper applies the candidate's REVERSE diff, runs the candidate's
@@ -330,7 +364,7 @@ g9_pins_behavior() {
   if ! out="$("${RSHELPER_BIN}" pins "${CANDIDATE}" 2>&1)"; then
     fail_stop G9 "vacuous test — passes on reverted code: ${out}"
   fi
-  pass G9 "degraded-mode: cargo-mutants unavailable ⇒ revert-and-assert ran for real; ${out}"
+  pass G9 "degraded-mode: ${reason} ⇒ revert-and-assert ran for real; ${out}"
 }
 
 # --- strictly ordered, every one must PASS, fail-closed -------------
