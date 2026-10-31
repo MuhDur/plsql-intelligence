@@ -447,9 +447,10 @@ fn fix_this_references(content: &str) -> String {
 ///   and ANTLR resolves that ambiguity to the lower-numbered alternative,
 ///   `standard_function`, which is the same parse.
 /// - `isNotStartOfJoin` → one-token lookahead: `false` only when the next
-///   tokens start a join (`JOIN`, `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`,
-///   `NATURAL`, `OUTER`, `PARTITION BY`). A constant `false` meant no table
-///   alias was ever consumed, so `FROM emp e` did not parse.
+///   token is a non-reserved join keyword that would also parse as the alias
+///   (`INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`, `NATURAL`). A constant
+///   `false` meant no table alias was ever consumed, so `FROM emp e` did not
+///   parse.
 /// - `IsNewlineAtPos` → `false` (conservative: no special newline handling)
 ///
 /// The traits are injected at the end of the respective generated file so
@@ -515,7 +516,7 @@ where
     /// non-reserved, so the next token is an alias unless it starts a join.
     fn isNotStartOfJoin(&mut self) -> bool {
         use antlr4rust::int_stream::IntStream;
-        plsql_is_not_start_of_join(self.input.la(1), self.input.la(2))
+        plsql_is_not_start_of_join(self.input.la(1))
     }
 }
 
@@ -531,24 +532,25 @@ where
     fn IsNotNumericFunction(&mut self) -> bool { true }
     fn isNotStartOfJoin(&mut self) -> bool {
         use antlr4rust::int_stream::IntStream;
-        plsql_is_not_start_of_join(self.base.input.la(1), self.base.input.la(2))
+        plsql_is_not_start_of_join(self.base.input.la(1))
     }
 }
 
-/// `true` unless the tokens after a table reference start a join: a join
-/// keyword, `OUTER`/`CROSS APPLY`, or `PARTITION BY` (partitioned outer join).
-fn plsql_is_not_start_of_join(la1: i32, la2: i32) -> bool {
+/// `false` when the next token is a non-reserved join keyword that could
+/// otherwise be read as the table alias: `t LEFT JOIN u` is also a valid
+/// parse with alias `LEFT`. ANTLR consults this predicate only while taking
+/// an alias is viable, so `JOIN`, `OUTER APPLY` and `PARTITION BY` need no
+/// entry: no alias can be followed by `u`, `APPLY` or `BY`.
+fn plsql_is_not_start_of_join(la1: i32) -> bool {
     !matches!(
         la1,
-        PlSqlParser_JOIN
-            | PlSqlParser_INNER
+        PlSqlParser_INNER
             | PlSqlParser_LEFT
             | PlSqlParser_RIGHT
             | PlSqlParser_FULL
             | PlSqlParser_CROSS
             | PlSqlParser_NATURAL
-            | PlSqlParser_OUTER
-    ) && !(la1 == PlSqlParser_PARTITION && la2 == PlSqlParser_BY)
+    )
 }
 "#;
             format!(

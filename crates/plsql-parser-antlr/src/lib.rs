@@ -85,6 +85,8 @@ pub mod tree_lower;
 #[cfg(feature = "antlr-codegen")]
 pub use backend::{ANTLR4RUST_DIAG_CODE, Antlr4RustBackend};
 
+#[cfg(all(test, feature = "antlr-codegen"))]
+mod join_alias_tests;
 /// Error recovery at statement boundaries (`;` and `/`).
 ///
 /// When the parser encounters unparseable text, recovery skips to the
