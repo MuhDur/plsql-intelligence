@@ -623,6 +623,135 @@ fn recursion_limit_diagnostic(
     )
 }
 
+/// Fold one name token the way declaration logical ids are folded:
+/// a quoted identifier keeps its case, anything else is upper-cased.
+fn folded_name_part(token: &plsql_parser::Token) -> Option<String> {
+    use plsql_parser::TokenKind;
+    match token.kind {
+        TokenKind::QuotedIdentifier => Some(token.text.trim_matches('"').to_string()),
+        TokenKind::Identifier | TokenKind::Keyword | TokenKind::BuiltIn => {
+            Some(token.text.to_ascii_uppercase())
+        }
+        _ => None,
+    }
+}
+
+/// One `CREATE [OR REPLACE] [NON]EDITIONABLE <kind> <name> WRAPPED` header.
+struct WrappedHeader {
+    package_body: bool,
+    name: String,
+}
+
+/// Wrapped-unit headers on a file's token tape. Comments are trivia and
+/// literals are single tokens, so neither can fake a header.
+fn wrapped_headers(tokens: &[plsql_parser::Token]) -> Vec<WrappedHeader> {
+    use plsql_parser::TokenKind;
+    let word = |i: usize| {
+        tokens
+            .get(i)
+            .filter(|t| matches!(t.kind, TokenKind::Keyword | TokenKind::Identifier))
+            .map(|t| t.text.to_ascii_uppercase())
+    };
+    let mut out = Vec::new();
+    for start in 0..tokens.len() {
+        if word(start).as_deref() != Some("CREATE") {
+            continue;
+        }
+        let mut i = start + 1;
+        if word(i).as_deref() == Some("OR") && word(i + 1).as_deref() == Some("REPLACE") {
+            i += 2;
+        }
+        if matches!(word(i).as_deref(), Some("EDITIONABLE" | "NONEDITIONABLE")) {
+            i += 1;
+        }
+        let mut package_body = false;
+        match word(i).as_deref() {
+            Some(kind @ ("PACKAGE" | "TYPE")) => {
+                i += 1;
+                if word(i).as_deref() == Some("BODY") {
+                    package_body = kind == "PACKAGE";
+                    i += 1;
+                }
+            }
+            Some("PROCEDURE" | "FUNCTION" | "LIBRARY") => i += 1,
+            _ => continue,
+        }
+        let mut parts = Vec::new();
+        while let Some(part) = tokens.get(i).and_then(folded_name_part) {
+            parts.push(part);
+            i += 1;
+            if tokens.get(i).is_some_and(|t| t.kind == TokenKind::Dot) {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        if !parts.is_empty() && word(i).as_deref() == Some("WRAPPED") {
+            out.push(WrappedHeader {
+                package_body,
+                name: parts.join("."),
+            });
+        }
+    }
+    out
+}
+
+/// One `object@dblink` reference on a file's token tape.
+struct DbLinkRef {
+    span: plsql_core::Span,
+    object: String,
+    db_link: String,
+}
+
+/// `[schema.]object@link[.domain]` references on a file's token tape: an
+/// `@` between two names. A SQL*Plus `@script` line follows no name inside
+/// a unit, so it never becomes an edge.
+fn db_link_refs(tokens: &[plsql_parser::Token]) -> Vec<DbLinkRef> {
+    use plsql_parser::TokenKind;
+    let mut out = Vec::new();
+    for at in 1..tokens.len().saturating_sub(1) {
+        let (before, sign, after) = (&tokens[at - 1], &tokens[at], &tokens[at + 1]);
+        if sign.text != "@" {
+            continue;
+        }
+        let Some(first_link) = folded_name_part(after) else {
+            continue;
+        };
+        let Some(last_object) = folded_name_part(before) else {
+            continue;
+        };
+        let mut object = vec![last_object];
+        let mut first = at - 1;
+        while first >= 2
+            && tokens[first - 1].kind == TokenKind::Dot
+            && let Some(part) = folded_name_part(&tokens[first - 2])
+        {
+            object.insert(0, part);
+            first -= 2;
+        }
+        let mut link = vec![first_link];
+        let mut last = at + 1;
+        while tokens
+            .get(last + 1)
+            .is_some_and(|t| t.kind == TokenKind::Dot)
+            && let Some(part) = tokens.get(last + 2).and_then(folded_name_part)
+        {
+            link.push(part);
+            last += 2;
+        }
+        out.push(DbLinkRef {
+            span: plsql_core::Span {
+                file_id: tokens[first].span.file_id,
+                start: tokens[first].span.start,
+                end: tokens[last].span.end,
+            },
+            object: object.join("."),
+            db_link: link.join("."),
+        });
+    }
+    out
+}
+
 /// Run the canonical analysis pipeline
 /// (`project → parse → catalog → IR → symbols → privileges →
 /// sqlsem → flow → facts → depgraph`) and emit a populated
@@ -720,7 +849,7 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
     // when identity/effect coverage changes even if the serialized shape is
     // unchanged: old trigger entries lost owners and declaration effects.
     const CACHE_STRATEGY: &str = "semantic_fragment";
-    const CACHE_LAYOUT: &str = "invocation_v3_catalog_defaults_owner_triggers";
+    const CACHE_LAYOUT: &str = "invocation_v4_completeness_metrics";
     let cache_ctx: Option<(plsql_store::Store, String, String)> = (|| {
         if !req.cache.enabled {
             return None;
@@ -809,6 +938,13 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
     let mut file_counter: u32 = 0;
     let mut files_parsed_cleanly = 0usize;
     let mut files_recovered = 0usize;
+    // CompletenessReport gap metrics, counted while the run walks the source.
+    let mut wrapped_units = 0usize;
+    let mut wrapped_package_bodies = std::collections::BTreeSet::new();
+    let mut dynamic_sql_sites = 0usize;
+    let mut opaque_dynamic_sql_sites = 0usize;
+    let mut dynamic_sql_truncated = false;
+    let mut call_sites_truncated = false;
 
     // Accumulate semantic artifacts across files.
     let mut fact_store = FactStore::default();
@@ -836,6 +972,13 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
         // Parse with the real ANTLR4 backend — this is the D2 real parse path.
         let parse_result = parse_with_backend(&source, file_id, &backend, &parse_opts);
         let ast = &parse_result.ast;
+        for header in wrapped_headers(&parse_result.cst.token_tape.tokens) {
+            wrapped_units += 1;
+            if header.package_body {
+                wrapped_package_bodies.insert(header.name);
+            }
+        }
+        let file_db_links = db_link_refs(&parse_result.cst.token_tape.tokens);
 
         let lowered = plsql_ir::lower_top_level(ast, &mut interner);
 
@@ -1077,7 +1220,60 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
                 ));
             }
 
+            // Each `object@link` reference becomes one DbLink edge from the
+            // innermost unit that contains it, to a remote-object node.
+            let mut linked = std::collections::BTreeSet::new();
+            for link in &file_db_links {
+                let inside = |span: &plsql_core::Span| {
+                    span.start.offset <= link.span.start.offset
+                        && link.span.end.offset <= span.end.offset
+                };
+                let Some((_, caller_node_id, _, _)) = work
+                    .iter()
+                    .filter(|(_, _, span, _)| inside(span))
+                    .min_by_key(|(_, _, span, _)| span.end.offset - span.start.offset)
+                else {
+                    continue;
+                };
+                let remote_id = format!("{}@{}", link.object, link.db_link);
+                if !linked.insert((*caller_node_id, remote_id.clone())) {
+                    continue;
+                }
+                let remote_node = if let Some(id) = nodes_by_logical_id.get(&remote_id) {
+                    *id
+                } else {
+                    let schema_name = unknown_schema(&mut interner);
+                    let symbol = interner
+                        .intern(remote_id.clone())
+                        .unwrap_or_else(|| plsql_core::SymbolId::new(0));
+                    let id = NodeId::new(next_node_id);
+                    next_node_id += 1;
+                    dep_graph.insert_node(Node::new(
+                        id,
+                        LogicalObjectId::new(remote_id.clone()),
+                        ObjectRevisionId::new("remote"),
+                        QualifiedName::new(Some(schema_name), plsql_core::ObjectName::from(symbol)),
+                        NodeIdentityKind::Unknown,
+                    ));
+                    nodes_by_logical_id.insert(remote_id, id);
+                    id
+                };
+                dep_graph.record_db_link_edge(
+                    EdgeId::new(next_edge_id),
+                    *caller_node_id,
+                    remote_node,
+                    &link.db_link,
+                    file_id,
+                    link.span,
+                );
+                next_edge_id += 1;
+            }
+
             for (caller_id_str, caller_node_id, caller_span, body_stmts) in work {
+                let census = effects::dynamic_sql_census(&body_stmts);
+                dynamic_sql_sites += census.sites;
+                opaque_dynamic_sql_sites += census.opaque;
+                dynamic_sql_truncated |= census.truncated;
                 let source_start = (caller_span.start.offset as usize).min(source.len());
                 let source_end = (caller_span.end.offset as usize).min(source.len());
                 let unit_source = source.get(source_start..source_end).unwrap_or("");
@@ -1246,6 +1442,7 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
                 }
                 let (call_sites, call_recursion) =
                     plsql_ir::extract_call_sites_bounded(&body_stmts);
+                call_sites_truncated |= call_recursion.limit_hit;
                 if call_recursion.limit_hit {
                     run.diagnostics.push(recursion_limit_diagnostic(
                         &caller_id_str,
@@ -1483,6 +1680,26 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
         .filter(|d| d.code == "IR_UNCLASSIFIED_DECL")
         .count();
     let diagnostics_total = run.diagnostics.len();
+    let edge_count = |kind: EdgeKind| {
+        run.dep_graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == kind)
+            .count()
+    };
+    // A spec that declares routines needs a body; a wrapped body is
+    // counted as wrapped, not missing.
+    let missing_package_bodies = run
+        .invocation_index
+        .packages
+        .iter()
+        .filter(|(name, shape)| {
+            shape.has_spec
+                && !shape.has_body
+                && !shape.spec_members.is_empty()
+                && !wrapped_package_bodies.contains(name.as_str())
+        })
+        .count();
 
     let mut completeness = CompletenessReport {
         files_total: run.parse_results.len(),
@@ -1492,16 +1709,27 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
         objects_total: declaration_count,
         objects_with_source: declaration_count,
         objects_catalog_only: 0,
-        // Pipeline stages that mint these are owned by their own
-        // (open) beads and not yet wired. They serialise as
-        // `{ "unmeasured": true }` — NEVER a misleading `0` that a
-        // reader could confuse with "looked, found none".
-        wrapped_units: plsql_core::Measured::Unmeasured,
-        missing_package_bodies: plsql_core::Measured::Unmeasured,
-        dynamic_sql_sites: plsql_core::Measured::Unmeasured,
-        opaque_dynamic_sql_sites: plsql_core::Measured::Unmeasured,
-        db_link_edges: plsql_core::Measured::Unmeasured,
-        unresolved_references: plsql_core::Measured::Unmeasured,
+        // Counted over the source this run lowered. A walk that hit the
+        // re-lowering depth cap saw only part of a unit, so its metric
+        // stays `{ "unmeasured": true }` rather than an undercount.
+        wrapped_units: plsql_core::Measured::Measured(wrapped_units),
+        missing_package_bodies: plsql_core::Measured::Measured(missing_package_bodies),
+        dynamic_sql_sites: if dynamic_sql_truncated {
+            plsql_core::Measured::Unmeasured
+        } else {
+            plsql_core::Measured::Measured(dynamic_sql_sites)
+        },
+        opaque_dynamic_sql_sites: if dynamic_sql_truncated {
+            plsql_core::Measured::Unmeasured
+        } else {
+            plsql_core::Measured::Measured(opaque_dynamic_sql_sites)
+        },
+        db_link_edges: plsql_core::Measured::Measured(edge_count(EdgeKind::DbLink)),
+        unresolved_references: if call_sites_truncated {
+            plsql_core::Measured::Unmeasured
+        } else {
+            plsql_core::Measured::Measured(edge_count(EdgeKind::UnresolvedCallee))
+        },
         diagnostics_total,
         objects_unrecognized,
         // Lowered declarations are the ones with real extracted
@@ -2522,8 +2750,7 @@ mod tests {
     /// The CompletenessReport must tell the TRUTH. A tree full of
     /// garbage the classifier cannot lower MUST NOT present as
     /// clean — and it must surface the unrecognized-object +
-    /// diagnostic counts; the not-yet-wired gap metrics must
-    /// serialise honestly as `unmeasured`, never 0.
+    /// diagnostic counts.
     #[test]
     fn bh4p_low_extraction_run_reports_honest_non_clean_completeness() {
         let base = std::env::temp_dir().join(format!(
@@ -2583,15 +2810,11 @@ mod tests {
             run.diagnostics.len(),
             "diagnostics_total must equal the real diagnostic count"
         );
-        // Not-yet-wired gap metrics must read honestly, never 0.
-        assert_eq!(c.dynamic_sql_sites, plsql_core::Measured::Unmeasured);
-        assert_eq!(c.unresolved_references, plsql_core::Measured::Unmeasured);
-        let v = serde_json::to_value(c).expect("serializes");
-        assert_eq!(
-            v["dynamic_sql_sites"],
-            serde_json::json!({"unmeasured": true})
-        );
-        assert_ne!(v["dynamic_sql_sites"], serde_json::json!(0));
+        // The gap metrics count the lowered source, and nothing here
+        // lowered: their zeros are bounded by the Degraded posture and
+        // the unrecognized-object count asserted above.
+        assert_eq!(c.dynamic_sql_sites, plsql_core::Measured::Measured(0));
+        assert_eq!(c.unresolved_references, plsql_core::Measured::Measured(0));
 
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -610,6 +610,171 @@ fn inspect_statements(
     }
 }
 
+/// Dynamic-SQL sites in one unit's statements, for the run's
+/// `CompletenessReport`. A site is an `EXECUTE IMMEDIATE`, an
+/// `OPEN cursor FOR <string>` or a `DBMS_SQL.PARSE` call; it is opaque when
+/// its SQL text is not a compile-time string literal.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DynamicSqlCensus {
+    pub(crate) sites: usize,
+    pub(crate) opaque: usize,
+    /// A nested body was abandoned at the re-lowering depth cap, so the
+    /// counts are a lower bound, not a measurement.
+    pub(crate) truncated: bool,
+}
+
+impl DynamicSqlCensus {
+    fn site(&mut self, literal: bool) {
+        self.sites += 1;
+        if !literal {
+            self.opaque += 1;
+        }
+    }
+}
+
+pub(crate) fn dynamic_sql_census(statements: &[Statement]) -> DynamicSqlCensus {
+    let mut census = DynamicSqlCensus::default();
+    census_statements(statements, 0, &mut census);
+    census
+}
+
+fn census_statements(statements: &[Statement], depth: usize, census: &mut DynamicSqlCensus) {
+    if depth >= plsql_ir::MAX_RELOWER_DEPTH {
+        census.truncated = true;
+        return;
+    }
+    let body = |text: &str, census: &mut DynamicSqlCensus| {
+        census_statements(&plsql_ir::lower_statement_body(text), depth + 1, census);
+    };
+    for stmt in statements {
+        match stmt {
+            Statement::Assignment { rhs_text: text, .. }
+            | Statement::Return {
+                value_text: Some(text),
+            }
+            | Statement::Exit {
+                when_text: Some(text),
+            } => census_expr(&lower_expression(text), census),
+            Statement::If {
+                arms,
+                else_body_text,
+            } => {
+                for arm in arms {
+                    census_expr(&lower_expression(&arm.cond_text), census);
+                    body(&arm.body_text, census);
+                }
+                if let Some(text) = else_body_text {
+                    body(text, census);
+                }
+            }
+            Statement::WhileLoop {
+                cond_text: text,
+                body_text,
+            }
+            | Statement::ForLoop {
+                range_text: text,
+                body_text,
+                ..
+            } => {
+                census_expr(&lower_expression(text), census);
+                body(body_text, census);
+            }
+            Statement::BareLoop { body_text } => body(body_text, census),
+            Statement::NestedBlock { body_text } => {
+                let inner = body_text.trim();
+                let inner = inner
+                    .strip_prefix("BEGIN")
+                    .or_else(|| inner.strip_prefix("begin"))
+                    .map(|inner| inner.trim_end_matches(';').trim_end())
+                    .and_then(|inner| {
+                        inner
+                            .strip_suffix("END")
+                            .or_else(|| inner.strip_suffix("end"))
+                    });
+                match inner {
+                    Some(inner) => body(inner, census),
+                    // `inspect_statements` reports this block as unknown;
+                    // the census cannot see into it either.
+                    None => census.truncated = true,
+                }
+            }
+            Statement::ExecuteImmediate { sql_literal, .. } => {
+                census.site(matches!(lower_expression(sql_literal), Expr::StringLit(_)))
+            }
+            Statement::Unrecognized { raw_text, .. } => census_unrecognized(raw_text, census),
+            Statement::Null
+            | Statement::Raise { .. }
+            | Statement::Return { value_text: None }
+            | Statement::Exit { when_text: None }
+            | Statement::Sql { .. }
+            | Statement::TransactionControl { .. } => {}
+        }
+    }
+}
+
+fn census_unrecognized(raw_text: &str, census: &mut DynamicSqlCensus) {
+    let text = raw_text.trim();
+    let upper = text.to_ascii_uppercase();
+    if upper.starts_with("EXECUTE IMMEDIATE") {
+        // The lowerer could not split out the SQL operand.
+        census.site(false);
+    } else if let Some(rest) = upper.strip_prefix("OPEN ")
+        && let Some(at) = rest.find(" FOR ")
+    {
+        let start = text.len() - rest.len() + at + " FOR ".len();
+        let query = text[start..].trim_start();
+        let query_upper = query.to_ascii_uppercase();
+        if !(query_upper.starts_with("SELECT")
+            || query_upper.starts_with("WITH")
+            || query_upper.starts_with('('))
+        {
+            let operand = match query_upper.find(" USING ") {
+                Some(using) => &query[..using],
+                None => query,
+            };
+            census.site(matches!(lower_expression(operand), Expr::StringLit(_)));
+        }
+    } else {
+        census_expr(&lower_expression(text), census);
+    }
+}
+
+fn census_expr(expr: &Expr, census: &mut DynamicSqlCensus) {
+    match expr {
+        Expr::Call { callee, args } => {
+            if callee.parts.len() == 2
+                && callee.parts[0] == "DBMS_SQL"
+                && callee.parts[1] == "PARSE"
+            {
+                // `DBMS_SQL.PARSE(c, statement, language_flag)`, positional
+                // or named.
+                let named = args.iter().find_map(|arg| match arg {
+                    Expr::Raw { text, .. } => text.split_once("=>").and_then(|(name, value)| {
+                        name.trim()
+                            .eq_ignore_ascii_case("STATEMENT")
+                            .then(|| lower_expression(value))
+                    }),
+                    _ => None,
+                });
+                let literal = match named {
+                    Some(statement) => matches!(statement, Expr::StringLit(_)),
+                    None => matches!(args.get(1), Some(Expr::StringLit(_))),
+                };
+                census.site(literal);
+            }
+            for arg in args {
+                census_expr(arg, census);
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            census_expr(lhs, census);
+            census_expr(rhs, census);
+        }
+        Expr::Unary { operand, .. } => census_expr(operand, census),
+        _ => {}
+    }
+}
+
 fn inspect_expression(
     text: &str,
     unit: &EffectUnit,
