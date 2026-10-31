@@ -2750,8 +2750,8 @@ mod tests {
     /// The CompletenessReport must tell the TRUTH. A tree full of
     /// garbage the classifier cannot lower MUST NOT present as
     /// clean — and it must surface the unrecognized-object +
-    /// diagnostic counts; the not-yet-wired gap metrics must
-    /// serialise honestly as `unmeasured`, never 0.
+    /// diagnostic counts; with no unit walked, the walk-based gap
+    /// metrics must serialise honestly as `unmeasured`, never 0.
     #[test]
     fn bh4p_low_extraction_run_reports_honest_non_clean_completeness() {
         let base = std::env::temp_dir().join(format!(
@@ -2811,15 +2811,25 @@ mod tests {
             run.diagnostics.len(),
             "diagnostics_total must equal the real diagnostic count"
         );
-        // Not-yet-wired gap metrics must read honestly, never 0.
+        // Nothing was walked, so these metrics have no coverage: never 0.
         assert_eq!(c.dynamic_sql_sites, plsql_core::Measured::Unmeasured);
+        assert_eq!(c.opaque_dynamic_sql_sites, plsql_core::Measured::Unmeasured);
+        assert_eq!(c.db_link_edges, plsql_core::Measured::Unmeasured);
         assert_eq!(c.unresolved_references, plsql_core::Measured::Unmeasured);
         let v = serde_json::to_value(c).expect("serializes");
-        assert_eq!(
-            v["dynamic_sql_sites"],
-            serde_json::json!({"unmeasured": true})
-        );
-        assert_ne!(v["dynamic_sql_sites"], serde_json::json!(0));
+        for metric in [
+            "dynamic_sql_sites",
+            "opaque_dynamic_sql_sites",
+            "db_link_edges",
+            "unresolved_references",
+        ] {
+            assert_eq!(
+                v[metric],
+                serde_json::json!({"unmeasured": true}),
+                "{metric}"
+            );
+            assert_ne!(v[metric], serde_json::json!(0), "{metric}");
+        }
 
         let _ = std::fs::remove_dir_all(&base);
     }
