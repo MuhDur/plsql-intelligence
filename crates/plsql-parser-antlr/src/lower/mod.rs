@@ -47,6 +47,7 @@ pub fn lower_source(source: &str, file_id: FileId) -> Ast {
     };
 
     Ast {
+        static_sql: plsql_parser::ast::StaticSqlProjection::Unknown,
         root,
         source_map: plsql_parser::ast::SourceMap::new(),
         body_statements: Vec::new(),

@@ -566,6 +566,32 @@ pub struct AstPackageUnits {
     pub unattributed: Vec<AstUnattributed>,
 }
 
+/// One maximal static SQL statement observed in the grammar tree. Nested SQL
+/// subqueries remain inside this exact source slice; dynamic SQL strings do not.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaticSqlStatement {
+    pub sql: String,
+    pub span: Span,
+}
+
+impl Spanned for StaticSqlStatement {
+    fn span(&self) -> Span {
+        self.span
+    }
+}
+
+/// An exhaustive grammar projection, independent of runtime-effect lowering.
+/// Old, partial or unsupported backends never imply a computed empty set.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum StaticSqlProjection {
+    #[default]
+    Unknown,
+    Computed {
+        statements: Vec<StaticSqlStatement>,
+    },
+}
+
 /// The typed abstract syntax tree.
 ///
 /// This is a **semantic** projection — it is NOT required to preserve
@@ -573,6 +599,9 @@ pub struct AstPackageUnits {
 /// from the AST produces *equivalent* but not *byte-identical* output.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Ast {
+    /// Every static SQL statement, including cursor queries and nested bodies.
+    #[serde(default)]
+    pub static_sql: StaticSqlProjection,
     /// The root source-file node.
     pub root: SourceFile,
     /// Source map for AST nodes (maps node IDs to spans).

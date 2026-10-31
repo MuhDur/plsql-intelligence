@@ -39,7 +39,7 @@ use plsql_core::{Diagnostic, FileId, Position, Severity, Span};
 use plsql_parser::ast::{
     Ast, AstDecl, AstInitSection, AstInitializer, AstOverload, AstPackageCursor, AstPackageMember,
     AstPackageUnits, AstParam, AstParamMode, AstRoutineKind, AstRoutineParameters, AstStatement,
-    AstUnattributed, SourceFile, SourceMap,
+    AstUnattributed, SourceFile, SourceMap, StaticSqlProjection, StaticSqlStatement,
 };
 
 use crate::backend::ANTLR4RUST_DIAG_CODE;
@@ -137,6 +137,7 @@ pub fn lower_parse_tree(source: &str, file_id: FileId, diagnostics: &mut Vec<Dia
                 format!("parse-tree lowering: sql_script() failed: {e:?}"),
             ));
             return Ast {
+                static_sql: StaticSqlProjection::Unknown,
                 root: SourceFile {
                     span: file_span,
                     declarations: vec![],
@@ -183,6 +184,7 @@ pub fn lower_parse_tree(source: &str, file_id: FileId, diagnostics: &mut Vec<Dia
     resolve_body_overloads(&mut decls);
 
     Ast {
+        static_sql: static_sql_projection(script_ctx, source, file_id, diagnostics),
         root: SourceFile {
             span: file_span,
             declarations: decls,
@@ -191,6 +193,66 @@ pub fn lower_parse_tree(source: &str, file_id: FileId, diagnostics: &mut Vec<Dia
         body_statements: body_stmts,
         routine_parameters,
     }
+}
+
+/// Use the existing grammar tree rather than reconstructing statement bodies.
+/// Stopping at a maximal SQL node includes all of its nested query trees once.
+fn static_sql_projection<'i>(
+    root: DynCtx<'i>,
+    source: &str,
+    file_id: FileId,
+    diagnostics: &[Diagnostic],
+) -> StaticSqlProjection {
+    if source.contains('\0') || !diagnostics.is_empty() {
+        return StaticSqlProjection::Unknown;
+    }
+    let mut stack = vec![(root, 0usize)];
+    let mut visited = 0usize;
+    let mut statements = Vec::new();
+    while let Some((node, depth)) = stack.pop() {
+        visited += 1;
+        if visited > 1_000_000 || depth > 512 {
+            return StaticSqlProjection::Unknown;
+        }
+        let Some(rule) = rule_name(node.get_rule_index()) else {
+            continue;
+        };
+        if matches!(rule, "selection_directive" | "call_spec") {
+            return StaticSqlProjection::Unknown;
+        }
+        if matches!(
+            rule,
+            "select_statement"
+                | "select_only_statement"
+                | "select_into_statement"
+                | "insert_statement"
+                | "update_statement"
+                | "delete_statement"
+                | "merge_statement"
+                | "lock_table_statement"
+        ) {
+            let span = node_span(&*node, file_id, source);
+            let Some(sql) = source.get(span.start.offset as usize..span.end.offset as usize) else {
+                return StaticSqlProjection::Unknown;
+            };
+            if sql.trim().is_empty() || statements.len() >= 256 {
+                return StaticSqlProjection::Unknown;
+            }
+            statements.push(StaticSqlStatement {
+                sql: sql.to_owned(),
+                span,
+            });
+            continue;
+        }
+        for index in (0..node.get_child_count()).rev() {
+            let Some(child) = node.get_child(index) else {
+                return StaticSqlProjection::Unknown;
+            };
+            stack.push((child, depth + 1));
+        }
+    }
+    statements.sort_by_key(|statement| statement.span.start.offset);
+    StaticSqlProjection::Computed { statements }
 }
 
 // ---------------------------------------------------------------------------

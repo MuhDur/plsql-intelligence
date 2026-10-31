@@ -23,6 +23,92 @@ fn fid() -> FileId {
     FileId::new(42)
 }
 
+#[test]
+fn static_sql_projection_covers_cursors_nested_bodies_and_handlers() {
+    use plsql_parser::ast::StaticSqlProjection;
+    let source = r#"CREATE OR REPLACE PACKAGE BODY CP_PARSE AS
+      CURSOR outer_c IS SELECT id FROM t_outer;
+      PROCEDURE p IS
+        n NUMBER;
+        CURSOR local_c IS SELECT id FROM t_local;
+      BEGIN
+        IF 1 = 1 THEN SELECT id INTO n FROM t_into; END IF;
+        FOR r IN (SELECT id FROM t_loop) LOOP
+          UPDATE t_update SET id = r.id;
+        END LOOP;
+        BEGIN
+          INSERT INTO t_insert SELECT id FROM t_read;
+        EXCEPTION WHEN OTHERS THEN
+          DELETE FROM t_delete;
+        END;
+        EXECUTE IMMEDIATE 'SELECT id FROM dynamic_only';
+      END;
+    END;"#;
+    let mut diagnostics = Vec::new();
+    let ast = lower_parse_tree(source, fid(), &mut diagnostics);
+    let StaticSqlProjection::Computed { statements } = ast.static_sql else {
+        panic!("complete grammar projection required: {diagnostics:?}");
+    };
+    assert_eq!(statements.len(), 7, "each maximal SQL node exactly once");
+    for (statement, expected) in statements.iter().zip([
+        "SELECT id FROM t_outer",
+        "SELECT id FROM t_local",
+        "SELECT id INTO n FROM t_into",
+        "SELECT id FROM t_loop",
+        "UPDATE t_update SET id = r.id",
+        "INSERT INTO t_insert SELECT id FROM t_read",
+        "DELETE FROM t_delete",
+    ]) {
+        assert_eq!(statement.sql, expected);
+        assert_eq!(
+            source.get(statement.span.start.offset as usize..statement.span.end.offset as usize),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn static_sql_projection_empty_dynamic_and_unknown_are_distinct() {
+    use plsql_parser::ast::StaticSqlProjection;
+    for source in [
+        "CREATE PROCEDURE cp_empty AS BEGIN NULL; END;",
+        "CREATE PROCEDURE cp_dynamic AS BEGIN EXECUTE IMMEDIATE 'SELECT * FROM secret'; END;",
+    ] {
+        let ast = lower_parse_tree(source, fid(), &mut Vec::new());
+        assert_eq!(
+            ast.static_sql,
+            StaticSqlProjection::Computed {
+                statements: Vec::new()
+            }
+        );
+    }
+    for source in [
+        "CREATE PROCEDURE cp_bad AS BEGIN SELECT FROM; END;",
+        "CREATE PROCEDURE cp_nul AS BEGIN NULL; END;\0SELECT * FROM hidden",
+        "CREATE PROCEDURE cp_cc AS BEGIN $IF $$flag $THEN SELECT id FROM hidden; $END END;",
+    ] {
+        let ast = lower_parse_tree(source, fid(), &mut Vec::new());
+        assert_eq!(ast.static_sql, StaticSqlProjection::Unknown);
+    }
+    assert_eq!(
+        plsql_parser::ast::Ast::default().static_sql,
+        StaticSqlProjection::Unknown
+    );
+}
+
+#[test]
+fn static_sql_projection_includes_merge_and_view_query() {
+    use plsql_parser::ast::StaticSqlProjection;
+    let source = "CREATE PROCEDURE cp_merge AS BEGIN MERGE INTO t USING s ON (t.id=s.id) WHEN MATCHED THEN UPDATE SET t.id=s.id; END;\nCREATE VIEW cp_view AS SELECT id FROM t;";
+    let ast = lower_parse_tree(source, fid(), &mut Vec::new());
+    let StaticSqlProjection::Computed { statements } = ast.static_sql else {
+        panic!("complete merge/view projection");
+    };
+    assert_eq!(statements.len(), 2);
+    assert!(statements[0].sql.starts_with("MERGE INTO"));
+    assert_eq!(statements[1].sql, "SELECT id FROM t");
+}
+
 // ---------------------------------------------------------------------------
 // Helper: lower a source fragment and return the first declaration.
 // ---------------------------------------------------------------------------

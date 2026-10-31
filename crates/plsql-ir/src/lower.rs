@@ -628,6 +628,7 @@ mod tests {
 
     fn ast_with(decls: Vec<AstDecl>) -> Ast {
         Ast {
+            static_sql: plsql_parser::ast::StaticSqlProjection::Unknown,
             root: SourceFile {
                 span: span(0, 0),
                 declarations: decls,
