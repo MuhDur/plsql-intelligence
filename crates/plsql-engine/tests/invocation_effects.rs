@@ -115,6 +115,44 @@ fn output_only_exact_sys_producers_are_session_effects() {
 }
 
 #[test]
+fn output_primitive_arguments_retain_calls_effects_and_unknowns() {
+    let run = analyze(
+        "CREATE FUNCTION APP.F RETURN VARCHAR2 IS PRAGMA AUTONOMOUS_TRANSACTION; BEGIN COMMIT; RETURN 'from callback'; END; /\nCREATE PROCEDURE APP.FX IS BEGIN SYS.DBMS_OUTPUT.PUT_LINE(APP.F()); END; /",
+    );
+    let actual = closure(&run, "APP.FX", 0);
+    assert_case(
+        "output_argument_callback",
+        &actual,
+        &[
+            RoutineEffect::SessionState,
+            RoutineEffect::Autonomous,
+            RoutineEffect::TxnControl,
+        ],
+        true,
+    );
+    assert!(
+        actual.units.contains("APP.F"),
+        "argument callback must remain in the pinned closure"
+    );
+    for argument in [
+        "APP.MISSING_FN()",
+        "DBMS_SQL.FETCH_ROWS(C)",
+        "SYS.DBMS_SQL.TO_REFCURSOR(C)",
+    ] {
+        let run = analyze(&format!(
+            "CREATE PROCEDURE APP.FX IS BEGIN SYS.DBMS_OUTPUT.PUT_LINE({argument}); END; /"
+        ));
+        let actual = closure(&run, "APP.FX", 0);
+        assert!(!actual.clean, "{argument}: {actual:?}");
+        assert!(
+            actual.effects.effects.contains(&RoutineEffect::Unknown),
+            "{argument}: {actual:?}"
+        );
+        assert!(!actual.unknown_reasons.is_empty(), "{argument}: {actual:?}");
+    }
+}
+
+#[test]
 fn output_shadowed_sys_qualifier_remains_unknown() {
     for declaration in ["SYS NUMBER;", "\"SYS\" APP.T;", "SYS APP.T;"] {
         let run = analyze(&format!(
