@@ -165,6 +165,68 @@ fn tree_lower_05_trigger_name() {
     assert!(span_non_empty(&d));
 }
 
+#[test]
+fn tree_lower_trigger_owner_and_quoted_components_are_exact() {
+    for (name, expected) in [
+        ("app.tr_auto", "APP.TR_AUTO"),
+        ("\"MiX\".\"Tr_Auto\"", "MiX.Tr_Auto"),
+    ] {
+        let decl = first_decl(&format!(
+            "CREATE TRIGGER {name} BEFORE INSERT ON APP.T BEGIN NULL; END;"
+        ));
+        assert!(matches!(decl, AstDecl::Trigger { .. }));
+        assert_eq!(decl_name(&decl), expected);
+    }
+}
+
+#[test]
+fn tree_lower_trigger_declarations_retain_pragma_and_initializer() {
+    use plsql_parser::ast::AstStatement;
+    let mut diagnostics = Vec::new();
+    let ast = lower_parse_tree(
+        "CREATE TRIGGER APP.TR_AUTO BEFORE INSERT ON APP.T FOR EACH ROW DECLARE PRAGMA AUTONOMOUS_TRANSACTION; v NUMBER := APP.FX(); BEGIN NULL; END;",
+        fid(),
+        &mut diagnostics,
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let body = &ast.body_statements[0];
+    assert_eq!(
+        body.len(),
+        3,
+        "every declaration effect must be attributed: {body:?}"
+    );
+    assert!(
+        matches!(&body[0],AstStatement::Sql{verb,raw_text,..} if verb=="PRAGMA" && raw_text.contains("AUTONOMOUS_TRANSACTION"))
+    );
+    assert!(
+        matches!(&body[1],AstStatement::Assignment{target,rhs_text,..} if target=="V" && rhs_text=="APP.FX()")
+    );
+    assert!(matches!(&body[2], AstStatement::Null { .. }));
+}
+
+#[test]
+fn tree_lower_trigger_compound_sections_cover_declarations_and_handlers() {
+    use plsql_parser::ast::AstStatement;
+    let mut diagnostics = Vec::new();
+    let ast = lower_parse_tree(
+        "CREATE TRIGGER APP.TR_COMPOUND FOR INSERT ON APP.T COMPOUND TRIGGER g NUMBER := 1;\nBEFORE STATEMENT IS v NUMBER := APP.FX(); BEGIN NULL; EXCEPTION WHEN OTHERS THEN INSERT INTO APP.AUDIT_T(ID) VALUES(1); END BEFORE STATEMENT;\nAFTER STATEMENT IS BEGIN UPDATE APP.AUDIT_T SET ID=2; END AFTER STATEMENT;\nEND;",
+        fid(),
+        &mut diagnostics,
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let body = &ast.body_statements[0];
+    assert_eq!(
+        body.len(),
+        5,
+        "shared declarations, section declarations, body, handler and later section: {body:?}"
+    );
+    assert!(matches!(&body[0],AstStatement::Assignment{target,..} if target=="G"));
+    assert!(matches!(&body[1],AstStatement::Assignment{target,..} if target=="V"));
+    assert!(matches!(&body[2], AstStatement::Null { .. }));
+    assert!(matches!(&body[3],AstStatement::Sql{verb,..} if verb=="INSERT"));
+    assert!(matches!(&body[4],AstStatement::Sql{verb,..} if verb=="UPDATE"));
+}
+
 // ---------------------------------------------------------------------------
 // Fixture 6: CREATE VIEW — name extraction
 // ---------------------------------------------------------------------------

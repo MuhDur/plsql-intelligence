@@ -115,6 +115,181 @@ fn standalone_owners_are_exact_and_local_calls_stay_in_the_owner() {
     assert!(!closure(&run, "APP.CALLER", 0).units.contains("OTHER.FX"));
 }
 
+#[test]
+fn trigger_owners_are_exact_and_autonomous_declarations_are_preserved() {
+    let run = analyze_files(&[
+        (
+            "app.sql",
+            "CREATE OR REPLACE TRIGGER APP.TR_AUTO BEFORE INSERT ON APP.T FOR EACH ROW DECLARE PRAGMA AUTONOMOUS_TRANSACTION; BEGIN NULL; END;",
+        ),
+        (
+            "other.sql",
+            "CREATE OR REPLACE TRIGGER OTHER.TR_AUTO BEFORE INSERT ON OTHER.T FOR EACH ROW BEGIN NULL; END;",
+        ),
+    ]);
+    assert_case(
+        "qualified_autonomous_trigger",
+        &closure(&run, "APP.TR_AUTO", 0),
+        &[RoutineEffect::Autonomous],
+        true,
+    );
+    assert_case(
+        "same_name_other_owner_is_pure",
+        &closure(&run, "OTHER.TR_AUTO", 0),
+        &[],
+        true,
+    );
+    assert!(
+        !closure(&run, "TR_AUTO", 0).clean,
+        "a bare name cannot alias an owner-qualified trigger"
+    );
+    assert!(!closure(&run, "THIRD.TR_AUTO", 0).clean);
+    assert_eq!(
+        closure(&run, "APP.TR_AUTO", 0).units,
+        BTreeSet::from(["APP.TR_AUTO".into()])
+    );
+}
+
+#[test]
+fn trigger_compound_covers_dml_in_the_second_timing_section() {
+    let run = analyze(
+        "CREATE OR REPLACE TRIGGER APP.TR_COMPOUND FOR INSERT OR UPDATE OR DELETE ON APP.T COMPOUND TRIGGER\nBEFORE STATEMENT IS BEGIN NULL; END BEFORE STATEMENT;\nAFTER EACH ROW IS BEGIN INSERT INTO APP.AUDIT_T (ID) VALUES (1); END AFTER EACH ROW;\nEND;\n",
+    );
+    assert_case(
+        "compound_second_section_dml",
+        &closure(&run, "APP.TR_COMPOUND", 0),
+        &[RoutineEffect::Dml],
+        true,
+    );
+}
+
+#[test]
+fn trigger_compound_pure_four_timing_sections_are_clean() {
+    let run = analyze(
+        "CREATE OR REPLACE TRIGGER APP.TR_PURE FOR INSERT ON APP.T COMPOUND TRIGGER\nBEFORE STATEMENT IS BEGIN NULL; END BEFORE STATEMENT;\nBEFORE EACH ROW IS BEGIN NULL; END BEFORE EACH ROW;\nAFTER EACH ROW IS BEGIN NULL; END AFTER EACH ROW;\nAFTER STATEMENT IS BEGIN NULL; END AFTER STATEMENT;\nEND TR_PURE;\n",
+    );
+    assert_case(
+        "compound_four_sections_pure",
+        &closure(&run, "APP.TR_PURE", 0),
+        &[],
+        true,
+    );
+}
+
+#[test]
+fn trigger_declaration_initializers_contribute_transitive_effects() {
+    let run = analyze_files(&[
+        (
+            "fn.sql",
+            "CREATE FUNCTION APP.EVIL_FN RETURN NUMBER IS PRAGMA AUTONOMOUS_TRANSACTION; BEGIN COMMIT; RETURN 1; END;",
+        ),
+        (
+            "tr.sql",
+            "CREATE TRIGGER APP.TR_INIT BEFORE INSERT ON APP.T FOR EACH ROW DECLARE v NUMBER := APP.EVIL_FN(); BEGIN NULL; END;",
+        ),
+    ]);
+    let actual = closure(&run, "APP.TR_INIT", 0);
+    assert_case(
+        "trigger_initializer",
+        &actual,
+        &[RoutineEffect::Autonomous, RoutineEffect::TxnControl],
+        true,
+    );
+    assert!(actual.units.contains("APP.EVIL_FN"));
+}
+
+#[test]
+fn trigger_compound_section_exception_handlers_are_classified() {
+    let run = analyze(
+        "CREATE TRIGGER APP.TR_HANDLER FOR INSERT ON APP.T COMPOUND TRIGGER\nBEFORE STATEMENT IS BEGIN NULL; END BEFORE STATEMENT;\nAFTER STATEMENT IS BEGIN NULL; EXCEPTION WHEN OTHERS THEN INSERT INTO APP.AUDIT_T(ID) VALUES(1); END AFTER STATEMENT;\nEND;\n",
+    );
+    assert_case(
+        "compound_section_exception",
+        &closure(&run, "APP.TR_HANDLER", 0),
+        &[RoutineEffect::Dml],
+        true,
+    );
+}
+
+#[test]
+fn trigger_compound_unresolved_call_in_later_section_is_unknown() {
+    let run = analyze(
+        "CREATE TRIGGER APP.TR_UNKNOWN FOR INSERT ON APP.T COMPOUND TRIGGER\nBEFORE STATEMENT IS BEGIN NULL; END BEFORE STATEMENT;\nAFTER STATEMENT IS BEGIN MISSING_PROC(); END AFTER STATEMENT;\nEND;\n",
+    );
+    let actual = closure(&run, "APP.TR_UNKNOWN", 0);
+    assert!(!actual.clean && actual.effects.effects.contains(&RoutineEffect::Unknown));
+    assert!(
+        actual
+            .unknown_reasons
+            .iter()
+            .any(|reason| reason.contains("MISSING_PROC")),
+        "later source must remain in the effect closure: {actual:?}"
+    );
+}
+
+#[test]
+fn trigger_quoted_owner_case_remains_distinct_and_separators_stay_unknown() {
+    let run = analyze_files(&[
+        (
+            "mixed.sql",
+            "CREATE TRIGGER \"MiX\".\"TrAuto\" BEFORE INSERT ON APP.T BEGIN NULL; END;",
+        ),
+        (
+            "upper.sql",
+            "CREATE TRIGGER \"MIX\".\"TrAuto\" BEFORE INSERT ON APP.T DECLARE PRAGMA AUTONOMOUS_TRANSACTION; BEGIN NULL; END;",
+        ),
+        (
+            "separator.sql",
+            "CREATE TRIGGER APP.\"TR.AUTO\" BEFORE INSERT ON APP.T BEGIN NULL; END;",
+        ),
+    ]);
+    assert_case(
+        "mixed_owner_trigger",
+        &closure(&run, "MiX.TrAuto", 0),
+        &[],
+        true,
+    );
+    assert_case(
+        "upper_owner_trigger",
+        &closure(&run, "MIX.TrAuto", 0),
+        &[RoutineEffect::Autonomous],
+        true,
+    );
+    let separator = closure(&run, "APP.TR.AUTO", 0);
+    assert!(
+        !separator.clean
+            && separator
+                .unknown_reasons
+                .iter()
+                .any(|reason| reason.contains("identifier separator"))
+    );
+}
+
+#[test]
+fn trigger_compound_shared_and_section_initializers_contribute_effects() {
+    for (shared, local) in [
+        ("v NUMBER := APP.EVIL_FN();", ""),
+        ("", "v NUMBER := APP.EVIL_FN();"),
+    ] {
+        let trigger = format!(
+            "CREATE TRIGGER APP.TR_INIT FOR INSERT ON APP.T COMPOUND TRIGGER {shared}\nBEFORE STATEMENT IS {local} BEGIN NULL; END BEFORE STATEMENT;\nAFTER EACH ROW IS BEGIN NULL; END AFTER EACH ROW;\nEND;"
+        );
+        let run = analyze_files(&[
+            (
+                "fn.sql",
+                "CREATE FUNCTION APP.EVIL_FN RETURN NUMBER IS PRAGMA AUTONOMOUS_TRANSACTION; BEGIN COMMIT; RETURN 1; END;",
+            ),
+            ("tr.sql", &trigger),
+        ]);
+        assert_case(
+            "compound_initializer",
+            &closure(&run, "APP.TR_INIT", 0),
+            &[RoutineEffect::Autonomous, RoutineEffect::TxnControl],
+            true,
+        );
+    }
+}
+
 fn assert_case(id: &str, actual: &InvocationClosureV1, expected: &[RoutineEffect], clean: bool) {
     let expected: BTreeSet<_> = expected.iter().copied().collect();
     println!(

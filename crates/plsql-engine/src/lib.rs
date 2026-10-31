@@ -716,11 +716,11 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
     // one wired up, a fragment cached under a permissive policy
     // must never be served to a request that asked for a stricter
     // one (which would under-redact).
-    // The invocation index is a newly materialized safety artifact. Old
-    // semantic fragments had no such index and must be recomputed rather
-    // than deserializing with an empty default that looks like an analysis.
+    // Invocation indexes are safety artifacts. Recompute earlier namespaces
+    // when identity/effect coverage changes even if the serialized shape is
+    // unchanged: old trigger entries lost owners and declaration effects.
     const CACHE_STRATEGY: &str = "semantic_fragment";
-    const CACHE_LAYOUT: &str = "invocation_v2_catalog_defaults_owner";
+    const CACHE_LAYOUT: &str = "invocation_v3_catalog_defaults_owner_triggers";
     let cache_ctx: Option<(plsql_store::Store, String, String)> = (|| {
         if !req.cache.enabled {
             return None;
@@ -1552,6 +1552,104 @@ mod tests {
         AnalysisRequest, CacheConfig, CatalogSnapshot, CatalogSourceConfig, EngineError,
         analyze_project,
     };
+
+    #[test]
+    fn legacy_cached_trigger_effects_are_recomputed() {
+        let root = std::env::temp_dir().join(format!(
+            "engine-trigger-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let project = root.join("project");
+        let cache = root.join("cache");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let source = "CREATE TRIGGER APP.TR_AUTO BEFORE INSERT ON APP.T DECLARE PRAGMA AUTONOMOUS_TRANSACTION; BEGIN NULL; END;";
+        std::fs::write(project.join("trigger.sql"), source).unwrap();
+        let request = AnalysisRequest {
+            project_root: project,
+            cache: CacheConfig {
+                directory: Some(cache.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut uncached = request.clone();
+        uncached.cache.enabled = false;
+        let mut legacy = analyze_project(uncached).unwrap();
+        // Persist the historical unsafe index in the old namespace: the
+        // owner and autonomous declaration were both absent. This uses the
+        // actual cache store/serialization path, not a mocked cache hit.
+        let mut unit = legacy.invocation_index.units.remove("APP.TR_AUTO").unwrap();
+        unit.id = "TR_AUTO".into();
+        unit.statements = vec![plsql_ir::Statement::Null];
+        legacy.invocation_index.units.insert(unit.id.clone(), unit);
+        let old = legacy.invocation_closure(&crate::InvocationShapeV1 {
+            routine_id: "TR_AUTO".into(),
+            ..Default::default()
+        });
+        assert!(old.clean && old.effects.effects.is_empty());
+        let mut content = b"trigger.sql\0".to_vec();
+        content.extend_from_slice(source.as_bytes());
+        content.push(0);
+        let content_hash = plsql_store::hash_hex(&content);
+        let profile_hash = plsql_store::hash_hex(
+            &serde_json::to_vec(&(
+                "invocation_v2_catalog_defaults_owner",
+                &request.analysis_profile,
+                &request.redaction_policy,
+                &legacy.catalog,
+            ))
+            .unwrap(),
+        );
+        let store =
+            plsql_store::Store::open(&cache.join("cache.db"), plsql_store::StoreConfig::default())
+                .unwrap();
+        let key = plsql_store::CacheKey {
+            strategy_name: "semantic_fragment",
+            content_hash: &content_hash,
+            profile_hash: &profile_hash,
+        };
+        store
+            .put_cached(
+                key,
+                "application/json",
+                &serde_json::to_vec(&legacy).unwrap(),
+            )
+            .unwrap();
+        assert!(
+            store.get_cached(key).unwrap().is_some(),
+            "legacy entry really exists"
+        );
+        let rebuilt = analyze_project(request.clone()).unwrap();
+        assert_eq!(
+            rebuilt.cache_outcome,
+            Some(false),
+            "old trigger safety artifacts must be recomputed"
+        );
+        let shape = crate::InvocationShapeV1 {
+            routine_id: "APP.TR_AUTO".into(),
+            ..Default::default()
+        };
+        let effects = rebuilt.invocation_closure(&shape);
+        assert!(
+            effects.clean
+                && effects
+                    .effects
+                    .effects
+                    .contains(&crate::RoutineEffect::Autonomous)
+        );
+        let fresh_hit = analyze_project(request).unwrap();
+        assert_eq!(
+            fresh_hit.cache_outcome,
+            Some(true),
+            "new cache namespace must still work"
+        );
+        assert_eq!(fresh_hit.invocation_closure(&shape), effects);
+    }
 
     #[test]
     fn supplied_catalog_is_loaded_and_cache_binds_its_content() {

@@ -46,18 +46,20 @@ use crate::backend::ANTLR4RUST_DIAG_CODE;
 use crate::generated::plsqllexer::PlSqlLexer;
 use crate::generated::plsqlparser::{
     Assignment_statementContextAttrs, BodyContextAttrs, Call_statementContextAttrs,
-    Create_function_bodyContextAttrs, Create_package_bodyContextAttrs, Create_packageContextAttrs,
-    Create_procedure_bodyContextAttrs, Create_triggerContextAttrs, Create_typeContextAttrs,
-    Create_viewContextAttrs, Cursor_declarationContextAttrs,
-    Data_manipulation_language_statementsContextAttrs, Declare_specContextAttrs,
-    Default_value_partContextAttrs, Exception_handlerContextAttrs, Execute_immediateContextAttrs,
-    Function_bodyContextAttrs, Function_nameContextAttrs, Function_specContextAttrs,
-    Package_obj_bodyContextAttrs, Package_obj_specContextAttrs, ParameterContextAttrs, PlSqlParser,
-    Procedure_bodyContextAttrs, Procedure_nameContextAttrs, Procedure_specContextAttrs,
-    Return_statementContextAttrs, Seq_of_declare_specsContextAttrs, Seq_of_statementsContextAttrs,
-    Sql_scriptContextAttrs, Sql_statementContextAttrs, StatementContextAttrs,
-    Trigger_blockContextAttrs, Trigger_bodyContextAttrs, Type_bodyContextAttrs,
-    Type_definitionContextAttrs, Unit_statementContextAttrs, Variable_declarationContextAttrs,
+    Compound_trigger_blockContextAttrs, Create_function_bodyContextAttrs,
+    Create_package_bodyContextAttrs, Create_packageContextAttrs, Create_procedure_bodyContextAttrs,
+    Create_triggerContextAttrs, Create_typeContextAttrs, Create_viewContextAttrs,
+    Cursor_declarationContextAttrs, Data_manipulation_language_statementsContextAttrs,
+    Declare_specContextAttrs, Default_value_partContextAttrs, Exception_handlerContextAttrs,
+    Execute_immediateContextAttrs, Function_bodyContextAttrs, Function_nameContextAttrs,
+    Function_specContextAttrs, Package_obj_bodyContextAttrs, Package_obj_specContextAttrs,
+    ParameterContextAttrs, PlSqlParser, Procedure_bodyContextAttrs, Procedure_nameContextAttrs,
+    Procedure_specContextAttrs, Return_statementContextAttrs, Seq_of_declare_specsContextAttrs,
+    Seq_of_statementsContextAttrs, Sql_scriptContextAttrs, Sql_statementContextAttrs,
+    StatementContextAttrs, Timing_point_sectionContextAttrs, Tps_blockContextAttrs,
+    Trigger_blockContextAttrs, Trigger_bodyContextAttrs, Trigger_nameContextAttrs,
+    Type_bodyContextAttrs, Type_definitionContextAttrs, Unit_statementContextAttrs,
+    Variable_declarationContextAttrs,
 };
 
 // ---------------------------------------------------------------------------
@@ -667,14 +669,99 @@ fn lower_create_trigger(
     fallback_span: Span,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> (AstDecl, Vec<AstStatement>) {
-    let name = last_component(node_name_exact(source, ctx.trigger_name()));
-    // Trigger body: trigger_body → trigger_block → body.
-    let stmts = ctx
-        .trigger_body()
-        .and_then(|tb| tb.trigger_block())
-        .and_then(|tbl| tbl.body())
-        .map(|b| lower_body_stmts(&b, source, file_id, diagnostics))
+    let name = ctx
+        .trigger_name()
+        .map(|name| {
+            let first = node_name_exact(source, name.identifier());
+            name.id_expression()
+                .map(|last| format!("{first}.{}", node_name_exact(source, Some(last))))
+                .unwrap_or(first)
+        })
         .unwrap_or_default();
+    let mut stmts = Vec::new();
+    let mut unattributed = Vec::new();
+    if let Some(trigger) = ctx.trigger_body() {
+        if let Some(block) = trigger.trigger_block() {
+            stmts.extend(lower_declare_items(
+                &block.declare_spec_all(),
+                source,
+                file_id,
+                diagnostics,
+                &mut unattributed,
+            ));
+            if let Some(body) = block.body() {
+                stmts.extend(lower_body_with_handlers(
+                    &body,
+                    source,
+                    file_id,
+                    diagnostics,
+                ));
+            } else {
+                stmts.push(AstStatement::Unknown {
+                    span: node_span(&*block, file_id, source),
+                });
+            }
+        } else if let Some(compound) = trigger.compound_trigger_block() {
+            // The shared declarations run before the timing sections. The
+            // effect closure conservatively includes every section and its
+            // handlers; stopping at the first BEGIN loses later DML.
+            stmts.extend(lower_declare_specs(
+                compound.seq_of_declare_specs(),
+                source,
+                file_id,
+                diagnostics,
+                &mut unattributed,
+            ));
+            let sections = compound.timing_point_section_all();
+            if sections.is_empty() {
+                stmts.push(AstStatement::Unknown {
+                    span: node_span(&*compound, file_id, source),
+                });
+            }
+            for section in sections {
+                if let Some(block) = section.tps_block() {
+                    stmts.extend(lower_declare_items(
+                        &block.declare_spec_all(),
+                        source,
+                        file_id,
+                        diagnostics,
+                        &mut unattributed,
+                    ));
+                    if let Some(body) = block.body() {
+                        stmts.extend(lower_body_with_handlers(
+                            &body,
+                            source,
+                            file_id,
+                            diagnostics,
+                        ));
+                    } else {
+                        stmts.push(AstStatement::Unknown {
+                            span: node_span(&*block, file_id, source),
+                        });
+                    }
+                } else {
+                    stmts.push(AstStatement::Unknown {
+                        span: node_span(&*section, file_id, source),
+                    });
+                }
+            }
+        } else {
+            // CALL triggers and future grammar arms need explicit coverage;
+            // an unhandled body is never evidence of an empty effect set.
+            stmts.push(AstStatement::Unknown {
+                span: node_span(&*trigger, file_id, source),
+            });
+        }
+    } else {
+        stmts.push(AstStatement::Unknown {
+            span: node_span(ctx, file_id, source),
+        });
+    }
+    if !unattributed.is_empty() {
+        stmts.push(AstStatement::Unknown {
+            span: node_span(ctx, file_id, source),
+        });
+    }
     (
         AstDecl::Trigger {
             name,
@@ -824,9 +911,24 @@ fn lower_declare_specs(
     diagnostics: &mut Vec<Diagnostic>,
     unattributed_out: &mut Vec<AstUnattributed>,
 ) -> Vec<AstStatement> {
+    let specs = specs
+        .map(|specs| specs.declare_spec_all())
+        .unwrap_or_default();
+    lower_declare_items(&specs, source, file_id, diagnostics, unattributed_out)
+}
+
+/// The grammar exposes declarations directly on simple trigger blocks and
+/// compound timing blocks, while routine/shared declarations have a wrapper.
+/// Both forms must use the same initializer, pragma and unknown handling.
+fn lower_declare_items(
+    specs: &[Rc<crate::generated::plsqlparser::Declare_specContextAll<'_>>],
+    source: &str,
+    file_id: FileId,
+    diagnostics: &mut Vec<Diagnostic>,
+    unattributed_out: &mut Vec<AstUnattributed>,
+) -> Vec<AstStatement> {
     let mut out = Vec::new();
-    let Some(specs) = specs else { return out };
-    for spec in &specs.declare_spec_all() {
+    for spec in specs {
         if let Some(var) = spec.variable_declaration() {
             if let Some(init) = var.default_value_part().and_then(|d| d.expression()) {
                 out.push(AstStatement::Assignment {
@@ -1462,16 +1564,6 @@ fn non_empty(preferred: Span, fallback: Span) -> Span {
         preferred
     } else {
         fallback
-    }
-}
-
-/// Take the last dot-separated component of a schema-qualified name.
-/// `"HR.EMPLOYEES"` → `"EMPLOYEES"`, `"P"` → `"P"`.
-fn last_component(name: String) -> String {
-    if let Some(last) = name.rsplit('.').next() {
-        last.trim().to_string()
-    } else {
-        name
     }
 }
 
