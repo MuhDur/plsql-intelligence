@@ -141,6 +141,10 @@ pub struct ParamShape {
     pub name: String,
     pub has_default: bool,
     pub type_text: Option<String>,
+    /// Source expression for a standalone default. Package defaults have their
+    /// own addressable units instead.
+    #[serde(default)]
+    pub default_text: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -281,6 +285,19 @@ impl InvocationIndexV1 {
                 }
             }
         }
+        let mut calls = Vec::new();
+        for (position, param) in unit.params.iter().enumerate() {
+            let supplied =
+                position < shape.positional_count || shape.named_arguments.contains(&param.name);
+            if !supplied && param.has_default && unit.kind.is_none() {
+                match &param.default_text {
+                    Some(text) => inspect_default_expression(text, unit, out, &mut calls),
+                    None => {
+                        out.unknown(format!("default source unavailable: {id}({})", param.name))
+                    }
+                }
+            }
+        }
         if matches!(unit.kind, Some(PackageUnitKind::Member { .. })) {
             for (position, param) in unit.params.iter().enumerate() {
                 let supplied = position < shape.positional_count
@@ -304,7 +321,6 @@ impl InvocationIndexV1 {
                 }
             }
         }
-        let mut calls = Vec::new();
         inspect_statements(&unit.statements, unit, self, 0, out, &mut calls);
         for call in calls {
             self.visit(&call, out, visiting);
@@ -314,10 +330,23 @@ impl InvocationIndexV1 {
     fn resolve(&self, shape: &InvocationShapeV1) -> Vec<String> {
         if self.units.contains_key(&shape.routine_id) {
             let unit = &self.units[&shape.routine_id];
-            if matches!(unit.kind, Some(PackageUnitKind::Member { .. })) {
+            if unit.kind.is_none() || matches!(unit.kind, Some(PackageUnitKind::Member { .. })) {
                 let supplied = shape.positional_count + shape.named_arguments.len();
                 let required = unit.params.iter().filter(|p| !p.has_default).count();
-                if supplied < required || supplied > unit.params.len() {
+                if supplied < required
+                    || supplied > unit.params.len()
+                    || !shape.named_arguments.iter().all(|name| {
+                        unit.params
+                            .iter()
+                            .enumerate()
+                            .any(|(pos, p)| p.name == *name && pos >= shape.positional_count)
+                    })
+                    || !unit.params.iter().enumerate().all(|(pos, p)| {
+                        p.has_default
+                            || pos < shape.positional_count
+                            || shape.named_arguments.contains(&p.name)
+                    })
+                {
                     return Vec::new();
                 }
             }
@@ -587,7 +616,38 @@ fn inspect_expression(
     out: &mut InvocationClosureV1,
     calls: &mut Vec<InvocationShapeV1>,
 ) {
+    if matches!(unit.kind, Some(PackageUnitKind::ParamDefault { .. })) {
+        inspect_default_expression(text, unit, out, calls);
+        return;
+    }
     inspect_expr(&lower_expression(text), unit, out, calls);
+}
+
+fn inspect_default_expression(
+    text: &str,
+    unit: &EffectUnit,
+    out: &mut InvocationClosureV1,
+    calls: &mut Vec<InvocationShapeV1>,
+) {
+    let expression = lower_expression(text);
+    let mut pending = vec![&expression];
+    while let Some(expr) = pending.pop() {
+        match expr {
+            // Oracle can invoke a zero-argument function without parentheses.
+            // A source-only name here cannot be assumed to be a value.
+            Expr::Name(name) if !name.parts.last().is_some_and(|part| part == "NEXTVAL") => {
+                out.unknown("unresolved value or zero-argument call in default")
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                pending.push(lhs);
+                pending.push(rhs);
+            }
+            Expr::Unary { operand, .. } => pending.push(operand),
+            Expr::Call { args, .. } => pending.extend(args),
+            _ => {}
+        }
+    }
+    inspect_expr(&expression, unit, out, calls);
 }
 
 fn inspect_expr(
@@ -669,7 +729,10 @@ fn inspect_expr(
                 let routine_id = if parts.len() == 1 {
                     match &unit.package {
                         Some(pkg) => format!("{pkg}.{name}"),
-                        None => name,
+                        None => match unit.id.rsplit_once('.') {
+                            Some((owner, _)) => format!("{owner}.{name}"),
+                            None => name,
+                        },
                     }
                 } else {
                     name

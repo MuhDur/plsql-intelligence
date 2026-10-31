@@ -634,6 +634,7 @@ mod tests {
             },
             source_map: plsql_parser::ast::SourceMap::new(),
             body_statements: Vec::new(),
+            routine_parameters: Vec::new(),
         }
     }
 

@@ -267,7 +267,7 @@ fn tree_lower_10_empty_source() {
 }
 
 // ---------------------------------------------------------------------------
-// Fixture 11: Schema-qualified procedure name — last component only
+// Fixture 11: Schema-qualified procedure name retains its owner
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -275,8 +275,7 @@ fn tree_lower_11_schema_qualified_proc() {
     let src = "CREATE OR REPLACE PROCEDURE hr.hire_employee IS BEGIN NULL; END hire_employee;\n/\n";
     let d = first_decl(src);
     assert!(matches!(d, AstDecl::Procedure { .. }), "got {d:?}");
-    // Name should be the last component without schema prefix.
-    assert_eq!(decl_name(&d), "HIRE_EMPLOYEE");
+    assert_eq!(decl_name(&d), "HR.HIRE_EMPLOYEE");
 }
 
 // ---------------------------------------------------------------------------

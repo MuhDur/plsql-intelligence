@@ -528,6 +528,8 @@ impl AnalysisArtifactManifest {
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum EngineError {
+    #[error("catalog source failed: {0}")]
+    CatalogSource(String),
     /// Project discovery failed (bad root, unreadable manifest).
     #[error("project discovery failed: {0}")]
     ProjectDiscovery(String),
@@ -662,6 +664,24 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
         redaction_policy: req.redaction_policy.clone(),
     };
 
+    // Catalog I/O belongs before cache lookup: an unreadable or changed snapshot
+    // must not borrow an older cached proof. The offline engine cannot open a
+    // live Oracle connection; callers must supply an exported snapshot.
+    run.catalog = match &req.catalog_source {
+        CatalogSourceConfig::Disabled => None,
+        CatalogSourceConfig::Snapshot(path) => Some(
+            plsql_catalog::load_snapshot_from_json(path)
+                .map_err(|error| EngineError::CatalogSource(error.to_string()))?,
+        ),
+        CatalogSourceConfig::LiveConnection => {
+            return Err(EngineError::CatalogSource(
+                "live connections belong to the caller; provide a catalog snapshot".into(),
+            ));
+        }
+    };
+    let catalog_available = run.catalog.is_some();
+    run.completeness.catalog_available = catalog_available;
+
     // An empty/default request (no project root) is a valid,
     // reproducible no-op run rather than an error — keeps callers
     // (and the default-construction tests) from needing a real
@@ -700,7 +720,7 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
     // semantic fragments had no such index and must be recomputed rather
     // than deserializing with an empty default that looks like an analysis.
     const CACHE_STRATEGY: &str = "semantic_fragment";
-    const CACHE_LAYOUT: &str = "invocation_v1";
+    const CACHE_LAYOUT: &str = "invocation_v2_catalog_defaults_owner";
     let cache_ctx: Option<(plsql_store::Store, String, String)> = (|| {
         if !req.cache.enabled {
             return None;
@@ -719,9 +739,13 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
         // same key component so a change to either invalidates the
         // cached fragment (a permissively-redacted artifact must never
         // satisfy a stricter-redaction request).
-        let profile_bytes =
-            serde_json::to_vec(&(CACHE_LAYOUT, &req.analysis_profile, &req.redaction_policy))
-                .ok()?;
+        let profile_bytes = serde_json::to_vec(&(
+            CACHE_LAYOUT,
+            &req.analysis_profile,
+            &req.redaction_policy,
+            &run.catalog,
+        ))
+        .ok()?;
         let profile_hash = plsql_store::hash_hex(&profile_bytes);
         let store =
             plsql_store::Store::open(&dir.join("cache.db"), plsql_store::StoreConfig::default())
@@ -737,6 +761,9 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
         };
         if let Ok(Some(blob)) = store.get_cached(key) {
             if let Ok(mut cached) = serde_json::from_slice::<AnalysisRun>(&blob.body) {
+                // Compact cache entries omit re-derivable catalog payloads.
+                cached.catalog = run.catalog;
+                cached.completeness.catalog_available = catalog_available;
                 cached.cache_outcome = Some(true);
                 return Ok(cached);
             }
@@ -1056,6 +1083,16 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
                 let unit_source = source.get(source_start..source_end).unwrap_or("");
                 let source_upper = unit_source.to_ascii_uppercase();
                 let mut source_reasons = std::collections::BTreeSet::new();
+                if parse_result.cst.token_tape.tokens.iter().any(|token| {
+                    token.span.start.offset >= caller_span.start.offset
+                        && token.span.end.offset <= caller_span.end.offset
+                        && token.kind == plsql_parser::TokenKind::QuotedIdentifier
+                        && token.text.contains(['.', '#', '(', ')', '@'])
+                }) {
+                    source_reasons.insert(
+                        "flat routine identity cannot represent an identifier separator".into(),
+                    );
+                }
                 for (marker, reason) in [
                     ("AUTHID CURRENT_USER", "AUTHID CURRENT_USER"),
                     ("LANGUAGE JAVA", "Java call spec"),
@@ -1094,6 +1131,7 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
                                         plsql_ir::TypeRef::Unresolved(text) => text.clone(),
                                         plsql_ir::TypeRef::Anchored(anchor) => anchor.raw.clone(),
                                     }),
+                                    default_text: None,
                                 })
                                 .collect()
                         })
@@ -1109,7 +1147,32 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
                         params,
                     )
                 } else {
-                    (None, None, Vec::new())
+                    let signature = ast
+                        .routine_parameters
+                        .iter()
+                        .find(|signature| signature.span == decl.common().span); // ubs:ignore — public AST source spans, not authentication secrets
+                    let routine = matches!(
+                        decl,
+                        plsql_ir::Declaration::Function(_) | plsql_ir::Declaration::Procedure(_)
+                    );
+                    if routine && signature.is_none() {
+                        source_reasons.insert("standalone signature unavailable".into());
+                    }
+                    let params = signature
+                        .map(|signature| {
+                            signature
+                                .params
+                                .iter()
+                                .map(|param| effects::ParamShape {
+                                    name: param.name.clone(),
+                                    has_default: param.default_text.is_some(),
+                                    type_text: Some(param.type_text.clone()),
+                                    default_text: param.default_text.clone(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (None, None, params)
                 };
                 run.invocation_index.insert_unit(effects::EffectUnit {
                     id: caller_id_str.clone(),
@@ -1395,13 +1458,6 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
     run.semantic_model = SemanticModel { declaration_count };
     // parser_backend already set unconditionally at top of analyze_project.
 
-    // --- Stage 3: catalog ---------------------------------------
-    // Live-connection / snapshot extraction is owned by the
-    // PLSQL-CAT beads. The spine records availability honestly;
-    // it does not synthesise a catalog.
-    run.catalog = None;
-    let catalog_available = false;
-
     // --- Stage 6-9: privileges / sqlsem / flow / facts ----------
     // Facts and call edges are now populated above from the real parse
     // tree. Deep SQL-semantic / flow analysis lives in its own beads.
@@ -1492,7 +1548,88 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
 
 #[cfg(test)]
 mod tests {
-    use crate::{AnalysisRequest, analyze_project};
+    use crate::{
+        AnalysisRequest, CacheConfig, CatalogSnapshot, CatalogSourceConfig, EngineError,
+        analyze_project,
+    };
+
+    #[test]
+    fn supplied_catalog_is_loaded_and_cache_binds_its_content() {
+        let root = std::env::temp_dir().join(format!(
+            "engine-catalog-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("fx.sql"),
+            "CREATE FUNCTION FX RETURN NUMBER IS BEGIN RETURN 1; END; /",
+        )
+        .unwrap();
+        let path = root.join("catalog.json");
+        std::fs::create_dir_all(root.join("cache")).unwrap();
+        let mut snapshot = CatalogSnapshot::default();
+        snapshot.source.description = Some("first observed catalog".into());
+        plsql_catalog::export_snapshot_to_json(&snapshot, &path).unwrap();
+        let request = AnalysisRequest {
+            project_root: project,
+            catalog_source: CatalogSourceConfig::Snapshot(path.clone()),
+            cache: CacheConfig {
+                directory: Some(root.join("cache")),
+                compact_persisted: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let first = analyze_project(request.clone()).unwrap();
+        assert_eq!(first.catalog.as_ref(), Some(&snapshot));
+        assert!(first.completeness.catalog_available);
+        assert_eq!(first.cache_outcome, Some(false));
+        let hit = analyze_project(request.clone()).unwrap();
+        assert_eq!(hit.cache_outcome, Some(true));
+        assert_eq!(
+            hit.catalog.as_ref(),
+            Some(&snapshot),
+            "compact cache must restore the current catalog"
+        );
+        snapshot.source.description = Some("changed observed catalog".into());
+        plsql_catalog::export_snapshot_to_json(&snapshot, &path).unwrap();
+        let changed = analyze_project(request.clone()).unwrap();
+        assert_eq!(changed.cache_outcome, Some(false));
+        assert_eq!(changed.catalog.as_ref(), Some(&snapshot));
+        let mut disabled = request.clone();
+        disabled.catalog_source = CatalogSourceConfig::Disabled;
+        let absent = analyze_project(disabled).unwrap();
+        assert!(absent.catalog.is_none());
+        assert!(!absent.completeness.catalog_available);
+        std::fs::write(&path, "invalid catalog").unwrap();
+        assert!(
+            matches!(analyze_project(request), Err(EngineError::CatalogSource(_))),
+            "an old cache must not conceal an unreadable catalog"
+        );
+    }
+
+    #[test]
+    fn unsupported_or_missing_catalog_fails_explicitly_even_without_a_project() {
+        for source in [
+            CatalogSourceConfig::LiveConnection,
+            CatalogSourceConfig::Snapshot(std::path::PathBuf::from(
+                "/nonexistent/engine-catalog.json",
+            )),
+        ] {
+            assert!(matches!(
+                analyze_project(AnalysisRequest {
+                    catalog_source: source,
+                    ..Default::default()
+                }),
+                Err(EngineError::CatalogSource(_))
+            ));
+        }
+    }
 
     #[test]
     fn analysis_request_default_is_constructible() {

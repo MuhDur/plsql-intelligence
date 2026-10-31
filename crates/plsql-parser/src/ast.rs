@@ -585,6 +585,23 @@ pub struct Ast {
     /// without body lowering remain valid (backward-compatible; R13).
     #[serde(default)]
     pub body_statements: Vec<Vec<AstStatement>>,
+    /// Formal parameters observed by the parser for standalone routines.
+    /// Matched by declaration span, rather than by a filtered declaration index.
+    /// No entry means the signature was not observed, not an empty signature.
+    #[serde(default)]
+    pub routine_parameters: Vec<AstRoutineParameters>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AstRoutineParameters {
+    pub span: Span,
+    pub params: Vec<AstParam>,
+}
+
+impl Spanned for AstRoutineParameters {
+    fn span(&self) -> Span {
+        self.span
+    }
 }
 
 impl Ast {

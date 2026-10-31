@@ -50,6 +50,7 @@ pub fn lower_source(source: &str, file_id: FileId) -> Ast {
         root,
         source_map: plsql_parser::ast::SourceMap::new(),
         body_statements: Vec::new(),
+        routine_parameters: Vec::new(),
     }
 }
 

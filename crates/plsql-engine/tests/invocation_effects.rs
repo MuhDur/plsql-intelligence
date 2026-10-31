@@ -40,6 +40,81 @@ fn closure(run: &AnalysisRun, id: &str, positional_count: usize) -> InvocationCl
     })
 }
 
+#[test]
+fn standalone_default_calls_contribute_only_when_omitted() {
+    for default in ["DEFAULT evil_fn()", ":= evil_fn()"] {
+        let run = analyze(&format!(
+            "CREATE FUNCTION evil_fn RETURN NUMBER IS PRAGMA AUTONOMOUS_TRANSACTION; BEGIN COMMIT; RETURN 1; END;\n/\n\
+             CREATE FUNCTION fx(p NUMBER {default}) RETURN NUMBER IS BEGIN RETURN p; END;\n/\n"
+        ));
+        let omitted = closure(&run, "FX", 0);
+        assert_case(
+            "standalone_default_omitted",
+            &omitted,
+            &[RoutineEffect::Autonomous, RoutineEffect::TxnControl],
+            true,
+        );
+        assert!(omitted.units.contains("EVIL_FN"));
+        let supplied = closure(&run, "FX", 1);
+        assert_case("standalone_default_supplied", &supplied, &[], true);
+        assert!(!supplied.units.contains("EVIL_FN"));
+        let named = run.invocation_closure(&InvocationShapeV1 {
+            routine_id: "FX".into(),
+            named_arguments: BTreeSet::from(["P".into()]),
+            ..Default::default()
+        });
+        assert_case("standalone_default_named", &named, &[], true);
+    }
+}
+
+#[test]
+fn standalone_unknown_default_and_invalid_arguments_are_unknown() {
+    let run = analyze(
+        "CREATE FUNCTION fx(p NUMBER DEFAULT missing_fn()) RETURN NUMBER IS BEGIN RETURN p; END; /",
+    );
+    assert!(!closure(&run, "FX", 0).clean);
+    assert!(closure(&run, "FX", 1).clean);
+    assert!(!closure(&run, "FX", 2).clean);
+    let wrong_named = run.invocation_closure(&InvocationShapeV1 {
+        routine_id: "FX".into(),
+        named_arguments: BTreeSet::from(["OTHER".into()]),
+        ..Default::default()
+    });
+    assert!(!wrong_named.clean);
+    let proc = analyze("CREATE PROCEDURE fx(p NUMBER DEFAULT missing_fn()) IS BEGIN NULL; END; /");
+    assert!(!closure(&proc, "FX", 0).clean);
+    assert!(closure(&proc, "FX", 1).clean);
+    let bare = analyze(
+        "CREATE FUNCTION evil_fn RETURN NUMBER IS PRAGMA AUTONOMOUS_TRANSACTION; BEGIN COMMIT; RETURN 1; END; /\nCREATE FUNCTION fx(p NUMBER DEFAULT evil_fn) RETURN NUMBER IS BEGIN RETURN p; END; /",
+    );
+    assert!(
+        !closure(&bare, "FX", 0).clean,
+        "a bare default name may be a zero-argument call"
+    );
+    assert!(closure(&bare, "FX", 1).clean);
+}
+
+#[test]
+fn standalone_owners_are_exact_and_local_calls_stay_in_the_owner() {
+    let run = analyze(
+        "CREATE FUNCTION APP.FX RETURN NUMBER IS BEGIN RETURN 1; END; /\n\
+        CREATE FUNCTION OTHER.FX RETURN NUMBER IS PRAGMA AUTONOMOUS_TRANSACTION; BEGIN COMMIT; RETURN 1; END; /\n\
+        CREATE FUNCTION APP.CALLER RETURN NUMBER IS BEGIN RETURN fx(); END; /",
+    );
+    assert_case("app_fx", &closure(&run, "APP.FX", 0), &[], true);
+    assert_case(
+        "other_fx",
+        &closure(&run, "OTHER.FX", 0),
+        &[RoutineEffect::Autonomous, RoutineEffect::TxnControl],
+        true,
+    );
+    assert_case("app_local_call", &closure(&run, "APP.CALLER", 0), &[], true);
+    assert!(!closure(&run, "FX", 0).clean);
+    assert!(!closure(&run, "THIRD.FX", 0).clean);
+    assert!(closure(&run, "APP.CALLER", 0).units.contains("APP.FX"));
+    assert!(!closure(&run, "APP.CALLER", 0).units.contains("OTHER.FX"));
+}
+
 fn assert_case(id: &str, actual: &InvocationClosureV1, expected: &[RoutineEffect], clean: bool) {
     let expected: BTreeSet<_> = expected.iter().copied().collect();
     println!(

@@ -38,8 +38,8 @@ use std::rc::Rc;
 use plsql_core::{Diagnostic, FileId, Position, Severity, Span};
 use plsql_parser::ast::{
     Ast, AstDecl, AstInitSection, AstInitializer, AstOverload, AstPackageCursor, AstPackageMember,
-    AstPackageUnits, AstParam, AstParamMode, AstRoutineKind, AstStatement, AstUnattributed,
-    SourceFile, SourceMap,
+    AstPackageUnits, AstParam, AstParamMode, AstRoutineKind, AstRoutineParameters, AstStatement,
+    AstUnattributed, SourceFile, SourceMap,
 };
 
 use crate::backend::ANTLR4RUST_DIAG_CODE;
@@ -51,13 +51,13 @@ use crate::generated::plsqlparser::{
     Create_viewContextAttrs, Cursor_declarationContextAttrs,
     Data_manipulation_language_statementsContextAttrs, Declare_specContextAttrs,
     Default_value_partContextAttrs, Exception_handlerContextAttrs, Execute_immediateContextAttrs,
-    Function_bodyContextAttrs, Function_specContextAttrs, Package_obj_bodyContextAttrs,
-    Package_obj_specContextAttrs, ParameterContextAttrs, PlSqlParser, Procedure_bodyContextAttrs,
-    Procedure_specContextAttrs, Return_statementContextAttrs, Seq_of_declare_specsContextAttrs,
-    Seq_of_statementsContextAttrs, Sql_scriptContextAttrs, Sql_statementContextAttrs,
-    StatementContextAttrs, Trigger_blockContextAttrs, Trigger_bodyContextAttrs,
-    Type_bodyContextAttrs, Type_definitionContextAttrs, Unit_statementContextAttrs,
-    Variable_declarationContextAttrs,
+    Function_bodyContextAttrs, Function_nameContextAttrs, Function_specContextAttrs,
+    Package_obj_bodyContextAttrs, Package_obj_specContextAttrs, ParameterContextAttrs, PlSqlParser,
+    Procedure_bodyContextAttrs, Procedure_nameContextAttrs, Procedure_specContextAttrs,
+    Return_statementContextAttrs, Seq_of_declare_specsContextAttrs, Seq_of_statementsContextAttrs,
+    Sql_scriptContextAttrs, Sql_statementContextAttrs, StatementContextAttrs,
+    Trigger_blockContextAttrs, Trigger_bodyContextAttrs, Type_bodyContextAttrs,
+    Type_definitionContextAttrs, Unit_statementContextAttrs, Variable_declarationContextAttrs,
 };
 
 // ---------------------------------------------------------------------------
@@ -141,12 +141,14 @@ pub fn lower_parse_tree(source: &str, file_id: FileId, diagnostics: &mut Vec<Dia
                 },
                 source_map: SourceMap::new(),
                 body_statements: vec![],
+                routine_parameters: vec![],
             };
         }
     };
 
     let mut decls: Vec<AstDecl> = Vec::new();
     let mut body_stmts: Vec<Vec<AstStatement>> = Vec::new();
+    let mut routine_parameters = Vec::new();
 
     // Each unit_statement child of sql_script becomes one AstDecl —
     // unless it is parser-recovery debris (trailing SQL*Plus client
@@ -160,6 +162,17 @@ pub fn lower_parse_tree(source: &str, file_id: FileId, diagnostics: &mut Vec<Dia
     // still surfaced honestly as `AstDecl::Unknown`.
     for unit in &script_ctx.unit_statement_all() {
         if let Some((d, stmts)) = lower_unit_statement(unit, source, file_id, diagnostics) {
+            use plsql_parser::ast::Spanned;
+            let params = unit
+                .create_function_body()
+                .map(|ctx| ctx.parameter_all())
+                .or_else(|| unit.create_procedure_body().map(|ctx| ctx.parameter_all()));
+            if let Some(params) = params {
+                routine_parameters.push(AstRoutineParameters {
+                    span: d.span(),
+                    params: lower_params(&params, source, file_id),
+                });
+            }
             decls.push(d);
             body_stmts.push(stmts);
         }
@@ -174,6 +187,7 @@ pub fn lower_parse_tree(source: &str, file_id: FileId, diagnostics: &mut Vec<Dia
         },
         source_map: SourceMap::new(),
         body_statements: body_stmts,
+        routine_parameters,
     }
 }
 
@@ -571,8 +585,15 @@ fn lower_create_procedure_body(
     fallback_span: Span,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> (AstDecl, Vec<AstStatement>) {
-    // The procedure name may be schema-qualified; take the last component.
-    let name = last_component(node_name_exact(source, ctx.procedure_name()));
+    let name = ctx
+        .procedure_name()
+        .map(|name| {
+            let first = node_name_exact(source, name.identifier());
+            name.id_expression()
+                .map(|last| format!("{first}.{}", node_name_exact(source, Some(last))))
+                .unwrap_or(first)
+        })
+        .unwrap_or_default();
     let mut unattributed = Vec::new();
     let mut stmts = lower_declare_specs(
         ctx.seq_of_declare_specs(),
@@ -605,7 +626,15 @@ fn lower_create_function_body(
     fallback_span: Span,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> (AstDecl, Vec<AstStatement>) {
-    let name = last_component(node_name_exact(source, ctx.function_name()));
+    let name = ctx
+        .function_name()
+        .map(|name| {
+            let first = node_name_exact(source, name.identifier());
+            name.id_expression()
+                .map(|last| format!("{first}.{}", node_name_exact(source, Some(last))))
+                .unwrap_or(first)
+        })
+        .unwrap_or_default();
     let mut unattributed = Vec::new();
     let mut stmts = lower_declare_specs(
         ctx.seq_of_declare_specs(),
@@ -1004,7 +1033,7 @@ fn resolve_body_overloads(decls: &mut [AstDecl]) {
             let key = signature_key(m);
             let conforming: Vec<&&AstPackageMember> = same_name
                 .iter()
-                .filter(|s| signature_key(s) == key)
+                .filter(|s| signature_key(s) == key) // ubs:ignore — public PL/SQL parameter type signatures, not authentication secrets
                 .collect();
             m.overload = match conforming.as_slice() {
                 [only] => only.overload,
