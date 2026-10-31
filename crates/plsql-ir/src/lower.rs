@@ -525,7 +525,7 @@ mod tests {
         for raw in [
             "EXPLAIN PLAN FOR SELECT col FROM t",
             "LOCK TABLE t IN EXCLUSIVE MODE",
-            "OPEN c FOR SELECT col FROM t",
+            "OPEN c FOR sql_text",
             "FETCH c INTO v",
             "CLOSE c",
         ] {
@@ -548,6 +548,13 @@ mod tests {
                 extract_table_accesses(&ir)
             );
         }
+        let opened = lower_ast_statements(&[sql_sentinel("OPEN c FOR SELECT col FROM t")]);
+        assert!(matches!(opened.as_slice(), [Statement::OpenCursor { .. }]));
+        assert_eq!(
+            extract_table_accesses(&opened).len(),
+            1,
+            "static OPEN keeps its real read"
+        );
         for raw in ["COMMIT", "ROLLBACK TO sp"] {
             let ir = lower_ast_statements(&[sql_sentinel(raw)]);
             assert!(

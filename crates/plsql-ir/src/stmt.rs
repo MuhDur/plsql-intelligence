@@ -84,6 +84,9 @@ pub enum Statement {
     /// captured plus the raw text so downstream lineage can walk
     /// the tables it touches.
     Sql { verb: SqlVerb, raw_text: String },
+    /// Static `OPEN cursor FOR SELECT ...`. Dynamic expressions and qualified
+    /// cursor targets remain unrecognized; consumers must retain uncertainty.
+    OpenCursor { target: String, query_text: String },
     /// Anonymous nested block — `[DECLARE …] BEGIN … END;` inside
     /// the surrounding body.
     NestedBlock { body_text: String },
@@ -644,6 +647,30 @@ fn classify(text: &str) -> Statement {
             .map(|s| s.trim().to_string());
         return Statement::Exit { when_text };
     }
+    if starts_with_keyword(trimmed, "OPEN") {
+        let rest = text[4..].trim();
+        if let Some(end) = rest.find(char::is_whitespace) {
+            let target = &rest[..end];
+            let rest = rest[end..].trim_start();
+            if target
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphabetic)
+                && target
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_$#".contains(&b))
+                && starts_with_keyword(rest, "FOR")
+            {
+                let query = rest[3..].trim_start();
+                if starts_with_keyword(query, "SELECT") {
+                    return Statement::OpenCursor {
+                        target: target.into(),
+                        query_text: query.into(),
+                    };
+                }
+            }
+        }
+    }
     for verb in ["SELECT", "INSERT", "UPDATE", "DELETE", "MERGE"] {
         if starts_with_keyword(trimmed, verb) {
             let kind = match verb {
@@ -858,6 +885,27 @@ fn is_word_boundary(text: &str, start: usize, end: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_static_select_is_typed_and_dynamic_stays_unknown() {
+        assert!(
+            matches!(&lower_statement_body("OPEN c FOR SELECT id FROM app.t;")[0],
+            Statement::OpenCursor { target, query_text } if target == "c" && query_text.starts_with("SELECT"))
+        );
+        for source in [
+            "OPEN c FOR sql_text;",
+            "OPEN c FOR 'SELECT 1 FROM dual';",
+            "OPEN pkg.c FOR SELECT 1 FROM dual;",
+        ] {
+            assert!(
+                matches!(
+                    &lower_statement_body(source)[0],
+                    Statement::Unrecognized { .. }
+                ),
+                "{source}"
+            );
+        }
+    }
 
     #[test]
     fn null_statement_classified() {

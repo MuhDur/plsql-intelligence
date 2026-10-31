@@ -107,6 +107,9 @@ fn walk_table_accesses(
             Statement::Sql { verb, raw_text } => {
                 accesses_from_sql(*verb, raw_text, out);
             }
+            Statement::OpenCursor { query_text, .. } => {
+                accesses_from_sql(SqlVerb::Select, query_text, out);
+            }
             Statement::If {
                 arms,
                 else_body_text,

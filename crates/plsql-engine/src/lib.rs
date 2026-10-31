@@ -849,7 +849,7 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
     // when identity/effect coverage changes even if the serialized shape is
     // unchanged: old trigger entries lost owners and declaration effects.
     const CACHE_STRATEGY: &str = "semantic_fragment";
-    const CACHE_LAYOUT: &str = "invocation_v4_completeness_metrics";
+    const CACHE_LAYOUT: &str = "invocation_v5_static_cursor_output_effects";
     let cache_ctx: Option<(plsql_store::Store, String, String)> = (|| {
         if !req.cache.enabled {
             return None;
@@ -1283,6 +1283,20 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
                 let unit_source = source.get(source_start..source_end).unwrap_or("");
                 let source_upper = unit_source.to_ascii_uppercase();
                 let mut source_reasons = std::collections::BTreeSet::new();
+                // Source-only invocation proof cannot assume that SYS is the
+                // schema when a parameter/local/package declaration can capture
+                // that qualifier. The public token tape includes declarations
+                // (including those without initializers), unlike body IR.
+                // Conservatively keep the file unknown if SYS occurs as a bare
+                // identifier rather than a schema qualifier. Strings/comments
+                // cannot create this evidence.
+                if parse_result.cst.token_tape.tokens.windows(2).any(|pair| {
+                    !matches!(pair[0].kind, plsql_parser::TokenKind::StringLiteral)
+                        && pair[0].text.trim_matches('"').eq_ignore_ascii_case("SYS")
+                        && pair[1].kind != plsql_parser::TokenKind::Dot
+                }) {
+                    source_reasons.insert("SYS qualifier may be lexically shadowed".into());
+                }
                 if parse_result.cst.token_tape.tokens.iter().any(|token| {
                     token.span.start.offset >= caller_span.start.offset
                         && token.span.end.offset <= caller_span.end.offset

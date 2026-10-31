@@ -41,6 +41,109 @@ fn closure(run: &AnalysisRun, id: &str, positional_count: usize) -> InvocationCl
 }
 
 #[test]
+fn output_static_cursor_select_keeps_reads_locks_and_callbacks() {
+    let run = analyze(
+        "CREATE FUNCTION APP.FX RETURN SYS_REFCURSOR IS C SYS_REFCURSOR; BEGIN OPEN C FOR SELECT ID FROM APP.T; RETURN C; END; /",
+    );
+    assert_case(
+        "static_cursor",
+        &closure(&run, "APP.FX", 0),
+        &[RoutineEffect::ReadDb],
+        true,
+    );
+    let accesses = run
+        .dep_graph
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == plsql_depgraph::EdgeKind::Reads)
+        .count();
+    assert!(accesses > 0, "OPEN SELECT must retain dependency reads");
+    let locked = analyze(
+        "CREATE FUNCTION APP.FX RETURN SYS_REFCURSOR IS C SYS_REFCURSOR; BEGIN OPEN C FOR SELECT ID FROM APP.T FOR UPDATE; RETURN C; END; /",
+    );
+    assert!(
+        closure(&locked, "APP.FX", 0)
+            .effects
+            .effects
+            .contains(&RoutineEffect::RowLock)
+    );
+    let callback = analyze(
+        "CREATE FUNCTION APP.FX RETURN SYS_REFCURSOR IS C SYS_REFCURSOR; BEGIN OPEN C FOR SELECT APP.MISSING_FN() FROM APP.T; RETURN C; END; /",
+    );
+    assert!(!closure(&callback, "APP.FX", 0).clean);
+}
+
+#[test]
+fn output_dynamic_open_remains_unknown() {
+    for query in ["'SELECT 1 FROM SYS.DUAL'", "Q", "'SELECT ' || Q"] {
+        let run = analyze(&format!(
+            "CREATE FUNCTION APP.FX(Q VARCHAR2) RETURN SYS_REFCURSOR IS C SYS_REFCURSOR; BEGIN OPEN C FOR {query}; RETURN C; END; /"
+        ));
+        let actual = closure(&run, "APP.FX", 1);
+        assert!(!actual.clean, "{query}: {actual:?}");
+        assert!(actual.effects.effects.contains(&RoutineEffect::Unknown));
+    }
+}
+
+#[test]
+fn output_only_exact_sys_producers_are_session_effects() {
+    for call in [
+        "SYS.DBMS_OUTPUT.PUT_LINE('x')",
+        "SYS.DBMS_OUTPUT.PUT('x')",
+        "SYS.DBMS_OUTPUT.NEW_LINE()",
+    ] {
+        let run = analyze(&format!("CREATE PROCEDURE APP.FX IS BEGIN {call}; END; /"));
+        assert_case(
+            call,
+            &closure(&run, "APP.FX", 0),
+            &[RoutineEffect::SessionState],
+            true,
+        );
+    }
+    for call in [
+        "DBMS_OUTPUT.PUT_LINE('x')",
+        "SYS.DBMS_OUTPUT.ENABLE(NULL)",
+        "SYS.DBMS_OUTPUT.DISABLE()",
+        "SYS.DBMS_OUTPUT.GET_LINE(X,N)",
+        "SYS.DBMS_OUTPUT.PUT_LINE('x','y')",
+        "SYS.DBMS_SQL.RETURN_RESULT(C)",
+        "SYS.DBMS_SESSION.SET_IDENTIFIER('x')",
+    ] {
+        let run = analyze(&format!("CREATE PROCEDURE APP.FX IS BEGIN {call}; END; /"));
+        assert!(!closure(&run, "APP.FX", 0).clean, "{call}");
+    }
+}
+
+#[test]
+fn output_shadowed_sys_qualifier_remains_unknown() {
+    for declaration in ["SYS NUMBER;", "\"SYS\" APP.T;", "SYS APP.T;"] {
+        let run = analyze(&format!(
+            "CREATE PROCEDURE APP.FX IS {declaration} BEGIN SYS.DBMS_OUTPUT.PUT_LINE('x'); END; /"
+        ));
+        let actual = closure(&run, "APP.FX", 0);
+        assert!(!actual.clean, "{declaration}: {actual:?}");
+        assert!(
+            actual
+                .unknown_reasons
+                .iter()
+                .any(|reason| reason.contains("shadow")),
+            "{actual:?}"
+        );
+    }
+    let run = analyze(
+        "CREATE PROCEDURE APP.FX(SYS APP.T) IS BEGIN SYS.DBMS_OUTPUT.PUT_LINE('x'); END; /",
+    );
+    assert!(!closure(&run, "APP.FX", 1).clean);
+    let local = analyze(
+        "CREATE PROCEDURE APP.FX IS DBMS_OUTPUT APP.T; BEGIN DBMS_OUTPUT.PUT_LINE('x'); END; /",
+    );
+    assert!(
+        !closure(&local, "APP.FX", 0).clean,
+        "local DBMS_OUTPUT is not SYS.DBMS_OUTPUT"
+    );
+}
+
+#[test]
 fn standalone_default_calls_contribute_only_when_omitted() {
     for default in ["DEFAULT evil_fn()", ":= evil_fn()"] {
         let run = analyze(&format!(

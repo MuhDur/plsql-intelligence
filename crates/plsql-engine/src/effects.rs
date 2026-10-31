@@ -414,6 +414,14 @@ fn inspect_statements(
         out.unknown("statement recursion limit");
         return;
     }
+    if unit
+        .package
+        .as_ref()
+        .and_then(|package| index.packages.get(package))
+        .is_some_and(|package| package.state_variables.contains("SYS"))
+    {
+        out.unknown("package state may shadow SYS qualifier");
+    }
     for stmt in statements {
         match stmt {
             Statement::Null | Statement::Raise { .. } => {}
@@ -564,6 +572,24 @@ fn inspect_statements(
                 inspect_sql_text(raw_text, out);
                 inspect_sql_calls(raw_text, unit, out, calls);
             }
+            Statement::OpenCursor { target, query_text } => {
+                // Opening a package-global cursor mutates session state just
+                // like assigning the variable. Reuse the target analysis.
+                inspect_statements(
+                    &[Statement::Assignment {
+                        target: target.clone(),
+                        rhs_text: "NULL".into(),
+                    }],
+                    unit,
+                    index,
+                    depth + 1,
+                    out,
+                    calls,
+                );
+                out.effects.effects.insert(RoutineEffect::ReadDb);
+                inspect_sql_text(query_text, out);
+                inspect_sql_calls(query_text, unit, out, calls);
+            }
             Statement::TransactionControl { .. } => {
                 out.effects.effects.insert(RoutineEffect::TxnControl);
             }
@@ -707,6 +733,7 @@ fn census_statements(statements: &[Statement], depth: usize, census: &mut Dynami
             | Statement::Return { value_text: None }
             | Statement::Exit { when_text: None }
             | Statement::Sql { .. }
+            | Statement::OpenCursor { .. }
             | Statement::TransactionControl { .. } => {}
         }
     }
@@ -853,7 +880,16 @@ fn inspect_expr(
             }
             let name = parts.join(".");
             let last = parts.last().map(String::as_str).unwrap_or("");
-            if matches!(last, "NEXTVAL") {
+            if is_dbms_output_primitive(&name, args.len())
+                && !args
+                    .iter()
+                    .any(|arg| matches!(arg, Expr::Raw { text, .. } if text.contains("=>")))
+            {
+                // Only fully qualified output producers. ENABLE/DISABLE and
+                // reads are intentionally not admitted: capture is controlled
+                // by the downstream session owner, with a bounded buffer.
+                out.effects.effects.insert(RoutineEffect::SessionState);
+            } else if matches!(last, "NEXTVAL") {
                 out.effects.effects.insert(RoutineEffect::SequenceAdvance);
             } else if name.starts_with("DBMS_SQL") {
                 out.effects.effects.insert(RoutineEffect::DynamicSql);
@@ -928,6 +964,17 @@ fn inspect_expr(
         Expr::Raw { text, .. } if text.trim() == "*" => {}
         Expr::Raw { text, .. } => out.unknown(format!("unclassified expression: {text}")),
     }
+}
+
+/// Exact supplied-package output producers modeled by this engine. This does
+/// not resolve synonyms or lexical shadowing; source completeness and the
+/// adapter's dictionary identity proof remain mandatory.
+#[must_use]
+pub fn is_dbms_output_primitive(name: &str, argument_count: usize) -> bool {
+    matches!(
+        (name, argument_count),
+        ("SYS.DBMS_OUTPUT.PUT" | "SYS.DBMS_OUTPUT.PUT_LINE", 1) | ("SYS.DBMS_OUTPUT.NEW_LINE", 0)
+    )
 }
 
 fn inspect_sql_text(text: &str, out: &mut InvocationClosureV1) {
