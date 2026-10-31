@@ -1610,37 +1610,35 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
                     // (SameSchemaLookup); a miss synthesises an Unknown node — we only
                     // have the lexical reference, so the strategy stays LocalLexical
                     // (honest provenance, oracle-687a.3). A remote object is
-                    // reached across the link boundary either way.
-                    let (table_node_id, table_strategy) =
-                        match nodes_by_logical_id.get(&table_logical).copied() {
-                            Some(id) if acc.db_link.is_some() => {
-                                (id, ResolutionStrategy::DbLinkBoundary)
-                            }
-                            Some(id) => (id, ResolutionStrategy::SameSchemaLookup),
-                            None => {
-                                let schema_name = unknown_schema(&mut interner);
-                                let tbl_sym = interner
-                                    .intern(table_logical.clone())
-                                    .unwrap_or_else(|| plsql_core::SymbolId::new(0));
-                                let obj_name = plsql_core::ObjectName::from(tbl_sym);
-                                let nid = NodeId::new(next_node_id);
-                                next_node_id += 1;
-                                dep_graph.insert_node(Node::new(
-                                    nid,
-                                    LogicalObjectId::new(table_logical.clone()),
-                                    ObjectRevisionId::new("source"),
-                                    QualifiedName::new(Some(schema_name), obj_name),
-                                    NodeIdentityKind::Unknown,
-                                ));
-                                nodes_by_logical_id.insert(table_logical.clone(), nid);
-                                let strategy = if acc.db_link.is_some() {
-                                    ResolutionStrategy::DbLinkBoundary
-                                } else {
-                                    ResolutionStrategy::LocalLexical
-                                };
-                                (nid, strategy)
-                            }
-                        };
+                    // reached across the link boundary whether or not its node
+                    // already exists, so the link decides the strategy first.
+                    let existing = nodes_by_logical_id.get(&table_logical).copied();
+                    let table_strategy = match (&acc.db_link, existing) {
+                        (Some(_), _) => ResolutionStrategy::DbLinkBoundary,
+                        (None, Some(_)) => ResolutionStrategy::SameSchemaLookup,
+                        (None, None) => ResolutionStrategy::LocalLexical,
+                    };
+                    let table_node_id = match existing {
+                        Some(id) => id,
+                        None => {
+                            let schema_name = unknown_schema(&mut interner);
+                            let tbl_sym = interner
+                                .intern(table_logical.clone())
+                                .unwrap_or_else(|| plsql_core::SymbolId::new(0));
+                            let obj_name = plsql_core::ObjectName::from(tbl_sym);
+                            let nid = NodeId::new(next_node_id);
+                            next_node_id += 1;
+                            dep_graph.insert_node(Node::new(
+                                nid,
+                                LogicalObjectId::new(table_logical.clone()),
+                                ObjectRevisionId::new("source"),
+                                QualifiedName::new(Some(schema_name), obj_name),
+                                NodeIdentityKind::Unknown,
+                            ));
+                            nodes_by_logical_id.insert(table_logical.clone(), nid);
+                            nid
+                        }
+                    };
 
                     let confidence = Confidence::new(ConfidenceLevel::Medium, None);
                     let edge = Edge::new(
