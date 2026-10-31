@@ -945,6 +945,9 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
     let mut opaque_dynamic_sql_sites = 0usize;
     let mut dynamic_sql_truncated = false;
     let mut call_sites_truncated = false;
+    // Units whose statements were walked. With none, the walk-based
+    // metrics have no coverage, and a `0` would claim a clean look.
+    let mut units_walked = 0usize;
 
     // Accumulate semantic artifacts across files.
     let mut fact_store = FactStore::default();
@@ -1270,6 +1273,7 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
             }
 
             for (caller_id_str, caller_node_id, caller_span, body_stmts) in work {
+                units_walked += 1;
                 let census = effects::dynamic_sql_census(&body_stmts);
                 dynamic_sql_sites += census.sites;
                 opaque_dynamic_sql_sites += census.opaque;
@@ -1680,6 +1684,13 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
         .filter(|d| d.code == "IR_UNCLASSIFIED_DECL")
         .count();
     let diagnostics_total = run.diagnostics.len();
+    let walked = |truncated: bool, count: usize| {
+        if truncated || units_walked == 0 {
+            plsql_core::Measured::Unmeasured
+        } else {
+            plsql_core::Measured::Measured(count)
+        }
+    };
     let edge_count = |kind: EdgeKind| {
         run.dep_graph
             .edges
@@ -1709,27 +1720,16 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
         objects_total: declaration_count,
         objects_with_source: declaration_count,
         objects_catalog_only: 0,
-        // Counted over the source this run lowered. A walk that hit the
-        // re-lowering depth cap saw only part of a unit, so its metric
-        // stays `{ "unmeasured": true }` rather than an undercount.
+        // Counted over the source this run lowered. The walk-based metrics
+        // stay `{ "unmeasured": true }` when no unit was walked (nothing
+        // lowered, so nothing was looked at) or when a walk hit the
+        // re-lowering depth cap (an undercount, not a measurement).
         wrapped_units: plsql_core::Measured::Measured(wrapped_units),
         missing_package_bodies: plsql_core::Measured::Measured(missing_package_bodies),
-        dynamic_sql_sites: if dynamic_sql_truncated {
-            plsql_core::Measured::Unmeasured
-        } else {
-            plsql_core::Measured::Measured(dynamic_sql_sites)
-        },
-        opaque_dynamic_sql_sites: if dynamic_sql_truncated {
-            plsql_core::Measured::Unmeasured
-        } else {
-            plsql_core::Measured::Measured(opaque_dynamic_sql_sites)
-        },
-        db_link_edges: plsql_core::Measured::Measured(edge_count(EdgeKind::DbLink)),
-        unresolved_references: if call_sites_truncated {
-            plsql_core::Measured::Unmeasured
-        } else {
-            plsql_core::Measured::Measured(edge_count(EdgeKind::UnresolvedCallee))
-        },
+        dynamic_sql_sites: walked(dynamic_sql_truncated, dynamic_sql_sites),
+        opaque_dynamic_sql_sites: walked(dynamic_sql_truncated, opaque_dynamic_sql_sites),
+        db_link_edges: walked(false, edge_count(EdgeKind::DbLink)),
+        unresolved_references: walked(call_sites_truncated, edge_count(EdgeKind::UnresolvedCallee)),
         diagnostics_total,
         objects_unrecognized,
         // Lowered declarations are the ones with real extracted
@@ -2750,7 +2750,8 @@ mod tests {
     /// The CompletenessReport must tell the TRUTH. A tree full of
     /// garbage the classifier cannot lower MUST NOT present as
     /// clean — and it must surface the unrecognized-object +
-    /// diagnostic counts.
+    /// diagnostic counts; the not-yet-wired gap metrics must
+    /// serialise honestly as `unmeasured`, never 0.
     #[test]
     fn bh4p_low_extraction_run_reports_honest_non_clean_completeness() {
         let base = std::env::temp_dir().join(format!(
@@ -2810,11 +2811,15 @@ mod tests {
             run.diagnostics.len(),
             "diagnostics_total must equal the real diagnostic count"
         );
-        // The gap metrics count the lowered source, and nothing here
-        // lowered: their zeros are bounded by the Degraded posture and
-        // the unrecognized-object count asserted above.
-        assert_eq!(c.dynamic_sql_sites, plsql_core::Measured::Measured(0));
-        assert_eq!(c.unresolved_references, plsql_core::Measured::Measured(0));
+        // Not-yet-wired gap metrics must read honestly, never 0.
+        assert_eq!(c.dynamic_sql_sites, plsql_core::Measured::Unmeasured);
+        assert_eq!(c.unresolved_references, plsql_core::Measured::Unmeasured);
+        let v = serde_json::to_value(c).expect("serializes");
+        assert_eq!(
+            v["dynamic_sql_sites"],
+            serde_json::json!({"unmeasured": true})
+        );
+        assert_ne!(v["dynamic_sql_sites"], serde_json::json!(0));
 
         let _ = std::fs::remove_dir_all(&base);
     }
