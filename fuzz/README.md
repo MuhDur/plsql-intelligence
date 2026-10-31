@@ -111,50 +111,6 @@ the offline JSON catalog snapshot parser. Any attacker-controlled snapshot
 Oracle: never panics (serde returning `Err` for invalid JSON is correct;
 only a panic/abort is the bug). Smoke: ~145 K exec/s, 0 crashes.
 
-## Legacy target sources (not registered in the manifest)
-
-The following source files still refer to retired adapter/runtime crates. They
-are retained in the tree, are not part of the cargo-fuzz build, and the dated
-soak results below are historical evidence only.
-
-### `mcp_async_dispatch`
-
-Drives `plsql_mcp::dispatch_tool` inside a current-thread Asupersync runtime.
-The fuzzer chooses a real `dispatch_table()` tool name (or an unknown tool)
-and arbitrary JSON arguments. Oracle: invalid arguments, runtime-state-required
-tools, and unknown tools may return error envelopes, but the async dispatcher
-must never panic.
-
-Last local soak (2026-06-28): `cargo +nightly-2026-05-11 fuzz run
-mcp_async_dispatch -- -max_total_time=30 -timeout=10 -verbosity=0
--print_final_stats=1` executed 17,999 units with 0 crashes.
-
-### `catalog_async_loader`
-
-Drives `plsql_mcp::OraclemcpCatalogConnection<FuzzDbConnection>` into
-`plsql_catalog::load_snapshot_from_connection`. This covers the MCP-side
-`oraclemcp-db` row/bind adapter plus the async dictionary-loader sequence
-without opening a real Oracle connection. Oracle: malformed metadata rows,
-permission-like query failures, and invalid schema filters may return `Err`;
-panic is the bug.
-
-Last local soak (2026-06-28): `cargo +nightly-2026-05-11 fuzz run
-catalog_async_loader -- -max_total_time=30 -timeout=10 -verbosity=0
--print_final_stats=1` executed 21,214 units with 0 crashes.
-
-### `live_runtime_ops`
-
-Drives `plsql_mcp::LiveDbRuntime` session operations with a boxed fake
-`oraclemcp-db::OracleConnection`: insert, activate, remove, lease validation,
-safety-profile transitions, DDL previews, enable/disable write tokens, and
-connection call-timeout access. Oracle: refused transitions, stale leases, and
-missing active sessions may return typed errors, but runtime state management
-must never panic.
-
-Last local soak (2026-06-28): `cargo +nightly-2026-05-11 fuzz run
-live_runtime_ops -- -max_total_time=30 -timeout=10 -verbosity=0
--print_final_stats=1` executed 45,778 units with 0 crashes.
-
 ## Target: `package_units_lower`
 
 Runs arbitrary valid UTF-8 input (excluding non-whitespace controls) inside a
