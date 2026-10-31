@@ -1,7 +1,8 @@
 //! The six `CompletenessReport` gap metrics are measured from the run
 //! (pvlqq.10.1.4): real parsed source through `analyze_project`, exact
 //! counts, and a gap-free project that reads `Measured(0)`, never
-//! `Unmeasured`. Fixtures are synthetic.
+//! `Unmeasured`. A `t@link` table access targets the remote object
+//! (oraclemcp-5e2d5). Fixtures are synthetic.
 
 use std::path::PathBuf;
 
@@ -129,6 +130,44 @@ fn gap_metrics_count_what_the_source_contains() {
             "OMCP_CM_REMOTE_ORDERS@OMCP_CM_LINK",
             "OMCP_CM_REMOTE_PROC@OMCP_CM_LINK"
         ]
+    );
+}
+
+/// oraclemcp-5e2d5: `SELECT ... FROM t@link` reads the remote object, the
+/// node the DbLink edge targets. It must not mint a Reads edge to local `T`.
+#[test]
+fn db_link_table_access_targets_the_remote_object() {
+    let run = analyze("completeness_remote_access", GAPS);
+    let graph = &run.dep_graph;
+    let logical = |id| graph.nodes[id].logical_id.as_str().to_string();
+    let reads: Vec<String> = graph
+        .edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Reads)
+        .map(|e| logical(&e.to))
+        .collect();
+    assert_eq!(reads, ["OMCP_CM_REMOTE_ORDERS@OMCP_CM_LINK"]);
+    assert!(
+        graph
+            .nodes
+            .values()
+            .all(|n| n.logical_id.as_str() != "OMCP_CM_REMOTE_ORDERS"),
+        "no local node for the remote table"
+    );
+    let read = graph
+        .edges
+        .iter()
+        .find(|e| e.kind == EdgeKind::Reads)
+        .expect("remote read edge");
+    let link = graph
+        .edges
+        .iter()
+        .find(|e| e.kind == EdgeKind::DbLink && logical(&e.to) == reads[0])
+        .expect("db-link edge to the remote table");
+    assert_eq!((read.from, read.to), (link.from, link.to));
+    assert_eq!(
+        graph.provenance[&read.id].resolution_strategy,
+        plsql_depgraph::ResolutionStrategy::DbLinkBoundary
     );
 }
 

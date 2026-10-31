@@ -1574,7 +1574,7 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
                     ));
                 }
                 for acc in &accesses {
-                    let table_logical = match &acc.schema {
+                    let mut table_logical = match &acc.schema {
                         Some(s) => format!(
                             "{}.{}",
                             s.to_ascii_uppercase(),
@@ -1582,6 +1582,11 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
                         ),
                         None => acc.table.to_ascii_uppercase(),
                     };
+                    // `t@link` is the remote object, the same node the DbLink
+                    // edge targets, never the local `t` (oraclemcp-5e2d5).
+                    if let Some(link) = &acc.db_link {
+                        table_logical = format!("{table_logical}@{}", link.to_ascii_uppercase());
+                    }
                     if table_logical.is_empty() {
                         continue;
                     }
@@ -1604,9 +1609,13 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
                     // object means the table is a known same-schema object
                     // (SameSchemaLookup); a miss synthesises an Unknown node — we only
                     // have the lexical reference, so the strategy stays LocalLexical
-                    // (honest provenance, oracle-687a.3).
+                    // (honest provenance, oracle-687a.3). A remote object is
+                    // reached across the link boundary either way.
                     let (table_node_id, table_strategy) =
                         match nodes_by_logical_id.get(&table_logical).copied() {
+                            Some(id) if acc.db_link.is_some() => {
+                                (id, ResolutionStrategy::DbLinkBoundary)
+                            }
                             Some(id) => (id, ResolutionStrategy::SameSchemaLookup),
                             None => {
                                 let schema_name = unknown_schema(&mut interner);
@@ -1624,7 +1633,12 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
                                     NodeIdentityKind::Unknown,
                                 ));
                                 nodes_by_logical_id.insert(table_logical.clone(), nid);
-                                (nid, ResolutionStrategy::LocalLexical)
+                                let strategy = if acc.db_link.is_some() {
+                                    ResolutionStrategy::DbLinkBoundary
+                                } else {
+                                    ResolutionStrategy::LocalLexical
+                                };
+                                (nid, strategy)
                             }
                         };
 

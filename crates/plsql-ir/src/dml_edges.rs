@@ -38,6 +38,10 @@ pub struct TableAccess {
     pub schema: Option<String>,
     /// Table / view / synonym name, case-folded.
     pub table: String,
+    /// Database link of a remote `table@link` reference, case-folded.
+    /// The table then names a remote object, never a local one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db_link: Option<String>,
     pub access: AccessKind,
 }
 
@@ -278,9 +282,9 @@ fn delete_target(raw: &str) -> Option<String> {
     {
         i = skip_ws(bytes, i + 4);
     }
-    // Read the `[schema.]table` token.
+    // Read the `[schema.]table[@link]` token.
     let start = i;
-    while i < bytes.len() && (is_ident_byte(bytes[i]) || bytes[i] == b'.') {
+    while i < bytes.len() && is_name_byte(bytes[i]) {
         i += 1;
     }
     if i > start {
@@ -288,6 +292,11 @@ fn delete_target(raw: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// A byte of a `[schema.]table[@link[.domain]]` reference.
+fn is_name_byte(byte: u8) -> bool {
+    is_ident_byte(byte) || byte == b'.' || byte == b'@'
 }
 
 fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
@@ -324,12 +333,12 @@ fn tables_after(upper: &str, raw: &str, keyword: &str) -> Vec<String> {
         }
         let mut i = after;
         loop {
-            // Skip whitespace, then read the `[schema.]table` token.
+            // Skip whitespace, then read the `[schema.]table[@link]` token.
             while i < bytes.len() && bytes[i].is_ascii_whitespace() {
                 i += 1;
             }
             let start = i;
-            while i < bytes.len() && (is_ident_byte(bytes[i]) || bytes[i] == b'.') {
+            while i < bytes.len() && is_name_byte(bytes[i]) {
                 i += 1;
             }
             if i == start {
@@ -365,6 +374,13 @@ fn tables_after(upper: &str, raw: &str, keyword: &str) -> Vec<String> {
 
 fn push(out: &mut Vec<TableAccess>, raw_name: String, access: AccessKind) {
     let folded = raw_name.to_ascii_uppercase();
+    let (folded, db_link) = match folded.split_once('@') {
+        Some((name, link)) => (name.to_string(), Some(link.to_string())),
+        None => (folded, None),
+    };
+    if db_link.as_deref().is_some_and(str::is_empty) {
+        return;
+    }
     let (schema, table) = match folded.rsplit_once('.') {
         Some((s, t)) if !t.is_empty() => (Some(s.to_string()), t.to_string()),
         _ => (None, folded),
@@ -375,17 +391,25 @@ fn push(out: &mut Vec<TableAccess>, raw_name: String, access: AccessKind) {
     out.push(TableAccess {
         schema,
         table,
+        db_link,
         access,
     });
 }
 
 /// A table written AND read in the same body keeps both entries
-/// (the depgraph wants both edges); identical (schema, table,
-/// access) triples dedupe.
+/// (the depgraph wants both edges); identical (schema, table, link,
+/// access) tuples dedupe.
 fn dedup(mut v: Vec<TableAccess>) -> Vec<TableAccess> {
-    let mut seen: std::collections::BTreeSet<(Option<String>, String, AccessKind)> =
-        std::collections::BTreeSet::new();
-    v.retain(|a| seen.insert((a.schema.clone(), a.table.clone(), a.access)));
+    type Key = (Option<String>, String, Option<String>, AccessKind);
+    let mut seen: std::collections::BTreeSet<Key> = std::collections::BTreeSet::new();
+    v.retain(|a| {
+        seen.insert((
+            a.schema.clone(),
+            a.table.clone(),
+            a.db_link.clone(),
+            a.access,
+        ))
+    });
     v
 }
 
@@ -412,6 +436,67 @@ mod tests {
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].table, "EMPLOYEES");
         assert_eq!(a[0].access, AccessKind::Read);
+    }
+
+    /// oraclemcp-5e2d5: `t@link` names a remote object. It must keep its
+    /// link, not collapse into an access of the local table `t`.
+    #[test]
+    fn db_link_reference_keeps_its_link() {
+        let accesses = |sql: &str| {
+            extract_table_accesses(&lower_statement_body(sql))
+                .into_iter()
+                .map(|a| (a.schema, a.table, a.db_link, a.access))
+                .collect::<Vec<_>>()
+        };
+        let remote = |schema: Option<&str>, table: &str, link: &str, access| {
+            (
+                schema.map(str::to_string),
+                table.to_string(),
+                Some(link.to_string()),
+                access,
+            )
+        };
+        assert_eq!(
+            accesses("SELECT id INTO v FROM hr.orders@remote.world o WHERE o.id = 1;"),
+            [remote(
+                Some("HR"),
+                "ORDERS",
+                "REMOTE.WORLD",
+                AccessKind::Read
+            )]
+        );
+        assert_eq!(
+            accesses("INSERT INTO audit_log@hub (id) SELECT id FROM staging;"),
+            [
+                remote(None, "AUDIT_LOG", "HUB", AccessKind::Write),
+                (None, "STAGING".to_string(), None, AccessKind::Read),
+            ]
+        );
+        assert_eq!(
+            accesses("UPDATE orders@hub SET status = 'X';"),
+            [remote(None, "ORDERS", "HUB", AccessKind::Write)]
+        );
+        assert_eq!(
+            accesses("DELETE FROM orders@hub WHERE id = 1;"),
+            [remote(None, "ORDERS", "HUB", AccessKind::Write)]
+        );
+        assert_eq!(
+            accesses("DELETE orders@hub WHERE id = 1;"),
+            [remote(None, "ORDERS", "HUB", AccessKind::Write)]
+        );
+        // The local and the remote table are different objects.
+        assert_eq!(
+            accesses("SELECT a.id INTO v FROM orders a, orders@hub b WHERE a.id = b.id;"),
+            [
+                (None, "ORDERS".to_string(), None, AccessKind::Read),
+                remote(None, "ORDERS", "HUB", AccessKind::Read),
+            ]
+        );
+        // An `@` inside a literal is not a link.
+        assert_eq!(
+            accesses("UPDATE orders SET mail = 'ops@hub';"),
+            [(None, "ORDERS".to_string(), None, AccessKind::Write)]
+        );
     }
 
     #[test]
