@@ -446,6 +446,10 @@ fn fix_this_references(content: &str) -> String {
 ///   with `true`, such an input matches both `standard_function` and `atom`,
 ///   and ANTLR resolves that ambiguity to the lower-numbered alternative,
 ///   `standard_function`, which is the same parse.
+/// - `isNotStartOfJoin` → one-token lookahead: `false` only when the next
+///   tokens start a join (`JOIN`, `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`,
+///   `NATURAL`, `OUTER`, `PARTITION BY`). A constant `false` meant no table
+///   alias was ever consumed, so `FROM emp e` did not parse.
 /// - `IsNewlineAtPos` → `false` (conservative: no special newline handling)
 ///
 /// The traits are injected at the end of the respective generated file so
@@ -506,11 +510,13 @@ where
     fn isVersion11(&mut self) -> bool { true }
     fn isVersion10(&mut self) -> bool { true }
     fn IsNotNumericFunction(&mut self) -> bool { true }
-    /// Return false to signal "this is the start of a JOIN clause" (permissive default).
     /// grammars-v4 semantics: `isNotStartOfJoin` guards alias consumption to avoid
-    /// ambiguity between `tbl alias` and `tbl JOIN`.  Returning false means the parser
-    /// will not consume the next token as an alias when it could be a JOIN keyword.
-    fn isNotStartOfJoin(&mut self) -> bool { false }
+    /// ambiguity between `tbl alias` and `tbl JOIN`. The join keywords are
+    /// non-reserved, so the next token is an alias unless it starts a join.
+    fn isNotStartOfJoin(&mut self) -> bool {
+        use antlr4rust::int_stream::IntStream;
+        plsql_is_not_start_of_join(self.input.la(1), self.input.la(2))
+    }
 }
 
 #[allow(non_snake_case)]
@@ -523,7 +529,26 @@ where
     fn isVersion11(&mut self) -> bool { true }
     fn isVersion10(&mut self) -> bool { true }
     fn IsNotNumericFunction(&mut self) -> bool { true }
-    fn isNotStartOfJoin(&mut self) -> bool { false }
+    fn isNotStartOfJoin(&mut self) -> bool {
+        use antlr4rust::int_stream::IntStream;
+        plsql_is_not_start_of_join(self.base.input.la(1), self.base.input.la(2))
+    }
+}
+
+/// `true` unless the tokens after a table reference start a join: a join
+/// keyword, `OUTER`/`CROSS APPLY`, or `PARTITION BY` (partitioned outer join).
+fn plsql_is_not_start_of_join(la1: i32, la2: i32) -> bool {
+    !matches!(
+        la1,
+        PlSqlParser_JOIN
+            | PlSqlParser_INNER
+            | PlSqlParser_LEFT
+            | PlSqlParser_RIGHT
+            | PlSqlParser_FULL
+            | PlSqlParser_CROSS
+            | PlSqlParser_NATURAL
+            | PlSqlParser_OUTER
+    ) && !(la1 == PlSqlParser_PARTITION && la2 == PlSqlParser_BY)
 }
 "#;
             format!(

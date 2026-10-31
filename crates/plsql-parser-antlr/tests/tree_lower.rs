@@ -68,6 +68,41 @@ fn static_sql_projection_covers_cursors_nested_bodies_and_handlers() {
 }
 
 #[test]
+fn static_sql_projection_parses_table_aliases_and_join_starts() {
+    use plsql_parser::ast::StaticSqlProjection;
+    // `isNotStartOfJoin` guards table-alias consumption. Each statement keeps
+    // an alias where one is written and still parses the following keyword
+    // as a join (JOIN, LEFT OUTER, NATURAL, CROSS APPLY, PARTITION BY).
+    let statements = [
+        "SELECT t.id FROM t_emp t",
+        "SELECT t.id FROM hr.t_emp t JOIN t_dept d ON d.id = t.dept_id WHERE t.id = 1",
+        "SELECT a.id FROM t_a a LEFT OUTER JOIN t_b b ON b.id = a.id",
+        "SELECT a.id FROM t_a a NATURAL JOIN t_b b",
+        "SELECT a.id FROM t_a a CROSS APPLY (SELECT b.id FROM t_b b WHERE b.id = a.id) x",
+        "SELECT a.id FROM t_a a PARTITION BY (a.k) RIGHT OUTER JOIN t_b b ON b.d = a.d",
+        "SELECT t_a.id FROM t_a JOIN t_b ON t_b.id = t_a.id",
+    ];
+    let mut source = String::from("CREATE OR REPLACE PROCEDURE CP_ALIAS IS\nBEGIN\n");
+    for statement in statements {
+        source.push_str("  FOR r IN (");
+        source.push_str(statement);
+        source.push_str(") LOOP NULL; END LOOP;\n");
+    }
+    source.push_str("END;");
+    let mut diagnostics = Vec::new();
+    let ast = lower_parse_tree(&source, fid(), &mut diagnostics);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let StaticSqlProjection::Computed {
+        statements: projected,
+    } = ast.static_sql
+    else {
+        panic!("aliased static SQL must project completely");
+    };
+    let projected: Vec<&str> = projected.iter().map(|s| s.sql.as_str()).collect();
+    assert_eq!(projected, statements);
+}
+
+#[test]
 fn static_sql_projection_empty_dynamic_and_unknown_are_distinct() {
     use plsql_parser::ast::StaticSqlProjection;
     for source in [
