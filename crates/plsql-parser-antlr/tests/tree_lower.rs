@@ -109,6 +109,63 @@ fn static_sql_projection_includes_merge_and_view_query() {
     assert_eq!(statements[1].sql, "SELECT id FROM t");
 }
 
+#[test]
+fn static_sql_projection_call_spec_only_units_are_computed_empty() {
+    use plsql_parser::ast::StaticSqlProjection;
+    for source in [
+        "CREATE OR REPLACE PROCEDURE cp_java AS LANGUAGE JAVA NAME 'EmployeeApi.run()';",
+        "CREATE OR REPLACE FUNCTION cp_c RETURN VARCHAR2 AS LANGUAGE C NAME \"employee_label\" LIBRARY employee_lib;",
+        "CREATE OR REPLACE PACKAGE BODY emp_api AS PROCEDURE run AS LANGUAGE JAVA NAME 'EmployeeApi.run()'; END emp_api;",
+        "CREATE OR REPLACE TYPE BODY employee_t AS STATIC FUNCTION label RETURN VARCHAR2 AS LANGUAGE C NAME \"employee_label\" LIBRARY employee_lib; END employee_t;",
+    ] {
+        let mut diagnostics = Vec::new();
+        let ast = lower_parse_tree(source, fid(), &mut diagnostics);
+        assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+        assert_eq!(
+            ast.static_sql,
+            StaticSqlProjection::Computed {
+                statements: Vec::new()
+            },
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn static_sql_projection_mixed_call_specs_remain_unknown() {
+    use plsql_parser::ast::StaticSqlProjection;
+    for source in [
+        "CREATE OR REPLACE PACKAGE BODY mixed_api AS PROCEDURE j AS LANGUAGE JAVA NAME 'X.j()'; PROCEDURE p IS BEGIN NULL; END; END;",
+        "CREATE OR REPLACE PACKAGE BODY mixed_sql AS PROCEDURE j AS LANGUAGE JAVA NAME 'X.j()'; PROCEDURE p IS n NUMBER; BEGIN SELECT id INTO n FROM hidden; END; END;",
+        "CREATE OR REPLACE PACKAGE BODY mixed_decl AS x NUMBER; PROCEDURE j AS LANGUAGE JAVA NAME 'X.j()'; END;",
+        "CREATE OR REPLACE PROCEDURE cp_broken AS LANGUAGE JAVA NAME 'X.j()' BEGIN SELECT FROM;",
+    ] {
+        let ast = lower_parse_tree(source, fid(), &mut Vec::new());
+        assert_eq!(ast.static_sql, StaticSqlProjection::Unknown, "{source}");
+    }
+}
+
+#[test]
+fn static_sql_projection_named_type_body_preserves_all_static_sql() {
+    use plsql_parser::ast::StaticSqlProjection;
+    let source = "CREATE OR REPLACE TYPE BODY employee_t AS MEMBER FUNCTION label RETURN VARCHAR2 IS n NUMBER; BEGIN SELECT id INTO n FROM app.t; RETURN 'ok'; END label; END employee_t;";
+    let mut diagnostics = Vec::new();
+    let ast = lower_parse_tree(source, fid(), &mut diagnostics);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let StaticSqlProjection::Computed { statements } = ast.static_sql else {
+        panic!("named END is complete grammar")
+    };
+    assert_eq!(statements.len(), 1);
+    assert_eq!(statements[0].sql, "SELECT id INTO n FROM app.t");
+    for source in [
+        "CREATE TYPE BODY t AS MEMBER PROCEDURE p IS BEGIN SELECT FROM; END; END t;",
+        "CREATE TYPE BODY t AS MEMBER PROCEDURE p IS BEGIN NULL; END; END t; DROP",
+    ] {
+        let ast = lower_parse_tree(source, fid(), &mut Vec::new());
+        assert_eq!(ast.static_sql, StaticSqlProjection::Unknown);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helper: lower a source fragment and return the first declaration.
 // ---------------------------------------------------------------------------

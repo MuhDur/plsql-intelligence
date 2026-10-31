@@ -1018,7 +1018,7 @@ sqlj_object_type
     ;
 
 type_body
-    : BODY type_name (IS | AS) (type_body_elements)+ END
+    : BODY type_name (IS | AS) (type_body_elements)+ END id_expression?
     ;
 
 type_body_elements
@@ -1040,14 +1040,14 @@ proc_decl_in_type
         (
             '(' type_elements_parameter (',' type_elements_parameter)* ')'
         )?
-        (IS | AS) (call_spec | DECLARE? seq_of_declare_specs? body ';')
+        (IS | AS) (call_spec ';' | DECLARE? seq_of_declare_specs? body ';')
     ;
 
 func_decl_in_type
     : FUNCTION function_name ('(' type_elements_parameter (',' type_elements_parameter)* ')')? RETURN type_spec (
         IS
         | AS
-    ) (call_spec | DECLARE? seq_of_declare_specs? body ';')
+    ) (call_spec ';' | DECLARE? seq_of_declare_specs? body ';')
     ;
 
 constructor_declaration
@@ -1055,7 +1055,7 @@ constructor_declaration
         (
             '(' (SELF IN OUT type_spec ',')? (type_elements_parameter (',' type_elements_parameter)*)? ')'
         )?
-      RETURN SELF AS RESULT (IS | AS) (call_spec | DECLARE? seq_of_declare_specs? body ';')
+      RETURN SELF AS RESULT (IS | AS) (call_spec ';' | DECLARE? seq_of_declare_specs? body ';')
     ;
 
 // Common Type Clauses
@@ -1105,7 +1105,7 @@ overriding_procedure_spec
         (
             '(' type_elements_parameter (',' type_elements_parameter)* ')'
         )?
-        (IS | AS) (call_spec | DECLARE? seq_of_declare_specs? body ';')
+        (IS | AS) (call_spec ';' | DECLARE? seq_of_declare_specs? body ';')
     ;
 
 type_procedure_spec

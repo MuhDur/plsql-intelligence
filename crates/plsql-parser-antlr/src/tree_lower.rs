@@ -209,6 +209,8 @@ fn static_sql_projection<'i>(
     let mut stack = vec![(root, 0usize)];
     let mut visited = 0usize;
     let mut statements = Vec::new();
+    let mut has_call_spec = false;
+    let mut has_other_member = false;
     while let Some((node, depth)) = stack.pop() {
         visited += 1;
         if visited > 1_000_000 || depth > 512 {
@@ -217,8 +219,46 @@ fn static_sql_projection<'i>(
         let Some(rule) = rule_name(node.get_rule_index()) else {
             continue;
         };
-        if matches!(rule, "selection_directive" | "call_spec") {
+        if rule == "selection_directive" {
             return StaticSqlProjection::Unknown;
+        }
+        if rule == "call_spec" {
+            has_call_spec = true;
+        }
+        // Complete grammar members distinguish call-spec-only units from
+        // mixed bodies. No text normalization or parser recovery is involved.
+        if matches!(
+            rule,
+            "body"
+                | "seq_of_statements"
+                | "pragma_declaration"
+                | "exception_declaration"
+                | "cursor_declaration"
+                | "variable_declaration"
+                | "type_declaration"
+                | "subtype_declaration"
+        ) {
+            has_other_member = true;
+        }
+        if matches!(
+            rule,
+            "create_function_body"
+                | "create_procedure_body"
+                | "function_body"
+                | "procedure_body"
+                | "function_spec"
+                | "procedure_spec"
+                | "proc_decl_in_type"
+                | "func_decl_in_type"
+                | "constructor_declaration"
+                | "overriding_function_spec"
+                | "overriding_procedure_spec"
+        ) && !(0..node.get_child_count()).any(|index| {
+            node.get_child(index)
+                .and_then(|child| rule_name(child.get_rule_index()))
+                == Some("call_spec")
+        }) {
+            has_other_member = true;
         }
         if matches!(
             rule,
@@ -250,6 +290,9 @@ fn static_sql_projection<'i>(
             };
             stack.push((child, depth + 1));
         }
+    }
+    if has_call_spec && (has_other_member || !statements.is_empty()) {
+        return StaticSqlProjection::Unknown;
     }
     statements.sort_by_key(|statement| statement.span.start.offset);
     StaticSqlProjection::Computed { statements }
