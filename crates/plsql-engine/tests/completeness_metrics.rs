@@ -2,7 +2,8 @@
 //! (pvlqq.10.1.4): real parsed source through `analyze_project`, exact
 //! counts, and a gap-free project that reads `Measured(0)`, never
 //! `Unmeasured`. A `t@link` table access targets the remote object
-//! (oraclemcp-5e2d5). Fixtures are synthetic.
+//! (oraclemcp-5e2d5). Unimplemented stage summaries read unmeasured
+//! (oraclemcp-5qmgz). Fixtures are synthetic.
 
 use std::path::PathBuf;
 
@@ -169,6 +170,23 @@ fn db_link_table_access_targets_the_remote_object() {
         graph.provenance[&read.id].resolution_strategy,
         plsql_depgraph::ResolutionStrategy::DbLinkBoundary
     );
+}
+
+/// oraclemcp-5qmgz: SQL-semantic modelling and inter-procedural flow are not
+/// implemented, so their summaries must never claim `0` (looked, found none).
+#[test]
+fn unimplemented_stage_summaries_read_unmeasured() {
+    let empty = analyze_project(AnalysisRequest::default()).expect("empty run");
+    for run in [analyze("stage_summaries", GAPS), empty] {
+        assert_eq!(run.sql_semantic.statement_count, Measured::Unmeasured);
+        assert_eq!(run.flow_summary.taint_path_count, Measured::Unmeasured);
+        assert_eq!(run.flow_summary.string_shape_count, Measured::Unmeasured);
+        let json = serde_json::to_value(&run).expect("run serializes");
+        let unmeasured = serde_json::json!({"unmeasured": true});
+        assert_eq!(json["sql_semantic"]["statement_count"], unmeasured);
+        assert_eq!(json["flow_summary"]["taint_path_count"], unmeasured);
+        assert_eq!(json["flow_summary"]["string_shape_count"], unmeasured);
+    }
 }
 
 #[test]

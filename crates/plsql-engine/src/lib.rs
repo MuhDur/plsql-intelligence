@@ -96,15 +96,19 @@ pub mod model {
         pub declaration_count: usize,
     }
 
+    /// SQL-semantic modelling summary. The stage is not implemented, so its
+    /// count reads `{ "unmeasured": true }`, never a `0` that would claim
+    /// statements were modelled and none found (R13).
     #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
     pub struct SqlSemanticModel {
-        pub statement_count: usize,
+        pub statement_count: plsql_core::Measured<usize>,
     }
 
+    /// Inter-procedural flow summary; unmeasured until that stage exists.
     #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
     pub struct FlowSummary {
-        pub taint_path_count: usize,
-        pub string_shape_count: usize,
+        pub taint_path_count: plsql_core::Measured<usize>,
+        pub string_shape_count: plsql_core::Measured<usize>,
     }
 
     #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -228,7 +232,9 @@ pub const ANALYSIS_RUN_SCHEMA: plsql_output::SchemaDescriptor = plsql_output::Sc
     // metrics now serialise as `{ "unmeasured": true }` instead of
     // a misleading `0`.
     // 1.2.0: source-backed InvocationIndexV1 and closure effects.
-    version: plsql_output::SchemaVersion::new(1, 2, 0),
+    // 1.3.0: the unimplemented SQL-semantic and flow summaries serialise
+    // their counts as `{ "unmeasured": true }` instead of `0`.
+    version: plsql_output::SchemaVersion::new(1, 3, 0),
     description: "Reusable canonical AnalysisRun artifact (PLSQL-ENG-004)",
 };
 
@@ -759,16 +765,14 @@ fn db_link_refs(tokens: &[plsql_parser::Token]) -> Vec<DbLinkRef> {
 ///
 /// ## Honest partial completeness (R13)
 ///
-/// This is the orchestration *spine*. Stages whose deep analysis
-/// is owned by their own follow-up components — live-catalog
-/// extraction, SQL-semantic modelling, inter-procedural flow, fact
-/// minting, dependency-edge construction — are wired but currently
-/// yield empty summaries. The pipeline never *fabricates* counts:
-/// the emitted [`CompletenessReport`] reports exactly what was
-/// established (`catalog_available`, `plscope_available`, parsed
-/// vs. recovered, object totals) so a consumer can see the
-/// boundary instead of mistaking "not yet wired" for "analysed
-/// and clean".
+/// Facts, the dependency graph, invocation effects and the completeness gap
+/// metrics are computed from the parsed source. Two stages are not
+/// implemented: SQL-semantic modelling and inter-procedural flow. Their
+/// summaries ([`AnalysisRun::sql_semantic`], [`AnalysisRun::flow_summary`])
+/// report every count as unmeasured. Live-catalog facts are present only
+/// when a catalog snapshot is supplied (`catalog_available`). The pipeline
+/// never *fabricates* counts: a consumer can tell "not computed" apart from
+/// "analysed and found none".
 #[instrument(level = "debug", skip(req), fields(root = %req.project_root.display()))]
 pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError> {
     use plsql_core::{AnalysisRunId, CompletenessReport, SymbolInterner};
@@ -849,7 +853,9 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
     // when identity/effect coverage changes even if the serialized shape is
     // unchanged: old trigger entries lost owners and declaration effects.
     const CACHE_STRATEGY: &str = "semantic_fragment";
-    const CACHE_LAYOUT: &str = "invocation_v5_static_cursor_output_effects";
+    // v6: stage summaries became Measured; a cached v5 run would read its
+    // stored `0` back as a measured zero.
+    const CACHE_LAYOUT: &str = "invocation_v6_unmeasured_stage_summaries";
     let cache_ctx: Option<(plsql_store::Store, String, String)> = (|| {
         if !req.cache.enabled {
             return None;
@@ -1686,10 +1692,15 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
     // parser_backend already set unconditionally at top of analyze_project.
 
     // --- Stage 6-9: privileges / sqlsem / flow / facts ----------
-    // Facts and call edges are now populated above from the real parse
-    // tree. Deep SQL-semantic / flow analysis lives in its own beads.
-    run.sql_semantic = SqlSemanticModel::default();
-    run.flow_summary = FlowSummary::default();
+    // Facts and call edges are populated above from the real parse tree.
+    // SQL-semantic and flow analysis are not implemented: unmeasured, not 0.
+    run.sql_semantic = SqlSemanticModel {
+        statement_count: plsql_core::Measured::Unmeasured,
+    };
+    run.flow_summary = FlowSummary {
+        taint_path_count: plsql_core::Measured::Unmeasured,
+        string_shape_count: plsql_core::Measured::Unmeasured,
+    };
     run.fact_store = FactStoreSnapshot {
         fact_count: fact_store.len(),
         facts: fact_store.facts.clone(),
