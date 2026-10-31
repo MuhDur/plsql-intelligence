@@ -75,6 +75,11 @@ pub mod lower;
 #[cfg(feature = "antlr-codegen")]
 pub mod backend;
 
+/// Rule-whitelisted syntactic shape of one Oracle read query
+/// ([`read_shape::read_query_shape`]).
+#[cfg(feature = "antlr-codegen")]
+pub mod read_shape;
+
 /// Real ANTLR parse-tree → [`plsql_parser::Ast`] lowering.
 ///
 /// Feature-gated on `antlr-codegen`. Supersedes the text-scanning
