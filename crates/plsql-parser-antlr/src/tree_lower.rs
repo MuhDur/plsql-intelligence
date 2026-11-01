@@ -715,7 +715,12 @@ fn lower_create_procedure_body(
         });
     }
     if let Some(body) = ctx.body() {
-        stmts.extend(lower_body_stmts(&body, source, file_id, diagnostics));
+        stmts.extend(lower_body_with_handlers(
+            &body,
+            source,
+            file_id,
+            diagnostics,
+        ));
     }
     (
         AstDecl::Procedure {
@@ -756,7 +761,12 @@ fn lower_create_function_body(
         });
     }
     if let Some(body) = ctx.body() {
-        stmts.extend(lower_body_stmts(&body, source, file_id, diagnostics));
+        stmts.extend(lower_body_with_handlers(
+            &body,
+            source,
+            file_id,
+            diagnostics,
+        ));
     }
     (
         AstDecl::Function {
@@ -824,6 +834,11 @@ fn lower_create_trigger(
                 });
             }
             for section in sections {
+                stmts.push(AstStatement::ValueScopeStart {
+                    parameters: Vec::new(),
+                    default_expressions: Vec::new(),
+                    span: node_span(&*section, file_id, source),
+                });
                 if let Some(block) = section.tps_block() {
                     stmts.extend(lower_declare_items(
                         &block.declare_spec_all(),
@@ -849,6 +864,9 @@ fn lower_create_trigger(
                         span: node_span(&*section, file_id, source),
                     });
                 }
+                stmts.push(AstStatement::ValueScopeEnd {
+                    span: node_span(&*section, file_id, source),
+                });
             }
         } else {
             // CALL triggers and future grammar arms need explicit coverage;
@@ -1045,6 +1063,12 @@ fn lower_declare_items(
                     span: node_span(&*var, file_id, source),
                 });
             }
+            // Earlier initializers cannot acquire a later value binding.
+            // Self-references remain uncertain until the initializer is proved.
+            out.push(AstStatement::ValueBinding {
+                name: ident_of(source, var.identifier()),
+                span: node_span(&*var, file_id, source),
+            });
         } else if let Some(cur) = spec.cursor_declaration() {
             if let Some(q) = cur.select_statement() {
                 out.push(AstStatement::Sql {
@@ -1054,6 +1078,15 @@ fn lower_declare_items(
                 });
             }
         } else if let Some(pb) = spec.procedure_body() {
+            let parameters = lower_params(&pb.parameter_all(), source, file_id);
+            out.push(AstStatement::ValueScopeStart {
+                parameters: parameters.iter().map(|p| p.name.clone()).collect(),
+                default_expressions: parameters
+                    .iter()
+                    .filter_map(|p| p.default_text.clone())
+                    .collect(),
+                span: node_span(&*pb, file_id, source),
+            });
             out.extend(lower_declare_specs(
                 pb.seq_of_declare_specs(),
                 source,
@@ -1067,7 +1100,19 @@ fn lower_declare_items(
             if pb.call_spec().is_some() {
                 unattributed_out.push(unattributed(&*pb, "call_spec", file_id, source));
             }
+            out.push(AstStatement::ValueScopeEnd {
+                span: node_span(&*pb, file_id, source),
+            });
         } else if let Some(fb) = spec.function_body() {
+            let parameters = lower_params(&fb.parameter_all(), source, file_id);
+            out.push(AstStatement::ValueScopeStart {
+                parameters: parameters.iter().map(|p| p.name.clone()).collect(),
+                default_expressions: parameters
+                    .iter()
+                    .filter_map(|p| p.default_text.clone())
+                    .collect(),
+                span: node_span(&*fb, file_id, source),
+            });
             out.extend(lower_declare_specs(
                 fb.seq_of_declare_specs(),
                 source,
@@ -1081,6 +1126,9 @@ fn lower_declare_items(
             if fb.call_spec().is_some() {
                 unattributed_out.push(unattributed(&*fb, "call_spec", file_id, source));
             }
+            out.push(AstStatement::ValueScopeEnd {
+                span: node_span(&*fb, file_id, source),
+            });
         } else if spec.selection_directive().is_some() {
             unattributed_out.push(unattributed(
                 &**spec,
@@ -1126,6 +1174,12 @@ fn push_initializer(
 ) {
     let name = ident_of(source, var.identifier());
     units.state_variables.push(name.clone());
+    units
+        .value_declarations
+        .push(plsql_parser::ast::AstValueDeclaration {
+            name: name.clone(),
+            span: node_span(var, file_id, source),
+        });
     if let Some(init) = var.default_value_part().and_then(|d| d.expression()) {
         units.initializers.push(AstInitializer {
             name,

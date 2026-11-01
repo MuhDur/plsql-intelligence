@@ -36,12 +36,26 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Statement {
+    /// Parser-proven value binding; never inferred from an assignment target.
+    ValueBinding {
+        name: String,
+    },
+    /// Begin/end lexical value scope without hiding the flattened statements
+    /// from existing SQL, call and control-flow walkers.
+    ValueScopeStart {
+        parameters: Vec<String>,
+        default_expressions: Vec<String>,
+    },
+    ValueScopeEnd,
     /// `NULL;` — the PL/SQL no-op.
     Null,
     /// `target := expr;` — captures the LHS target name and the
     /// raw RHS expression text. Sub-expression lowering happens
     /// in a later pass.
-    Assignment { target: String, rhs_text: String },
+    Assignment {
+        target: String,
+        rhs_text: String,
+    },
     /// `IF cond THEN … [ELSIF …] [ELSE …] END IF;`. We capture the
     /// condition text per arm + the body source slice; full body
     /// lowering re-enters `lower_statement_body` on each slice once
@@ -51,7 +65,9 @@ pub enum Statement {
         else_body_text: Option<String>,
     },
     /// `LOOP … END LOOP;` (bare loop).
-    BareLoop { body_text: String },
+    BareLoop {
+        body_text: String,
+    },
     /// `FOR <ident> IN <range> LOOP … END LOOP;` — captures the
     /// iterator name + the range text.
     ForLoop {
@@ -65,11 +81,17 @@ pub enum Statement {
         body_text: String,
     },
     /// `RAISE [exception_name];`.
-    Raise { exception: Option<String> },
+    Raise {
+        exception: Option<String>,
+    },
     /// `RETURN [expr];`.
-    Return { value_text: Option<String> },
+    Return {
+        value_text: Option<String>,
+    },
     /// `EXIT [WHEN cond];`.
-    Exit { when_text: Option<String> },
+    Exit {
+        when_text: Option<String>,
+    },
     /// `EXECUTE IMMEDIATE expr [USING binds] [INTO targets];`.
     /// `sql_literal` retains the entire SQL expression (including
     /// quotes when literal), so a literal prefix followed by a variable
@@ -83,17 +105,27 @@ pub enum Statement {
     /// `INSERT`, `UPDATE`, `DELETE`, `MERGE`). The verb is
     /// captured plus the raw text so downstream lineage can walk
     /// the tables it touches.
-    Sql { verb: SqlVerb, raw_text: String },
+    Sql {
+        verb: SqlVerb,
+        raw_text: String,
+    },
     /// Static `OPEN cursor FOR SELECT ...`. Dynamic expressions and qualified
     /// cursor targets remain unrecognized; consumers must retain uncertainty.
-    OpenCursor { target: String, query_text: String },
+    OpenCursor {
+        target: String,
+        query_text: String,
+    },
     /// Anonymous nested block — `[DECLARE …] BEGIN … END;` inside
     /// the surrounding body.
-    NestedBlock { body_text: String },
+    NestedBlock {
+        body_text: String,
+    },
     /// `COMMIT;` / `ROLLBACK [TO …];` / `SAVEPOINT …;` — captured
     /// as a single kind because the engine treats them uniformly
     /// for now.
-    TransactionControl { verb: String },
+    TransactionControl {
+        verb: String,
+    },
     /// Statement the recognizer could not classify. The
     /// `unknown_reason` discriminant feeds R13 reporting so the
     /// engine never silently drops a line.
@@ -662,7 +694,7 @@ fn classify(text: &str) -> Statement {
                 && starts_with_keyword(rest, "FOR")
             {
                 let query = rest[3..].trim_start();
-                if starts_with_keyword(query, "SELECT") {
+                if starts_with_keyword(query, "SELECT") || starts_with_keyword(query, "WITH") {
                     return Statement::OpenCursor {
                         target: target.into(),
                         query_text: query.into(),
@@ -891,6 +923,10 @@ mod tests {
         assert!(
             matches!(&lower_statement_body("OPEN c FOR SELECT id FROM app.t;")[0],
             Statement::OpenCursor { target, query_text } if target == "c" && query_text.starts_with("SELECT"))
+        );
+        assert!(
+            matches!(&lower_statement_body("OPEN c FOR WITH t AS (SELECT 1 n FROM dual) SELECT n FROM t;")[0],
+            Statement::OpenCursor { target, query_text } if target == "c" && query_text.starts_with("WITH"))
         );
         for source in [
             "OPEN c FOR sql_text;",

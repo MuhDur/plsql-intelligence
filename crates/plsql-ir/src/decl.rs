@@ -421,10 +421,19 @@ pub struct PackageUnits {
     pub lowered: bool,
     pub members: Vec<PackageMember>,
     pub state_variables: Vec<String>,
+    #[serde(default)]
+    pub value_declarations: Vec<ValueDeclaration>,
     pub initializers: Vec<PackageInitializer>,
     pub cursors: Vec<PackageCursor>,
     pub init_section: Option<PackageInitSection>,
     pub unattributed: Vec<UnattributedConstruct>,
+}
+
+/// A value's exact declaration position, used to prove lexical visibility.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValueDeclaration {
+    pub name: String,
+    pub span: Span,
 }
 
 /// What an addressable unit is.
@@ -516,19 +525,41 @@ impl PackageUnits {
                 }
             }
         }
-        if let Some(first) = self.initializers.first() {
+        if let Some(span) = self
+            .value_declarations
+            .first()
+            .map(|v| v.span)
+            .or_else(|| self.initializers.first().map(|i| i.span))
+        {
+            let mut statements: Vec<_> = self
+                .value_declarations
+                .iter()
+                .map(|v| {
+                    (
+                        v.span.start.offset,
+                        1u8,
+                        Statement::ValueBinding {
+                            name: v.name.clone(),
+                        },
+                    )
+                })
+                .collect();
+            statements.extend(self.initializers.iter().map(|i| {
+                (
+                    i.span.start.offset,
+                    0u8,
+                    Statement::Assignment {
+                        target: i.name.clone(),
+                        rhs_text: i.initializer_text.clone(),
+                    },
+                )
+            }));
+            statements.sort_by_key(|(offset, kind, _)| (*offset, *kind));
             out.push(PackageUnit {
                 id: format!("{package}#{part}_initializers"),
                 kind: PackageUnitKind::Initializers,
-                statements: self
-                    .initializers
-                    .iter()
-                    .map(|i| Statement::Assignment {
-                        target: i.name.clone(),
-                        rhs_text: i.initializer_text.clone(),
-                    })
-                    .collect(),
-                span: first.span,
+                statements: statements.into_iter().map(|(_, _, stmt)| stmt).collect(),
+                span,
             });
         }
         if let Some(section) = &self.init_section {

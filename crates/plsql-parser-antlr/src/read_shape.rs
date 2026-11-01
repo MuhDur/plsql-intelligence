@@ -68,6 +68,17 @@ pub struct ReadQueryShape {
     pub query: ShapeQuery,
 }
 
+/// The existing SQL expression/query projection, including DML value slots.
+/// This describes syntax only and grants no execution authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatementValueShape {
+    Query(ShapeQuery),
+    Dml {
+        sources: Vec<ShapeTableRef>,
+        values: Vec<ShapeExpr>,
+    },
+}
+
 /// A query: optional CTEs, one or more set branches and trailing clauses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShapeQuery {
@@ -258,6 +269,21 @@ impl<'a, T: Recognizer<'a>> ErrorListener<'a, T> for ErrorCount {
 
 /// Parse `sql` and return its complete read shape, or why there is none.
 pub fn read_query_shape(sql: &str) -> Result<ReadQueryShape, ShapeRefusal> {
+    let root = parse_sql_root(sql)?;
+    Walker::default().script(&root)
+}
+
+/// Project SELECT/INTO and DML through the same whitelisted ANTLR walker.
+pub fn statement_value_shape(sql: &str) -> Result<StatementValueShape, ShapeRefusal> {
+    let root = parse_sql_root(sql)?;
+    Walker {
+        value_mode: true,
+        ..Default::default()
+    }
+    .value_script(&root)
+}
+
+fn parse_sql_root(sql: &str) -> Result<Node<'_>, ShapeRefusal> {
     if sql.contains('\0') || sql.len() > MAX_SHAPE_SQL_BYTES {
         return Err(ShapeRefusal::InvalidInput);
     }
@@ -272,18 +298,158 @@ pub fn read_query_shape(sql: &str) -> Result<ReadQueryShape, ShapeRefusal> {
     if errors.get() != 0 {
         return Err(ShapeRefusal::SyntaxError);
     }
-    let root: Node<'_> = script;
-    let mut walker = Walker::default();
-    walker.script(&root)
+    Ok(script)
 }
 
 #[derive(Default)]
 struct Walker {
     nodes: usize,
     depth: usize,
+    value_mode: bool,
 }
 
 impl Walker {
+    fn value_script(&mut self, root: &Node<'_>) -> Result<StatementValueShape, ShapeRefusal> {
+        let mut units = Vec::new();
+        for child in children(root) {
+            match rule_of(&child) {
+                Some("unit_statement") => units.push(child),
+                None if matches!(keyword(&child).as_deref(), Some(";" | "<EOF>")) => {}
+                _ => return Err(ShapeRefusal::NotSingleSelect),
+            }
+        }
+        let [unit] = units.as_slice() else {
+            return Err(ShapeRefusal::NotSingleSelect);
+        };
+        let dml = sole_rule_child(unit, "data_manipulation_language_statements")?;
+        let statements: Vec<_> = children(&dml)
+            .into_iter()
+            .filter(|n| rule_of(n).is_some())
+            .collect();
+        let [statement] = statements.as_slice() else {
+            return Err(ShapeRefusal::NotSingleSelect);
+        };
+        if rule_of(statement) == Some("select_statement") {
+            return self
+                .select_statement(statement)
+                .map(StatementValueShape::Query);
+        }
+        if !matches!(
+            rule_of(statement),
+            Some("insert_statement" | "update_statement" | "delete_statement" | "merge_statement")
+        ) {
+            return Err(ShapeRefusal::UnsupportedConstruct("DML value statement"));
+        }
+        let mut sources = Vec::new();
+        let mut values = Vec::new();
+        self.dml_values(statement, &mut sources, &mut values)?;
+        Ok(StatementValueShape::Dml { sources, values })
+    }
+
+    fn value_table(&mut self, node: &Node<'_>) -> Result<ShapeTableRef, ShapeRefusal> {
+        let mut source = None;
+        let mut alias = None;
+        for child in children(node) {
+            match rule_of(&child) {
+                Some("dml_table_expression_clause") if source.is_none() => {
+                    source = Some(self.dml_table_expression_clause(&child)?)
+                }
+                Some("tableview_name") if source.is_none() => {
+                    let (name, db_link, partition) = self.tableview_name(&child)?;
+                    source = Some(ShapeSource::Table {
+                        name,
+                        db_link,
+                        partition,
+                    });
+                }
+                Some("select_statement") if source.is_none() => {
+                    source = Some(ShapeSource::Derived(Box::new(
+                        self.select_statement(&child)?,
+                    )))
+                }
+                Some("table_alias") if alias.is_none() => alias = Some(self.table_alias(&child)?),
+                None if matches!(keyword(&child).as_deref(), Some("ONLY" | "(" | ")")) => {}
+                Some(rule) => return Err(ShapeRefusal::UnsupportedRule(rule)),
+                None => return Err(ShapeRefusal::UnsupportedConstruct("DML source token")),
+            }
+        }
+        Ok(ShapeTableRef {
+            source: source.ok_or(ShapeRefusal::UnsupportedConstruct("DML source"))?,
+            alias,
+            flashback: Vec::new(),
+        })
+    }
+
+    fn target_only(&mut self, node: &Node<'_>) -> Result<(), ShapeRefusal> {
+        let mut pending = vec![(node.clone(), 0usize)];
+        while let Some((node, depth)) = pending.pop() {
+            self.nodes += 1;
+            if self.nodes > MAX_NODES || depth > MAX_DEPTH {
+                return Err(ShapeRefusal::LimitExceeded);
+            }
+            if matches!(
+                rule_of(&node),
+                Some("expression" | "condition" | "function_argument" | "subquery")
+            ) {
+                return Err(ShapeRefusal::UnsupportedConstruct("computed SQL target"));
+            }
+            pending.extend(children(&node).into_iter().map(|n| (n, depth + 1)));
+        }
+        Ok(())
+    }
+
+    fn dml_values(
+        &mut self,
+        node: &Node<'_>,
+        sources: &mut Vec<ShapeTableRef>,
+        values: &mut Vec<ShapeExpr>,
+    ) -> Result<(), ShapeRefusal> {
+        self.enter()?;
+        match rule_of(node) {
+            Some("expression" | "condition") => values.push(self.transparent_expr(node)?),
+            Some("expressions_") => values.extend(self.expression_list(node)?),
+            Some("select_statement") => values.push(ShapeExpr::Subquery {
+                kind: ShapeSubqueryKind::Scalar,
+                query: Box::new(self.select_statement(node)?),
+            }),
+            Some("subquery") => values.push(ShapeExpr::Subquery {
+                kind: ShapeSubqueryKind::Scalar,
+                query: Box::new(self.subquery(node)?),
+            }),
+            Some("general_table_ref" | "selected_tableview") => {
+                sources.push(self.value_table(node)?)
+            }
+            // INSERT destinations, SET targets and INTO variables are not
+            // value references and cannot supply readable column bindings.
+            Some("insert_into_clause" | "column_name" | "paren_column_list" | "into_clause") => {
+                self.target_only(node)?
+            }
+            Some(
+                "update_statement"
+                | "delete_statement"
+                | "insert_statement"
+                | "single_table_insert"
+                | "merge_statement"
+                | "update_set_clause"
+                | "column_based_update_set_clause"
+                | "merge_update_clause"
+                | "merge_insert_clause"
+                | "merge_element"
+                | "merge_update_delete_part"
+                | "where_clause"
+                | "values_clause"
+                | "static_returning_clause",
+            ) => {
+                for child in children(node) {
+                    self.dml_values(&child, sources, values)?;
+                }
+            }
+            None => terminal_without_identifier(node)?,
+            Some(rule) => return Err(ShapeRefusal::UnsupportedRule(rule)),
+        }
+        self.leave();
+        Ok(())
+    }
     fn enter(&mut self) -> Result<(), ShapeRefusal> {
         self.nodes += 1;
         self.depth += 1;
@@ -333,7 +499,17 @@ impl Walker {
                     row_limit.push(self.transparent_expr(&child)?);
                 }
                 Some("for_update_clause") => {
-                    return Err(ShapeRefusal::UnsupportedConstruct("FOR UPDATE"));
+                    if !self.value_mode {
+                        return Err(ShapeRefusal::UnsupportedConstruct("FOR UPDATE"));
+                    }
+                    for part in children(&child) {
+                        match rule_of(&part) {
+                            Some("expression") => row_limit.push(self.expression(&part)?),
+                            Some("for_update_of_part") => self.target_only(&part)?,
+                            None => terminal_without_identifier(&part)?,
+                            Some(rule) => return Err(ShapeRefusal::UnsupportedRule(rule)),
+                        }
+                    }
                 }
                 Some(other) => return Err(ShapeRefusal::UnsupportedRule(other)),
                 None => return Err(ShapeRefusal::NotSingleSelect),
@@ -546,6 +722,7 @@ impl Walker {
                 Some("offset_clause" | "fetch_clause") => {
                     select.row_limit.push(self.transparent_expr(&child)?);
                 }
+                Some("into_clause") if self.value_mode => self.target_only(&child)?,
                 Some("into_clause") => return Err(ShapeRefusal::UnsupportedConstruct("INTO")),
                 Some("model_clause") => return Err(ShapeRefusal::UnsupportedConstruct("MODEL")),
                 Some(other) => return Err(ShapeRefusal::UnsupportedRule(other)),
@@ -556,7 +733,7 @@ impl Walker {
                 },
             }
         }
-        if !saw_list || select.from.is_empty() {
+        if !saw_list || (select.from.is_empty() && !self.value_mode) {
             return Err(ShapeRefusal::UnsupportedConstruct("SELECT without FROM"));
         }
         self.leave();

@@ -6,8 +6,80 @@
 
 use plsql_parser_antlr::read_shape::{
     ReadQueryShape, ShapeBranch, ShapeExpr, ShapeIdent, ShapeJoinKind, ShapePartition,
-    ShapeRefusal, ShapeSelect, ShapeSelectItem, ShapeSource, ShapeSubqueryKind, read_query_shape,
+    ShapeRefusal, ShapeSelect, ShapeSelectItem, ShapeSource, ShapeSubqueryKind,
+    StatementValueShape, read_query_shape, statement_value_shape,
 };
+
+#[test]
+fn statement_value_shape_reuses_query_projection_without_admitting_mutations_as_reads() {
+    let plain = shape("SELECT APP.F, D.DUMMY FROM SYS.DUAL D");
+    let StatementValueShape::Query(into) =
+        statement_value_shape("SELECT APP.F, D.DUMMY INTO V, W FROM SYS.DUAL D").unwrap()
+    else {
+        panic!("expected query");
+    };
+    assert_eq!(
+        plain.query, into,
+        "INTO lvalues must not become expression names"
+    );
+    for sql in [
+        "SELECT F INTO V FROM DUAL",
+        "SELECT F",
+        "SELECT ID FROM APP.T FOR UPDATE",
+    ] {
+        assert!(statement_value_shape(sql).is_ok(), "{sql}");
+        assert!(
+            read_query_shape(sql).is_err(),
+            "read admission remains unchanged: {sql}"
+        );
+    }
+}
+
+#[test]
+fn statement_value_shape_keeps_dml_sources_and_value_names_separate_from_targets() {
+    for (sql, expected, source_count) in [
+        (
+            "UPDATE APP.T T SET ID = APP.F WHERE T.ID = 1",
+            vec![vec!["APP", "F"], vec!["T", "ID"]],
+            1,
+        ),
+        (
+            "INSERT INTO APP.T(ID) VALUES(APP.F)",
+            vec![vec!["APP", "F"]],
+            0,
+        ),
+        (
+            "DELETE FROM APP.T T WHERE T.ID = APP.F",
+            vec![vec!["T", "ID"], vec!["APP", "F"]],
+            1,
+        ),
+        (
+            "MERGE INTO APP.T T USING APP.U U ON (T.ID = U.ID) WHEN MATCHED THEN UPDATE SET T.ID = APP.F",
+            vec![vec!["T", "ID"], vec!["U", "ID"], vec!["APP", "F"]],
+            2,
+        ),
+    ] {
+        let StatementValueShape::Dml { sources, values } =
+            statement_value_shape(sql).unwrap_or_else(|reason| panic!("{sql}: {reason:?}"))
+        else {
+            panic!("expected DML");
+        };
+        assert_eq!(sources.len(), source_count, "{sql}");
+        let mut names = Vec::new();
+        for value in &values {
+            names_in(value, &mut names);
+        }
+        assert_eq!(names, expected, "{sql}");
+        assert!(read_query_shape(sql).is_err());
+    }
+    for sql in [
+        "SELECT 1 FROM DUAL; SELECT APP.F FROM DUAL",
+        "BEGIN APP.F; END;",
+        "CALL APP.F()",
+    ] {
+        assert!(statement_value_shape(sql).is_err(), "{sql}");
+    }
+}
 
 fn ident(text: &str) -> ShapeIdent {
     ShapeIdent {

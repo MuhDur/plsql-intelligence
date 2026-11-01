@@ -262,8 +262,24 @@ impl Spanned for AstDecl {
 /// Every variant carries a `span` (Spanned invariant).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AstStatement {
+    /// A parser-observed value declaration, in lexical declaration order.
+    ValueBinding {
+        name: String,
+        span: Span,
+    },
+    /// Lexical scope around conservatively flattened nested subprogram bodies.
+    ValueScopeStart {
+        parameters: Vec<String>,
+        default_expressions: Vec<String>,
+        span: Span,
+    },
+    ValueScopeEnd {
+        span: Span,
+    },
     /// `NULL;`
-    Null { span: Span },
+    Null {
+        span: Span,
+    },
     /// `target := <rhs>;` — RHS kept as raw text for the IR
     /// lowering layer to re-parse.
     Assignment {
@@ -273,9 +289,15 @@ pub enum AstStatement {
     },
     /// `IF … THEN … [ELSIF …] [ELSE …] END IF;` — the body
     /// slices are raw text the IR layer recurses into.
-    If { cond_text: String, span: Span },
+    If {
+        cond_text: String,
+        span: Span,
+    },
     /// Any loop form (`LOOP` / `FOR … LOOP` / `WHILE … LOOP`).
-    Loop { header_text: String, span: Span },
+    Loop {
+        header_text: String,
+        span: Span,
+    },
     /// `RAISE [exception];`
     Raise {
         exception: Option<String>,
@@ -312,13 +334,18 @@ pub enum AstStatement {
         span: Span,
     },
     /// A statement the backend could not classify (R13).
-    Unknown { span: Span },
+    Unknown {
+        span: Span,
+    },
 }
 
 impl Spanned for AstStatement {
     fn span(&self) -> Span {
         match self {
-            Self::Null { span }
+            Self::ValueBinding { span, .. }
+            | Self::ValueScopeStart { span, .. }
+            | Self::ValueScopeEnd { span }
+            | Self::Null { span }
             | Self::Assignment { span, .. }
             | Self::If { span, .. }
             | Self::Loop { span, .. }
@@ -559,11 +586,20 @@ pub struct AstPackageUnits {
     /// Package variables, with or without an initializer. Assignments to
     /// these names mutate session package state.
     pub state_variables: Vec<String>,
+    /// Exact declaration locations; names alone do not establish visibility.
+    #[serde(default)]
+    pub value_declarations: Vec<AstValueDeclaration>,
     pub initializers: Vec<AstInitializer>,
     pub cursors: Vec<AstPackageCursor>,
     /// Body only.
     pub init_section: Option<AstInitSection>,
     pub unattributed: Vec<AstUnattributed>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AstValueDeclaration {
+    pub name: String,
+    pub span: Span,
 }
 
 /// One maximal static SQL statement observed in the grammar tree. Nested SQL

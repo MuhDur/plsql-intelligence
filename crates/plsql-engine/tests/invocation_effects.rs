@@ -153,6 +153,223 @@ fn output_primitive_arguments_retain_calls_effects_and_unknowns() {
 }
 
 #[test]
+fn value_position_names_require_bindings_in_every_expression_context() {
+    for value in ["APP.F", "PKG.F", "F"] {
+        for body in [
+            format!("V := {value}; RETURN V;"),
+            format!("IF {value} = 1 THEN RETURN 1; END IF; RETURN 0;"),
+            format!("WHILE {value} = 1 LOOP EXIT; END LOOP; RETURN 0;"),
+            format!("SYS.DBMS_OUTPUT.PUT_LINE({value}); RETURN 0;"),
+            format!("RETURN {value};"),
+            format!("RETURN 1 + {value};"),
+        ] {
+            let run = analyze(&format!(
+                "CREATE FUNCTION APP.F RETURN NUMBER IS PRAGMA AUTONOMOUS_TRANSACTION; BEGIN COMMIT; RETURN 1; END; /\nCREATE FUNCTION APP.FX RETURN NUMBER IS V NUMBER; BEGIN {body} END; /"
+            ));
+            let actual = closure(&run, "APP.FX", 0);
+            assert!(!actual.clean, "{value} in {body}: {actual:?}");
+            assert!(
+                actual.effects.effects.contains(&RoutineEffect::Unknown),
+                "{actual:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn declared_locals_parameters_and_constants_stay_values() {
+    let run = analyze(
+        "CREATE FUNCTION APP.V RETURN NUMBER IS PRAGMA AUTONOMOUS_TRANSACTION; BEGIN COMMIT; RETURN 9; END; /\nCREATE FUNCTION APP.FX(P NUMBER) RETURN NUMBER IS V NUMBER; C CONSTANT NUMBER := 1; BEGIN V := P+C; IF V > 0 THEN SYS.DBMS_OUTPUT.PUT_LINE(V); RETURN V; END IF; RETURN C; END; /",
+    );
+    let actual = closure(&run, "APP.FX", 1);
+    assert_case(
+        "known_value_bindings",
+        &actual,
+        &[RoutineEffect::SessionState],
+        true,
+    );
+    assert!(!actual.units.contains("APP.V"));
+    let uninitialized =
+        analyze("CREATE FUNCTION APP.FX RETURN NUMBER IS V NUMBER; BEGIN RETURN V; END; /");
+    assert_case(
+        "uninitialized_local_value",
+        &closure(&uninitialized, "APP.FX", 0),
+        &[],
+        true,
+    );
+}
+
+#[test]
+fn value_bindings_do_not_leak_from_later_declarations_or_nested_scopes() {
+    for source in [
+        "CREATE FUNCTION APP.FX RETURN NUMBER IS V NUMBER := F; F NUMBER := 1; BEGIN RETURN V; END; /",
+        "CREATE FUNCTION APP.FX RETURN NUMBER IS PROCEDURE N IS F NUMBER; BEGIN NULL; END; BEGIN RETURN F; END; /",
+    ] {
+        let run = analyze(source);
+        assert!(!closure(&run, "APP.FX", 0).clean, "{source}");
+    }
+}
+
+#[test]
+fn value_names_in_standalone_handlers_are_checked() {
+    for source in [
+        "CREATE PROCEDURE APP.FX IS BEGIN NULL; EXCEPTION WHEN OTHERS THEN SYS.DBMS_OUTPUT.PUT_LINE(APP.F); END; /",
+        "CREATE FUNCTION APP.FX RETURN NUMBER IS BEGIN RETURN 0; EXCEPTION WHEN OTHERS THEN RETURN APP.F; END; /",
+        "CREATE PROCEDURE APP.FX IS PROCEDURE N(P NUMBER DEFAULT APP.F) IS BEGIN NULL; END; BEGIN NULL; END; /",
+    ] {
+        let run = analyze(source);
+        let actual = closure(&run, "APP.FX", 0);
+        assert!(!actual.clean, "{source}: {actual:?}");
+        assert!(actual.effects.effects.contains(&RoutineEffect::Unknown));
+    }
+}
+
+#[test]
+fn compound_timing_section_value_bindings_do_not_leak() {
+    let run = analyze(
+        "CREATE TRIGGER APP.TR_SCOPE FOR INSERT ON APP.T COMPOUND TRIGGER G NUMBER; BEFORE STATEMENT IS F NUMBER; BEGIN NULL; END BEFORE STATEMENT; AFTER STATEMENT IS BEGIN SYS.DBMS_OUTPUT.PUT_LINE(F); END AFTER STATEMENT; END; /",
+    );
+    let actual = closure(&run, "APP.TR_SCOPE", 0);
+    assert!(
+        !actual.clean,
+        "section-local F cannot hide a possible call in another section: {actual:?}"
+    );
+    let known = analyze(
+        "CREATE TRIGGER APP.TR_SCOPE FOR INSERT ON APP.T COMPOUND TRIGGER G NUMBER; BEFORE STATEMENT IS V NUMBER; BEGIN SYS.DBMS_OUTPUT.PUT_LINE(V); END BEFORE STATEMENT; AFTER STATEMENT IS BEGIN SYS.DBMS_OUTPUT.PUT_LINE(G); END AFTER STATEMENT; END; /",
+    );
+    assert!(
+        closure(&known, "APP.TR_SCOPE", 0).clean,
+        "shared G and section-local V are known values"
+    );
+}
+
+#[test]
+fn embedded_sql_bare_function_values_are_not_purity_evidence() {
+    for body in [
+        "SELECT APP.F INTO V FROM SYS.DUAL; RETURN V;",
+        "OPEN C FOR SELECT APP.F AS N FROM SYS.DUAL; RETURN 0;",
+        "UPDATE APP.T SET ID=APP.F; RETURN 0;",
+    ] {
+        let run = analyze(&format!(
+            "CREATE FUNCTION APP.F RETURN NUMBER IS PRAGMA AUTONOMOUS_TRANSACTION; BEGIN COMMIT; RETURN 1; END; /\nCREATE FUNCTION APP.FX RETURN NUMBER IS V NUMBER; C SYS_REFCURSOR; BEGIN {body} END; /"
+        ));
+        let actual = closure(&run, "APP.FX", 0);
+        assert!(
+            !actual.clean || actual.effects.effects.contains(&RoutineEffect::Autonomous),
+            "embedded SQL value {body} omitted its possible call: {actual:?}"
+        );
+    }
+}
+
+#[test]
+fn sql_non_alias_qualified_values_are_unknown_across_statement_kinds() {
+    for statement in [
+        "SELECT APP.F INTO V FROM SYS.DUAL;",
+        "SELECT APP.F INTO V FROM APP.T T;",
+        "SELECT APP.F INTO V FROM APP.T;",
+        "SELECT APP.PKG.F INTO V FROM APP.T T;",
+        "OPEN C FOR SELECT APP.F FROM SYS.DUAL;",
+        "UPDATE APP.T T SET ID = APP.F WHERE T.ID = 1;",
+        "INSERT INTO APP.T(ID) VALUES(APP.F);",
+        "DELETE FROM APP.T T WHERE T.ID = APP.F;",
+        "MERGE INTO APP.T T USING APP.U U ON (T.ID = U.ID) WHEN MATCHED THEN UPDATE SET T.ID = APP.F;",
+        // An alias in a nested or sibling block cannot bind the outer name.
+        "SELECT (SELECT 1 FROM APP.U APP) + APP.F INTO V FROM SYS.DUAL;",
+        "OPEN C FOR SELECT 1 FROM APP.U APP UNION ALL SELECT APP.F FROM SYS.DUAL;",
+    ] {
+        let run = analyze(&format!(
+            "CREATE PROCEDURE APP.FX IS V NUMBER; C SYS_REFCURSOR; BEGIN {statement} END; /"
+        ));
+        let actual = closure(&run, "APP.FX", 0);
+        assert!(!actual.clean, "{statement}: {actual:?}");
+        assert!(
+            actual
+                .unknown_reasons
+                .iter()
+                .any(|reason| reason.starts_with("unresolved SQL value or zero-argument call:")),
+            "the complete SQL shape must reach the name check: {statement}: {actual:?}"
+        );
+    }
+}
+
+#[test]
+fn sql_dual_only_and_sourceless_bare_values_need_bindings() {
+    for statement in [
+        "SELECT F INTO V FROM DUAL;",
+        "SELECT F INTO V FROM SYS.DUAL D;",
+        "SELECT F INTO V;",
+        "OPEN C FOR SELECT F FROM SYS.DUAL;",
+        "INSERT INTO APP.T(ID) VALUES(F);",
+        "UPDATE APP.T SET ID = (SELECT F FROM SYS.DUAL);",
+        "DELETE FROM APP.T WHERE ID = (SELECT F);",
+        "OPEN C FOR SELECT F FROM (SELECT 1 ID FROM DUAL) T;",
+        "OPEN C FOR WITH T AS (SELECT 1 ID FROM DUAL) SELECT F FROM T;",
+        "OPEN C FOR WITH T(ID) AS (SELECT 1 FROM DUAL UNION ALL SELECT F FROM T) SELECT ID FROM T;",
+    ] {
+        let run = analyze(&format!(
+            "CREATE PROCEDURE APP.FX IS V NUMBER; C SYS_REFCURSOR; BEGIN {statement} END; /"
+        ));
+        let actual = closure(&run, "APP.FX", 0);
+        assert!(!actual.clean, "{statement}: {actual:?}");
+        assert!(
+            actual
+                .unknown_reasons
+                .iter()
+                .any(|reason| reason == "unresolved SQL value or zero-argument call: F"),
+            "the bare name must be checked: {statement}: {actual:?}"
+        );
+    }
+}
+
+#[test]
+fn sql_aliases_sources_dual_columns_and_local_values_stay_usable() {
+    for statement in [
+        "SELECT DUMMY INTO V FROM DUAL;",
+        "SELECT D.DUMMY INTO V FROM SYS.DUAL D;",
+        "SELECT P INTO V FROM DUAL;",
+        "SELECT P INTO V;",
+        "SELECT ID INTO V FROM APP.T;",
+        "SELECT T.ID INTO V FROM APP.T T;",
+        "SELECT T.ID INTO V FROM APP.T;",
+        "SELECT APP.T.ID INTO V FROM APP.T;",
+        "SELECT APP.F INTO V FROM APP.T APP;",
+        "OPEN C FOR SELECT LEVEL FROM DUAL CONNECT BY LEVEL <= 8;",
+        "OPEN C FOR SELECT ID FROM (SELECT 1 ID FROM DUAL) T;",
+        "OPEN C FOR WITH T(ID) AS (SELECT 1 FROM DUAL) SELECT ID FROM T;",
+        "OPEN C FOR WITH T(ID) AS (SELECT 1 FROM DUAL UNION ALL SELECT ID FROM T WHERE ID < 2) SELECT ID FROM T;",
+        "OPEN C FOR SELECT 1 ID FROM DUAL ORDER BY ID;",
+        "UPDATE APP.T T SET ID = P WHERE T.ID = 1;",
+        "INSERT INTO APP.T(ID) VALUES(P);",
+        "DELETE FROM APP.T T WHERE T.ID = P;",
+        "MERGE INTO APP.T T USING APP.U U ON (T.ID = U.ID) WHEN MATCHED THEN UPDATE SET T.ID = U.ID;",
+    ] {
+        let run = analyze(&format!(
+            "CREATE PROCEDURE APP.FX(P NUMBER) IS V VARCHAR2(100); C SYS_REFCURSOR; BEGIN {statement} END; /"
+        ));
+        let actual = closure(&run, "APP.FX", 1);
+        assert!(actual.clean, "{statement}: {actual:?}");
+        assert!(!actual.effects.effects.contains(&RoutineEffect::Unknown));
+    }
+}
+
+#[test]
+fn package_value_visibility_is_proven_at_the_member_declaration() {
+    let run = analyze(
+        "CREATE PACKAGE PKG AS C CONSTANT NUMBER := 1; FUNCTION FX RETURN NUMBER; END; /\nCREATE PACKAGE BODY PKG AS V NUMBER; FUNCTION FX RETURN NUMBER IS BEGIN RETURN C + V; END; END; /",
+    );
+    let actual = closure(&run, "PKG.FX", 0);
+    assert!(
+        actual.clean,
+        "{actual:?}; units={:?}",
+        run.invocation_index.units.keys().collect::<Vec<_>>()
+    );
+    let later = analyze(
+        "CREATE PACKAGE PKG AS FUNCTION FX RETURN NUMBER; END; /\nCREATE PACKAGE BODY PKG AS FUNCTION FX RETURN NUMBER IS BEGIN RETURN F; END; F NUMBER := 1; END; /",
+    );
+    assert!(!closure(&later, "PKG.FX", 0).clean);
+}
+
+#[test]
 fn output_shadowed_sys_qualifier_remains_unknown() {
     for declaration in ["SYS NUMBER;", "\"SYS\" APP.T;", "SYS APP.T;"] {
         let run = analyze(&format!(

@@ -370,7 +370,7 @@ fn tree_lower_trigger_declarations_retain_pragma_and_initializer() {
     let body = &ast.body_statements[0];
     assert_eq!(
         body.len(),
-        3,
+        4,
         "every declaration effect must be attributed: {body:?}"
     );
     assert!(
@@ -379,7 +379,8 @@ fn tree_lower_trigger_declarations_retain_pragma_and_initializer() {
     assert!(
         matches!(&body[1],AstStatement::Assignment{target,rhs_text,..} if target=="V" && rhs_text=="APP.FX()")
     );
-    assert!(matches!(&body[2], AstStatement::Null { .. }));
+    assert!(matches!(&body[2], AstStatement::ValueBinding {name,..} if name=="V"));
+    assert!(matches!(&body[3], AstStatement::Null { .. }));
 }
 
 #[test]
@@ -395,14 +396,24 @@ fn tree_lower_trigger_compound_sections_cover_declarations_and_handlers() {
     let body = &ast.body_statements[0];
     assert_eq!(
         body.len(),
-        5,
+        11,
         "shared declarations, section declarations, body, handler and later section: {body:?}"
     );
     assert!(matches!(&body[0],AstStatement::Assignment{target,..} if target=="G"));
-    assert!(matches!(&body[1],AstStatement::Assignment{target,..} if target=="V"));
-    assert!(matches!(&body[2], AstStatement::Null { .. }));
-    assert!(matches!(&body[3],AstStatement::Sql{verb,..} if verb=="INSERT"));
-    assert!(matches!(&body[4],AstStatement::Sql{verb,..} if verb=="UPDATE"));
+    assert!(matches!(&body[1],AstStatement::ValueBinding{name,..} if name=="G"));
+    assert!(
+        matches!(&body[2],AstStatement::ValueScopeStart{parameters,default_expressions,..} if parameters.is_empty() && default_expressions.is_empty())
+    );
+    assert!(matches!(&body[3],AstStatement::Assignment{target,..} if target=="V"));
+    assert!(matches!(&body[4],AstStatement::ValueBinding{name,..} if name=="V"));
+    assert!(matches!(&body[5], AstStatement::Null { .. }));
+    assert!(matches!(&body[6],AstStatement::Sql{verb,..} if verb=="INSERT"));
+    assert!(matches!(&body[7], AstStatement::ValueScopeEnd { .. }));
+    assert!(
+        matches!(&body[8],AstStatement::ValueScopeStart{parameters,default_expressions,..} if parameters.is_empty() && default_expressions.is_empty())
+    );
+    assert!(matches!(&body[9],AstStatement::Sql{verb,..} if verb=="UPDATE"));
+    assert!(matches!(&body[10], AstStatement::ValueScopeEnd { .. }));
 }
 
 // ---------------------------------------------------------------------------

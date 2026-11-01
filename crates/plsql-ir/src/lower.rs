@@ -202,6 +202,14 @@ fn lower_package_units(units: &AstPackageUnits, part: PackagePart) -> PackageUni
         part,
         lowered: units.lowered,
         state_variables: units.state_variables.clone(),
+        value_declarations: units
+            .value_declarations
+            .iter()
+            .map(|value| crate::decl::ValueDeclaration {
+                name: value.name.clone(),
+                span: value.span,
+            })
+            .collect(),
         members: units
             .members
             .iter()
@@ -402,6 +410,18 @@ pub fn lower_ast_statements(
     ast_stmts
         .iter()
         .flat_map(|s| match s {
+            AstStatement::ValueBinding { name, .. } => {
+                vec![Statement::ValueBinding { name: name.clone() }]
+            }
+            AstStatement::ValueScopeStart {
+                parameters,
+                default_expressions,
+                ..
+            } => vec![Statement::ValueScopeStart {
+                parameters: parameters.clone(),
+                default_expressions: default_expressions.clone(),
+            }],
+            AstStatement::ValueScopeEnd { .. } => vec![Statement::ValueScopeEnd],
             AstStatement::Null { .. } => vec![Statement::Null],
             AstStatement::Assignment {
                 target, rhs_text, ..

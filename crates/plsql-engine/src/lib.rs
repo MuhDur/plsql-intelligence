@@ -853,9 +853,9 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
     // when identity/effect coverage changes even if the serialized shape is
     // unchanged: old trigger entries lost owners and declaration effects.
     const CACHE_STRATEGY: &str = "semantic_fragment";
-    // v6: stage summaries became Measured; a cached v5 run would read its
-    // stored `0` back as a measured zero.
-    const CACHE_LAYOUT: &str = "invocation_v6_unmeasured_stage_summaries";
+    // v7: value-position names need lexical binding evidence. Older cached
+    // invocation indexes silently treated possible zero-argument calls as values.
+    const CACHE_LAYOUT: &str = "invocation_v7_value_name_bindings";
     let cache_ctx: Option<(plsql_store::Store, String, String)> = (|| {
         if !req.cache.enabled {
             return None;
@@ -1097,6 +1097,9 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
                 match pkg.units.part {
                     plsql_ir::PackagePart::Spec => {
                         entry.has_spec = true;
+                        entry
+                            .spec_variables
+                            .extend(pkg.units.state_variables.iter().cloned());
                         entry
                             .spec_members
                             .extend(pkg.units.members.iter().map(|m| m.unit_id(&logical_id)));
@@ -1402,6 +1405,21 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
                     params,
                     source_complete: !had_errors && !parse_result.recovered,
                     source_reasons,
+                    visible_values: if let plsql_ir::Declaration::Package(pkg) = decl {
+                        pkg.units
+                            .value_declarations
+                            .iter()
+                            .filter(|v| v.span.end.offset <= caller_span.start.offset)
+                            .map(|v| v.name.clone())
+                            .collect()
+                    } else {
+                        Default::default()
+                    },
+                    package_part: if let plsql_ir::Declaration::Package(pkg) = decl {
+                        Some(pkg.units.part)
+                    } else {
+                        None
+                    },
                 });
                 for effect in run.invocation_index.local_effects(&caller_id_str) {
                     let edge_kind = match effect {
@@ -1817,6 +1835,95 @@ mod tests {
         AnalysisRequest, CacheConfig, CatalogSnapshot, CatalogSourceConfig, EngineError,
         analyze_project,
     };
+
+    #[test]
+    fn legacy_cached_value_names_are_rebuilt_with_binding_evidence() {
+        let root = std::env::temp_dir().join(format!(
+            "engine-value-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let project = root.join("project");
+        let cache = root.join("cache");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let source = "CREATE FUNCTION APP.FX RETURN NUMBER IS V NUMBER; BEGIN RETURN V; END;";
+        std::fs::write(project.join("value.sql"), source).unwrap();
+        let request = AnalysisRequest {
+            project_root: project,
+            cache: CacheConfig {
+                enabled: true,
+                directory: Some(cache.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut uncached = request.clone();
+        uncached.cache.enabled = false;
+        let mut legacy = analyze_project(uncached).unwrap();
+        let shape = crate::InvocationShapeV1 {
+            routine_id: "APP.FX".into(),
+            ..Default::default()
+        };
+        assert!(legacy.invocation_closure(&shape).clean);
+        let unit = legacy.invocation_index.units.get_mut("APP.FX").unwrap();
+        unit.statements.retain(|stmt| {
+            !matches!(
+                stmt,
+                plsql_ir::Statement::ValueBinding { .. }
+                    | plsql_ir::Statement::ValueScopeStart { .. }
+                    | plsql_ir::Statement::ValueScopeEnd
+            )
+        });
+        unit.visible_values.clear();
+        assert!(
+            !legacy.invocation_closure(&shape).clean,
+            "historical cache really lacks local binding evidence"
+        );
+        let mut content = b"value.sql\0".to_vec();
+        content.extend_from_slice(source.as_bytes());
+        content.push(0);
+        let content_hash = plsql_store::hash_hex(&content);
+        let profile_hash = plsql_store::hash_hex(
+            &serde_json::to_vec(&(
+                "invocation_v6_unmeasured_stage_summaries",
+                &request.analysis_profile,
+                &request.redaction_policy,
+                &legacy.catalog,
+            ))
+            .unwrap(),
+        );
+        let store =
+            plsql_store::Store::open(&cache.join("cache.db"), plsql_store::StoreConfig::default())
+                .unwrap();
+        let key = plsql_store::CacheKey {
+            strategy_name: "semantic_fragment",
+            content_hash: &content_hash,
+            profile_hash: &profile_hash,
+        };
+        store
+            .put_cached(
+                key,
+                "application/json",
+                &serde_json::to_vec(&legacy).unwrap(),
+            )
+            .unwrap();
+        assert!(store.get_cached(key).unwrap().is_some());
+        let rebuilt = analyze_project(request.clone()).unwrap();
+        assert_eq!(
+            rebuilt.cache_outcome,
+            Some(false),
+            "v6 lost declarations and must not be reused"
+        );
+        assert!(
+            rebuilt.invocation_closure(&shape).clean,
+            "fresh parsing must retain the local V"
+        );
+        assert_eq!(analyze_project(request).unwrap().cache_outcome, Some(true));
+    }
 
     #[test]
     fn legacy_cached_trigger_effects_are_recomputed() {
