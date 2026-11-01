@@ -35,6 +35,11 @@ use antlr4rust::token_factory::TokenFactory;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::generated::plsqlparser::{
+    Field_specContextAttrs, Record_type_defContextAttrs, Type_declarationContextAttrs,
+    Varray_type_defContextAttrs,
+};
+
 use plsql_core::{Diagnostic, FileId, Position, Severity, Span};
 use plsql_parser::ast::{
     Ast, AstDecl, AstInitSection, AstInitializer, AstOverload, AstPackageCursor, AstPackageMember,
@@ -1067,6 +1072,10 @@ fn lower_declare_items(
             // Self-references remain uncertain until the initializer is proved.
             out.push(AstStatement::ValueBinding {
                 name: ident_of(source, var.identifier()),
+                type_text: var
+                    .type_spec()
+                    .map(|t| node_text(source, &*t))
+                    .unwrap_or_default(),
                 span: node_span(&*var, file_id, source),
             });
         } else if let Some(cur) = spec.cursor_declaration() {
@@ -1080,7 +1089,10 @@ fn lower_declare_items(
         } else if let Some(pb) = spec.procedure_body() {
             let parameters = lower_params(&pb.parameter_all(), source, file_id);
             out.push(AstStatement::ValueScopeStart {
-                parameters: parameters.iter().map(|p| p.name.clone()).collect(),
+                parameters: parameters
+                    .iter()
+                    .map(|p| (p.name.clone(), p.type_text.clone()))
+                    .collect(),
                 default_expressions: parameters
                     .iter()
                     .filter_map(|p| p.default_text.clone())
@@ -1106,7 +1118,10 @@ fn lower_declare_items(
         } else if let Some(fb) = spec.function_body() {
             let parameters = lower_params(&fb.parameter_all(), source, file_id);
             out.push(AstStatement::ValueScopeStart {
-                parameters: parameters.iter().map(|p| p.name.clone()).collect(),
+                parameters: parameters
+                    .iter()
+                    .map(|p| (p.name.clone(), p.type_text.clone()))
+                    .collect(),
                 default_expressions: parameters
                     .iter()
                     .filter_map(|p| p.default_text.clone())
@@ -1142,8 +1157,37 @@ fn lower_declare_items(
                 raw_text: node_text(source, &*pragma),
                 span: node_span(&*pragma, file_id, source),
             });
-        } else if spec.type_declaration().is_some()
-            || spec.subtype_declaration().is_some()
+        } else if let Some(declaration) = spec.type_declaration() {
+            if let Some(record) = declaration.record_type_def() {
+                let expressions = record
+                    .field_spec_all()
+                    .iter()
+                    .filter_map(|field| field.default_value_part())
+                    .filter_map(|default| default.expression())
+                    .map(|e| node_text(source, &*e))
+                    .collect();
+                out.push(AstStatement::LocalTypeBinding {
+                    name: ident_of(source, declaration.identifier()),
+                    collection: false,
+                    expressions,
+                    span: node_span(&*declaration, file_id, source),
+                });
+            } else if declaration.table_type_def().is_some()
+                || declaration.varray_type_def().is_some()
+            {
+                let expressions = declaration
+                    .varray_type_def()
+                    .and_then(|v| v.expression())
+                    .map(|e| vec![node_text(source, &*e)])
+                    .unwrap_or_default();
+                out.push(AstStatement::LocalTypeBinding {
+                    name: ident_of(source, declaration.identifier()),
+                    collection: true,
+                    expressions,
+                    span: node_span(&*declaration, file_id, source),
+                });
+            }
+        } else if spec.subtype_declaration().is_some()
             || spec.exception_declaration().is_some()
             || spec.procedure_spec().is_some()
             || spec.function_spec().is_some()
@@ -1178,6 +1222,10 @@ fn push_initializer(
         .value_declarations
         .push(plsql_parser::ast::AstValueDeclaration {
             name: name.clone(),
+            type_text: var
+                .type_spec()
+                .map(|t| node_text(source, &*t))
+                .unwrap_or_default(),
             span: node_span(var, file_id, source),
         });
     if let Some(init) = var.default_value_part().and_then(|d| d.expression()) {

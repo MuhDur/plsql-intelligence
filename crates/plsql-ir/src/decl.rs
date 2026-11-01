@@ -433,6 +433,8 @@ pub struct PackageUnits {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValueDeclaration {
     pub name: String,
+    #[serde(default)]
+    pub type_text: String,
     pub span: Span,
 }
 
@@ -540,6 +542,7 @@ impl PackageUnits {
                         1u8,
                         Statement::ValueBinding {
                             name: v.name.clone(),
+                            type_text: v.type_text.clone(),
                         },
                     )
                 })

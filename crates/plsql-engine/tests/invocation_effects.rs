@@ -200,6 +200,114 @@ fn declared_locals_parameters_and_constants_stay_values() {
 }
 
 #[test]
+fn proven_local_record_fields_and_collection_operations_are_values() {
+    for (source, arguments) in [
+        (
+            "CREATE FUNCTION APP.FX RETURN NUMBER IS R APP.T%ROWTYPE; BEGIN RETURN R.ID; END; /",
+            0,
+        ),
+        (
+            "CREATE FUNCTION APP.FX(P IN APP.T%ROWTYPE) RETURN NUMBER IS BEGIN RETURN P.ID; END; /",
+            1,
+        ),
+        (
+            "CREATE FUNCTION APP.FX RETURN NUMBER IS R APP.T%ROWTYPE; S R%TYPE; BEGIN RETURN S.ID; END; /",
+            0,
+        ),
+        (
+            "CREATE FUNCTION APP.FX RETURN NUMBER IS TYPE RT IS RECORD(ID NUMBER); R RT; BEGIN RETURN R.ID; END; /",
+            0,
+        ),
+        (
+            "CREATE FUNCTION APP.FX RETURN NUMBER IS TYPE TT IS TABLE OF NUMBER; C TT := TT(); BEGIN RETURN C.COUNT; END; /",
+            0,
+        ),
+        (
+            "CREATE FUNCTION APP.FX RETURN NUMBER IS TYPE TT IS TABLE OF NUMBER; C TT := TT(1,2); BEGIN RETURN C.COUNT() + C.FIRST + C.LAST + C.LIMIT + C.NEXT(1) + C.PRIOR(2) + C(1); END; /",
+            0,
+        ),
+        (
+            "CREATE FUNCTION APP.FX RETURN BOOLEAN IS TYPE TT IS TABLE OF NUMBER; C TT := TT(1); BEGIN RETURN C.EXISTS(1); END; /",
+            0,
+        ),
+    ] {
+        let run = analyze(source);
+        let actual = closure(&run, "APP.FX", arguments);
+        assert!(actual.clean, "{source}: {actual:?}");
+        assert_eq!(
+            actual.effects.effects,
+            BTreeSet::new(),
+            "{source}: {actual:?}"
+        );
+    }
+}
+
+#[test]
+fn object_and_unknown_prefixes_and_nonbuiltin_collection_members_stay_unknown() {
+    for source in [
+        "CREATE FUNCTION APP.FX RETURN NUMBER IS O APP.OBJECT_TYPE; BEGIN RETURN O.M; END; /",
+        "CREATE FUNCTION APP.FX RETURN NUMBER IS O APP.UNKNOWN_TYPE; BEGIN RETURN O.M(); END; /",
+        "CREATE FUNCTION APP.FX RETURN NUMBER IS O APP.T.ID%TYPE; BEGIN RETURN O.M; END; /",
+        "CREATE FUNCTION APP.FX RETURN NUMBER IS TYPE TT IS TABLE OF NUMBER; C TT; BEGIN RETURN C.FOREIGN_MEMBER; END; /",
+        "CREATE FUNCTION APP.FX RETURN NUMBER IS R APP.T%ROWTYPE; BEGIN RETURN R.OBJECT_COLUMN.M; END; /",
+        "CREATE FUNCTION APP.FX RETURN NUMBER IS TYPE TT IS TABLE OF NUMBER; C TT; BEGIN RETURN C.COUNT(1); END; /",
+        "CREATE FUNCTION APP.FX RETURN NUMBER IS PROCEDURE N IS TYPE TT IS TABLE OF NUMBER; BEGIN NULL; END; BEGIN RETURN TT(); END; /",
+    ] {
+        let run = analyze(source);
+        assert!(!closure(&run, "APP.FX", 0).clean, "{source}");
+    }
+}
+
+#[test]
+fn local_collection_arguments_and_record_defaults_retain_effects() {
+    for body in [
+        "TYPE TT IS TABLE OF NUMBER; C TT := TT(APP.F()); BEGIN RETURN C.COUNT;",
+        "TYPE TT IS TABLE OF NUMBER; C TT; BEGIN RETURN C.NEXT(APP.F());",
+        "TYPE RT IS RECORD(ID NUMBER DEFAULT APP.F()); R RT; BEGIN RETURN R.ID;",
+    ] {
+        let run = analyze(&format!(
+            "CREATE FUNCTION APP.F RETURN NUMBER IS PRAGMA AUTONOMOUS_TRANSACTION; BEGIN COMMIT; RETURN 1; END; /\nCREATE FUNCTION APP.FX RETURN NUMBER IS {body} END; /"
+        ));
+        let actual = closure(&run, "APP.FX", 0);
+        assert!(actual.units.contains("APP.F"), "{body}: {actual:?}");
+        assert!(
+            actual.effects.effects.contains(&RoutineEffect::Autonomous),
+            "{body}: {actual:?}"
+        );
+        assert!(
+            actual.effects.effects.contains(&RoutineEffect::TxnControl),
+            "{body}: {actual:?}"
+        );
+    }
+}
+
+#[test]
+fn sql_record_bindings_keep_values_but_do_not_hide_sql_calls() {
+    let row = analyze(
+        "CREATE FUNCTION APP.FX RETURN NUMBER IS R APP.T%ROWTYPE; V NUMBER; BEGIN SELECT R.ID INTO V FROM DUAL; RETURN V; END; /",
+    );
+    assert_case(
+        "SQL record field",
+        &closure(&row, "APP.FX", 0),
+        &[RoutineEffect::ReadDb],
+        true,
+    );
+    let object = analyze(
+        "CREATE FUNCTION APP.FX RETURN NUMBER IS O APP.OBJECT_TYPE; V NUMBER; BEGIN SELECT O.M INTO V FROM DUAL; RETURN V; END; /",
+    );
+    assert!(!closure(&object, "APP.FX", 0).clean);
+    let sql = analyze(
+        "CREATE FUNCTION APP.TT RETURN NUMBER IS PRAGMA AUTONOMOUS_TRANSACTION; BEGIN COMMIT; RETURN 1; END; /\nCREATE FUNCTION APP.FX RETURN NUMBER IS TYPE TT IS TABLE OF NUMBER; V NUMBER; BEGIN SELECT TT() INTO V FROM DUAL; RETURN V; END; /",
+    );
+    let actual = closure(&sql, "APP.FX", 0);
+    assert!(
+        actual.units.contains("APP.TT")
+            && actual.effects.effects.contains(&RoutineEffect::Autonomous),
+        "local PL/SQL type must not conceal an SQL callback: {actual:?}"
+    );
+}
+
+#[test]
 fn value_bindings_do_not_leak_from_later_declarations_or_nested_scopes() {
     for source in [
         "CREATE FUNCTION APP.FX RETURN NUMBER IS V NUMBER := F; F NUMBER := 1; BEGIN RETURN V; END; /",

@@ -265,11 +265,21 @@ pub enum AstStatement {
     /// A parser-observed value declaration, in lexical declaration order.
     ValueBinding {
         name: String,
+        #[serde(default)]
+        type_text: String,
+        span: Span,
+    },
+    /// A lexical local type, whose shape is established by the grammar.
+    LocalTypeBinding {
+        name: String,
+        collection: bool,
+        /// Record field defaults, or a collection's capacity expression.
+        expressions: Vec<String>,
         span: Span,
     },
     /// Lexical scope around conservatively flattened nested subprogram bodies.
     ValueScopeStart {
-        parameters: Vec<String>,
+        parameters: Vec<(String, String)>,
         default_expressions: Vec<String>,
         span: Span,
     },
@@ -343,6 +353,7 @@ impl Spanned for AstStatement {
     fn span(&self) -> Span {
         match self {
             Self::ValueBinding { span, .. }
+            | Self::LocalTypeBinding { span, .. }
             | Self::ValueScopeStart { span, .. }
             | Self::ValueScopeEnd { span }
             | Self::Null { span }
@@ -599,6 +610,8 @@ pub struct AstPackageUnits {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AstValueDeclaration {
     pub name: String,
+    #[serde(default)]
+    pub type_text: String,
     pub span: Span,
 }
 

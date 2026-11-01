@@ -207,6 +207,7 @@ fn lower_package_units(units: &AstPackageUnits, part: PackagePart) -> PackageUni
             .iter()
             .map(|value| crate::decl::ValueDeclaration {
                 name: value.name.clone(),
+                type_text: value.type_text.clone(),
                 span: value.span,
             })
             .collect(),
@@ -410,9 +411,24 @@ pub fn lower_ast_statements(
     ast_stmts
         .iter()
         .flat_map(|s| match s {
-            AstStatement::ValueBinding { name, .. } => {
-                vec![Statement::ValueBinding { name: name.clone() }]
+            AstStatement::ValueBinding {
+                name, type_text, ..
+            } => {
+                vec![Statement::ValueBinding {
+                    name: name.clone(),
+                    type_text: type_text.clone(),
+                }]
             }
+            AstStatement::LocalTypeBinding {
+                name,
+                collection,
+                expressions,
+                ..
+            } => vec![Statement::LocalTypeBinding {
+                name: name.clone(),
+                collection: *collection,
+                expressions: expressions.clone(),
+            }],
             AstStatement::ValueScopeStart {
                 parameters,
                 default_expressions,

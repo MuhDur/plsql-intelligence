@@ -39,11 +39,20 @@ pub enum Statement {
     /// Parser-proven value binding; never inferred from an assignment target.
     ValueBinding {
         name: String,
+        #[serde(default)]
+        type_text: String,
+    },
+    /// Grammar-proven local RECORD or collection type. Record expressions
+    /// are field defaults; collection expressions are evaluated capacity bounds.
+    LocalTypeBinding {
+        name: String,
+        collection: bool,
+        expressions: Vec<String>,
     },
     /// Begin/end lexical value scope without hiding the flattened statements
     /// from existing SQL, call and control-flow walkers.
     ValueScopeStart {
-        parameters: Vec<String>,
+        parameters: Vec<(String, String)>,
         default_expressions: Vec<String>,
     },
     ValueScopeEnd,

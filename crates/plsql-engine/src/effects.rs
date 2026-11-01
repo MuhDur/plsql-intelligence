@@ -165,6 +165,8 @@ pub struct EffectUnit {
     #[serde(default)]
     pub visible_values: BTreeSet<String>,
     #[serde(default)]
+    pub visible_value_types: BTreeMap<String, String>,
+    #[serde(default)]
     pub package_part: Option<plsql_ir::PackagePart>,
 }
 
@@ -179,12 +181,25 @@ pub struct PackageShape {
     pub source_reasons: BTreeSet<String>,
     #[serde(default)]
     pub spec_variables: BTreeSet<String>,
+    #[serde(default)]
+    pub spec_value_types: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Default)]
+enum LocalValueShape {
+    #[default]
+    Opaque,
+    Record(Vec<String>),
+    Collection,
 }
 
 #[derive(Clone)]
 struct ValueScope<'a> {
     unit: &'a EffectUnit,
     values: BTreeSet<String>,
+    value_types: BTreeMap<String, LocalValueShape>,
+    local_types: BTreeMap<String, LocalValueShape>,
+    sql_calls: bool,
 }
 
 impl std::ops::Deref for ValueScope<'_> {
@@ -203,7 +218,107 @@ impl<'a> ValueScope<'a> {
         {
             values.extend(package.spec_variables.iter().cloned());
         }
-        Self { unit, values }
+        let mut scope = Self {
+            unit,
+            values,
+            value_types: BTreeMap::new(),
+            local_types: BTreeMap::new(),
+            sql_calls: false,
+        };
+        for (name, text) in &unit.visible_value_types {
+            let shape = scope.resolve_type(text);
+            scope.value_types.insert(name.clone(), shape);
+        }
+        if unit.package_part == Some(plsql_ir::PackagePart::Body)
+            && let Some(package) = unit.package.as_ref().and_then(|p| index.packages.get(p))
+        {
+            for (name, text) in &package.spec_value_types {
+                let shape = scope.resolve_type(text);
+                scope.value_types.insert(name.clone(), shape);
+            }
+        }
+        for param in &unit.params {
+            let shape = scope.resolve_type(param.type_text.as_deref().unwrap_or(""));
+            scope.value_types.insert(param.name.clone(), shape);
+        }
+        scope
+    }
+
+    fn resolve_type(&self, text: &str) -> LocalValueShape {
+        let text = text.trim();
+        let upper = text.to_ascii_uppercase();
+        if upper.ends_with("%ROWTYPE") {
+            return LocalValueShape::Record(Vec::new());
+        }
+        if upper.ends_with("%TYPE") {
+            return match lower_expression(text[..text.len() - 5].trim()) {
+                Expr::Name(name) if name.parts.len() == 1 => self
+                    .value_types
+                    .get(&name.parts[0])
+                    .cloned()
+                    .unwrap_or_default(),
+                _ => LocalValueShape::Opaque,
+            };
+        }
+        match lower_expression(text) {
+            Expr::Name(name) if name.parts.len() == 1 => self
+                .local_types
+                .get(&name.parts[0])
+                .cloned()
+                .unwrap_or_default(),
+            _ => LocalValueShape::Opaque,
+        }
+    }
+
+    fn value_call(&self, parts: &[String], arity: usize) -> bool {
+        if self.sql_calls {
+            return false;
+        }
+        match parts {
+            [name] => {
+                matches!(
+                    self.local_types.get(name),
+                    Some(LocalValueShape::Collection)
+                ) || (arity == 1
+                    && matches!(
+                        self.value_types.get(name),
+                        Some(LocalValueShape::Collection)
+                    ))
+            }
+            [name, member]
+                if matches!(
+                    self.value_types.get(name),
+                    Some(LocalValueShape::Collection)
+                ) =>
+            {
+                collection_method(member, arity)
+            }
+            _ => false,
+        }
+    }
+}
+
+fn collection_method(name: &str, arity: usize) -> bool {
+    matches!(
+        (name, arity),
+        ("COUNT" | "FIRST" | "LAST" | "LIMIT", 0) | ("NEXT" | "PRIOR" | "EXISTS", 1)
+    )
+}
+
+fn known_value(
+    parts: &[String],
+    values: &BTreeSet<String>,
+    types: &BTreeMap<String, LocalValueShape>,
+) -> bool {
+    if values.contains(&parts.join(".")) {
+        return true;
+    }
+    match parts {
+        [name, _] if matches!(types.get(name), Some(LocalValueShape::Record(_))) => true,
+        [name, member] if matches!(types.get(name), Some(LocalValueShape::Collection)) => {
+            collection_method(member, 0)
+        }
+        _ => false,
     }
 }
 
@@ -226,6 +341,7 @@ impl InvocationIndexV1 {
                 || existing.package_part.is_none()
             {
                 existing.visible_values = unit.visible_values;
+                existing.visible_value_types = unit.visible_value_types;
                 existing.package_part = unit.package_part;
             }
         } else {
@@ -473,8 +589,33 @@ fn inspect_statements(
     }
     for stmt in statements {
         match stmt {
-            Statement::ValueBinding { name } => {
+            Statement::ValueBinding { name, type_text } => {
+                let shape = unit.resolve_type(type_text);
+                if let LocalValueShape::Record(defaults) = &shape {
+                    for expr in defaults {
+                        inspect_expression(expr, unit, out, calls);
+                    }
+                }
                 unit.values.insert(name.clone());
+                unit.value_types.insert(name.clone(), shape);
+                unit.local_types.remove(name);
+            }
+            Statement::LocalTypeBinding {
+                name,
+                collection,
+                expressions,
+            } => {
+                let shape = if *collection {
+                    for expr in expressions {
+                        inspect_expression(expr, unit, out, calls);
+                    }
+                    LocalValueShape::Collection
+                } else {
+                    LocalValueShape::Record(expressions.clone())
+                };
+                unit.local_types.insert(name.clone(), shape);
+                unit.values.remove(name);
+                unit.value_types.remove(name);
             }
             Statement::ValueScopeStart {
                 parameters,
@@ -489,12 +630,23 @@ fn inspect_statements(
                 for expression in default_expressions {
                     inspect_default_expression(expression, unit, out, calls);
                 }
-                scopes.push(unit.values.clone());
-                unit.values.extend(parameters.iter().cloned());
+                scopes.push((
+                    unit.values.clone(),
+                    unit.value_types.clone(),
+                    unit.local_types.clone(),
+                ));
+                for (name, ty) in parameters {
+                    let shape = unit.resolve_type(ty);
+                    unit.values.insert(name.clone());
+                    unit.value_types.insert(name.clone(), shape);
+                    unit.local_types.remove(name);
+                }
             }
             Statement::ValueScopeEnd => {
-                if let Some(values) = scopes.pop() {
+                if let Some((values, value_types, local_types)) = scopes.pop() {
                     unit.values = values;
+                    unit.value_types = value_types;
+                    unit.local_types = local_types;
                 } else {
                     out.unknown("unbalanced lexical value scope");
                 }
@@ -589,6 +741,9 @@ fn inspect_statements(
                 inspect_expression(range_text, unit, out, calls);
                 let mut body_scope = (*unit).clone();
                 body_scope.values.insert(iterator.clone());
+                body_scope
+                    .value_types
+                    .insert(iterator.clone(), LocalValueShape::Opaque);
                 inspect_statements(
                     &plsql_ir::lower_statement_body(body_text),
                     &body_scope,
@@ -810,6 +965,7 @@ fn census_statements(statements: &[Statement], depth: usize, census: &mut Dynami
             }
             Statement::Unrecognized { raw_text, .. } => census_unrecognized(raw_text, census),
             Statement::ValueBinding { .. }
+            | Statement::LocalTypeBinding { .. }
             | Statement::ValueScopeStart { .. }
             | Statement::ValueScopeEnd
             | Statement::Null
@@ -943,7 +1099,7 @@ fn inspect_expr(
             out.unknown("runtime expression input");
         }
         Expr::Name(name) => {
-            if unit.values.contains(&name.parts.join(".")) {
+            if known_value(&name.parts, &unit.values, &unit.value_types) {
                 // Parser-proven value binding wins over a possible bare call.
             } else if name.parts.last().is_some_and(|p| p == "NEXTVAL") {
                 out.effects.effects.insert(RoutineEffect::SequenceAdvance);
@@ -971,7 +1127,10 @@ fn inspect_expr(
             }
             let name = parts.join(".");
             let last = parts.last().map(String::as_str).unwrap_or("");
-            if is_dbms_output_primitive(&name, args.len())
+            if unit.value_call(parts, args.len()) {
+                // Parser-proven local collection constructors, indexing and
+                // built-in methods are values. Arguments are still inspected.
+            } else if is_dbms_output_primitive(&name, args.len())
                 && !args
                     .iter()
                     .any(|arg| matches!(arg, Expr::Raw { text, .. } if text.contains("=>")))
@@ -1103,6 +1262,7 @@ fn inspect_sql_calls(
     // uncertainty already found by this block-scoped walk.
     let mut values = SqlValueNames {
         bindings: &unit.values,
+        value_types: &unit.value_types,
         out,
         accepted: BTreeSet::new(),
         call_names: BTreeSet::new(),
@@ -1128,6 +1288,7 @@ fn inspect_sql_calls(
             .unknown(format!("incomplete SQL value shape: {reason:?}")),
     }
     let mut sql_unit = unit.clone();
+    sql_unit.sql_calls = true;
     sql_unit.values.extend(values.accepted);
     let call_names = values.call_names;
     let unit = &sql_unit;
@@ -1229,6 +1390,7 @@ struct SqlValueScope {
 
 struct SqlValueNames<'a, 'b> {
     bindings: &'a BTreeSet<String>,
+    value_types: &'a BTreeMap<String, LocalValueShape>,
     out: &'b mut InvocationClosureV1,
     accepted: BTreeSet<String>,
     call_names: BTreeSet<String>,
@@ -1459,14 +1621,15 @@ impl SqlValueNames<'_, '_> {
             ShapeExpr::Name(parts) => {
                 let parts: Vec<_> = parts.iter().map(sql_ident).collect();
                 let name = parts.join(".");
-                let column = if parts.len() == 1 {
-                    self.bindings.contains(&name)
-                        || scope.columns.names.contains(&name)
-                        || scope.columns.unresolved
-                        || matches!(name.as_str(), "ROWNUM" | "LEVEL")
-                } else {
-                    scope.qualifiers.contains_key(&parts[..parts.len() - 1])
-                };
+                let column = known_value(&parts, self.bindings, self.value_types)
+                    || if parts.len() == 1 {
+                        self.bindings.contains(&name)
+                            || scope.columns.names.contains(&name)
+                            || scope.columns.unresolved
+                            || matches!(name.as_str(), "ROWNUM" | "LEVEL")
+                    } else {
+                        scope.qualifiers.contains_key(&parts[..parts.len() - 1])
+                    };
                 if parts.last().is_some_and(|p| p == "NEXTVAL") {
                     self.out
                         .effects
