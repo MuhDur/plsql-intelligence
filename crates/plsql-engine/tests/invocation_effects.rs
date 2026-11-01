@@ -296,6 +296,82 @@ fn opaque_bound_call_arguments_still_contribute_calls_and_effects() {
 }
 
 #[test]
+fn sql_bound_calls_do_not_resolve_to_colliding_schema_routines() {
+    for body in [
+        "SELECT O.M() INTO V FROM SYS.DUAL;",
+        "OPEN C FOR SELECT O.M() FROM SYS.DUAL;",
+        "INSERT INTO APP.T(ID) VALUES(O.M());",
+        "UPDATE APP.T SET ID=O.M() WHERE ID=1;",
+        "DELETE FROM APP.T WHERE ID=O.M();",
+    ] {
+        let run = analyze(&format!(
+            "CREATE FUNCTION O.M RETURN NUMBER IS BEGIN RETURN 1; END; /\nCREATE FUNCTION APP.FX RETURN NUMBER IS O APP.OBJ_T; V NUMBER; C SYS_REFCURSOR; BEGIN {body} RETURN V; END; /"
+        ));
+        let actual = closure(&run, "APP.FX", 0);
+        assert!(
+            !actual.clean,
+            "SQL bound member became pure schema call: {body}: {actual:?}"
+        );
+        assert!(
+            actual
+                .unknown_reasons
+                .iter()
+                .any(|reason| reason
+                    .contains("unproven SQL call through a value or local type: O.M")),
+            "{body}: {actual:?}"
+        );
+        assert!(!actual.units.contains("O.M"), "{body}: {actual:?}");
+    }
+}
+
+#[test]
+fn sql_from_alias_wins_over_a_bound_plsql_call_prefix() {
+    for source in ["APP.T T", "APP.T"] {
+        let body = format!("SELECT T.M() INTO V FROM {source};");
+        let baseline = analyze(&format!(
+            "CREATE FUNCTION T.M RETURN NUMBER IS BEGIN RETURN 1; END; /\nCREATE FUNCTION APP.FX RETURN NUMBER IS V NUMBER; BEGIN {body} RETURN V; END; /"
+        ));
+        let shadowed = analyze(&format!(
+            "CREATE FUNCTION T.M RETURN NUMBER IS BEGIN RETURN 1; END; /\nCREATE FUNCTION APP.FX RETURN NUMBER IS T APP.OBJ_T; V NUMBER; BEGIN {body} RETURN V; END; /"
+        ));
+        assert_eq!(
+            closure(&baseline, "APP.FX", 0),
+            closure(&shadowed, "APP.FX", 0),
+            "FROM alias/source must retain its existing SQL resolution path: {body}"
+        );
+    }
+}
+
+#[test]
+fn sql_alias_ownership_does_not_escape_its_query_block() {
+    let run = analyze(
+        "CREATE FUNCTION O.M RETURN NUMBER IS BEGIN RETURN 1; END; /\nCREATE FUNCTION APP.FX RETURN NUMBER IS O APP.OBJ_T; V NUMBER; BEGIN SELECT O.M() INTO V FROM APP.T O UNION ALL SELECT O.M() FROM SYS.DUAL; RETURN V; END; /",
+    );
+    let actual = closure(&run, "APP.FX", 0);
+    assert!(!actual.clean, "{actual:?}");
+    assert!(
+        actual
+            .unknown_reasons
+            .iter()
+            .any(|reason| reason.contains("unproven SQL call through a value or local type: O.M")),
+        "the first branch's alias must not prove the second branch's call: {actual:?}"
+    );
+}
+
+#[test]
+fn sql_opaque_bound_call_arguments_retain_calls_and_effects() {
+    let run = analyze(
+        "CREATE FUNCTION O.M(X NUMBER) RETURN NUMBER IS BEGIN RETURN 1; END; /\nCREATE FUNCTION APP.F RETURN NUMBER IS PRAGMA AUTONOMOUS_TRANSACTION; BEGIN COMMIT; RETURN 1; END; /\nCREATE FUNCTION APP.FX RETURN NUMBER IS O APP.OBJ_T; V NUMBER; BEGIN SELECT O.M(APP.F()) INTO V FROM SYS.DUAL; RETURN V; END; /",
+    );
+    let actual = closure(&run, "APP.FX", 0);
+    assert!(!actual.clean, "{actual:?}");
+    assert!(!actual.units.contains("O.M"), "{actual:?}");
+    assert!(actual.units.contains("APP.F"), "{actual:?}");
+    assert!(actual.effects.effects.contains(&RoutineEffect::Autonomous));
+    assert!(actual.effects.effects.contains(&RoutineEffect::TxnControl));
+}
+
+#[test]
 fn local_collection_arguments_and_record_defaults_retain_effects() {
     for body in [
         "TYPE TT IS TABLE OF NUMBER; C TT := TT(APP.F()); BEGIN RETURN C.COUNT;",

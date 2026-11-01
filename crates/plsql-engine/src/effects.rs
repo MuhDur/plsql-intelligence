@@ -1273,6 +1273,7 @@ fn inspect_sql_calls(
     let mut values = SqlValueNames {
         bindings: &unit.values,
         value_types: &unit.value_types,
+        local_types: &unit.local_types,
         out,
         accepted: BTreeSet::new(),
         call_names: BTreeSet::new(),
@@ -1401,6 +1402,7 @@ struct SqlValueScope {
 struct SqlValueNames<'a, 'b> {
     bindings: &'a BTreeSet<String>,
     value_types: &'a BTreeMap<String, LocalValueShape>,
+    local_types: &'a BTreeMap<String, LocalValueShape>,
     out: &'b mut InvocationClosureV1,
     accepted: BTreeSet<String>,
     call_names: BTreeSet<String>,
@@ -1654,8 +1656,25 @@ impl SqlValueNames<'_, '_> {
                 }
             }
             ShapeExpr::Call { name, args, .. } => {
-                self.call_names
-                    .insert(name.iter().map(sql_ident).collect::<Vec<_>>().join("."));
+                let name: Vec<_> = name.iter().map(sql_ident).collect();
+                let bound_prefix = name.first().is_some_and(|prefix| {
+                    self.bindings.contains(prefix) || self.local_types.contains_key(prefix)
+                });
+                let sql_source = scope
+                    .qualifiers
+                    .keys()
+                    .any(|qualifier| name.len() > qualifier.len() && name.starts_with(qualifier));
+                if name.len() > 1 && bound_prefix && !sql_source {
+                    // SQL source/alias ownership takes precedence in this
+                    // query block. Otherwise the bound PL/SQL value/type
+                    // prevents proving an unrelated schema routine identity.
+                    self.out.unknown(format!(
+                        "unproven SQL call through a value or local type: {}",
+                        name.join(".")
+                    ));
+                } else {
+                    self.call_names.insert(name.join("."));
+                }
                 for arg in args {
                     self.expression(arg, scope, ctes, depth + 1);
                 }
