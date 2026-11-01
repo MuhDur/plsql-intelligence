@@ -7,9 +7,110 @@ Pre-1.0 the API can move at any time; the changelog still captures every
 substantive change so contributors and downstream tooling can navigate the
 work.
 
-## [Unreleased]
+## [Unreleased] (0.8.0)
 
-- No unreleased changes.
+### Added
+
+- `CompletenessReport` measures its six gap metrics from the run instead of
+  reporting all of them as `{"unmeasured": true}`:
+  - `wrapped_units`: `CREATE ... <name> WRAPPED` headers on the token tape,
+    so comments and string literals cannot produce one.
+  - `missing_package_bodies`: package specs that declare routines but have no
+    body. A wrapped body counts as wrapped, not missing.
+  - `dynamic_sql_sites` and `opaque_dynamic_sql_sites`: `EXECUTE IMMEDIATE`,
+    `OPEN cursor FOR <string>` and `DBMS_SQL.PARSE` sites. A site is opaque
+    when its SQL text is not a string literal.
+  - `db_link_edges`: the new `DbLink` dependency edges described below.
+  - `unresolved_references`: `UnresolvedCallee` edges. Calls to built-ins and
+    SYS packages are included, because the engine has no catalog to resolve
+    them against.
+- `object@link` references produce `DbLink` dependency edges from the
+  innermost containing unit to a remote node named `OBJECT@LINK`.
+- `plsql_parser_antlr::read_query_shape(sql)` parses an Oracle query with the
+  ANTLR grammar and returns what a read classifier needs: query blocks, CTEs,
+  set branches, FROM items with exact names and aliases, flashback (`AS OF`,
+  `VERSIONS`) and partition modifiers, joins, value-position names, calls with
+  their arguments, and scalar, `EXISTS`, `IN` and quantified subqueries. Only
+  whitelisted grammar rules are accepted.
+- Source-backed routine effects and invocation closures (`InvocationIndexV1`,
+  `RoutineEffectsV1`, `InvocationClosureV1`) on every run. New dependency edge
+  kinds cover transaction control, autonomous transactions, sequence advance,
+  row locks, session state, DDL, admin and operator-only statements,
+  unresolved dynamic SQL and external I/O.
+- Package members, declaration initializers, the package init section and
+  parameter default expressions are separately addressable units
+  (`PackageUnits`). Standalone routine parameters and their defaults are
+  captured too.
+- Static `OPEN cursor FOR SELECT ...` lowers to a new `Statement::OpenCursor`
+  IR variant and counts as a database read; opening a package-global cursor
+  also counts as a session-state change. Fully qualified
+  `SYS.DBMS_OUTPUT.PUT`, `PUT_LINE` and `NEW_LINE` calls are modeled as
+  session-state output producers. Unqualified calls and synonyms are not.
+- The AST carries a static SQL projection per routine (`StaticSqlStatement`,
+  `StaticSqlProjection`), computed from grammar nodes.
+- Fuzz targets for package-unit lowering and effect extraction.
+- Release builds publish `install.sh` and `install.ps1` as release assets.
+
+### Changed
+
+- `ANALYSIS_RUN_SCHEMA` is 1.3.0 (0.7.0 shipped 1.1.0). 1.2.0 added the
+  invocation index and closure effects. 1.3.0 turns the stage-summary counts
+  into measured values.
+- `SqlSemanticModel::statement_count`, `FlowSummary::taint_path_count` and
+  `FlowSummary::string_shape_count` are `plsql_core::Measured<usize>`. The
+  SQL-semantic and inter-procedural flow stages are not implemented, so these
+  serialize as `{"unmeasured": true}` instead of `0`. Artifacts that stored a
+  plain number still deserialize, as `Measured(n)`.
+- The walk-based gap metrics (`dynamic_sql_sites`, `opaque_dynamic_sql_sites`,
+  `db_link_edges`, `unresolved_references`) stay unmeasured when no unit was
+  walked, for example when nothing parsed, and when a walk hit the
+  re-lowering depth cap. A reported `0` means the source was examined.
+- A `t@link` table access in embedded SQL gets its Reads or Writes edge to
+  the remote `T@LINK` node, with the `DbLinkBoundary` resolution strategy.
+  It used to point at a local table `T`. `plsql_ir::TableAccess` has a new
+  `db_link` field, omitted from JSON when absent.
+- Breaking for Rust consumers: `Statement` has the new `OpenCursor` variant,
+  `EdgeKind` has the new effect kinds, and `TableAccess` has the new
+  `db_link` field. Exhaustive matches and struct literals need updating.
+- The analysis cache key includes a layout version (now
+  `invocation_v6_unmeasured_stage_summaries`) and the catalog snapshot, which
+  is read before the cache lookup. Runs cached by 0.7.0 are recomputed rather
+  than reused.
+- Parser code generation moved from `antlr-rust 0.3.0-beta` to
+  `antlr4rust 0.5.2`; the `antlr-codegen` feature now depends on
+  `antlr4rust`. The bundled ANTLR generator jar was removed.
+- When `SYS` appears in a file as a bare identifier rather than a schema
+  qualifier, the file's units get the source reason "SYS qualifier may be
+  lexically shadowed", which keeps their invocation proof uncertain.
+- The SQL effect token scan no longer allocates per token.
+
+### Fixed
+
+- Expressions starting with a literal, name or call (`g NUMBER := 1;`,
+  `RETURN 1;`, `p IN NUMBER DEFAULT f()`) did not parse, because the
+  `IsNotNumericFunction` grammar predicate was stubbed to `false`. Error
+  recovery then split the surrounding statements.
+- Table aliases were never consumed, so `FROM emp t` and
+  `FROM hr.emp e JOIN dept d ON ...` failed after the table name. The
+  `isNotStartOfJoin` predicate was stubbed to `false`; it now returns `false`
+  only when the next token starts a join.
+- A type body that contains only call specs now reports an empty computed
+  static SQL projection, and a named type body keeps all of its static SQL.
+- Trigger declarations, every compound-trigger timing section and their
+  exception handlers are lowered, so trigger effects on qualified names are
+  kept. Invocation indexes cached under the old trigger handling are
+  recomputed.
+- Declaration spans beyond the `u32` byte-offset range saturate instead of
+  wrapping.
+- `install.sh` failed under macOS's bash 3.2 when no proxy was set, because
+  it expanded an empty proxy-argument array under `set -u`.
+
+### Removed
+
+- Three fuzz target sources that `fuzz/Cargo.toml` never declared and that
+  imported retired crates: `catalog_async_loader`, `live_runtime_ops` and
+  `mcp_async_dispatch`. A test now checks that every target source is
+  declared and every declared target has a source.
 
 ## [0.7.0] - 2026-06-30
 
