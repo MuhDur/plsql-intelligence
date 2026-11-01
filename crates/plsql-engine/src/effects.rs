@@ -1130,6 +1130,16 @@ fn inspect_expr(
             if unit.value_call(parts, args.len()) {
                 // Parser-proven local collection constructors, indexing and
                 // built-in methods are values. Arguments are still inspected.
+            } else if !unit.sql_calls
+                && parts.first().is_some_and(|prefix| {
+                    unit.values.contains(prefix) || unit.local_types.contains_key(prefix)
+                })
+            {
+                // A bound value/type prefix cannot identify an unrelated schema
+                // routine. Object member dispatch needs type resolution.
+                out.unknown(format!(
+                    "unproven call through a value or local type: {name}"
+                ));
             } else if is_dbms_output_primitive(&name, args.len())
                 && !args
                     .iter()

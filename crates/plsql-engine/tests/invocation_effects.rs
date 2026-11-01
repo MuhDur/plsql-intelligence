@@ -259,6 +259,43 @@ fn object_and_unknown_prefixes_and_nonbuiltin_collection_members_stay_unknown() 
 }
 
 #[test]
+fn opaque_bound_calls_do_not_resolve_to_colliding_schema_routines() {
+    for (declarations, callee) in [
+        ("O APP.OBJECT_TYPE;", "O.M"),
+        ("O APP.UNKNOWN_TYPE;", "O.M"),
+        ("R APP.T%ROWTYPE;", "R.ID"),
+        ("TYPE TT IS TABLE OF NUMBER; C TT;", "C.FOO"),
+        ("TYPE TT IS TABLE OF NUMBER;", "TT.FOO"),
+    ] {
+        let run = analyze(&format!(
+            "CREATE FUNCTION {callee} RETURN NUMBER IS BEGIN RETURN 1; END; /\nCREATE FUNCTION APP.FX RETURN NUMBER IS {declarations} BEGIN RETURN {callee}(); END; /"
+        ));
+        let actual = closure(&run, "APP.FX", 0);
+        assert!(
+            !actual.clean,
+            "bound value/type prefix must not become an unrelated pure schema call: {actual:?}"
+        );
+        assert!(
+            !actual.units.contains(callee),
+            "a bound member has no proven schema-routine identity: {actual:?}"
+        );
+    }
+}
+
+#[test]
+fn opaque_bound_call_arguments_still_contribute_calls_and_effects() {
+    let run = analyze(
+        "CREATE FUNCTION O.M(X NUMBER) RETURN NUMBER IS BEGIN RETURN 1; END; /\nCREATE FUNCTION APP.F RETURN NUMBER IS PRAGMA AUTONOMOUS_TRANSACTION; BEGIN COMMIT; RETURN 1; END; /\nCREATE FUNCTION APP.FX RETURN NUMBER IS O APP.OBJECT_TYPE; BEGIN RETURN O.M(APP.F()); END; /",
+    );
+    let actual = closure(&run, "APP.FX", 0);
+    assert!(!actual.clean, "{actual:?}");
+    assert!(!actual.units.contains("O.M"), "{actual:?}");
+    assert!(actual.units.contains("APP.F"), "{actual:?}");
+    assert!(actual.effects.effects.contains(&RoutineEffect::Autonomous));
+    assert!(actual.effects.effects.contains(&RoutineEffect::TxnControl));
+}
+
+#[test]
 fn local_collection_arguments_and_record_defaults_retain_effects() {
     for body in [
         "TYPE TT IS TABLE OF NUMBER; C TT := TT(APP.F()); BEGIN RETURN C.COUNT;",

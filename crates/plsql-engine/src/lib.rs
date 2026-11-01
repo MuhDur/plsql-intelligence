@@ -853,9 +853,9 @@ pub fn analyze_project(req: AnalysisRequest) -> Result<AnalysisRun, EngineError>
     // when identity/effect coverage changes even if the serialized shape is
     // unchanged: old trigger entries lost owners and declaration effects.
     const CACHE_STRATEGY: &str = "semantic_fragment";
-    // v8: qualified values require record/collection type evidence, distinct
-    // from opaque object types whose member calls can have effects.
-    const CACHE_LAYOUT: &str = "invocation_v8_typed_value_name_bindings";
+    // v9: bound value/type call prefixes cannot resolve to schema routines;
+    // v8 could cache a false-clean closure from a colliding routine name.
+    const CACHE_LAYOUT: &str = "invocation_v9_bound_call_targets";
     let cache_ctx: Option<(plsql_store::Store, String, String)> = (|| {
         if !req.cache.enabled {
             return None;
@@ -1911,6 +1911,7 @@ mod tests {
         for layout in [
             "invocation_v6_unmeasured_stage_summaries",
             "invocation_v7_value_name_bindings",
+            "invocation_v8_typed_value_name_bindings",
         ] {
             let profile_hash = plsql_store::hash_hex(
                 &serde_json::to_vec(&(
@@ -1939,7 +1940,7 @@ mod tests {
         assert_eq!(
             rebuilt.cache_outcome,
             Some(false),
-            "v6/v7 lost typed binding evidence and must not be reused"
+            "v6/v7/v8 closure evidence must be rebuilt with bound-call resolution"
         );
         assert!(
             rebuilt.invocation_closure(&shape).clean,
