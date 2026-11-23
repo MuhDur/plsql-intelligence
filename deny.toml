@@ -9,18 +9,7 @@ version = 2
 # Fail the build on a known security advisory; warn (don't fail) on yanked or
 # unmaintained crates so a transitive yank doesn't wedge CI unrelated to a fix.
 yanked = "warn"
-ignore = [
-    # Transitive, unmaintained-only (NOT vulnerabilities), no safe upgrade —
-    # accepted until upstream drops them. Real vulnerability advisories still
-    # fail the build.
-    # `paste` 1.0.x via the Oracle driver (oracle 0.6.x).
-    "RUSTSEC-2024-0436",
-    # `instant` via parking_lot 0.11 -> parking_lot_core 0.8.6.
-    "RUSTSEC-2024-0384",
-    # `rustls-pemfile` via asupersync/oracledb 0.5.0; unmaintained-only,
-    # no safe upgrade in the adopted upstream stack.
-    "RUSTSEC-2025-0134",
-]
+ignore = []
 
 [licenses]
 version = 2
